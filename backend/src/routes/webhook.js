@@ -105,7 +105,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
 // ── DEV TEST ENDPOINT ─────────────────────────────────────────
 // Allows testing bot without real WhatsApp connection
-if (process.env.NODE_ENV !== 'production') {
+if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT === 'true') {
   router.post('/webhook/test', async (req, res) => {
     const { phone = '919999999999', message = 'Hi', button_id } = req.body;
     try {
