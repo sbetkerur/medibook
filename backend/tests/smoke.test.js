@@ -47,7 +47,7 @@ async function req(method, path, body, token) {
 }
 
 async function bot(message, button_id) {
-  return req('POST', '/api/webhook/test', { phone: TEST_PHONE, message, button_id });
+  return req('POST', '/api/webhook/test', { phone: TEST_PHONE, message, button_id, tenant_slug: SLUG });
 }
 
 function assert(cond, msg) {

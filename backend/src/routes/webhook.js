@@ -107,9 +107,11 @@ router.post('/webhook/whatsapp', async (req, res) => {
 // Allows testing bot without real WhatsApp connection
 if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT === 'true') {
   router.post('/webhook/test', async (req, res) => {
-    const { phone = '919999999999', message = 'Hi', button_id } = req.body;
+    const { phone = '919999999999', message = 'Hi', button_id, tenant_slug } = req.body;
     try {
-      const r = await query(`SELECT * FROM tenants WHERE status='active' LIMIT 1`);
+      const r = tenant_slug
+        ? await query(`SELECT * FROM tenants WHERE slug=$1 AND status='active'`, [tenant_slug])
+        : await query(`SELECT * FROM tenants WHERE status='active' ORDER BY created_at LIMIT 1`);
       if (!r.rows[0]) {
         return res.status(400).json({ error: 'No tenants found. Run: npm run seed' });
       }
