@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"C:\\\\Users\\\\sande\\\\pg_portable\\\\pgsql\\\\bin\\\\pg_ctl.exe\":*)",
+      "Bash(\"C:\\\\Users\\\\sande\\\\pg_portable\\\\pgsql\\\\bin\\\\pg_isready.exe\":*)",
+      "Bash(net start:*)",
+      "Bash(timeout 3 C:\\\\Program:*)",
+      "Bash(cd /c/Users/sande/WhatsAppHospitalProject/medibook/backend && npm install 2>&1)",
+      "Bash(cd /c/Users/sande/WhatsAppHospitalProject/medibook/frontend && npm install 2>&1)",
+      "Bash(cd:*)",
+      "Bash(cd /c/Users/sande/WhatsAppHospitalProject/medibook/backend && node src/db/migrate.js 2>&1)",
+      "Bash(cd /c/Users/sande/WhatsAppHospitalProject/medibook/backend && node src/db/seed.js 2>&1)",
+      "Bash(cd /c/Users/sande/WhatsAppHospitalProject/medibook/backend && node tests/bot.test.js 2>&1)",
+      "Bash(cd /c/Users/sande/WhatsAppHospitalProject/medibook/frontend && npm run build 2>&1)",
+      "Bash(curl:*)"
+    ]
+  }
+}

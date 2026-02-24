@@ -1,0 +1,85 @@
+You are setting up the MediBook WhatsApp Appointment SaaS. All source files are already written. Your job is to verify, fix, install, and confirm everything works end-to-end.
+
+Execute these steps in order. Fix every error before moving to the next step. Do not stop unless something is genuinely unresolvable.
+
+---
+
+STEP 1 — READ THE CODEBASE
+Read CLAUDE.md to understand the project. Then list all files in backend/src/ and frontend/src/ to confirm they exist.
+
+STEP 2 — CHECK PREREQUISITES
+Run these and report results:
+- node --version (need v18+)
+- docker info (need Docker running)
+- docker-compose --version
+
+STEP 3 — START DOCKER SERVICES
+Run: docker-compose up -d postgres redis
+Wait for postgres to be healthy: docker exec $(docker-compose ps -q postgres) pg_isready -U postgres
+Retry up to 10 times with 2 second waits.
+
+STEP 4 — INSTALL DEPENDENCIES
+Run: cd backend && npm install
+Run: cd ../frontend && npm install
+Fix any install errors.
+
+STEP 5 — SYNTAX CHECK ALL JS FILES
+Run node --check on every file in backend/src/ recursively.
+Fix any syntax errors you find before continuing.
+
+STEP 6 — RUN DATABASE MIGRATION
+Run: cd backend && node src/db/migrate.js
+Expected output: 3 lines starting with ✅
+If it fails, check DATABASE_URL in backend/.env is set to:
+postgresql://postgres:password@localhost:5432/medibook
+
+STEP 7 — SEED TEST DATA
+Run: node src/db/seed.js
+Expected output: shows Demo Clinic created with doctors and slots.
+
+STEP 8 — RUN BOT TESTS
+Run: node tests/bot.test.js
+Expected: 8 tests pass. If any fail, read the error, fix the code, run again.
+
+STEP 9 — BUILD FRONTEND
+Run: cd ../frontend && npm run build
+Fix every TypeScript/ESLint error. Common fixes:
+- Add 'use client' to pages that use hooks
+- Fix missing imports
+- Fix @/ path alias (already in next.config.js)
+
+STEP 10 — START BACKEND AND TEST LIVE
+Start backend: cd backend && node src/index.js &
+Wait 3 seconds then test:
+
+Test 1 - Health:
+curl http://localhost:3001/health
+Expected: {"status":"ok",...}
+
+Test 2 - Super admin login:
+curl -X POST http://localhost:3001/api/auth/superadmin/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@medibook.com","password":"SuperAdmin@123"}'
+Expected: {"token":"eyJ...","user":{...}}
+
+Test 3 - Bot flow:
+curl -X POST http://localhost:3001/api/webhook/test \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"919999999999","message":"Hi"}'
+Expected: {"responses":[{"type":"buttons","text":"👋 Welcome..."}]}
+
+Test 4 - Clinic admin login:
+curl -X POST http://localhost:3001/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"demo@medibook.com","password":"Demo@123456","tenant_slug":"demo-clinic"}'
+Expected: {"token":"eyJ...","user":{"tenant":"Demo Clinic Hyderabad"}}
+
+STEP 11 — REPORT
+Print a summary table showing:
+- Which steps passed ✅ 
+- Which steps failed ❌
+- What you fixed 🔧
+- How to start the app (START.bat)
+- Login credentials
+
+If all 4 live tests pass, the system is working correctly.
