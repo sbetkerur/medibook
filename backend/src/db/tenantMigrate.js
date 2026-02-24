@@ -134,6 +134,7 @@ async function createTenantSchema(schemaName) {
 
     console.log(`✅ Schema "${schemaName}" created successfully`);
   } finally {
+    await client.query('RESET search_path').catch(() => {});
     client.release();
   }
 }
