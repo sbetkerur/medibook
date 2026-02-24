@@ -3,6 +3,7 @@ const wa = require('./whatsapp');
 const { decrypt } = require('../utils/encryption');
 const logger = require('../utils/logger');
 const { format, addDays, parseISO } = require('date-fns');
+const emailService = require('./email');
 
 const IST = 'Asia/Kolkata';
 
@@ -145,7 +146,14 @@ async function handle({ phone, text, buttonId, tenant }) {
   if (session.state === STATES.COLLECT_DOB) {
     const m = input.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
     if (!m) { await send.text('Invalid format. Please use DD/MM/YYYY\nExample: 15/08/1990'); return; }
-    ctx.patient_dob = `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+    const [_, dd, mm, yyyy] = m;
+    const day = parseInt(dd, 10), mon = parseInt(mm, 10), yr = parseInt(yyyy, 10);
+    const currentYear = new Date().getFullYear();
+    if (mon < 1 || mon > 12 || day < 1 || day > 31 || yr < 1900 || yr > currentYear) {
+      await send.text('Please enter a valid date in DD/MM/YYYY format.\nExample: 15/08/1990');
+      return;
+    }
+    ctx.patient_dob = `${yyyy}-${mm.padStart(2,'0')}-${dd.padStart(2,'0')}`;
     await send.buttons('👤 *Your Gender*', ['Male', 'Female', 'Other']);
     await updateSession(schema, phone, STATES.COLLECT_GENDER, ctx);
     return;
@@ -659,6 +667,27 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     `You'll receive a reminder 24 hours before your appointment.\n\n` +
     `Reply *Hi* to book another appointment or *Status* to view appointments.`
   );
+
+  // Send email confirmation if patient has email on file
+  if (patientId) {
+    try {
+      const patientR = await tenantQuery(schema, `SELECT email FROM patients WHERE id=$1`, [patientId]);
+      const patientEmail = patientR.rows[0]?.email;
+      if (patientEmail) {
+        let dateLabel2 = ctx.appointment_date;
+        try { dateLabel2 = format(parseISO(ctx.appointment_date), 'EEE, d MMM yyyy'); } catch {}
+        await emailService.sendBookingConfirmation(patientEmail, {
+          bookingId,
+          patientName: ctx.patient_name,
+          doctorName: ctx.doctor_name,
+          hospitalName: ctx.hospital_name,
+          date: dateLabel2,
+          time: ctx.appointment_time?.slice(0, 5),
+          visitType: ctx.visit_type || 'in_person',
+        });
+      }
+    } catch (_) { /* non-fatal */ }
+  }
 
   await updateSession(schema, phone, STATES.IDLE, {});
   logger.info(`✅ Booking confirmed: ${bookingId}`, { phone, tenant: tenant.name });

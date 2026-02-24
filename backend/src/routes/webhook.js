@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const crypto = require('crypto');
-const { query } = require('../db');
+const { query, tenantQuery } = require('../db');
 const botEngine = require('../services/botEngine');
 const logger = require('../utils/logger');
 
@@ -47,6 +47,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
     const msg = value.messages[0];
     const phone = msg.from; // e.g. "919876543210"
+    const msgId = msg.id;
 
     // Parse message content
     let text = '';
@@ -93,6 +94,28 @@ router.post('/webhook/whatsapp', async (req, res) => {
     if (!tenant) {
       logger.warn('No tenant found for webhook', { phoneNumberId });
       return;
+    }
+
+    // Idempotency — skip duplicate message IDs
+    if (msgId) {
+      try {
+        const existing = await tenantQuery(
+          tenant.schema_name,
+          `SELECT id FROM wa_messages WHERE wa_message_id=$1 LIMIT 1`,
+          [msgId]
+        );
+        if (existing.rows.length > 0) {
+          logger.info('Duplicate message skipped', { msgId, phone });
+          return;
+        }
+        // Log this message
+        await tenantQuery(
+          tenant.schema_name,
+          `INSERT INTO wa_messages (phone, direction, message_type, content, wa_message_id)
+           VALUES ($1,'in',$2,$3,$4)`,
+          [phone, msg.type, (text || buttonId || '').slice(0, 500), msgId]
+        );
+      } catch (_) { /* if dedup fails, still process */ }
     }
 
     logger.info('Incoming WhatsApp message', { phone, tenant: tenant.slug, text: text.slice(0, 50) });

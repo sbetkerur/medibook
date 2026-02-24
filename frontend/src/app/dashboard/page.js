@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
@@ -41,6 +42,7 @@ const NAV = [
   { id: 'overview', label: 'Overview', icon: '📊' },
   { id: 'appointments', label: 'Appointments', icon: '📅' },
   { id: 'doctors', label: 'Doctors', icon: '👨‍⚕️' },
+  { id: 'hospitals', label: 'Hospitals', icon: '🏥' },
   { id: 'patients', label: 'Patients', icon: '👥' },
   { id: 'analytics', label: 'Analytics', icon: '📈' },
   { id: 'test', label: 'Bot Tester', icon: '🤖' },
@@ -121,6 +123,28 @@ export default function Dashboard() {
   // Inactive doctor toggle
   const [showInactive, setShowInactive] = useState(false);
 
+  // Hospital & department management state
+  const [showHospitalModal, setShowHospitalModal] = useState(false);
+  const [hospitalForm, setHospitalForm] = useState({ name: '', address: '', city: '', phone: '' });
+  const [hospitalSaving, setHospitalSaving] = useState(false);
+  const [showDeptModal, setShowDeptModal] = useState(false);
+  const [deptHospital, setDeptHospital] = useState(null);
+  const [deptForm, setDeptForm] = useState({ name: '', description: '' });
+  const [deptSaving, setDeptSaving] = useState(false);
+  const [deptsByHospital, setDeptsByHospital] = useState({});
+
+  // Pagination state
+  const [apptPage, setApptPage] = useState(1);
+  const [patientPage, setPatientPage] = useState(1);
+  const [apptHasMore, setApptHasMore] = useState(false);
+  const [patientHasMore, setPatientHasMore] = useState(false);
+
+  // Patient history modal state
+  const [showPatientHistory, setShowPatientHistory] = useState(false);
+  const [selectedPatient, setSelectedPatient] = useState(null);
+  const [patientHistory, setPatientHistory] = useState([]);
+  const [patientHistoryLoading, setPatientHistoryLoading] = useState(false);
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     const u = localStorage.getItem('user');
@@ -138,15 +162,17 @@ export default function Dashboard() {
     finally { setLoading(false); }
   }, []);
 
-  const fetchAppointments = useCallback(async () => {
+  const fetchAppointments = useCallback(async (page = apptPage) => {
     try {
-      const params = new URLSearchParams({ limit: '50' });
+      const params = new URLSearchParams({ limit: '25', page: String(page) });
       if (filterDate) params.set('date', filterDate);
       if (filterStatus) params.set('status', filterStatus);
       const { data } = await api.get(`/admin/appointments?${params}`);
-      setAppointments(data.appointments || []);
+      const rows = data.appointments || [];
+      setAppointments(rows);
+      setApptHasMore(rows.length === 25);
     } catch { toast.error('Failed to load appointments'); }
-  }, [filterDate, filterStatus]);
+  }, [filterDate, filterStatus, apptPage]);
 
   const fetchDoctors = useCallback(async () => {
     try {
@@ -156,13 +182,16 @@ export default function Dashboard() {
     } catch { toast.error('Failed to load doctors'); }
   }, [showInactive]);
 
-  const fetchPatients = useCallback(async () => {
+  const fetchPatients = useCallback(async (page = patientPage) => {
     try {
-      const params = patientSearch ? `?search=${encodeURIComponent(patientSearch)}` : '';
-      const { data } = await api.get(`/admin/patients${params}`);
-      setPatients(data.patients || []);
+      const params = new URLSearchParams({ limit: '25', page: String(page) });
+      if (patientSearch) params.set('search', patientSearch);
+      const { data } = await api.get(`/admin/patients?${params}`);
+      const rows = data.patients || [];
+      setPatients(rows);
+      setPatientHasMore(rows.length === 25);
     } catch { toast.error('Failed to load patients'); }
-  }, [patientSearch]);
+  }, [patientSearch, patientPage]);
 
   const fetchAnalytics = useCallback(async () => {
     try {
@@ -175,7 +204,8 @@ export default function Dashboard() {
     try {
       const { data } = await api.get('/admin/hospitals');
       setHospitals(data.hospitals || []);
-    } catch { /* silent */ }
+      return data.hospitals || [];
+    } catch { /* silent */ return []; }
   }, []);
 
   const fetchDepartments = useCallback(async (hospital_id) => {
@@ -185,6 +215,73 @@ export default function Dashboard() {
       setDepartments(data.departments || []);
     } catch { /* silent */ }
   }, []);
+
+  async function fetchDeptsForHospital(hospitalId) {
+    try {
+      const { data } = await api.get(`/admin/departments?hospital_id=${hospitalId}`);
+      setDeptsByHospital(prev => ({ ...prev, [hospitalId]: data.departments || [] }));
+    } catch { /* silent */ }
+  }
+
+  async function fetchAllHospitalDepts(hospList) {
+    for (const h of hospList) {
+      await fetchDeptsForHospital(h.id);
+    }
+  }
+
+  async function saveHospital(e) {
+    e.preventDefault();
+    if (!hospitalForm.name.trim()) return toast.error('Hospital name is required');
+    setHospitalSaving(true);
+    try {
+      await api.post('/admin/hospitals', hospitalForm);
+      toast.success('Hospital created');
+      setShowHospitalModal(false);
+      setHospitalForm({ name: '', address: '', city: '', phone: '' });
+      const { data } = await api.get('/admin/hospitals');
+      setHospitals(data.hospitals || []);
+      fetchAllHospitalDepts(data.hospitals || []);
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to create hospital');
+    } finally { setHospitalSaving(false); }
+  }
+
+  async function saveDepartment(e) {
+    e.preventDefault();
+    if (!deptForm.name.trim()) return toast.error('Department name is required');
+    setDeptSaving(true);
+    try {
+      await api.post('/admin/departments', { ...deptForm, hospital_id: deptHospital.id });
+      toast.success('Department added');
+      setShowDeptModal(false);
+      setDeptForm({ name: '', description: '' });
+      fetchDeptsForHospital(deptHospital.id);
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to add department');
+    } finally { setDeptSaving(false); }
+  }
+
+  async function openPatientHistory(patient) {
+    setSelectedPatient(patient);
+    setPatientHistory([]);
+    setPatientHistoryLoading(true);
+    setShowPatientHistory(true);
+    try {
+      const { data } = await api.get(`/admin/patients/${patient.id}/appointments`);
+      setPatientHistory(data.appointments || []);
+    } catch { toast.error('Failed to load history'); }
+    finally { setPatientHistoryLoading(false); }
+  }
+
+  async function updateApptStatus(apptId, newStatus) {
+    try {
+      await api.patch(`/admin/appointments/${apptId}`, { status: newStatus });
+      setAppointments(prev => prev.map(a => a.id === apptId ? { ...a, status: newStatus } : a));
+      toast.success(`Marked as ${newStatus.replace('_', ' ')}`);
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to update status');
+    }
+  }
 
   function openAddDoctor() {
     setEditingDoctor(null);
@@ -351,10 +448,15 @@ export default function Dashboard() {
     if (tab === 'doctors') fetchDoctors();
     if (tab === 'patients') fetchPatients();
     if (tab === 'analytics') fetchAnalytics();
+    if (tab === 'hospitals') {
+      fetchHospitals().then(data => {
+        if (data) fetchAllHospitalDepts(data);
+      });
+    }
   }, [tab]);
 
   useEffect(() => {
-    if (tab === 'appointments') fetchAppointments();
+    if (tab === 'appointments') { setApptPage(1); fetchAppointments(1); }
   }, [filterDate, filterStatus]);
 
   useEffect(() => {
@@ -532,7 +634,7 @@ export default function Dashboard() {
                   <table className="w-full text-sm">
                     <thead className="bg-gray-50 border-b border-gray-200">
                       <tr>
-                        {['Booking ID', 'Patient', 'Doctor', 'Date', 'Time', 'Type', 'Status'].map(h => (
+                        {['Booking ID', 'Patient', 'Doctor', 'Date', 'Time', 'Type', 'Status', 'Actions'].map(h => (
                           <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
                         ))}
                       </tr>
@@ -553,11 +655,25 @@ export default function Dashboard() {
                           <td className="px-4 py-3 text-gray-600 text-sm">{a.appointment_time?.slice(0, 5)}</td>
                           <td className="px-4 py-3 text-xs text-gray-500 capitalize">{a.visit_type?.replace('_', ' ')}</td>
                           <td className="px-4 py-3"><Badge status={a.status} /></td>
+                          <td className="px-4 py-3">
+                            {a.status === 'confirmed' && (
+                              <div className="flex gap-1">
+                                <button onClick={() => updateApptStatus(a.id, 'completed')}
+                                  className="px-2 py-1 text-xs bg-blue-50 text-blue-600 border border-blue-200 rounded hover:bg-blue-100 transition whitespace-nowrap">
+                                  ✅ Done
+                                </button>
+                                <button onClick={() => updateApptStatus(a.id, 'no_show')}
+                                  className="px-2 py-1 text-xs bg-gray-50 text-gray-500 border border-gray-200 rounded hover:bg-gray-100 transition whitespace-nowrap">
+                                  🚫 No Show
+                                </button>
+                              </div>
+                            )}
+                          </td>
                         </tr>
                       ))}
                       {!appointments.length && (
                         <tr>
-                          <td colSpan={7} className="px-4 py-12 text-center text-gray-400">
+                          <td colSpan={8} className="px-4 py-12 text-center text-gray-400">
                             No appointments found{filterDate || filterStatus ? ' for selected filters' : ''}
                           </td>
                         </tr>
@@ -566,6 +682,21 @@ export default function Dashboard() {
                   </table>
                 </div>
               </div>
+              {(apptPage > 1 || apptHasMore) && (
+                <div className="flex items-center justify-between mt-2">
+                  <button onClick={() => { const p = apptPage - 1; setApptPage(p); fetchAppointments(p); }}
+                    disabled={apptPage === 1}
+                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
+                    ← Previous
+                  </button>
+                  <span className="text-sm text-gray-500">Page {apptPage}</span>
+                  <button onClick={() => { const p = apptPage + 1; setApptPage(p); fetchAppointments(p); }}
+                    disabled={!apptHasMore}
+                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
+                    Next →
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -665,8 +796,8 @@ export default function Dashboard() {
                   </thead>
                   <tbody className="divide-y divide-gray-50">
                     {patients.map(p => (
-                      <tr key={p.id} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-4 py-3 font-medium text-gray-900">{p.name || '—'}</td>
+                      <tr key={p.id} className="hover:bg-gray-50 transition-colors cursor-pointer" onClick={() => openPatientHistory(p)}>
+                        <td className="px-4 py-3 font-medium text-gray-900 hover:text-blue-600">{p.name || '—'}</td>
                         <td className="px-4 py-3">
                           <a href={`https://wa.me/${p.phone}`} target="_blank" rel="noreferrer"
                             className="text-green-600 hover:underline">+{p.phone}</a>
@@ -687,6 +818,89 @@ export default function Dashboard() {
                   </tbody>
                 </table>
               </div>
+              {(patientPage > 1 || patientHasMore) && (
+                <div className="flex items-center justify-between mt-2">
+                  <button onClick={() => { const p = patientPage - 1; setPatientPage(p); fetchPatients(p); }}
+                    disabled={patientPage === 1}
+                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
+                    ← Previous
+                  </button>
+                  <span className="text-sm text-gray-500">Page {patientPage}</span>
+                  <button onClick={() => { const p = patientPage + 1; setPatientPage(p); fetchPatients(p); }}
+                    disabled={!patientHasMore}
+                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
+                    Next →
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── HOSPITALS ── */}
+          {tab === 'hospitals' && (
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <p className="text-sm text-gray-500">{hospitals.length} hospital{hospitals.length !== 1 ? 's' : ''}</p>
+                <button onClick={() => setShowHospitalModal(true)}
+                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
+                  + Add Hospital
+                </button>
+              </div>
+
+              {hospitals.length === 0 ? (
+                <div className="text-center py-16 bg-white rounded-xl shadow-sm">
+                  <div className="text-5xl mb-3">🏥</div>
+                  <p className="text-gray-500 font-medium">No hospitals yet</p>
+                  <p className="text-gray-400 text-sm mt-1">Add your first hospital to get started</p>
+                  <button onClick={() => setShowHospitalModal(true)}
+                    className="mt-4 px-5 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
+                    + Add Hospital
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {hospitals.map(h => {
+                    const depts = deptsByHospital[h.id] || [];
+                    return (
+                      <div key={h.id} className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div className="px-5 py-4 flex items-start justify-between border-b border-gray-50">
+                          <div>
+                            <h3 className="font-semibold text-gray-900 text-base">{h.name}</h3>
+                            <div className="flex flex-wrap gap-3 mt-1 text-sm text-gray-500">
+                              {h.city && <span>📍 {h.city}</span>}
+                              {h.address && <span>{h.address}</span>}
+                              {h.phone && <span>📞 {h.phone}</span>}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => { setDeptHospital(h); setDeptForm({ name: '', description: '' }); setShowDeptModal(true); }}
+                            className="px-3 py-1.5 text-xs font-medium bg-green-50 text-green-600 border border-green-200 rounded-lg hover:bg-green-100 transition shrink-0 ml-3">
+                            + Add Department
+                          </button>
+                        </div>
+                        <div className="px-5 py-3">
+                          <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
+                            Departments ({depts.length})
+                          </p>
+                          {depts.length === 0 ? (
+                            <p className="text-sm text-gray-400 italic">No departments yet — add one to start booking</p>
+                          ) : (
+                            <div className="flex flex-wrap gap-2">
+                              {depts.map(d => (
+                                <span key={d.id}
+                                  className="px-3 py-1.5 bg-blue-50 text-blue-700 text-sm rounded-lg border border-blue-100">
+                                  {d.name}
+                                  {d.description && <span className="text-blue-400 ml-1 text-xs">— {d.description}</span>}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -718,39 +932,53 @@ export default function Dashboard() {
                         })}
                       </div>
                     </div>
-                    {/* By Doctor */}
+                    {/* By Doctor — BarChart */}
                     <div className="bg-white rounded-xl p-5 shadow-sm">
                       <h3 className="font-semibold text-gray-800 mb-4">Top Doctors (30 days)</h3>
-                      <div className="space-y-3">
-                        {analytics.by_doctor?.slice(0, 6).map((d, i) => (
-                          <div key={i} className="flex justify-between items-center text-sm">
-                            <span className="text-gray-700 truncate">Dr. {d.name}</span>
-                            <div className="text-right ml-3">
-                              <span className="font-semibold text-gray-900">{d.count}</span>
-                              {d.revenue && <span className="text-xs text-green-600 ml-2">₹{d.revenue}</span>}
-                            </div>
-                          </div>
-                        ))}
-                        {!analytics.by_doctor?.length && <p className="text-gray-400 text-sm">No data yet</p>}
-                      </div>
+                      {analytics.by_doctor?.length > 0 ? (
+                        <ResponsiveContainer width="100%" height={200}>
+                          <BarChart data={analytics.by_doctor.slice(0, 6).map(d => ({ name: d.name.split(' ')[0], count: parseInt(d.count) }))} layout="vertical">
+                            <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
+                            <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} width={70} />
+                            <Tooltip formatter={(v) => [v, 'Appointments']} />
+                            <Bar dataKey="count" fill="#10b981" radius={[0, 4, 4, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      ) : (
+                        <p className="text-gray-400 text-sm">No data yet</p>
+                      )}
                     </div>
                   </div>
-                  {/* Daily trend */}
+                  {/* Daily trend — Recharts LineChart */}
                   <div className="bg-white rounded-xl p-5 shadow-sm">
                     <h3 className="font-semibold text-gray-800 mb-4">Daily Appointments (30 days)</h3>
-                    <div className="flex items-end gap-1 h-24">
-                      {analytics.by_day?.map((d, i) => {
-                        const max = Math.max(...analytics.by_day.map(x => parseInt(x.count)));
-                        const h = max > 0 ? Math.max(4, (parseInt(d.count) / max) * 96) : 4;
-                        return (
-                          <div key={i} className="flex-1 flex flex-col items-center gap-1" title={`${d.date}: ${d.count}`}>
-                            <div className="w-full bg-blue-500 rounded-sm" style={{ height: h + '%' }} />
-                          </div>
-                        );
-                      })}
-                      {!analytics.by_day?.length && <p className="text-gray-400 text-sm">No data yet</p>}
-                    </div>
+                    {analytics.by_day?.length > 0 ? (
+                      <ResponsiveContainer width="100%" height={200}>
+                        <LineChart data={analytics.by_day.map(d => ({ date: d.date?.slice(5), count: parseInt(d.count) }))}>
+                          <XAxis dataKey="date" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
+                          <YAxis tick={{ fontSize: 11 }} allowDecimals={false} width={30} />
+                          <Tooltip formatter={(v) => [v, 'Appointments']} />
+                          <Line type="monotone" dataKey="count" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <p className="text-gray-400 text-sm py-8 text-center">No data yet — book appointments to see trends</p>
+                    )}
                   </div>
+                  {/* By Department */}
+                  {analytics.by_department?.length > 0 && (
+                    <div className="bg-white rounded-xl p-5 shadow-sm">
+                      <h3 className="font-semibold text-gray-800 mb-4">By Department (30 days)</h3>
+                      <ResponsiveContainer width="100%" height={180}>
+                        <BarChart data={analytics.by_department.map(d => ({ name: d.name || 'Other', count: parseInt(d.count) }))}>
+                          <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                          <YAxis tick={{ fontSize: 11 }} allowDecimals={false} width={30} />
+                          <Tooltip formatter={(v) => [v, 'Appointments']} />
+                          <Bar dataKey="count" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
                 </>
               ) : (
                 <div className="text-center text-gray-400 py-12">Loading analytics...</div>
@@ -986,6 +1214,119 @@ export default function Dashboard() {
               <div className="text-3xl mb-2">📭</div>
               <p className="font-medium text-gray-500">No slots for this date</p>
               <p className="text-sm mt-1">Use the <strong>Schedule</strong> button on the doctor card to set working hours and generate slots.</p>
+            </div>
+          )}
+        </div>
+      </Modal>
+    )}
+
+    {/* ── ADD HOSPITAL MODAL ── */}
+    {showHospitalModal && (
+      <Modal title="Add New Hospital" onClose={() => setShowHospitalModal(false)}>
+        <form onSubmit={saveHospital} className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Hospital Name *</label>
+            <input value={hospitalForm.name} onChange={e => setHospitalForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="e.g. Apollo Clinic Hyderabad"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">City</label>
+              <input value={hospitalForm.city} onChange={e => setHospitalForm(f => ({ ...f, city: e.target.value }))}
+                placeholder="Hyderabad"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Phone</label>
+              <input value={hospitalForm.phone} onChange={e => setHospitalForm(f => ({ ...f, phone: e.target.value }))}
+                placeholder="040-12345678"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Address</label>
+            <input value={hospitalForm.address} onChange={e => setHospitalForm(f => ({ ...f, address: e.target.value }))}
+              placeholder="Banjara Hills, Road No. 12"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div className="flex gap-3 pt-2">
+            <button type="button" onClick={() => setShowHospitalModal(false)}
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              Cancel
+            </button>
+            <button type="submit" disabled={hospitalSaving}
+              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
+              {hospitalSaving ? 'Creating...' : 'Create Hospital'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+    )}
+
+    {/* ── ADD DEPARTMENT MODAL ── */}
+    {showDeptModal && deptHospital && (
+      <Modal title={`Add Department — ${deptHospital.name}`} onClose={() => setShowDeptModal(false)}>
+        <form onSubmit={saveDepartment} className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Department Name *</label>
+            <input value={deptForm.name} onChange={e => setDeptForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="e.g. Cardiology"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Description (optional)</label>
+            <input value={deptForm.description} onChange={e => setDeptForm(f => ({ ...f, description: e.target.value }))}
+              placeholder="Brief description of the department"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div className="flex gap-3 pt-2">
+            <button type="button" onClick={() => setShowDeptModal(false)}
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              Cancel
+            </button>
+            <button type="submit" disabled={deptSaving}
+              className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition">
+              {deptSaving ? 'Adding...' : 'Add Department'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+    )}
+
+    {/* ── PATIENT HISTORY MODAL ── */}
+    {showPatientHistory && selectedPatient && (
+      <Modal title={`${selectedPatient.name || selectedPatient.phone} — History`} onClose={() => setShowPatientHistory(false)} wide>
+        <div className="space-y-3">
+          <div className="flex gap-4 text-sm text-gray-600 pb-3 border-b border-gray-100">
+            <span>📱 +{selectedPatient.phone}</span>
+            {selectedPatient.gender && <span className="capitalize">👤 {selectedPatient.gender}</span>}
+            <span>🗓 {selectedPatient.visit_count} total visits</span>
+          </div>
+          {patientHistoryLoading ? (
+            <div className="text-center text-gray-400 py-10">Loading history...</div>
+          ) : patientHistory.length === 0 ? (
+            <div className="text-center text-gray-400 py-10">
+              <div className="text-3xl mb-2">📭</div>
+              <p>No appointment history found</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {patientHistory.map(a => (
+                <div key={a.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                  <div>
+                    <div className="text-sm font-medium text-gray-900">Dr. {a.doctor_name}</div>
+                    <div className="text-xs text-gray-500 mt-0.5">
+                      {(() => { try { return format(parseISO(a.appointment_date), 'EEE, d MMM yyyy'); } catch { return a.appointment_date; } })()}
+                      {' '}at {a.appointment_time?.slice(0, 5)}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <Badge status={a.status} />
+                    <div className="text-xs text-gray-400 mt-1 font-mono">{a.booking_id}</div>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>
