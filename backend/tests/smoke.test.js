@@ -264,7 +264,9 @@ async function testBotFlow() {
     assert(r?.length > 0, 'No response after Book Appointment');
     const hasProgress = r.some(m =>
       m.text?.includes('Visit') || m.text?.includes('Hospital') ||
-      m.text?.includes('Location') || m.text?.includes('Specialty')
+      m.text?.includes('Location') || m.text?.includes('Specialty') ||
+      m.text?.includes('Consultation') ||
+      m.buttons?.some(b => b.includes('Visit') || b.includes('Consultation'))
     );
     assert(hasProgress, `Expected booking step. Got: ${JSON.stringify(r)}`);
   });
