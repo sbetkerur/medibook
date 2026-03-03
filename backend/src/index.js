@@ -32,6 +32,10 @@ if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
   logger.warn('META credentials not configured — WhatsApp messaging requires real credentials in production');
 }
 if (!process.env.FRONTEND_URL) {
+  if (process.env.NODE_ENV === 'production') {
+    logger.error('FRONTEND_URL is required in production (CORS will block all frontend requests). Set it and restart.');
+    process.exit(1);
+  }
   logger.warn('FRONTEND_URL not set — using default http://localhost:3000 for CORS and email links');
 }
 

@@ -148,6 +148,11 @@ router.post('/auth/forgot-password', forgotPasswordLimiter, validate(schemas.for
       const token = crypto.randomBytes(32).toString('hex');
       const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
 
+      // Invalidate any existing unused tokens for this email/tenant before creating a new one
+      await query(
+        `UPDATE password_resets SET used=true WHERE email=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND used=false`,
+        [foundEmail, tenantId]
+      );
       await query(
         `INSERT INTO password_resets (email, tenant_id, token, expires_at)
          VALUES ($1, $2, $3, $4)`,
@@ -226,12 +231,16 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
     const hash = await bcrypt.hash(password, 12);
 
     if (reset.tenant_id) {
-      // Tenant user
-      const tenantR = await query(`SELECT schema_name FROM tenants WHERE id=$1`, [reset.tenant_id]);
-      if (tenantR.rows[0]) {
-        await tenantQuery(tenantR.rows[0].schema_name,
-          `UPDATE users SET password_hash=$1 WHERE email=$2`, [hash, reset.email]);
+      // Tenant user — verify tenant still exists and is active
+      const tenantR = await query(`SELECT schema_name, status FROM tenants WHERE id=$1`, [reset.tenant_id]);
+      if (!tenantR.rows[0]) {
+        return res.status(410).json({ error: 'This clinic no longer exists. Contact support.' });
       }
+      if (tenantR.rows[0].status !== 'active') {
+        return res.status(403).json({ error: 'This clinic account is suspended. Contact support.' });
+      }
+      await tenantQuery(tenantR.rows[0].schema_name,
+        `UPDATE users SET password_hash=$1 WHERE email=$2`, [hash, reset.email]);
     } else {
       // Super admin
       await query(`UPDATE super_admins SET password_hash=$1 WHERE email=$2`, [hash, reset.email]);

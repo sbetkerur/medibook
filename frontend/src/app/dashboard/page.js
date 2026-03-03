@@ -976,9 +976,11 @@ export default function Dashboard() {
     const csv = [h, ...rows].map(r => r.map(v => `"${String(v || '').replace(/"/g, '""')}"`).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
+    const objectUrl = URL.createObjectURL(blob);
+    link.href = objectUrl;
     link.download = `appointments_${format(new Date(), 'yyyyMMdd')}.csv`;
     link.click();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 100);
     toast.success('CSV exported!');
   }
 

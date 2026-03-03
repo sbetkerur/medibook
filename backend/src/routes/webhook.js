@@ -136,7 +136,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
       wa.sendText(phone,
         `Sorry, I can only process text messages. Please type *Hi* to start booking an appointment. 😊`,
         waToken, tenant.wa_phone_number_id
-      ).catch(() => {});
+      ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone, type: unsupportedType, error: err.message }));
       return;
     }
 
