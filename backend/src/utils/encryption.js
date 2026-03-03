@@ -1,6 +1,21 @@
 const CryptoJS = require('crypto-js');
 
-const KEY = process.env.ENCRYPTION_KEY || 'medibook-default-dev-key-32chars!';
+const DEFAULT_KEY = 'medibook-default-dev-key-32chars!';
+const KEY = process.env.ENCRYPTION_KEY || DEFAULT_KEY;
+
+// Startup key validation
+if (KEY === DEFAULT_KEY) {
+  if (process.env.NODE_ENV === 'production') {
+    // eslint-disable-next-line no-console
+    console.error('FATAL: ENCRYPTION_KEY is the default insecure value in production. Set a strong 32-char key in environment variables.');
+    process.exit(1);
+  } else {
+    // Lazy require to avoid circular dependency at module load time
+    process.nextTick(() => {
+      try { require('./logger').warn('ENCRYPTION_KEY is using the default dev value — set a real key before production'); } catch (_) {}
+    });
+  }
+}
 
 function encrypt(text) {
   if (!text) return null;
@@ -17,4 +32,4 @@ function decrypt(ciphertext) {
   }
 }
 
-module.exports = { encrypt, decrypt };
+module.exports = { encrypt, decrypt, KEY };

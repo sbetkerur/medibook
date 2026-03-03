@@ -27,4 +27,14 @@ api.interceptors.response.use(
   }
 );
 
+// Shared error message extractor — use instead of err.response?.data?.error || 'fallback'
+export function getApiError(err, fallback = 'Something went wrong') {
+  if (err?.response?.data?.error) return err.response.data.error;
+  if (err?.response?.status === 503) return 'Service temporarily unavailable';
+  if (err?.response?.status === 429) return 'Too many requests — please slow down';
+  if (err?.message === 'Network Error') return 'Cannot connect to server. Check your internet.';
+  if (err?.code === 'ECONNABORTED') return 'Request timed out. Please try again.';
+  return fallback;
+}
+
 export default api;

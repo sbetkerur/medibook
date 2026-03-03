@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
 export default function SuperAdminPage() {
   const router = useRouter();
@@ -13,10 +14,19 @@ export default function SuperAdminPage() {
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({
-    name: '', slug: '', owner_email: '', owner_password: 'Admin@123456',
+    name: '', slug: '', owner_email: '', owner_password: '',
     owner_name: '', plan: 'starter', wa_phone_number_id: '', wa_access_token: '',
   });
   const [creating, setCreating] = useState(false);
+
+  // Suspension modal state
+  const [suspendModal, setSuspendModal] = useState(null); // { tenant }
+  const [suspendReason, setSuspendReason] = useState('');
+  const [suspending, setSuspending] = useState(false);
+
+  // Tenant health state
+  const [tenantHealth, setTenantHealth] = useState({}); // { [tenantId]: healthData }
+  const [loadingHealth, setLoadingHealth] = useState(null);
 
   useEffect(() => {
     const u = localStorage.getItem('user');
@@ -49,7 +59,7 @@ export default function SuperAdminPage() {
       const { data } = await api.post('/superadmin/tenants', form);
       toast.success(`Tenant "${data.tenant.name}" created!`);
       setShowCreate(false);
-      setForm({ name: '', slug: '', owner_email: '', owner_password: 'Admin@123456', owner_name: '', plan: 'starter', wa_phone_number_id: '', wa_access_token: '' });
+      setForm({ name: '', slug: '', owner_email: '', owner_password: '', owner_name: '', plan: 'starter', wa_phone_number_id: '', wa_access_token: '' });
       fetchAll();
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to create tenant');
@@ -57,12 +67,44 @@ export default function SuperAdminPage() {
   }
 
   async function toggleStatus(tenant) {
-    const newStatus = tenant.status === 'active' ? 'suspended' : 'active';
+    if (tenant.status === 'active') {
+      // Show suspension reason modal
+      setSuspendModal({ tenant });
+      setSuspendReason('');
+      return;
+    }
+    // Reactivate immediately
     try {
-      await api.patch(`/superadmin/tenants/${tenant.id}`, { status: newStatus });
-      toast.success(`Tenant ${newStatus}`);
+      await api.patch(`/superadmin/tenants/${tenant.id}`, { status: 'active' });
+      toast.success('Tenant reactivated');
       fetchAll();
-    } catch { toast.error('Failed to update status'); }
+    } catch { toast.error('Failed to activate tenant'); }
+  }
+
+  async function confirmSuspend() {
+    if (!suspendModal) return;
+    setSuspending(true);
+    try {
+      await api.patch(`/superadmin/tenants/${suspendModal.tenant.id}`, {
+        status: 'suspended',
+        suspension_reason: suspendReason || null,
+      });
+      toast.success('Tenant suspended');
+      setSuspendModal(null);
+      setSuspendReason('');
+      fetchAll();
+    } catch { toast.error('Failed to suspend tenant'); }
+    finally { setSuspending(false); }
+  }
+
+  async function loadTenantHealth(tenantId) {
+    if (tenantHealth[tenantId]) return; // already loaded
+    setLoadingHealth(tenantId);
+    try {
+      const { data } = await api.get(`/superadmin/tenants/${tenantId}/health`);
+      setTenantHealth(prev => ({ ...prev, [tenantId]: data }));
+    } catch { /* silent */ }
+    finally { setLoadingHealth(null); }
   }
 
   function slugify(name) {
@@ -84,22 +126,61 @@ export default function SuperAdminPage() {
       <div className="max-w-6xl mx-auto p-6 space-y-6">
         {/* Stats */}
         {stats && (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-blue-500">
-              <p className="text-xs text-gray-500 uppercase">Total Tenants</p>
-              <p className="text-3xl font-bold text-gray-900">{stats.total_tenants}</p>
-            </div>
-            <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-green-500">
-              <p className="text-xs text-gray-500 uppercase">Active</p>
-              <p className="text-3xl font-bold text-gray-900">{stats.active_tenants}</p>
-            </div>
-            {stats.by_plan?.map(p => (
-              <div key={p.plan} className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-purple-400">
-                <p className="text-xs text-gray-500 uppercase capitalize">{p.plan} Plan</p>
-                <p className="text-3xl font-bold text-gray-900">{p.count}</p>
+          <>
+            <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-4">
+              <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-blue-500">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Total Tenants</p>
+                <p className="text-3xl font-bold text-gray-900">{stats.total_tenants}</p>
               </div>
-            ))}
-          </div>
+              <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-green-500">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Active</p>
+                <p className="text-3xl font-bold text-gray-900">{stats.active_tenants}</p>
+              </div>
+              <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-indigo-400">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">New (30d)</p>
+                <p className="text-3xl font-bold text-gray-900">{stats.monthly_growth ?? 0}</p>
+              </div>
+              <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-orange-400">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Appts (30d)</p>
+                <p className="text-3xl font-bold text-gray-900">{(stats.total_appointments_30d ?? 0).toLocaleString()}</p>
+              </div>
+              <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-pink-400">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Total Patients</p>
+                <p className="text-3xl font-bold text-gray-900">{(stats.total_patients ?? 0).toLocaleString()}</p>
+              </div>
+              {stats.mrr != null && (
+                <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-yellow-400">
+                  <p className="text-xs text-gray-500 uppercase tracking-wide">MRR</p>
+                  <p className="text-3xl font-bold text-gray-900">₹{stats.mrr.toLocaleString('en-IN')}</p>
+                </div>
+              )}
+              {stats.by_plan?.slice(0, 1).map(p => (
+                <div key={p.plan} className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-purple-400">
+                  <p className="text-xs text-gray-500 uppercase capitalize tracking-wide">{p.plan} plan</p>
+                  <p className="text-3xl font-bold text-gray-900">{p.count}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Plan distribution bar chart */}
+            {stats.by_plan?.length > 0 && (
+              <div className="bg-white rounded-xl p-5 shadow-sm">
+                <h3 className="font-semibold text-gray-800 mb-4">Tenants by Plan</h3>
+                <ResponsiveContainer width="100%" height={160}>
+                  <BarChart data={stats.by_plan.map(p => ({ name: p.plan, count: parseInt(p.count) }))} barSize={40}>
+                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                    <YAxis tick={{ fontSize: 12 }} allowDecimals={false} width={30} />
+                    <Tooltip formatter={(v) => [v, 'Tenants']} />
+                    <Bar dataKey="count" radius={[4, 4, 0, 0]}>
+                      {stats.by_plan.map((_, i) => (
+                        <Cell key={i} fill={['#3b82f6','#10b981','#8b5cf6','#f59e0b'][i % 4]} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </>
         )}
 
         {/* Tenants table */}
@@ -119,47 +200,83 @@ export default function SuperAdminPage() {
               <table className="w-full text-sm">
                 <thead className="bg-gray-50">
                   <tr>
-                    {['Clinic', 'Slug', 'Owner', 'Plan', 'WhatsApp', 'Status', 'Created', 'Actions'].map(h => (
+                    {['Clinic', 'Slug', 'Owner', 'Plan', 'WhatsApp', 'Status', 'Health', 'Created', 'Actions'].map(h => (
                       <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
-                  {tenants.map(t => (
-                    <tr key={t.id} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 font-medium text-gray-900">{t.name}</td>
-                      <td className="px-4 py-3 font-mono text-xs text-blue-600">{t.slug}</td>
-                      <td className="px-4 py-3 text-gray-600 text-xs">{t.owner_email}</td>
-                      <td className="px-4 py-3">
-                        <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full capitalize">{t.plan}</span>
-                      </td>
-                      <td className="px-4 py-3 text-xs">
-                        {t.wa_phone_number_id
-                          ? <span className="text-green-600">✅ Configured</span>
-                          : <span className="text-gray-400">Not set</span>}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${
-                          t.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600'
-                        }`}>{t.status}</span>
-                      </td>
-                      <td className="px-4 py-3 text-xs text-gray-400">
-                        {t.created_at ? format(parseISO(t.created_at), 'd MMM yy') : '—'}
-                      </td>
-                      <td className="px-4 py-3">
-                        <button onClick={() => toggleStatus(t)}
-                          className={`text-xs px-2 py-1 rounded transition ${
-                            t.status === 'active'
-                              ? 'text-red-600 hover:bg-red-50'
-                              : 'text-green-600 hover:bg-green-50'
-                          }`}>
-                          {t.status === 'active' ? 'Suspend' : 'Activate'}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {tenants.map(t => {
+                    const health = tenantHealth[t.id];
+                    const flags = health?.flags || {};
+                    return (
+                      <tr key={t.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 font-medium text-gray-900">{t.name}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-blue-600">{t.slug}</td>
+                        <td className="px-4 py-3 text-gray-600 text-xs">{t.owner_email}</td>
+                        <td className="px-4 py-3">
+                          <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full capitalize">{t.plan_name || t.plan}</span>
+                        </td>
+                        <td className="px-4 py-3 text-xs">
+                          {t.wa_phone_number_id
+                            ? <span className="text-green-600">✅ Configured</span>
+                            : <span className="text-gray-400">Not set</span>}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div>
+                            <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${
+                              t.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600'
+                            }`}>{t.status}</span>
+                            {t.suspension_reason && (
+                              <div className="text-xs text-red-400 mt-0.5 max-w-[120px] truncate" title={t.suspension_reason}>
+                                {t.suspension_reason}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          {health ? (
+                            <div className="flex flex-col gap-0.5">
+                              {flags.no_recent_activity && (
+                                <span className="text-xs text-orange-500" title="No appointments in 30 days">⚠️ Inactive</span>
+                              )}
+                              {flags.low_slots && (
+                                <span className="text-xs text-yellow-600" title="Fewer than 5 available slots">📅 Low slots</span>
+                              )}
+                              {flags.no_whatsapp && (
+                                <span className="text-xs text-gray-400" title="WhatsApp not configured">📵 No WA</span>
+                              )}
+                              {!flags.no_recent_activity && !flags.low_slots && !flags.no_whatsapp && (
+                                <span className="text-xs text-green-600">✅ Healthy</span>
+                              )}
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => loadTenantHealth(t.id)}
+                              disabled={loadingHealth === t.id}
+                              className="text-xs text-blue-500 hover:underline disabled:opacity-50">
+                              {loadingHealth === t.id ? '...' : 'Check'}
+                            </button>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-gray-400">
+                          {t.created_at ? format(parseISO(t.created_at), 'd MMM yy') : '—'}
+                        </td>
+                        <td className="px-4 py-3">
+                          <button onClick={() => toggleStatus(t)}
+                            className={`text-xs px-2 py-1 rounded transition ${
+                              t.status === 'active'
+                                ? 'text-red-600 hover:bg-red-50'
+                                : 'text-green-600 hover:bg-green-50'
+                            }`}>
+                            {t.status === 'active' ? 'Suspend' : 'Activate'}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                   {!tenants.length && (
-                    <tr><td colSpan={8} className="px-4 py-12 text-center text-gray-400">No tenants yet. Create the first one!</td></tr>
+                    <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-400">No tenants yet. Create the first one!</td></tr>
                   )}
                 </tbody>
               </table>
@@ -167,6 +284,39 @@ export default function SuperAdminPage() {
           )}
         </div>
       </div>
+
+      {/* Suspension Reason Modal */}
+      {suspendModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-2xl">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-base font-semibold text-gray-900">Suspend Tenant</h2>
+              <button onClick={() => setSuspendModal(null)} className="text-gray-400 hover:text-gray-600 text-xl">✕</button>
+            </div>
+            <p className="text-sm text-gray-600 mb-4">
+              You are about to suspend <strong>{suspendModal.tenant.name}</strong>. Their WhatsApp bot will stop responding immediately.
+            </p>
+            <div className="mb-5">
+              <label className="block text-xs font-medium text-gray-700 mb-1">Reason (optional)</label>
+              <textarea value={suspendReason}
+                onChange={e => setSuspendReason(e.target.value)}
+                rows={3}
+                placeholder="e.g. Non-payment, policy violation..."
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-400 resize-none" />
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => setSuspendModal(null)}
+                className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+                Cancel
+              </button>
+              <button onClick={confirmSuspend} disabled={suspending}
+                className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50 transition">
+                {suspending ? 'Suspending...' : 'Suspend Tenant'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Create Tenant Modal */}
       {showCreate && (
@@ -183,7 +333,7 @@ export default function SuperAdminPage() {
                 ['Slug (URL ID) *', 'slug', 'text', 'e.g. apollo-mumbai'],
                 ['Owner Email *', 'owner_email', 'email', 'admin@apollomumbai.com'],
                 ['Owner Name', 'owner_name', 'text', 'Dr. Sharma'],
-                ['Password', 'owner_password', 'text', 'Admin@123456'],
+                ['Password', 'owner_password', 'password', 'Min 8 chars, uppercase + number'],
               ].map(([label, name, type, placeholder]) => (
                 <div key={name}>
                   <label className="block text-xs font-medium text-gray-600 mb-1">{label}</label>

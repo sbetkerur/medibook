@@ -74,12 +74,13 @@ async function createTenantSchema(schemaName) {
 
       CREATE TABLE IF NOT EXISTS patients (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        phone VARCHAR(20) UNIQUE NOT NULL,
+        phone VARCHAR(20) UNIQUE NOT NULL CHECK (phone ~ '^[+]?[0-9]{7,20}$'),
         name VARCHAR(255),
         date_of_birth DATE,
         gender VARCHAR(20),
         email VARCHAR(255),
         visit_count INTEGER DEFAULT 0,
+        medical_history JSONB DEFAULT '{}',
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
@@ -95,7 +96,11 @@ async function createTenantSchema(schemaName) {
         appointment_time TIME NOT NULL,
         status VARCHAR(50) DEFAULT 'confirmed' CHECK (status IN ('confirmed','completed','cancelled','no_show')),
         cancellation_reason TEXT,
+        cancelled_by VARCHAR(20) DEFAULT 'user' CHECK (cancelled_by IN ('user','admin','bot')),
+        cancelled_by_user_id UUID,
+        cancelled_at TIMESTAMPTZ,
         visit_type VARCHAR(50) DEFAULT 'in_person',
+        note_category VARCHAR(50) DEFAULT 'general',
         notes TEXT,
         reminder_24h_sent BOOLEAN DEFAULT false,
         reminder_2h_sent BOOLEAN DEFAULT false,
@@ -123,6 +128,49 @@ async function createTenantSchema(schemaName) {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS waiting_list (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        patient_id UUID REFERENCES patients(id),
+        doctor_id UUID REFERENCES doctors(id),
+        hospital_id UUID REFERENCES hospitals(id),
+        requested_date DATE,
+        notified BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS appointment_feedback (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        appointment_id UUID REFERENCES appointments(id),
+        patient_id UUID REFERENCES patients(id),
+        rating INTEGER CHECK (rating BETWEEN 1 AND 5),
+        comment TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS doctor_leaves (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        doctor_id UUID REFERENCES doctors(id) ON DELETE CASCADE,
+        leave_date DATE NOT NULL,
+        reason TEXT,
+        created_by_user_id UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(doctor_id, leave_date)
+      );
+
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        actor_id UUID,
+        actor_role VARCHAR(50),
+        action VARCHAR(100) NOT NULL,
+        resource_type VARCHAR(100),
+        resource_id TEXT,
+        old_values JSONB,
+        new_values JSONB,
+        ip_address VARCHAR(45),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      -- Core indexes
       CREATE INDEX IF NOT EXISTS idx_slots_date_status ON time_slots(slot_date, status);
       CREATE INDEX IF NOT EXISTS idx_slots_doctor ON time_slots(doctor_id);
       CREATE INDEX IF NOT EXISTS idx_appt_date ON appointments(appointment_date);
@@ -130,6 +178,17 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id);
       CREATE INDEX IF NOT EXISTS idx_patients_phone ON patients(phone);
       CREATE INDEX IF NOT EXISTS idx_bot_sessions_phone ON bot_sessions(phone);
+      CREATE INDEX IF NOT EXISTS idx_wa_messages_phone ON wa_messages(phone);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_waiting_list_doctor ON waiting_list(doctor_id, notified);
+      CREATE INDEX IF NOT EXISTS idx_waiting_list_created_at ON waiting_list(created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_feedback_appointment ON appointment_feedback(appointment_id);
+      -- New performance indexes
+      CREATE INDEX IF NOT EXISTS idx_appt_status_date ON appointments(status, appointment_date DESC);
+      CREATE INDEX IF NOT EXISTS idx_appt_created_at ON appointments(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_bot_sessions_activity ON bot_sessions(last_activity);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_doctor_leaves_doctor ON doctor_leaves(doctor_id, leave_date);
     `);
 
     console.log(`✅ Schema "${schemaName}" created successfully`);
@@ -139,4 +198,90 @@ async function createTenantSchema(schemaName) {
   }
 }
 
-module.exports = { createTenantSchema };
+/**
+ * Apply incremental migrations to an existing tenant schema.
+ * All statements are idempotent (ALTER … IF NOT EXISTS, CREATE … IF NOT EXISTS).
+ * Called by migrate.js for every existing tenant.
+ */
+async function runTenantMigrations(schemaName) {
+  const client = await pool.connect();
+  try {
+    await client.query(`SET search_path TO "${schemaName}", public`);
+
+    // Add new columns to appointments (idempotent)
+    await client.query(`
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_by_user_id UUID;
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS note_category VARCHAR(50) DEFAULT 'general';
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_by VARCHAR(20) DEFAULT 'user';
+    `);
+
+    // Add medical_history to patients
+    await client.query(`
+      ALTER TABLE patients ADD COLUMN IF NOT EXISTS medical_history JSONB DEFAULT '{}';
+    `);
+
+    // Create doctor_leaves table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS doctor_leaves (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        doctor_id UUID REFERENCES doctors(id) ON DELETE CASCADE,
+        leave_date DATE NOT NULL,
+        reason TEXT,
+        created_by_user_id UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(doctor_id, leave_date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_doctor_leaves_doctor ON doctor_leaves(doctor_id, leave_date);
+    `);
+
+    // Add phone format constraint to patients (idempotent)
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE patients
+          ADD CONSTRAINT patients_phone_format CHECK (phone ~ '^[+]?[0-9]{7,20}$');
+      EXCEPTION WHEN duplicate_object THEN NULL;
+      END $$;
+    `);
+
+    // Add new indexes (idempotent)
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_appt_status_date ON appointments(status, appointment_date DESC);
+      CREATE INDEX IF NOT EXISTS idx_appt_created_at ON appointments(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_bot_sessions_activity ON bot_sessions(last_activity);
+      CREATE INDEX IF NOT EXISTS idx_waiting_list_created_at ON waiting_list(created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_wa_messages_phone ON wa_messages(phone);
+      DROP INDEX IF EXISTS idx_wa_messages_msg_id;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
+    `);
+
+    // Create audit_logs table if not exists
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        actor_id UUID,
+        actor_role VARCHAR(50),
+        action VARCHAR(100) NOT NULL,
+        resource_type VARCHAR(100),
+        resource_id TEXT,
+        old_values JSONB,
+        new_values JSONB,
+        ip_address VARCHAR(45),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, created_at DESC);
+    `);
+
+    // Add lunch_start_time and lunch_end_time to doctor_schedules if missing
+    await client.query(`
+      ALTER TABLE doctor_schedules ADD COLUMN IF NOT EXISTS lunch_start_time TIME DEFAULT NULL;
+      ALTER TABLE doctor_schedules ADD COLUMN IF NOT EXISTS lunch_end_time TIME DEFAULT NULL;
+    `);
+
+  } finally {
+    await client.query('RESET search_path').catch(() => {});
+    client.release();
+  }
+}
+
+module.exports = { createTenantSchema, runTenantMigrations };

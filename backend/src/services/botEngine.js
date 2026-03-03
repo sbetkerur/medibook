@@ -1,9 +1,10 @@
-const { tenantQuery, query } = require('../db');
+const { tenantQuery, query, pool, tenantTransaction } = require('../db');
 const wa = require('./whatsapp');
 const { decrypt } = require('../utils/encryption');
 const logger = require('../utils/logger');
 const { format, addDays, parseISO } = require('date-fns');
 const emailService = require('./email');
+const { SLOT_LOOKAHEAD_DAYS } = require('../utils/errors');
 
 const IST = 'Asia/Kolkata';
 
@@ -26,11 +27,52 @@ const STATES = {
   RESCHEDULE_SLOT: 'reschedule_slot',
   RESCHEDULE_CONFIRM: 'reschedule_confirm',
   CANCEL_SELECT: 'cancel_select',
+  CANCEL_REASON: 'cancel_reason',
   CANCEL_CONFIRM: 'cancel_confirm',
+  COLLECT_EMAIL: 'collect_email',
+  CHECK_BOOKING_STATUS: 'check_booking_status',
+  WAITLIST_CONFIRM: 'waitlist_confirm',
+  COLLECT_FEEDBACK_RATING: 'collect_feedback_rating',
+  COLLECT_FEEDBACK_COMMENT: 'collect_feedback_comment',
 };
 
 function genBookingId() {
-  return 'MB' + Date.now().toString(36).toUpperCase().slice(-6);
+  const { randomUUID } = require('crypto');
+  return 'MB' + randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+}
+
+// Simple Levenshtein distance for fuzzy matching
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i-1] === b[j-1]
+        ? dp[i-1][j-1]
+        : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+    }
+  }
+  return dp[m][n];
+}
+
+function fuzzyFind(items, input, nameField = 'name') {
+  const lower = input.toLowerCase();
+  const exact = items.find(item =>
+    item[nameField].toLowerCase() === lower ||
+    item[nameField].toLowerCase().includes(lower)
+  );
+  if (exact) return exact;
+  let best = null, bestDist = Infinity;
+  for (const item of items) {
+    const dist = levenshtein(lower, item[nameField].toLowerCase());
+    const threshold = Math.max(2, Math.floor(item[nameField].length * 0.4));
+    if (dist < bestDist && dist <= threshold) {
+      bestDist = dist;
+      best = item;
+    }
+  }
+  return best;
 }
 
 async function getSession(schemaName, phone) {
@@ -46,9 +88,16 @@ async function getSession(schemaName, phone) {
 }
 
 async function updateSession(schemaName, phone, state, context) {
+  const contextStr = JSON.stringify(context || {});
+  if (contextStr.length > 10000) {
+    logger.warn(`Session context too large for ${phone} (${contextStr.length} bytes), resetting to idle`);
+    await tenantQuery(schemaName,
+      `UPDATE bot_sessions SET state='idle', context='{}', last_activity=NOW() WHERE phone=$1`, [phone]);
+    return;
+  }
   await tenantQuery(schemaName,
     `UPDATE bot_sessions SET state=$1, context=$2, last_activity=NOW() WHERE phone=$3`,
-    [state, JSON.stringify(context || {}), phone]);
+    [state, contextStr, phone]);
 }
 
 async function getPatient(schemaName, phone) {
@@ -57,17 +106,37 @@ async function getPatient(schemaName, phone) {
   return r.rows[0] || null;
 }
 
-async function handle({ phone, text, buttonId, tenant }) {
+async function logMessage(schemaName, phone, direction, type, content, waMessageId) {
+  try {
+    await tenantQuery(schemaName,
+      `INSERT INTO wa_messages (phone, direction, message_type, content, wa_message_id)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [phone, direction, type, content, waMessageId || null]);
+  } catch (_) {}
+}
+
+async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   if (!text && !buttonId) return;
 
   const schema = tenant.schema_name;
   const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
   const waPhoneId = tenant.wa_phone_number_id;
 
+  await logMessage(schema, phone, 'in', buttonId ? 'interactive' : 'text', text || buttonId, waMessageId);
+
   const send = {
-    text: (t) => wa.sendText(phone, t, waToken, waPhoneId),
-    buttons: (t, btns) => wa.sendButtons(phone, t, btns, waToken, waPhoneId),
-    list: (t, label, sections) => wa.sendList(phone, t, label, sections, waToken, waPhoneId),
+    text: async (t) => {
+      await logMessage(schema, phone, 'out', 'text', t, null);
+      return wa.sendText(phone, t, waToken, waPhoneId);
+    },
+    buttons: async (t, btns) => {
+      await logMessage(schema, phone, 'out', 'buttons', t, null);
+      return wa.sendButtons(phone, t, btns, waToken, waPhoneId);
+    },
+    list: async (t, label, sections) => {
+      await logMessage(schema, phone, 'out', 'list', t, null);
+      return wa.sendList(phone, t, label, sections, waToken, waPhoneId);
+    },
   };
 
   const input = (text || '').trim();
@@ -76,23 +145,63 @@ async function handle({ phone, text, buttonId, tenant }) {
   const isGreeting = /^(hi|hello|hey|menu|start|helo|hy|hai)$/i.test(input);
 
   let session = await getSession(schema, phone);
-  let ctx = session.context
-    ? (typeof session.context === 'string' ? JSON.parse(session.context) : session.context)
-    : {};
+  let ctx = {};
+  try {
+    ctx = session.context
+      ? (typeof session.context === 'string' ? JSON.parse(session.context) : session.context)
+      : {};
+  } catch (err) {
+    logger.warn(`Malformed session context for ${phone}, resetting to idle`, { error: err.message });
+    await updateSession(schema, phone, STATES.IDLE, {});
+    await send.text('Sorry, something went wrong. Let\'s start over — reply *Hi* to continue.');
+    return;
+  }
 
-  // Reset to main menu on greeting
+  // ── FEEDBACK FLOW ─────────────────────────────────────────────
+  if (session.state === STATES.COLLECT_FEEDBACK_RATING) {
+    return handleFeedbackRating(phone, schema, send, ctx, choice, input);
+  }
+  if (session.state === STATES.COLLECT_FEEDBACK_COMMENT) {
+    return handleFeedbackComment(phone, schema, send, ctx, input);
+  }
+
+  // ── REMINDER BUTTON SHORTCUTS ─────────────────────────────────
+  if (/^reschedule$/i.test(input) && !isGreeting) {
+    const patient = await getPatient(schema, phone);
+    if (!patient) {
+      await send.text('No appointments found. Reply *Hi* to book your first appointment.');
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
+    await send.text('Please enter the Booking ID you want to reschedule (e.g. MB12AB3):');
+    await updateSession(schema, phone, STATES.RESCHEDULE_SELECT, {});
+    return;
+  }
+  if (/^cancel appointment$/i.test(input) && !isGreeting) {
+    const patient = await getPatient(schema, phone);
+    if (!patient) {
+      await send.text('No appointments found. Reply *Hi* to book your first appointment.');
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
+    await send.text('Please enter the Booking ID you want to cancel (e.g. MB12AB3):');
+    await updateSession(schema, phone, STATES.CANCEL_SELECT, {});
+    return;
+  }
+
+  // Reset on greeting
   if (isGreeting || session.state === STATES.IDLE) {
     const patient = await getPatient(schema, phone);
     const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
     await send.buttons(
       `👋 Welcome${firstName} to *${tenant.name}*!\n\nHow can I help you today?`,
-      ['📅 Book Appointment', '🗓 My Appointments', 'ℹ️ Help']
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
     );
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
 
-  // ── MAIN MENU ────────────────────────────────────────────────
+  // ── MAIN MENU ──────────────────────────────────────────────────
   if (session.state === STATES.MAIN_MENU) {
     if (/book|btn_0/i.test(choice) || choice === '1') {
       return startBooking(phone, schema, tenant, send, ctx, waToken, waPhoneId);
@@ -100,24 +209,60 @@ async function handle({ phone, text, buttonId, tenant }) {
     if (/appointment|my|btn_1/i.test(choice) || choice === '2') {
       return showMyAppointments(phone, schema, tenant, send);
     }
-    if (/help|info|btn_2/i.test(choice) || choice === '3') {
+    if (/status|check|btn_2/i.test(choice) || choice === '3') {
+      await send.text('📋 *Check Appointment Status*\n\nPlease enter your Booking ID (e.g. MB12AB3):');
+      await updateSession(schema, phone, STATES.CHECK_BOOKING_STATUS, {});
+      return;
+    }
+    if (/help|info/i.test(choice)) {
       await send.text(
         `ℹ️ *Help*\n\n` +
         `• Reply *Book* — Book an appointment\n` +
-        `• Reply *Status* — View your appointments\n` +
+        `• Reply *Status* — Check appointment status\n` +
+        `• Reply *My* — View your appointments\n` +
         `• Reply *Hi* — Return to main menu\n\n` +
         `For emergencies, please call the clinic directly.`
       );
       return;
     }
-    if (/status|check/i.test(choice)) {
-      return showMyAppointments(phone, schema, tenant, send);
-    }
     await send.text('Please choose an option from the menu. Reply *Hi* to see the menu again.');
     return;
   }
 
-  // ── BOOKING FLOW ─────────────────────────────────────────────
+  // ── CHECK BOOKING STATUS ───────────────────────────────────────
+  if (session.state === STATES.CHECK_BOOKING_STATUS) {
+    const bookingId = input.toUpperCase().trim();
+    const apptR = await tenantQuery(schema,
+      `SELECT a.*, d.name as doctor_name, h.name as hospital_name, p.name as patient_name
+       FROM appointments a
+       JOIN doctors d ON d.id=a.doctor_id
+       JOIN hospitals h ON h.id=a.hospital_id
+       JOIN patients p ON p.id=a.patient_id
+       WHERE a.booking_id=$1`,
+      [bookingId]);
+    if (!apptR.rows[0]) {
+      await send.text('Booking ID not found. Please check and try again.\n\nReply *Hi* to go back.');
+      return;
+    }
+    const a = apptR.rows[0];
+    let dt = a.appointment_date;
+    try { dt = format(parseISO(a.appointment_date), 'EEE, d MMM yyyy'); } catch {}
+    const statusEmoji = { confirmed: '✅', completed: '🏁', cancelled: '❌', no_show: '⚠️' }[a.status] || '📋';
+    await send.text(
+      `📋 *Appointment Status*\n\n` +
+      `Booking ID: *${a.booking_id}*\n` +
+      `${statusEmoji} Status: *${a.status.replace('_', ' ').toUpperCase()}*\n\n` +
+      `👤 ${a.patient_name}\n` +
+      `👨‍⚕️ Dr. ${a.doctor_name}\n` +
+      `🏥 ${a.hospital_name}\n` +
+      `📅 ${dt} at ${a.appointment_time.slice(0, 5)}\n\n` +
+      `Reply *Hi* for the main menu.`
+    );
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
+
+  // ── BOOKING FLOW ───────────────────────────────────────────────
   if (session.state === STATES.SELECT_HOSPITAL) {
     return handleSelectHospital(phone, schema, tenant, send, ctx, choice, input);
   }
@@ -136,6 +281,9 @@ async function handle({ phone, text, buttonId, tenant }) {
   if (session.state === STATES.SELECT_SLOT) {
     return handleSelectSlot(phone, schema, tenant, send, ctx, choice, input);
   }
+  if (session.state === STATES.WAITLIST_CONFIRM) {
+    return handleWaitlistConfirm(phone, schema, tenant, send, ctx, choice);
+  }
   if (session.state === STATES.COLLECT_NAME) {
     if (input.length < 2) { await send.text('Please enter your full name (at least 2 characters).'); return; }
     ctx.patient_name = input;
@@ -148,9 +296,14 @@ async function handle({ phone, text, buttonId, tenant }) {
     if (!m) { await send.text('Invalid format. Please use DD/MM/YYYY\nExample: 15/08/1990'); return; }
     const [_, dd, mm, yyyy] = m;
     const day = parseInt(dd, 10), mon = parseInt(mm, 10), yr = parseInt(yyyy, 10);
-    const currentYear = new Date().getFullYear();
-    if (mon < 1 || mon > 12 || day < 1 || day > 31 || yr < 1900 || yr > currentYear) {
-      await send.text('Please enter a valid date in DD/MM/YYYY format.\nExample: 15/08/1990');
+    // Use Date object to catch impossible dates (e.g. 31/02, 30/02)
+    const parsedDate = new Date(yr, mon - 1, day);
+    const today = new Date();
+    const isValidDate = parsedDate.getFullYear() === yr &&
+      parsedDate.getMonth() === mon - 1 &&
+      parsedDate.getDate() === day;
+    if (!isValidDate || yr < 1900 || parsedDate > today || (today.getFullYear() - yr) > 150) {
+      await send.text('Please enter a valid date of birth in DD/MM/YYYY format.\nExample: 15/08/1990');
       return;
     }
     ctx.patient_dob = `${yyyy}-${mm.padStart(2,'0')}-${dd.padStart(2,'0')}`;
@@ -160,6 +313,19 @@ async function handle({ phone, text, buttonId, tenant }) {
   }
   if (session.state === STATES.COLLECT_GENDER) {
     ctx.patient_gender = /male|btn_0/i.test(choice) ? 'male' : /female|btn_1/i.test(choice) ? 'female' : 'other';
+    await send.text('📧 *Email Address* (optional)\n\nEnter your email to receive booking confirmations:\n\nReply *Skip* to skip.');
+    await updateSession(schema, phone, STATES.COLLECT_EMAIL, ctx);
+    return;
+  }
+  if (session.state === STATES.COLLECT_EMAIL) {
+    if (!/skip/i.test(input) && input.length > 0) {
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input)) {
+        ctx.patient_email = input.toLowerCase();
+      } else {
+        await send.text('Invalid email format. Please enter a valid email or reply *Skip* to skip.');
+        return;
+      }
+    }
     return showConfirmation(phone, schema, send, ctx, updateSession);
   }
   if (session.state === STATES.CONFIRM_BOOKING) {
@@ -175,7 +341,7 @@ async function handle({ phone, text, buttonId, tenant }) {
     return;
   }
 
-  // ── MY APPOINTMENTS FLOW ─────────────────────────────────────
+  // ── MY APPOINTMENTS FLOW ───────────────────────────────────────
   if (session.state === STATES.MY_APPOINTMENTS) {
     if (/reschedule|btn_0/i.test(choice)) {
       await send.text('Enter the *Booking ID* to reschedule (e.g. MB12AB3):');
@@ -204,13 +370,12 @@ async function handle({ phone, text, buttonId, tenant }) {
       return;
     }
     const a = appt.rows[0];
-    // Find available dates for the same doctor in next 14 days
     const today = new Date();
     const dates = [];
-    for (let i = 1; i <= 14 && dates.length < 7; i++) {
+    for (let i = 1; i <= SLOT_LOOKAHEAD_DAYS && dates.length < 7; i++) {
       const d = addDays(today, i);
       const dateStr = format(d, 'yyyy-MM-dd');
-      if (dateStr === a.appointment_date) continue; // skip current date
+      if (dateStr === a.appointment_date) continue;
       const count = await tenantQuery(schema,
         `SELECT COUNT(*) FROM time_slots WHERE doctor_id=$1 AND slot_date=$2 AND status='available'`,
         [a.doctor_id, dateStr]);
@@ -218,7 +383,7 @@ async function handle({ phone, text, buttonId, tenant }) {
       if (n > 0) dates.push({ date: dateStr, label: format(d, 'EEE, d MMM'), slots: n });
     }
     if (!dates.length) {
-      await send.text(`No available slots for Dr. ${a.doctor_name} in the next 14 days.\n\nReply *Hi* to go back.`);
+      await send.text(`No available slots for Dr. ${a.doctor_name} in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nReply *Hi* to go back.`);
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -229,7 +394,6 @@ async function handle({ phone, text, buttonId, tenant }) {
     ctx.reschedule_booking_id = a.booking_id;
     ctx.reschedule_old_date = a.appointment_date;
     ctx.reschedule_old_time = a.appointment_time;
-
     const sections = [{
       title: 'Available Dates',
       rows: dates.map(d => ({ id: d.date, title: d.label, description: `${d.slots} slots available` }))
@@ -305,25 +469,31 @@ async function handle({ phone, text, buttonId, tenant }) {
 
   if (session.state === STATES.RESCHEDULE_CONFIRM) {
     if (/yes|reschedule|confirm|btn_0/i.test(choice)) {
-      // Atomically book new slot
-      const lock = await tenantQuery(schema,
-        `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
-        [ctx.reschedule_new_slot_id]);
-      if (!lock.rows.length) {
+      // Atomic: lock new slot + release old slot + update appointment in one transaction
+      const rescheduled = await tenantTransaction(schema, async (client) => {
+        const lock = await client.query(
+          `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
+          [ctx.reschedule_new_slot_id]
+        );
+        if (!lock.rows.length) return null; // slot taken
+        await client.query(
+          `UPDATE time_slots SET status='available' WHERE id=$1`,
+          [ctx.reschedule_old_slot_id]
+        );
+        await client.query(
+          `UPDATE appointments SET
+             slot_id=$1, appointment_date=$2, appointment_time=$3,
+             reminder_24h_sent=false, reminder_2h_sent=false, updated_at=NOW()
+           WHERE id=$4`,
+          [ctx.reschedule_new_slot_id, ctx.reschedule_new_date, ctx.reschedule_new_time, ctx.reschedule_appt_id]
+        );
+        return true;
+      });
+      if (!rescheduled) {
         await send.text('⚠️ That slot was just taken! Reply *Hi* to pick another time.');
         await updateSession(schema, phone, STATES.IDLE, {});
         return;
       }
-      // Release old slot
-      await tenantQuery(schema,
-        `UPDATE time_slots SET status='available' WHERE id=$1`, [ctx.reschedule_old_slot_id]);
-      // Update appointment
-      await tenantQuery(schema,
-        `UPDATE appointments SET
-           slot_id=$1, appointment_date=$2, appointment_time=$3,
-           reminder_24h_sent=false, reminder_2h_sent=false, updated_at=NOW()
-         WHERE id=$4`,
-        [ctx.reschedule_new_slot_id, ctx.reschedule_new_date, ctx.reschedule_new_time, ctx.reschedule_appt_id]);
 
       let newDate = ctx.reschedule_new_date;
       try { newDate = format(parseISO(newDate), 'EEE, d MMM yyyy'); } catch {}
@@ -342,6 +512,7 @@ async function handle({ phone, text, buttonId, tenant }) {
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
+
   if (session.state === STATES.CANCEL_SELECT) {
     const appt = await tenantQuery(schema,
       `SELECT a.*, d.name as doctor_name FROM appointments a
@@ -355,23 +526,43 @@ async function handle({ phone, text, buttonId, tenant }) {
     const a = appt.rows[0];
     ctx.cancel_appt_id = a.id;
     ctx.cancel_slot_id = a.slot_id;
+    ctx.cancel_doctor_id = a.doctor_id;
+    ctx.cancel_booking_id = a.booking_id;
+    ctx.cancel_doctor_name = a.doctor_name;
+    ctx.cancel_date = a.appointment_date;
+    ctx.cancel_time = a.appointment_time;
     await send.buttons(
-      `❌ *Cancel Appointment*\n\n` +
-      `Booking: *${a.booking_id}*\n` +
-      `Dr. ${a.doctor_name}\n` +
-      `${a.appointment_date} at ${a.appointment_time.slice(0,5)}\n\n` +
-      `Are you sure you want to cancel?`,
+      `❌ *Cancel Appointment*\n\nBooking: *${a.booking_id}*\nDr. ${a.doctor_name}\n${a.appointment_date} at ${a.appointment_time.slice(0,5)}\n\nWhy are you cancelling?`,
+      ['Doctor not available', 'Schedule conflict', 'Other reason']
+    );
+    await updateSession(schema, phone, STATES.CANCEL_REASON, ctx);
+    return;
+  }
+
+  if (session.state === STATES.CANCEL_REASON) {
+    const reasonMap = { btn_0: 'Doctor not available', btn_1: 'Schedule conflict', btn_2: 'Other' };
+    ctx.cancel_reason = reasonMap[buttonId] || input || 'Not specified';
+    await send.buttons(
+      `❌ *Confirm Cancellation*\n\nBooking: *${ctx.cancel_booking_id}*\nDr. ${ctx.cancel_doctor_name}\n${ctx.cancel_date} at ${ctx.cancel_time?.slice(0,5)}\nReason: ${ctx.cancel_reason}\n\nAre you sure?`,
       ['Yes, Cancel It', 'No, Keep It']
     );
     await updateSession(schema, phone, STATES.CANCEL_CONFIRM, ctx);
     return;
   }
+
   if (session.state === STATES.CANCEL_CONFIRM) {
     if (/yes|cancel|btn_0/i.test(choice)) {
-      await tenantQuery(schema,
-        `UPDATE appointments SET status='cancelled', updated_at=NOW() WHERE id=$1`, [ctx.cancel_appt_id]);
-      await tenantQuery(schema,
-        `UPDATE time_slots SET status='available' WHERE id=$1`, [ctx.cancel_slot_id]);
+      await tenantTransaction(schema, async (client) => {
+        await client.query(
+          `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed'`,
+          [ctx.cancel_reason || null, ctx.cancel_appt_id]);
+        await client.query(
+          `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`, [ctx.cancel_slot_id]);
+      });
+      // Notify waitlist for this doctor since a slot opened up
+      if (ctx.cancel_doctor_id) {
+        notifyWaitlistForDoctor(schema, ctx.cancel_doctor_id, tenant).catch(() => {});
+      }
       await send.text('✅ Appointment cancelled successfully.\n\nReply *Hi* to book a new appointment anytime.');
     } else {
       await send.text('Your appointment is kept. ✅\n\nReply *Hi* for the main menu.');
@@ -460,9 +651,7 @@ async function handleSelectVisitType(phone, schema, tenant, send, ctx, choice) {
 
 async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input) {
   const depts = ctx._depts || [];
-  const dept = depts.find(d =>
-    d.id === choice || d.name.toLowerCase().includes(input.toLowerCase())
-  );
+  const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input);
   if (!dept) { await send.text('Please select a specialty from the options.'); return; }
 
   ctx.department_id = dept.id;
@@ -500,21 +689,24 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
 async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, input) {
   const doctors = ctx._doctors || [];
   const cleanInput = input.toLowerCase().replace(/^dr\.?\s*/i, '').trim();
-  const doc = doctors.find(d =>
-    d.id === choice ||
-    d.name.toLowerCase() === cleanInput ||
-    d.name.toLowerCase().includes(cleanInput) ||
-    `dr. ${d.name}`.toLowerCase() === input.toLowerCase()
-  );
+  const doc = doctors.find(d => d.id === choice) || fuzzyFind(doctors, cleanInput);
   if (!doc) { await send.text('Please select a doctor from the options shown.'); return; }
 
   ctx.doctor_id = doc.id;
   ctx.doctor_name = doc.name;
 
-  // Find available dates in next 14 days
+  // Find available dates including today if there are future slots today
   const today = new Date();
   const dates = [];
-  for (let i = 1; i <= 14 && dates.length < 7; i++) {
+  // Check today first (same-day booking)
+  const todayStr = format(today, 'yyyy-MM-dd');
+  const todayCount = await tenantQuery(schema,
+    `SELECT COUNT(*) FROM time_slots WHERE doctor_id=$1 AND slot_date=$2 AND status='available' AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time`,
+    [doc.id, todayStr]);
+  const todayN = parseInt(todayCount.rows[0].count);
+  if (todayN > 0) dates.push({ date: todayStr, label: `Today (${format(today, 'd MMM')})`, slots: todayN });
+
+  for (let i = 1; i <= SLOT_LOOKAHEAD_DAYS && dates.length < 7; i++) {
     const d = addDays(today, i);
     const dateStr = format(d, 'yyyy-MM-dd');
     const count = await tenantQuery(schema,
@@ -525,7 +717,11 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   }
 
   if (!dates.length) {
-    await send.text(`No available slots for Dr. ${doc.name} in the next 14 days.\n\nReply *Hi* to choose a different doctor.`);
+    await send.buttons(
+      `No available slots for Dr. ${doc.name} in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nWould you like to join the waiting list? We'll notify you when a slot opens!`,
+      ['🔔 Join Waiting List', '🔙 Choose Another Doctor']
+    );
+    await updateSession(schema, phone, STATES.WAITLIST_CONFIRM, ctx);
     return;
   }
 
@@ -535,6 +731,34 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   }];
   await send.list(`📅 *Select Date*\n\nAvailable dates for Dr. ${doc.name}:`, 'Choose Date', sections);
   await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
+}
+
+async function handleWaitlistConfirm(phone, schema, tenant, send, ctx, choice) {
+  if (/join|waitlist|🔔|btn_0/i.test(choice)) {
+    const patient = await getPatient(schema, phone);
+    let patientId = patient?.id;
+
+    if (!patientId) {
+      await send.text('To join the waiting list, please provide your name first.\n\nEnter your full name:');
+      ctx._waitlist_pending = true;
+      await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
+      return;
+    }
+
+    await tenantQuery(schema,
+      `INSERT INTO waiting_list (patient_id, doctor_id, hospital_id) VALUES ($1,$2,$3)`,
+      [patientId, ctx.doctor_id, ctx.hospital_id]);
+
+    await send.text(
+      `✅ *You've joined the waiting list!*\n\n` +
+      `We'll send you a WhatsApp notification as soon as Dr. ${ctx.doctor_name} has an available slot.\n\n` +
+      `Reply *Hi* for the main menu.`
+    );
+    await updateSession(schema, phone, STATES.IDLE, {});
+  } else {
+    await send.text('Okay, let\'s choose a different doctor.\n\nReply *Hi* to start over.');
+    await updateSession(schema, phone, STATES.IDLE, {});
+  }
 }
 
 async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
@@ -616,44 +840,80 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
 }
 
 async function completeBooking(phone, schema, tenant, send, ctx) {
-  // Atomic slot lock — prevents double booking
-  const slotUpdate = await tenantQuery(schema,
-    `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
-    [ctx.slot_id]);
+  // Phone rate limit: max 3 confirmed bookings per hour
+  try {
+    const recentR = await tenantQuery(schema,
+      `SELECT COUNT(*) FROM appointments a
+       JOIN patients p ON p.id=a.patient_id
+       WHERE p.phone=$1 AND a.status='confirmed' AND a.created_at >= NOW() - INTERVAL '1 hour'`,
+      [phone]);
+    if (parseInt(recentR.rows[0].count) >= 3) {
+      await send.text('⚠️ You\'ve made 3 bookings in the last hour. Please wait before booking again.\n\nReply *Hi* for the main menu.');
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
+  } catch (_) {} // rate limit check is non-fatal
 
-  if (!slotUpdate.rows.length) {
-    await send.text('⚠️ Sorry, that slot was just taken by someone else!\n\nReply *Hi* to choose another time.');
+  // Single transaction: slot lock + patient upsert + appointment insert
+  const client = await pool.connect();
+  let bookingId;
+  let patientId = ctx.patient_id;
+
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL search_path TO "${schema}", public`);
+
+    // Atomic slot lock
+    const slotUpdate = await client.query(
+      `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
+      [ctx.slot_id]);
+
+    if (!slotUpdate.rows.length) {
+      await client.query('ROLLBACK');
+      await send.text('⚠️ Sorry, that slot was just taken! Reply *Hi* to choose another time.');
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
+
+    // Upsert patient (include email if collected)
+    if (!patientId) {
+      const pr = await client.query(
+        `INSERT INTO patients (phone, name, date_of_birth, gender, email, visit_count)
+         VALUES ($1,$2,$3,$4,$5,1)
+         ON CONFLICT (phone) DO UPDATE SET
+           name=EXCLUDED.name, date_of_birth=EXCLUDED.date_of_birth,
+           gender=EXCLUDED.gender,
+           email=COALESCE(EXCLUDED.email, patients.email),
+           visit_count=patients.visit_count+1, updated_at=NOW()
+         RETURNING id`,
+        [phone, ctx.patient_name, ctx.patient_dob || null, ctx.patient_gender || null, ctx.patient_email || null]);
+      patientId = pr.rows[0].id;
+    } else {
+      await client.query(
+        `UPDATE patients SET visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`, [patientId]);
+    }
+
+    bookingId = genBookingId();
+    await client.query(
+      `INSERT INTO appointments
+       (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed')`,
+      [bookingId, patientId, ctx.doctor_id, ctx.hospital_id, ctx.slot_id,
+       ctx.appointment_date, ctx.appointment_time, ctx.visit_type || 'in_person']);
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    logger.error('Booking transaction failed', { error: err.message });
+    await send.text('⚠️ Sorry, there was an error completing your booking. Please try again.\n\nReply *Hi* to start over.');
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
+  } finally {
+    client.release();
   }
 
-  // Upsert patient
-  let patientId = ctx.patient_id;
-  if (!patientId) {
-    const pr = await tenantQuery(schema,
-      `INSERT INTO patients (phone, name, date_of_birth, gender, visit_count)
-       VALUES ($1,$2,$3,$4,1)
-       ON CONFLICT (phone) DO UPDATE SET
-         name=EXCLUDED.name,
-         date_of_birth=EXCLUDED.date_of_birth,
-         gender=EXCLUDED.gender,
-         visit_count=patients.visit_count+1,
-         updated_at=NOW()
-       RETURNING id`,
-      [phone, ctx.patient_name, ctx.patient_dob || null, ctx.patient_gender || null]);
-    patientId = pr.rows[0].id;
-  } else {
-    await tenantQuery(schema,
-      `UPDATE patients SET visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`, [patientId]);
-  }
-
-  const bookingId = genBookingId();
-  await tenantQuery(schema,
-    `INSERT INTO appointments
-     (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed')`,
-    [bookingId, patientId, ctx.doctor_id, ctx.hospital_id, ctx.slot_id,
-     ctx.appointment_date, ctx.appointment_time, ctx.visit_type || 'in_person']);
+  // Post-transaction actions
+  notifyWaitlistForDoctor(schema, ctx.doctor_id, tenant).catch(() => {});
 
   let dateLabel = ctx.appointment_date;
   try { dateLabel = format(parseISO(ctx.appointment_date), 'EEE, d MMM yyyy'); } catch {}
@@ -668,7 +928,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     `Reply *Hi* to book another appointment or *Status* to view appointments.`
   );
 
-  // Send email confirmation if patient has email on file
+  // Email confirmation (best-effort)
   if (patientId) {
     try {
       const patientR = await tenantQuery(schema, `SELECT email FROM patients WHERE id=$1`, [patientId]);
@@ -686,11 +946,44 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
           visitType: ctx.visit_type || 'in_person',
         });
       }
-    } catch (_) { /* non-fatal */ }
+    } catch (emailErr) {
+      logger.error('Email confirmation failed', { error: emailErr.message });
+      // WA fallback notification (best-effort)
+      try {
+        await send.text(`📧 Note: We couldn't send an email confirmation, but your booking *${bookingId}* is confirmed.`);
+      } catch (_) {}
+    }
   }
 
   await updateSession(schema, phone, STATES.IDLE, {});
   logger.info(`✅ Booking confirmed: ${bookingId}`, { phone, tenant: tenant.name });
+}
+
+async function notifyWaitlistForDoctor(schema, doctorId, tenant) {
+  try {
+    const waToken = tenant?.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
+    const waPhoneId = tenant?.wa_phone_number_id;
+    if (!waToken || !waPhoneId) return;
+
+    const doctorR = await tenantQuery(schema, `SELECT name FROM doctors WHERE id=$1`, [doctorId]);
+    const doctorName = doctorR.rows[0]?.name || 'your doctor';
+
+    const wl = await tenantQuery(schema,
+      `SELECT wl.*, p.phone FROM waiting_list wl JOIN patients p ON p.id=wl.patient_id
+       WHERE wl.doctor_id=$1 AND wl.notified=false LIMIT 5`, [doctorId]);
+    for (const entry of wl.rows) {
+      try {
+        await wa.sendText(entry.phone,
+          `🎉 *Slot Available!*\n\nA slot has opened up with Dr. ${doctorName}.\n\nReply *Hi* to book your appointment now before it's taken!`,
+          waToken, waPhoneId
+        );
+        await tenantQuery(schema,
+          `UPDATE bot_sessions SET state='main_menu', context='{}', last_activity=NOW() WHERE phone=$1`, [entry.phone]);
+        await tenantQuery(schema,
+          `UPDATE waiting_list SET notified=true WHERE id=$1`, [entry.id]);
+      } catch (_) {}
+    }
+  } catch (_) {}
 }
 
 async function showMyAppointments(phone, schema, tenant, send) {
@@ -730,4 +1023,56 @@ async function showMyAppointments(phone, schema, tenant, send) {
   await updateSession(schema, phone, STATES.MY_APPOINTMENTS, { _appts: appts.rows });
 }
 
-module.exports = { handle };
+// ── FEEDBACK HANDLERS ──────────────────────────────────────────
+
+async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
+  const ratingMap = { btn_0: 1, btn_1: 2, btn_2: 3, btn_3: 4, btn_4: 5 };
+  let rating = ratingMap[choice] || parseInt(input);
+  if (/skip/i.test(input)) {
+    await send.text('No problem! Reply *Hi* for the main menu.');
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
+  if (!rating || rating < 1 || rating > 5) {
+    await send.buttons(
+      `Please rate your experience (1-5):\n1⭐ Poor → 5⭐ Excellent\n\nOr reply with a number 1-5.`,
+      ['⭐ 1', '⭐⭐⭐ 3', '⭐⭐⭐⭐⭐ 5']
+    );
+    return;
+  }
+  ctx.feedback_rating = rating;
+  await send.text(
+    `${rating >= 4 ? '🌟' : '📝'} Thank you for rating ${rating}/5!\n\n` +
+    `Would you like to leave a comment? (Reply *Skip* to finish)`
+  );
+  await updateSession(schema, phone, STATES.COLLECT_FEEDBACK_COMMENT, ctx);
+}
+
+async function handleFeedbackComment(phone, schema, send, ctx, input) {
+  const comment = /skip/i.test(input) ? null : input;
+  try {
+    if (ctx.feedback_appointment_id && ctx.feedback_patient_id) {
+      await tenantQuery(schema,
+        `INSERT INTO appointment_feedback (appointment_id, patient_id, rating, comment)
+         VALUES ($1,$2,$3,$4)`,
+        [ctx.feedback_appointment_id, ctx.feedback_patient_id, ctx.feedback_rating, comment]);
+    }
+  } catch (_) {}
+  await send.text('✅ Thank you for your feedback! It helps us serve you better.\n\nReply *Hi* for the main menu.');
+  await updateSession(schema, phone, STATES.IDLE, {});
+}
+
+async function triggerFeedback(schemaName, phone, appointmentId, patientId, doctorName) {
+  try {
+    await tenantQuery(schemaName,
+      `UPDATE bot_sessions SET state=$1, context=$2, last_activity=NOW() WHERE phone=$3`,
+      [
+        STATES.COLLECT_FEEDBACK_RATING,
+        JSON.stringify({ feedback_appointment_id: appointmentId, feedback_patient_id: patientId, doctor_name: doctorName }),
+        phone
+      ]
+    );
+  } catch (_) {}
+}
+
+module.exports = { handle, triggerFeedback };

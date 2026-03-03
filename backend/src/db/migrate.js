@@ -7,6 +7,7 @@ async function migrate() {
   try {
     console.log('Running migrations...');
 
+    // ── PUBLIC SCHEMA — platform-level tables ──────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS tenants (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -46,6 +47,86 @@ async function migrate() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email VARCHAR(255) NOT NULL,
+        tenant_id UUID,
+        token VARCHAR(255) UNIQUE NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS token_blacklist (
+        jti VARCHAR(255) PRIMARY KEY,
+        expires_at TIMESTAMPTZ NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_pwd_reset_token ON password_resets(token);
+      CREATE INDEX IF NOT EXISTS idx_token_bl_expires ON token_blacklist(expires_at);
+    `);
+
+    // ── TENANTS: add new columns for suspension & onboarding ──────
+    await client.query(`
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspension_reason TEXT;
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT false;
+    `);
+
+    // ── ADMIN ACCESS LOGS ─────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS admin_access_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID,
+        email VARCHAR(255),
+        tenant_id UUID,
+        event VARCHAR(50) NOT NULL,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_access_logs_email ON admin_access_logs(email);
+      CREATE INDEX IF NOT EXISTS idx_access_logs_tenant ON admin_access_logs(tenant_id);
+      CREATE INDEX IF NOT EXISTS idx_access_logs_created ON admin_access_logs(created_at DESC);
+    `);
+
+    // ── PUBLIC AUDIT LOG ───────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        actor_id UUID,
+        actor_role VARCHAR(50),
+        action VARCHAR(100) NOT NULL,
+        resource_type VARCHAR(100),
+        resource_id TEXT,
+        old_values JSONB,
+        new_values JSONB,
+        ip_address VARCHAR(45),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+    `);
+
+    // ── CRON JOB TRACKING ──────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cron_jobs (
+        job_name VARCHAR(100) PRIMARY KEY,
+        last_run_at TIMESTAMPTZ,
+        last_status VARCHAR(50),
+        last_error TEXT
+      );
+
+      INSERT INTO cron_jobs (job_name) VALUES
+        ('slot_generator'),
+        ('reminders'),
+        ('feedback')
+      ON CONFLICT (job_name) DO NOTHING;
+    `);
+
+    // ── SEED PLANS ────────────────────────────────────────────
+    await client.query(`
       INSERT INTO plans (id, name, max_doctors, max_appointments_per_month, price_monthly) VALUES
         ('starter',      'Starter',      3,    200,  0),
         ('growth',       'Growth',       10,   1000, 1999),
@@ -54,6 +135,7 @@ async function migrate() {
       ON CONFLICT (id) DO NOTHING;
     `);
 
+    // ── SEED SUPER ADMIN ──────────────────────────────────────
     const hash = await bcrypt.hash('SuperAdmin@123', 12);
     await client.query(`
       INSERT INTO super_admins (email, password_hash, name)
@@ -64,11 +146,32 @@ async function migrate() {
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
     console.log('✅ Super admin created: admin@medibook.com / SuperAdmin@123');
+    console.log('✅ audit_logs, cron_jobs, admin_access_logs tables created');
 
   } finally {
     client.release();
-    await pool.end();
+  }
+
+  // ── RUN TENANT MIGRATIONS for existing schemas ───────────────
+  try {
+    const { runTenantMigrations } = require('./tenantMigrate');
+    const tenantsR = await pool.query(`SELECT schema_name, name FROM tenants`);
+    if (tenantsR.rows.length > 0) {
+      console.log(`Running tenant migrations for ${tenantsR.rows.length} existing schemas...`);
+      for (const t of tenantsR.rows) {
+        try {
+          await runTenantMigrations(t.schema_name);
+          console.log(`✅ Tenant migrations applied: ${t.name} (${t.schema_name})`);
+        } catch (err) {
+          console.error(`❌ Tenant migration failed for ${t.schema_name}:`, err.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to run tenant schema migrations:', err.message);
   }
 }
 
-migrate().catch(err => { console.error('Migration failed:', err); process.exit(1); });
+migrate()
+  .catch(err => { console.error('Migration failed:', err); process.exit(1); })
+  .finally(() => pool.end());

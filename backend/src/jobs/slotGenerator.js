@@ -2,6 +2,27 @@ const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
 const { addDays, format } = require('date-fns');
 const logger = require('../utils/logger');
+const { CRON_LOOKAHEAD_DAYS } = require('../utils/errors');
+const { withCronLock } = require('../utils/cronLock');
+
+const BATCH_SIZE = 100;
+
+// Flush accumulated slot tuples in a single multi-value INSERT
+async function flushSlots(schema, batch) {
+  if (!batch.length) return;
+  const values = [];
+  const params = [];
+  for (const s of batch) {
+    const i = params.length;
+    values.push(`($${i + 1},$${i + 2},$${i + 3},$${i + 4},$${i + 5},'available')`);
+    params.push(s.docId, s.hospitalId, s.dateStr, s.st, s.et);
+  }
+  await tenantQuery(schema, `
+    INSERT INTO time_slots (doctor_id, hospital_id, slot_date, start_time, end_time, status)
+    VALUES ${values.join(',')}
+    ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING
+  `, params);
+}
 
 async function generateSlotsForTenant(schema) {
   const doctors = await tenantQuery(schema,
@@ -20,7 +41,7 @@ async function generateSlotsForTenant(schema) {
     if (!docMap[row.id]) {
       docMap[row.id] = {
         hospital_id: row.hospital_id,
-        duration: row.slot_duration_minutes || 30,
+        duration: Math.max(5, row.slot_duration_minutes || 30),
         schedules: [],
       };
     }
@@ -35,10 +56,10 @@ async function generateSlotsForTenant(schema) {
 
   const today = new Date();
   let count = 0;
+  let batch = [];
 
   for (const [docId, doc] of Object.entries(docMap)) {
-    // Generate 7 days ahead
-    for (let i = 1; i <= 7; i++) {
+    for (let i = 1; i <= CRON_LOOKAHEAD_DAYS; i++) {
       const date = addDays(today, i);
       const dow = date.getDay();
       const sched = doc.schedules.find(s => s.dow === dow);
@@ -67,41 +88,126 @@ async function generateSlotsForTenant(schema) {
         }
         const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
         const et = `${String(Math.floor((cur + doc.duration) / 60)).padStart(2, '0')}:${String((cur + doc.duration) % 60).padStart(2, '0')}`;
-        await tenantQuery(schema, `
-          INSERT INTO time_slots (doctor_id, hospital_id, slot_date, start_time, end_time, status)
-          VALUES ($1,$2,$3,$4,$5,'available')
-          ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING
-        `, [docId, doc.hospital_id, dateStr, st, et]);
-        cur += doc.duration;
+        batch.push({ docId, hospitalId: doc.hospital_id, dateStr, st, et });
         count++;
+        cur += doc.duration;
+
+        // Flush every BATCH_SIZE rows
+        if (batch.length >= BATCH_SIZE) {
+          await flushSlots(schema, batch);
+          batch = [];
+        }
       }
     }
   }
+
+  // Flush any remaining rows
+  if (batch.length) {
+    await flushSlots(schema, batch);
+  }
+
   return count;
+}
+
+// Mark past available slots as expired; purge old records; clean stale sessions
+async function cleanupExpiredSlots(schema) {
+  try {
+    const r = await tenantQuery(schema,
+      `UPDATE time_slots SET status='expired'
+       WHERE slot_date < CURRENT_DATE AND status='available'
+       RETURNING id`);
+    // Hard-delete expired slot records older than 90 days (prevents unbounded growth)
+    await tenantQuery(schema,
+      `DELETE FROM time_slots WHERE status='expired' AND slot_date < CURRENT_DATE - INTERVAL '90 days'`);
+    // Purge bot sessions: inactive 30+ days OR stuck mid-flow for 7+ days
+    await tenantQuery(schema,
+      `DELETE FROM bot_sessions WHERE last_activity < NOW() - INTERVAL '30 days'
+          OR (state != 'idle' AND last_activity < NOW() - INTERVAL '7 days')`);
+    // Purge old wa_messages (keep 90 days to allow dedup lookups)
+    await tenantQuery(schema,
+      `DELETE FROM wa_messages WHERE created_at < NOW() - INTERVAL '90 days'`);
+    return r.rows.length;
+  } catch (err) {
+    logger.error(`cleanupExpiredSlots failed for schema ${schema}`, { error: err.message });
+    return 0;
+  }
+}
+
+// Clean up public-schema housekeeping: expired tokens, old audit logs, stale password resets
+async function cleanupTokenBlacklist() {
+  try {
+    await query(`DELETE FROM token_blacklist WHERE expires_at < NOW()`);
+  } catch (_) { /* non-fatal */ }
+  try {
+    await query(`DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '1 year'`);
+  } catch (_) { /* non-fatal */ }
+  try {
+    // Remove used or expired password reset tokens older than 24 hours
+    await query(`DELETE FROM password_resets WHERE used=true OR expires_at < NOW() - INTERVAL '24 hours'`);
+  } catch (_) { /* non-fatal */ }
+  try {
+    // Trim admin_access_logs older than 6 months
+    await query(`DELETE FROM admin_access_logs WHERE created_at < NOW() - INTERVAL '6 months'`);
+  } catch (_) { /* non-fatal */ }
 }
 
 function startSlotGeneratorCron() {
   // Run daily at 11:30 PM IST (18:00 UTC)
-  cron.schedule('0 18 * * *', async () => {
-    logger.info('Starting nightly slot generation...');
-    try {
-      const tenants = await query(`SELECT schema_name, name FROM tenants WHERE status='active'`);
-      let total = 0;
-      for (const tenant of tenants.rows) {
-        try {
-          const n = await generateSlotsForTenant(tenant.schema_name);
-          total += n;
-          if (n > 0) logger.info(`Slots generated for ${tenant.name}: ${n}`);
-        } catch (err) {
-          logger.error(`Slot generation failed for ${tenant.name}`, { error: err.message });
+  const slotTask = cron.schedule('0 18 * * *', async () => {
+    await withCronLock('cron:slot_generator', 3600, async () => {
+      logger.info('Starting nightly slot generation...');
+      try {
+        const tenants = await query(`SELECT schema_name, name FROM tenants WHERE status='active'`);
+        let total = 0;
+        for (const tenant of tenants.rows) {
+          try {
+            const n = await generateSlotsForTenant(tenant.schema_name);
+            total += n;
+            if (n > 0) logger.info(`Slots generated for ${tenant.name}: ${n}`);
+          } catch (err) {
+            logger.error(`Slot generation failed for ${tenant.name}`, { error: err.message });
+          }
         }
+        logger.info(`Nightly slot generation done: ${total} slots across ${tenants.rows.length} tenants`);
+        try {
+          await query(
+            `UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='slot_generator'`
+          );
+        } catch (_) {}
+      } catch (err) {
+        logger.error('Slot generator cron error', { error: err.message });
+        try {
+          await query(
+            `UPDATE cron_jobs SET last_run_at=NOW(), last_status='error', last_error=$1 WHERE job_name='slot_generator'`,
+            [err.message.slice(0, 500)]
+          );
+        } catch (_) {}
       }
-      logger.info(`Nightly slot generation done: ${total} slots across ${tenants.rows.length} tenants`);
-    } catch (err) {
-      logger.error('Slot generator cron error', { error: err.message });
-    }
+    });
   });
+
+  // Cleanup expired slots daily at midnight IST (18:30 UTC)
+  const cleanupTask = cron.schedule('30 18 * * *', async () => {
+    await withCronLock('cron:slot_cleanup', 3600, async () => {
+      logger.info('Running slot expiry cleanup...');
+      try {
+        const tenants = await query(`SELECT schema_name FROM tenants WHERE status='active'`);
+        let total = 0;
+        for (const tenant of tenants.rows) {
+          const n = await cleanupExpiredSlots(tenant.schema_name);
+          total += n;
+        }
+        await cleanupTokenBlacklist();
+        logger.info(`Slot expiry cleanup done: ${total} slots expired`);
+      } catch (err) {
+        logger.error('Slot expiry cleanup error', { error: err.message });
+      }
+    });
+  });
+
   logger.info('Slot generator cron registered (daily at 11:30 PM IST)');
+  logger.info('Slot expiry cleanup cron registered (daily at midnight IST)');
+  return [slotTask, cleanupTask];
 }
 
-module.exports = { startSlotGeneratorCron, generateSlotsForTenant };
+module.exports = { startSlotGeneratorCron, generateSlotsForTenant, cleanupExpiredSlots };
