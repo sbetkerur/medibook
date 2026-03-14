@@ -12,8 +12,11 @@ for i in $(seq 1 30); do
   " && break || { echo "  Retry $i/30..."; sleep 2; }
 done
 
-echo "🔄 Running migrations..."
+echo "Running migrations..."
 node src/db/migrate.js
 
-echo "🚀 Starting MediBook API..."
+echo "Seeding initial data..."
+node src/db/seed.js || echo "Seed skipped (may already exist)"
+
+echo "Starting MediBook API..."
 exec node src/index.js
