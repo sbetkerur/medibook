@@ -15,6 +15,9 @@ function createConnection() {
     maxRetriesPerRequest: null, // Required by BullMQ
     enableReadyCheck: false,
     lazyConnect: true,
+    keepAlive: 30000,         // Send TCP keepalive every 30s to prevent Railway proxy from dropping idle connections
+    connectTimeout: 10000,
+    commandTimeout: 30000,
   });
   conn.on('error', () => { /* suppress connection noise */ });
   return conn;
