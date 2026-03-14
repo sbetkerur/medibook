@@ -17,6 +17,20 @@ if (KEY === DEFAULT_KEY) {
   }
 }
 
+// Minimum key length check (applies only to custom keys, not the default placeholder)
+if (KEY !== DEFAULT_KEY && KEY.length < 32) {
+  const msg = `ENCRYPTION_KEY is too short (${KEY.length} chars) — use at least 32 characters for adequate security`;
+  if (process.env.NODE_ENV === 'production') {
+    // eslint-disable-next-line no-console
+    console.error(`FATAL: ${msg}`);
+    process.exit(1);
+  } else {
+    process.nextTick(() => {
+      try { require('./logger').warn(msg); } catch (_) {}
+    });
+  }
+}
+
 function encrypt(text) {
   if (!text) return null;
   return CryptoJS.AES.encrypt(text, KEY).toString();

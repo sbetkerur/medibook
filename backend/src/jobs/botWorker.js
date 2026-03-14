@@ -6,6 +6,8 @@ const logger = require('../utils/logger');
 
 let botQueue = null;
 let dlQueue = null;  // dead-letter queue for failed jobs
+let emailQueue = null;
+let emailWorker = null;
 let queueAvailable = false;
 
 function createConnection() {
@@ -50,8 +52,29 @@ async function setup() {
     botQueue = new Queue('bot-messages', { connection });
     // Dead-letter queue — stores jobs that failed all 3 attempts for manual inspection
     dlQueue = new Queue('bot-messages-failed', { connection });
+    // Email queue — async sending with 3-attempt exponential backoff retry
+    emailQueue = new Queue('email-jobs', { connection });
+    // Wire email service to use queue
+    require('../services/email').setEmailQueue(emailQueue);
     queueAvailable = true;
-    logger.info('BullMQ bot queue initialized (with dead-letter queue)');
+    logger.info('BullMQ queues initialized (bot + email, with dead-letter queue)');
+
+    // Alert if dead-letter queue grows too large (check every 5 minutes)
+    const DLQ_ALERT_THRESHOLD = 50;
+    setInterval(async () => {
+      if (!dlQueue) return;
+      try {
+        const counts = await dlQueue.getJobCounts('waiting');
+        const depth = counts.waiting || 0;
+        if (depth >= DLQ_ALERT_THRESHOLD) {
+          logger.error('Dead-letter queue depth exceeded threshold — manual intervention required', {
+            queue: 'bot-messages-failed',
+            depth,
+            threshold: DLQ_ALERT_THRESHOLD,
+          });
+        }
+      } catch (_) {}
+    }, 5 * 60 * 1000).unref(); // .unref() prevents this timer from keeping the process alive
   } catch (err) {
     logger.warn('BullMQ queue init failed, using sync fallback', { error: err.message });
     queueAvailable = false;
@@ -93,6 +116,32 @@ function startBotWorker() {
     }
   });
 
+  // Email worker — processes email-jobs queue
+  if (emailQueue) {
+    const emailConn = createConnection();
+    const emailSvc = require('../services/email');
+    emailWorker = new Worker('email-jobs', async (job) => {
+      const { type, data: jobData } = job;
+      if (type === 'booking_confirmation') {
+        await emailSvc.sendBookingConfirmation(job.data.toEmail, job.data.data);
+      } else if (type === 'reminder') {
+        await emailSvc.sendReminderEmail(job.data.toEmail, job.data.data);
+      } else if (type === 'admin_booking_alert') {
+        await emailSvc.sendAdminBookingAlert(job.data);
+      } else {
+        logger.warn('Unknown email job type', { type });
+      }
+    }, { connection: emailConn, concurrency: 3 });
+
+    emailWorker.on('failed', (job, err) => {
+      logger.error('Email job failed', { jobId: job?.id, type: job?.name, attempts: job?.attemptsMade, error: err.message });
+    });
+    emailWorker.on('completed', (job) => {
+      logger.info('Email job completed', { jobId: job?.id, type: job?.name });
+    });
+    logger.info('BullMQ email worker started (concurrency: 3)');
+  }
+
   logger.info('BullMQ bot worker started (concurrency: 5)');
   return worker;
 }
@@ -124,8 +173,10 @@ async function getQueueStats() {
 
 async function shutdown() {
   try {
+    if (emailWorker) await emailWorker.close();
     if (botQueue) await botQueue.close();
     if (dlQueue) await dlQueue.close();
+    if (emailQueue) await emailQueue.close();
     logger.info('BullMQ queues closed');
   } catch (err) {
     logger.warn('Error closing BullMQ queues on shutdown', { error: err.message });

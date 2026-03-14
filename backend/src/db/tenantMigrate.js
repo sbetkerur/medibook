@@ -24,6 +24,7 @@ async function createTenantSchema(schemaName) {
         city VARCHAR(100),
         phone VARCHAR(20),
         is_active BOOLEAN DEFAULT true,
+        deleted_at TIMESTAMPTZ DEFAULT NULL,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
@@ -81,6 +82,8 @@ async function createTenantSchema(schemaName) {
         email VARCHAR(255),
         visit_count INTEGER DEFAULT 0,
         medical_history JSONB DEFAULT '{}',
+        opted_out BOOLEAN DEFAULT false,
+        deleted_at TIMESTAMPTZ DEFAULT NULL,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
@@ -135,7 +138,8 @@ async function createTenantSchema(schemaName) {
         hospital_id UUID REFERENCES hospitals(id),
         requested_date DATE,
         notified BOOLEAN DEFAULT false,
-        created_at TIMESTAMPTZ DEFAULT NOW()
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (patient_id, doctor_id)
       );
 
       CREATE TABLE IF NOT EXISTS appointment_feedback (
@@ -183,13 +187,48 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_waiting_list_doctor ON waiting_list(doctor_id, notified);
       CREATE INDEX IF NOT EXISTS idx_waiting_list_created_at ON waiting_list(created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_feedback_appointment ON appointment_feedback(appointment_id);
-      -- New performance indexes
+      -- Existing performance indexes
       CREATE INDEX IF NOT EXISTS idx_appt_status_date ON appointments(status, appointment_date DESC);
       CREATE INDEX IF NOT EXISTS idx_appt_created_at ON appointments(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_bot_sessions_activity ON bot_sessions(last_activity);
       CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_doctor_leaves_doctor ON doctor_leaves(doctor_id, leave_date);
+      -- Composite indexes for common query patterns
+      CREATE INDEX IF NOT EXISTS idx_appt_doctor_date ON appointments(doctor_id, appointment_date);
+      CREATE INDEX IF NOT EXISTS idx_appt_patient_status ON appointments(patient_id, status, appointment_date DESC);
+      CREATE INDEX IF NOT EXISTS idx_appt_reminder_24h ON appointments(appointment_date, reminder_24h_sent) WHERE status='confirmed' AND reminder_24h_sent=false;
+      CREATE INDEX IF NOT EXISTS idx_appt_reminder_2h ON appointments(appointment_date, appointment_time, reminder_2h_sent) WHERE status='confirmed' AND reminder_2h_sent=false;
+      CREATE INDEX IF NOT EXISTS idx_slots_doctor_date_status ON time_slots(doctor_id, slot_date, status);
+      -- Hospital-scoped indexes (Today's Schedule + slot listing)
+      CREATE INDEX IF NOT EXISTS idx_appt_hospital_date ON appointments(hospital_id, appointment_date DESC);
+      CREATE INDEX IF NOT EXISTS idx_patients_created ON patients(created_at DESC);
+      -- Filtered (partial) indexes for soft-delete columns — O(1) lookups on active records
+      CREATE INDEX IF NOT EXISTS idx_hospitals_active ON hospitals(id) WHERE is_active=true AND deleted_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_patients_active ON patients(created_at DESC) WHERE deleted_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(id) WHERE is_active=true;
     `);
+
+    // Append-only trigger for tenant-schema audit_logs
+    await client.query(`
+      CREATE OR REPLACE FUNCTION prevent_tenant_audit_mutation()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'audit_logs is append-only and cannot be modified or deleted';
+      END $$;
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_trigger
+          WHERE tgname = 'audit_logs_immutable'
+            AND tgrelid = 'audit_logs'::regclass
+        ) THEN
+          CREATE TRIGGER audit_logs_immutable
+          BEFORE UPDATE OR DELETE ON audit_logs
+          FOR EACH ROW EXECUTE FUNCTION prevent_tenant_audit_mutation();
+        END IF;
+      END $$;
+    `).catch(() => {});
 
     console.log(`✅ Schema "${schemaName}" created successfully`);
   } finally {
@@ -277,6 +316,76 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE doctor_schedules ADD COLUMN IF NOT EXISTS lunch_start_time TIME DEFAULT NULL;
       ALTER TABLE doctor_schedules ADD COLUMN IF NOT EXISTS lunch_end_time TIME DEFAULT NULL;
     `);
+
+    // Soft-delete columns for hospitals and patients
+    await client.query(`
+      ALTER TABLE hospitals ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
+      ALTER TABLE patients  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;
+      ALTER TABLE patients  ADD COLUMN IF NOT EXISTS opted_out   BOOLEAN DEFAULT false;
+    `);
+
+    // New composite indexes for reminder cron and common query patterns
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_appt_doctor_date        ON appointments(doctor_id, appointment_date);
+      CREATE INDEX IF NOT EXISTS idx_appt_patient_status     ON appointments(patient_id, status, appointment_date DESC);
+      CREATE INDEX IF NOT EXISTS idx_appt_reminder_24h       ON appointments(appointment_date, reminder_24h_sent) WHERE status='confirmed' AND reminder_24h_sent=false;
+      CREATE INDEX IF NOT EXISTS idx_appt_reminder_2h        ON appointments(appointment_date, appointment_time, reminder_2h_sent) WHERE status='confirmed' AND reminder_2h_sent=false;
+      CREATE INDEX IF NOT EXISTS idx_slots_doctor_date_status ON time_slots(doctor_id, slot_date, status);
+      CREATE INDEX IF NOT EXISTS idx_appt_hospital_date       ON appointments(hospital_id, appointment_date DESC);
+      CREATE INDEX IF NOT EXISTS idx_patients_created         ON patients(created_at DESC);
+      -- Filtered (partial) indexes for soft-delete columns
+      CREATE INDEX IF NOT EXISTS idx_hospitals_active ON hospitals(id) WHERE is_active=true AND deleted_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_patients_active  ON patients(created_at DESC) WHERE deleted_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_doctors_active   ON doctors(id) WHERE is_active=true;
+    `);
+
+    // Audit log immutability trigger (idempotent)
+    await client.query(`
+      CREATE OR REPLACE FUNCTION prevent_tenant_audit_mutation()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'audit_logs is append-only and cannot be modified or deleted';
+      END $$;
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_trigger
+          WHERE tgname = 'audit_logs_immutable'
+            AND tgrelid = 'audit_logs'::regclass
+        ) THEN
+          CREATE TRIGGER audit_logs_immutable
+          BEFORE UPDATE OR DELETE ON audit_logs
+          FOR EACH ROW EXECUTE FUNCTION prevent_tenant_audit_mutation();
+        END IF;
+      END $$;
+    `).catch(() => {});
+
+    // Add unique constraint on appointment_feedback to prevent duplicate feedback per appointment
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'uq_feedback_appointment'
+            AND conrelid = ('"${schemaName}".appointment_feedback')::regclass
+        ) THEN
+          ALTER TABLE appointment_feedback ADD CONSTRAINT uq_feedback_appointment UNIQUE (appointment_id);
+        END IF;
+      END $$;
+    `).catch(() => {}); // Non-fatal if constraint already exists with different method
+
+    // Add unique constraint on waiting_list to prevent duplicate entries per patient+doctor
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'uq_waiting_list_patient_doctor'
+            AND conrelid = ('"${schemaName}".waiting_list')::regclass
+        ) THEN
+          ALTER TABLE waiting_list ADD CONSTRAINT uq_waiting_list_patient_doctor UNIQUE (patient_id, doctor_id);
+        END IF;
+      END $$;
+    `).catch(() => {});
 
   } finally {
     await client.query('RESET search_path').catch(() => {});

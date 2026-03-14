@@ -2,6 +2,27 @@ require('dotenv').config();
 const { pool } = require('./index');
 const bcrypt = require('bcryptjs');
 
+async function runMigration(client, version, name, sqlFn) {
+  // Ensure schema_migrations table exists first
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      applied_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  const exists = await client.query(
+    `SELECT 1 FROM schema_migrations WHERE version = $1`, [version]);
+  if (exists.rows.length > 0) {
+    console.log(`  ⏭  Migration ${version} (${name}) already applied`);
+    return;
+  }
+  await sqlFn();
+  await client.query(
+    `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, [version, name]);
+  console.log(`  ✅ Migration ${version}: ${name}`);
+}
+
 async function migrate() {
   const client = await pool.connect();
   try {
@@ -124,6 +145,74 @@ async function migrate() {
         ('feedback')
       ON CONFLICT (job_name) DO NOTHING;
     `);
+
+    // ── EMAIL SENT LOG (deduplication) ────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_sent_log (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        content_hash VARCHAR(64) NOT NULL,
+        sent_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_email_sent_log_hash ON email_sent_log(content_hash);
+      CREATE INDEX IF NOT EXISTS idx_email_sent_log_sent ON email_sent_log(sent_at DESC);
+    `);
+
+    // ── REFRESH TOKENS ────────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        user_role VARCHAR(50) NOT NULL,
+        tenant_id UUID,
+        token VARCHAR(255) UNIQUE NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, used, expires_at);
+    `);
+
+    // ── PUBLIC AUDIT LOG IMMUTABILITY ─────────────────────────
+    // Prevents admins from deleting/modifying audit records to cover their tracks
+    await client.query(`
+      CREATE OR REPLACE FUNCTION prevent_audit_mutation()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'audit_logs is append-only and cannot be modified or deleted';
+      END $$;
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_trigger
+          WHERE tgname = 'audit_logs_immutable'
+            AND tgrelid = 'public.audit_logs'::regclass
+        ) THEN
+          CREATE TRIGGER audit_logs_immutable
+          BEFORE UPDATE OR DELETE ON audit_logs
+          FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
+        END IF;
+      END $$;
+    `).catch(() => {}); // Non-fatal if audit_logs doesn't exist yet on first run
+
+    // ── TENANT STATS CACHE ────────────────────────────────────
+    await runMigration(client, 5, 'tenant_stats_cache', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS tenant_stats_cache (
+          tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+          stat_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          appointments_today INTEGER DEFAULT 0,
+          appointments_month INTEGER DEFAULT 0,
+          patients_total INTEGER DEFAULT 0,
+          active_slots INTEGER DEFAULT 0,
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (tenant_id, stat_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tenant_stats_date ON tenant_stats_cache(stat_date DESC);
+      `);
+    });
 
     // ── SEED PLANS ────────────────────────────────────────────
     await client.query(`

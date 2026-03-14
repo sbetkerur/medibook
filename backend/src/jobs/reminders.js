@@ -2,13 +2,19 @@ const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
 const wa = require('../services/whatsapp');
 const { decrypt } = require('../utils/encryption');
-const { forEachActiveTenant } = require('../utils/tenantUtils');
+const { forEachActiveTenantParallel } = require('../utils/tenantUtils');
 const { format, parseISO } = require('date-fns');
+const { toZonedTime } = require('date-fns-tz');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
 
+// Allow timezone override via env var so multi-region deployments work without code changes
+const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
+  ? process.env.TIMEZONE
+  : 'Asia/Kolkata';
+
 async function sendReminders() {
-  await forEachActiveTenant('sendReminders', async (tenant) => {
+  await forEachActiveTenantParallel('sendReminders', async (tenant) => {
     if (!tenant.wa_access_token_enc || !tenant.wa_phone_number_id) return;
     const waToken = decrypt(tenant.wa_access_token_enc);
     const waPhoneId = tenant.wa_phone_number_id;
@@ -56,6 +62,10 @@ async function sendReminders() {
     }
 
     // ── 2-HOUR REMINDERS ────────────────────────────────────
+    // Compute current time in the configured timezone in JS and pass as a
+    // parameterized value — avoids interpolating TIMEZONE into the SQL string.
+    const nowInTz = toZonedTime(new Date(), TIMEZONE);
+    const nowTimeStr = format(nowInTz, 'HH:mm:ss');
     const r2 = await tenantQuery(tenant.schema_name, `
       SELECT a.id, a.booking_id, a.appointment_time,
              p.phone, p.name as patient_name, d.name as doctor_name
@@ -65,9 +75,9 @@ async function sendReminders() {
       WHERE a.status='confirmed'
         AND a.reminder_2h_sent=false
         AND a.appointment_date = CURRENT_DATE
-        AND (a.appointment_time - INTERVAL '2 hours') <= (NOW() AT TIME ZONE 'Asia/Kolkata')::time
-        AND a.appointment_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time
-    `);
+        AND (a.appointment_time - INTERVAL '2 hours') <= $1::time
+        AND a.appointment_time > $1::time
+    `, [nowTimeStr]);
 
     for (const appt of r2.rows) {
       try {
@@ -88,14 +98,15 @@ async function sendReminders() {
         } catch (_templateErr) {
           await wa.sendText(
             appt.phone,
-            `⏰ *2-Hour Reminder*\n\nYour appointment is in 2 hours!\n\n` +
-            `👨‍⚕️ Dr. ${appt.doctor_name} at ${(appt.appointment_time || '').slice(0, 5)}\n\n` +
-            `📋 *Pre-Visit Checklist:*\n` +
-            `✅ Arrive 10 minutes early\n` +
-            `✅ Bring previous prescriptions/reports\n` +
-            `✅ Carry a valid photo ID\n` +
-            `✅ Note down your symptoms/questions\n\n` +
-            `Reply *Reschedule* or *Cancel Appointment* if needed.`,
+            `⏰ *Heads up — appointment in 2 hours!*\n\n` +
+            `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
+            `🕐 ${(appt.appointment_time || '').slice(0, 5)}\n\n` +
+            `📋 *Quick checklist before you go:*\n` +
+            `• Arrive 10 minutes early\n` +
+            `• Bring any previous reports or prescriptions\n` +
+            `• Carry a valid photo ID\n` +
+            `• Have a list of your symptoms or questions ready\n\n` +
+            `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`,
             waToken, waPhoneId
           );
         }
@@ -113,14 +124,14 @@ async function sendReminders() {
 async function sendFeedbackRequests() {
   const { triggerFeedback } = require('../services/botEngine');
 
-  await forEachActiveTenant('sendFeedbackRequests', async (tenant) => {
+  await forEachActiveTenantParallel('sendFeedbackRequests', async (tenant) => {
     if (!tenant.wa_access_token_enc || !tenant.wa_phone_number_id) return;
     const waToken = decrypt(tenant.wa_access_token_enc);
     const waPhoneId = tenant.wa_phone_number_id;
     if (!waToken) return;
 
     const appts = await tenantQuery(tenant.schema_name, `
-      SELECT a.id, a.status, p.phone, p.id as patient_id, d.name as doctor_name
+      SELECT a.id, a.status, p.phone, p.id as patient_id, p.name as patient_name, d.name as doctor_name
       FROM appointments a
       JOIN patients p ON p.id=a.patient_id
       JOIN doctors d ON d.id=a.doctor_id
@@ -134,9 +145,18 @@ async function sendFeedbackRequests() {
 
     for (const appt of appts.rows) {
       try {
+        const firstName = appt.patient_name ? appt.patient_name.split(' ')[0] : 'there';
         await wa.sendText(
           appt.phone,
-          `⭐ *Feedback Request*\n\nHi! How was your recent appointment with Dr. ${appt.doctor_name}?\n\nPlease rate your experience from 1 (Poor) to 5 (Excellent).\nJust reply with a number!`,
+          `⭐ *How did it go, ${firstName}?*\n\n` +
+          `We hope your visit with Dr. ${appt.doctor_name} went well!\n\n` +
+          `Rate your experience:\n` +
+          `1 ⭐ — Poor\n` +
+          `2 ⭐⭐ — Below average\n` +
+          `3 ⭐⭐⭐ — Average\n` +
+          `4 ⭐⭐⭐⭐ — Good\n` +
+          `5 ⭐⭐⭐⭐⭐ — Excellent\n\n` +
+          `Just reply with a number *1–5*. Takes 5 seconds! 🙏`,
           waToken, waPhoneId
         );
         await triggerFeedback(

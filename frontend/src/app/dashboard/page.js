@@ -1,10 +1,16 @@
 'use client';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import api from '@/lib/api';
+import api, { clearSessionTimers, resetSessionTimers } from '@/lib/api';
+import ErrorBoundary from '@/components/ErrorBoundary';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import Modal from '@/components/ui/Modal';
+import ConfirmModal from '@/components/ui/ConfirmModal';
+import StatCard from '@/components/ui/StatCard';
+import Badge from '@/components/ui/Badge';
+import SlotsTab from '@/components/tabs/SlotsTab';
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
@@ -17,48 +23,7 @@ const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
   lunch_end_time: '14:00',
 }));
 
-function Modal({ title, onClose, children, wide }) {
-  const ref = useRef();
-  useEffect(() => {
-    function onKey(e) { if (e.key === 'Escape') onClose(); }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm"
-      onClick={e => { if (e.target === ref.current) onClose(); }} ref={ref}>
-      <div className={`bg-white rounded-2xl shadow-2xl w-full ${wide === 'xl' ? 'max-w-4xl' : wide ? 'max-w-2xl' : 'max-w-lg'} max-h-[90vh] flex flex-col`}>
-        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 shrink-0">
-          <h2 className="text-base font-semibold text-gray-900">{title}</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
-        </div>
-        <div className="overflow-y-auto flex-1 p-6">{children}</div>
-      </div>
-    </div>
-  );
-}
-
-// ── CONFIRM MODAL ─────────────────────────────────────────────
-function ConfirmModal({ title, message, onConfirm, onCancel, danger = false }) {
-  return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6">
-        <h3 className="text-base font-semibold text-gray-900 mb-2">{title}</h3>
-        <p className="text-sm text-gray-600 mb-6">{message}</p>
-        <div className="flex gap-3">
-          <button onClick={onCancel}
-            className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
-            Cancel
-          </button>
-          <button onClick={onConfirm}
-            className={`flex-1 px-4 py-2 rounded-lg text-sm font-medium text-white transition ${danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}>
-            Confirm
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
+// Modal, ConfirmModal imported from @/components/ui
 
 const NAV = [
   { id: 'overview', label: 'Overview', icon: '📊' },
@@ -70,40 +35,15 @@ const NAV = [
   { id: 'feedback', label: 'Feedback', icon: '⭐' },
   { id: 'analytics', label: 'Analytics', icon: '📈' },
   { id: 'calendar', label: 'Calendar', icon: '📆' },
+  { id: 'slots', label: 'Slots', icon: '🕐' },
   { id: 'staff', label: 'Staff', icon: '👤' },
   { id: 'leaves', label: 'Doctor Leaves', icon: '🏖️' },
   { id: 'settings', label: 'Settings', icon: '⚙️' },
   { id: 'test', label: 'Bot Tester', icon: '🤖' },
+  { id: 'audit', label: 'Audit Logs', icon: '📋' },
 ];
 
-function StatCard({ label, value, icon, color = 'border-blue-500', sub }) {
-  return (
-    <div className={`bg-white rounded-xl p-5 border-l-4 ${color} shadow-sm`}>
-      <div className="flex items-start justify-between">
-        <div>
-          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">{label}</p>
-          <p className="text-3xl font-bold text-gray-900 mt-1">{value ?? '—'}</p>
-          {sub && <p className="text-xs text-gray-400 mt-1">{sub}</p>}
-        </div>
-        <span className="text-2xl">{icon}</span>
-      </div>
-    </div>
-  );
-}
-
-function Badge({ status }) {
-  const map = {
-    confirmed: 'bg-green-100 text-green-700',
-    cancelled: 'bg-red-100 text-red-700',
-    completed: 'bg-blue-100 text-blue-700',
-    no_show: 'bg-gray-100 text-gray-600',
-  };
-  return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${map[status] || 'bg-gray-100 text-gray-600'}`}>
-      {status?.replace('_', ' ')}
-    </span>
-  );
-}
+// StatCard, Badge, SlotsTab imported from @/components/ui and @/components/tabs
 
 export default function Dashboard() {
   const router = useRouter();
@@ -275,6 +215,25 @@ export default function Dashboard() {
   // Bot session reset state
   const [botResetting, setBotResetting] = useState(false);
 
+  // Audit logs state
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [auditPage, setAuditPage] = useState(1);
+  const [auditHasMore, setAuditHasMore] = useState(false);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [auditFrom, setAuditFrom] = useState('');
+  const [auditTo, setAuditTo] = useState('');
+  const [auditAction, setAuditAction] = useState('');
+
+  // Bulk appointment update state
+  const [selectedApptIds, setSelectedApptIds] = useState(new Set());
+  const [bulkUpdating, setBulkUpdating] = useState(false);
+
+  // Send WhatsApp message state
+  const [showWaMessageModal, setShowWaMessageModal] = useState(false);
+  const [waMessagePhone, setWaMessagePhone] = useState('');
+  const [waMessageText, setWaMessageText] = useState('');
+  const [waSending, setWaSending] = useState(false);
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     const u = localStorage.getItem('user');
@@ -283,6 +242,19 @@ export default function Dashboard() {
     fetchStats();
     fetchAnalyticsSummary();
     fetchOnboarding();
+
+    // Session timeout warning: fire 1 hour before JWT expires (at 23h)
+    const onSessionWarning = (e) => {
+      toast(`Your session expires in ${e.detail?.minutesLeft || 60} minutes. Save your work.`, {
+        icon: '⏳',
+        duration: 10000,
+        style: { background: '#fef3c7', color: '#92400e', border: '1px solid #f59e0b' },
+      });
+    };
+    window.addEventListener('medibook:session-warning', onSessionWarning);
+    return () => {
+      window.removeEventListener('medibook:session-warning', onSessionWarning);
+    };
   }, []);
 
   useEffect(() => {
@@ -385,6 +357,20 @@ export default function Dashboard() {
       setFeedbackDistribution(data.distribution || []);
     } catch { toast.error('Failed to load feedback'); }
   }, []);
+
+  const fetchAuditLogs = useCallback(async (page = 1) => {
+    try {
+      const params = new URLSearchParams({ page: String(page), limit: '50' });
+      if (auditFrom) params.set('from', auditFrom);
+      if (auditTo) params.set('to', auditTo);
+      if (auditAction) params.set('action', auditAction);
+      const { data } = await api.get(`/admin/audit-logs?${params}`);
+      setAuditLogs(data.logs || []);
+      setAuditPage(page);
+      setAuditHasMore(data.has_more || false);
+      setAuditTotal(data.total || 0);
+    } catch { toast.error('Failed to load audit logs'); }
+  }, [auditFrom, auditTo, auditAction]);
 
   const fetchOnboarding = useCallback(async () => {
     try {
@@ -850,6 +836,7 @@ export default function Dashboard() {
         else if (tab === 'staff') await fetchStaff();
         else if (tab === 'leaves') { const { data } = await api.get('/admin/doctors'); setLeavesDoctorList(data.doctors || []); }
         else if (tab === 'settings') await fetchSettings();
+        else if (tab === 'audit') await fetchAuditLogs(1);
         else if (tab === 'calendar') {
           const now = calendarDate;
           await fetchCalendarAppts(now.getFullYear(), now.getMonth());
@@ -860,6 +847,19 @@ export default function Dashboard() {
     };
     load();
   }, [tab]);
+
+  // Auto-refresh: Overview stats every 30s, Appointments every 60s
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (!token) return;
+    const statsInterval = setInterval(() => {
+      if (tab === 'overview') fetchStats();
+    }, 30000);
+    const apptInterval = setInterval(() => {
+      if (tab === 'appointments') fetchAppointments();
+    }, 60000);
+    return () => { clearInterval(statsInterval); clearInterval(apptInterval); };
+  }, [tab, fetchStats, fetchAppointments]);
 
   useEffect(() => {
     if (tab === 'appointments') { setApptPage(1); fetchAppointments(1); }
@@ -964,6 +964,38 @@ export default function Dashboard() {
     } finally { setBotResetting(false); }
   }
 
+  async function bulkUpdateAppointments(status) {
+    if (selectedApptIds.size === 0) return toast.error('No appointments selected');
+    setBulkUpdating(true);
+    try {
+      const { data } = await api.patch('/admin/appointments/bulk', {
+        ids: [...selectedApptIds],
+        status,
+      });
+      toast.success(`${data.updated} appointment${data.updated !== 1 ? 's' : ''} marked as ${status.replace('_', ' ')}`);
+      setSelectedApptIds(new Set());
+      fetchAppointments();
+      fetchStats();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Bulk update failed');
+    } finally { setBulkUpdating(false); }
+  }
+
+  async function sendWaMessage(e) {
+    e.preventDefault();
+    if (!waMessagePhone || !waMessageText) return toast.error('Phone and message required');
+    setWaSending(true);
+    try {
+      await api.post('/admin/messages/send', { phone: waMessagePhone, message: waMessageText });
+      toast.success(`Message sent to ${waMessagePhone}`);
+      setShowWaMessageModal(false);
+      setWaMessagePhone('');
+      setWaMessageText('');
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to send message');
+    } finally { setWaSending(false); }
+  }
+
   async function exportCSV() {
     if (!appointments.length) { toast.error('No data to export'); return; }
     const h = ['Booking ID', 'Patient', 'Phone', 'Doctor', 'Department', 'Date', 'Time', 'Type', 'Status'];
@@ -997,6 +1029,7 @@ export default function Dashboard() {
 
   async function logout() {
     try { await api.post('/auth/logout'); } catch (_) {}
+    clearSessionTimers();
     localStorage.clear();
     router.push('/login');
   }
@@ -1175,11 +1208,28 @@ export default function Dashboard() {
 
         <main className="flex-1 overflow-y-auto p-6">
 
-          {/* Tab loading spinner */}
+          {/* Tab loading skeleton */}
           {tabLoading && (
-            <div className="flex items-center justify-center py-16 text-gray-400">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500 mr-3" />
-              <span className="text-sm">Loading...</span>
+            <div className="space-y-4 animate-pulse">
+              <div className="flex gap-3">
+                <div className="h-9 w-32 bg-gray-200 rounded-lg" />
+                <div className="h-9 w-40 bg-gray-200 rounded-lg" />
+                <div className="ml-auto h-9 w-24 bg-gray-200 rounded-lg" />
+              </div>
+              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                <div className="p-4 border-b border-gray-100">
+                  <div className="h-4 w-48 bg-gray-200 rounded" />
+                </div>
+                {[1,2,3,4,5].map(i => (
+                  <div key={i} className="px-4 py-3 border-b border-gray-50 flex items-center gap-4">
+                    <div className="h-3 w-20 bg-gray-200 rounded" />
+                    <div className="h-3 w-32 bg-gray-200 rounded" />
+                    <div className="h-3 w-24 bg-gray-100 rounded" />
+                    <div className="h-3 w-16 bg-gray-100 rounded ml-auto" />
+                    <div className="h-5 w-16 bg-gray-200 rounded-full" />
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
@@ -1210,13 +1260,24 @@ export default function Dashboard() {
             </div>
           )}
 
+          {/* ── TAB CONTENT (wrapped in ErrorBoundary so one broken tab doesn't crash the whole dashboard) ── */}
+          <ErrorBoundary key={tab}>
+
           {/* ── OVERVIEW ── */}
           {tab === 'overview' && (
             <div className="space-y-6">
               {loading ? (
-                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                  {[1,2,3,4].map(i => (
-                    <div key={i} className="bg-white rounded-xl p-5 h-24 animate-pulse bg-gray-100" />
+                <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                  {[1,2,3,4,5].map(i => (
+                    <div key={i} className="bg-white rounded-xl p-5 border-l-4 border-gray-200 shadow-sm animate-pulse">
+                      <div className="flex items-center justify-between">
+                        <div className="space-y-2">
+                          <div className="h-3 w-20 bg-gray-200 rounded" />
+                          <div className="h-8 w-12 bg-gray-200 rounded" />
+                        </div>
+                        <div className="h-8 w-8 bg-gray-200 rounded-full" />
+                      </div>
+                    </div>
                   ))}
                 </div>
               ) : (
@@ -1235,8 +1296,31 @@ export default function Dashboard() {
                 </div>
               )}
 
+              {/* Today's schedule skeleton */}
+              {loading && (
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden animate-pulse">
+                  <div className="px-5 py-4 border-b border-gray-100">
+                    <div className="h-4 w-32 bg-gray-200 rounded" />
+                  </div>
+                  <div className="divide-y divide-gray-50">
+                    {[1,2,3].map(i => (
+                      <div key={i} className="px-5 py-3 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="h-4 w-10 bg-gray-200 rounded" />
+                          <div className="space-y-1.5">
+                            <div className="h-3 w-28 bg-gray-200 rounded" />
+                            <div className="h-2.5 w-20 bg-gray-100 rounded" />
+                          </div>
+                        </div>
+                        <div className="h-5 w-16 bg-gray-200 rounded-full" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Today's schedule */}
-              {stats?.todays_schedule?.length > 0 && (
+              {!loading && stats?.todays_schedule?.length > 0 && (
                 <div className="bg-white rounded-xl shadow-sm overflow-hidden">
                   <div className="px-5 py-4 border-b border-gray-100">
                     <h2 className="font-semibold text-gray-800">Today's Schedule</h2>
@@ -1289,17 +1373,52 @@ export default function Dashboard() {
                     className="text-sm text-blue-600 hover:underline">Clear filters</button>
                 )}
                 <span className="text-sm text-gray-400 ml-auto">{apptTotal > 0 ? `${apptTotal} total` : `${appointments.length} records`}</span>
+                <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(''); setWaMessageText(''); }}
+                  className="px-3 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition flex items-center gap-1.5">
+                  📤 Message Patient
+                </button>
                 <button onClick={() => { if (!hospitals.length) fetchHospitals(); if (!doctors.length) fetchDoctors(); setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', visit_type: 'in_person', notes: '' }); setShowWalkinModal(true); }}
                   className="px-3 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-1.5">
                   + Walk-in
                 </button>
               </div>
 
+              {selectedApptIds.size > 0 && (
+                <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 flex flex-wrap items-center gap-3">
+                  <span className="text-sm font-medium text-blue-700">{selectedApptIds.size} selected</span>
+                  <button onClick={() => bulkUpdateAppointments('completed')} disabled={bulkUpdating}
+                    className="px-3 py-1.5 bg-blue-600 text-white text-xs font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition">
+                    ✅ Mark Completed
+                  </button>
+                  <button onClick={() => bulkUpdateAppointments('no_show')} disabled={bulkUpdating}
+                    className="px-3 py-1.5 bg-gray-600 text-white text-xs font-medium rounded-lg hover:bg-gray-700 disabled:opacity-50 transition">
+                    🚫 Mark No-Show
+                  </button>
+                  <button onClick={() => bulkUpdateAppointments('cancelled')} disabled={bulkUpdating}
+                    className="px-3 py-1.5 bg-red-600 text-white text-xs font-medium rounded-lg hover:bg-red-700 disabled:opacity-50 transition">
+                    ✕ Cancel All
+                  </button>
+                  <button onClick={() => setSelectedApptIds(new Set())}
+                    className="px-3 py-1.5 border border-gray-300 text-gray-600 text-xs rounded-lg hover:bg-gray-50 transition ml-auto">
+                    Clear selection
+                  </button>
+                </div>
+              )}
+
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead className="bg-gray-50 border-b border-gray-200">
                       <tr>
+                        <th className="px-3 py-3 w-8">
+                          <input type="checkbox"
+                            checked={appointments.length > 0 && appointments.every(a => selectedApptIds.has(a.id))}
+                            onChange={e => {
+                              if (e.target.checked) setSelectedApptIds(new Set(appointments.map(a => a.id)));
+                              else setSelectedApptIds(new Set());
+                            }}
+                            className="rounded border-gray-300 text-blue-600" />
+                        </th>
                         {['Booking ID', 'Patient', 'Doctor', 'Date', 'Time', 'Type', 'Status', 'Actions'].map(h => (
                           <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
                         ))}
@@ -1307,12 +1426,26 @@ export default function Dashboard() {
                     </thead>
                     <tbody className="divide-y divide-gray-50">
                       {appointments.map(a => (
-                        <tr key={a.id} className="hover:bg-gray-50 transition-colors">
+                        <tr key={a.id} className={`hover:bg-gray-50 transition-colors ${selectedApptIds.has(a.id) ? 'bg-blue-50' : ''}`}>
+                          <td className="px-3 py-3">
+                            <input type="checkbox" checked={selectedApptIds.has(a.id)}
+                              onChange={e => {
+                                const next = new Set(selectedApptIds);
+                                if (e.target.checked) next.add(a.id); else next.delete(a.id);
+                                setSelectedApptIds(next);
+                              }}
+                              className="rounded border-gray-300 text-blue-600" />
+                          </td>
                           <td className="px-4 py-3 font-mono text-xs font-medium text-blue-600">{a.booking_id}</td>
                           <td className="px-4 py-3">
                             <div className="font-medium text-gray-900 text-sm">{a.patient_name}</div>
-                            <a href={`https://wa.me/${a.patient_phone}`} target="_blank" rel="noreferrer"
-                              className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
+                            <div className="flex items-center gap-1.5">
+                              <a href={`https://wa.me/${a.patient_phone}`} target="_blank" rel="noreferrer"
+                                className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
+                              <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(a.patient_phone || ''); setWaMessageText(''); }}
+                                title="Send WhatsApp message"
+                                className="text-xs text-green-500 hover:text-green-700">📤</button>
+                            </div>
                           </td>
                           <td className="px-4 py-3 text-gray-700 text-sm">Dr. {a.doctor_name}</td>
                           <td className="px-4 py-3 text-gray-600 text-sm">
@@ -1343,7 +1476,7 @@ export default function Dashboard() {
                       ))}
                       {!appointments.length && (
                         <tr>
-                          <td colSpan={8} className="px-4 py-12 text-center text-gray-400">
+                          <td colSpan={9} className="px-4 py-12 text-center text-gray-400">
                             No appointments found{filterDate || filterStatus ? ' for selected filters' : ''}
                           </td>
                         </tr>
@@ -2280,6 +2413,92 @@ export default function Dashboard() {
             </div>
           )}
 
+          {/* ── AUDIT LOGS ── */}
+          {tab === 'audit' && !tabLoading && (
+            <div className="space-y-4">
+              {/* Filters */}
+              <div className="bg-white rounded-xl p-4 shadow-sm flex flex-wrap gap-3 items-end">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">From</label>
+                  <input type="date" value={auditFrom} onChange={e => setAuditFrom(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">To</label>
+                  <input type="date" value={auditTo} onChange={e => setAuditTo(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Action</label>
+                  <input value={auditAction} onChange={e => setAuditAction(e.target.value)}
+                    placeholder="e.g. CREATE_DOCTOR"
+                    className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm w-44 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <button onClick={() => fetchAuditLogs(1)}
+                  className="px-4 py-1.5 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">
+                  Search
+                </button>
+                <span className="text-sm text-gray-400 ml-auto">{auditTotal} records</span>
+              </div>
+
+              {/* Table */}
+              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-gray-200">
+                      <tr>
+                        {['Timestamp', 'Role', 'Action', 'Resource', 'Resource ID', 'IP'].map(h => (
+                          <th key={h} className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {auditLogs.map(log => (
+                        <tr key={log.id} className="hover:bg-gray-50">
+                          <td className="px-4 py-2.5 text-xs text-gray-500 whitespace-nowrap">
+                            {log.created_at ? new Date(log.created_at).toLocaleString('en-IN') : '—'}
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${log.actor_role === 'admin' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
+                              {log.actor_role || '—'}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2.5 font-mono text-xs font-medium text-gray-800">{log.action || '—'}</td>
+                          <td className="px-4 py-2.5 text-gray-600 text-xs">{log.resource_type || '—'}</td>
+                          <td className="px-4 py-2.5 font-mono text-xs text-gray-400 truncate max-w-[120px]">{log.resource_id || '—'}</td>
+                          <td className="px-4 py-2.5 text-xs text-gray-400">{log.ip_address || '—'}</td>
+                        </tr>
+                      ))}
+                      {!auditLogs.length && (
+                        <tr><td colSpan={6} className="px-4 py-8 text-center text-gray-400">No audit log entries found</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                {(auditLogs.length > 0 || auditPage > 1) && (
+                  <div className="px-4 py-3 border-t border-gray-100 flex items-center gap-3">
+                    <button disabled={auditPage <= 1}
+                      onClick={() => fetchAuditLogs(auditPage - 1)}
+                      className="px-3 py-1.5 border border-gray-300 text-sm rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
+                      ← Prev
+                    </button>
+                    <span className="text-sm text-gray-500">Page {auditPage}</span>
+                    <button disabled={!auditHasMore}
+                      onClick={() => fetchAuditLogs(auditPage + 1)}
+                      className="px-3 py-1.5 border border-gray-300 text-sm rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
+                      Next →
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── SLOTS ── */}
+          {tab === 'slots' && !tabLoading && (
+            <SlotsTab doctors={doctors} />
+          )}
+
           {/* ── BOT TESTER ── */}
           {tab === 'test' && !tabLoading && (
             <div className="max-w-2xl space-y-4">
@@ -2385,6 +2604,8 @@ export default function Dashboard() {
               )}
             </div>
           )}
+
+          </ErrorBoundary>
         </main>
       </div>
     </div>
@@ -2957,6 +3178,42 @@ export default function Dashboard() {
         onConfirm={confirmModal.onConfirm}
         onCancel={() => setConfirmModal(null)}
       />
+    )}
+
+    {/* ── SEND WHATSAPP MESSAGE MODAL ── */}
+    {showWaMessageModal && (
+      <Modal title="Send WhatsApp Message" onClose={() => setShowWaMessageModal(false)}>
+        <form onSubmit={sendWaMessage} className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Phone Number <span className="text-red-400">*</span></label>
+            <input value={waMessagePhone} onChange={e => setWaMessagePhone(e.target.value)}
+              placeholder="919876543210"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+            <p className="text-xs text-gray-400 mt-1">Include country code, no + or spaces (e.g. 919876543210)</p>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Message <span className="text-red-400">*</span></label>
+            <textarea value={waMessageText} onChange={e => setWaMessageText(e.target.value)}
+              rows={4} maxLength={1000}
+              placeholder="Type your message here..."
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" required />
+            <p className="text-xs text-gray-400 mt-1">{waMessageText.length}/1000 characters</p>
+          </div>
+          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-xs text-yellow-700">
+            ⚠️ Only send messages to patients who have previously contacted this WhatsApp number. Unsolicited messages may violate WhatsApp policy.
+          </div>
+          <div className="flex gap-3 pt-2">
+            <button type="button" onClick={() => setShowWaMessageModal(false)}
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              Cancel
+            </button>
+            <button type="submit" disabled={waSending}
+              className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition">
+              {waSending ? 'Sending...' : '📤 Send Message'}
+            </button>
+          </div>
+        </form>
+      </Modal>
     )}
 
     {/* ── ADD / EDIT STAFF MODAL ── */}

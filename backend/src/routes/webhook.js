@@ -16,6 +16,73 @@ const testEndpointLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Rate limiting — uses Redis (INCR+EXPIRE) when available so limits are
+// shared across all backend instances. Falls back to in-process Maps when
+// Redis is unavailable (e.g. local dev with old Redis).
+const { getClient: getRedisClient } = require('../utils/redisClient');
+
+const tenantMsgCounts = new Map(); // fallback: tenant_id -> { count, resetAt }
+const phoneMsgCounts  = new Map(); // fallback: phone     -> { count, resetAt }
+
+async function checkRateLimitRedis(key, maxPerMinute) {
+  try {
+    const redis = getRedisClient();
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, 60); // set TTL on first increment
+    return count <= maxPerMinute;
+  } catch (_) {
+    return null; // Redis unavailable — caller uses in-memory fallback
+  }
+}
+
+// Max entries per in-memory map to prevent memory exhaustion if Redis is down
+// and thousands of unique phones message simultaneously.
+const IN_MEMORY_MAP_MAX_SIZE = 5000;
+
+function checkRateLimitInMemory(map, key, maxPerMinute) {
+  const now = Date.now();
+  let entry = map.get(key);
+  if (!entry || now > entry.resetAt) {
+    // If map is at capacity and this is a new key, fail open (allow) to avoid blocking
+    // legitimate users. The cleanup interval will shrink it shortly.
+    if (!entry && map.size >= IN_MEMORY_MAP_MAX_SIZE) return true;
+    entry = { count: 0, resetAt: now + 60000 };
+    map.set(key, entry);
+  }
+  entry.count++;
+  return entry.count <= maxPerMinute;
+}
+
+async function checkTenantRateLimit(tenantId) {
+  const result = await checkRateLimitRedis(`rl:tenant:${tenantId}`, 60);
+  if (result !== null) return result;
+  return checkRateLimitInMemory(tenantMsgCounts, tenantId, 60);
+}
+
+async function checkPhoneRateLimit(phone) {
+  const result = await checkRateLimitRedis(`rl:phone:${phone}`, 5);
+  if (result !== null) return result;
+  return checkRateLimitInMemory(phoneMsgCounts, phone, 5);
+}
+
+// Cleanup in-memory fallback maps every 5 minutes to prevent memory leak
+const _rlCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of tenantMsgCounts.entries()) {
+    if (now > val.resetAt + 60000) tenantMsgCounts.delete(key);
+  }
+  for (const [key, val] of phoneMsgCounts.entries()) {
+    if (now > val.resetAt + 60000) phoneMsgCounts.delete(key);
+  }
+}, 5 * 60 * 1000);
+_rlCleanupInterval.unref(); // don't block process exit
+
+// Mask phone for logging: show only last 4 digits
+function maskPhone(phone) {
+  if (!phone || phone.length < 4) return '****';
+  return '*'.repeat(Math.min(phone.length - 4, 8)) + phone.slice(-4);
+}
+
 // Startup warning if META_APP_SECRET looks like a placeholder
 const { META_APP_SECRET } = process.env;
 if (!META_APP_SECRET || META_APP_SECRET === 'PLACEHOLDER_REPLACE_WITH_APP_SECRET' || META_APP_SECRET === 'your_app_secret_here') {
@@ -43,25 +110,30 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
   try {
     const sig = req.headers['x-hub-signature-256'];
+    const hasRealSecret = META_APP_SECRET &&
+      META_APP_SECRET !== 'PLACEHOLDER_REPLACE_WITH_APP_SECRET' &&
+      META_APP_SECRET !== 'your_app_secret_here';
 
-    // In production, reject unsigned requests
-    if (process.env.NODE_ENV === 'production' && !sig) {
-      logger.warn('Unsigned webhook request rejected in production');
-      return;
-    }
-
-    // Verify signature when present and secret is properly configured
-    if (sig && META_APP_SECRET &&
-        META_APP_SECRET !== 'PLACEHOLDER_REPLACE_WITH_APP_SECRET' &&
-        META_APP_SECRET !== 'your_app_secret_here') {
+    // If META_APP_SECRET is properly configured, always require and verify the signature
+    // regardless of NODE_ENV — this prevents unsigned requests even in staging/dev if
+    // a real secret is present.
+    if (hasRealSecret) {
+      if (!sig) {
+        logger.warn('Unsigned webhook request rejected — META_APP_SECRET is configured');
+        return;
+      }
+      const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
       const expected = 'sha256=' + crypto
         .createHmac('sha256', META_APP_SECRET)
-        .update(JSON.stringify(req.body))
+        .update(rawBody)
         .digest('hex');
       if (sig !== expected) {
         logger.warn('Invalid Meta webhook signature — ignoring');
         return;
       }
+    } else if (process.env.NODE_ENV === 'production' && !sig) {
+      // Fallback: in production without a configured secret, still warn on unsigned requests
+      logger.warn('Unsigned webhook request in production (META_APP_SECRET not configured)');
     }
 
     const entry = req.body?.entry?.[0];
@@ -76,7 +148,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
     // Normalize phone: strip leading '+' so '919876543210' and '+919876543210' map to same user
     const phone = (msg.from || '').replace(/^\+/, '');
     if (!/^\d{7,20}$/.test(phone)) {
-      logger.warn('Webhook received invalid phone format', { phone: msg.from });
+      logger.warn('Webhook received invalid phone format', { phone: maskPhone(msg.from || '') });
       return;
     }
     const msgId = msg.id;
@@ -129,6 +201,18 @@ router.post('/webhook/whatsapp', async (req, res) => {
       return;
     }
 
+    // Per-tenant rate limiting: max 60 messages/minute (Redis-backed, multi-instance safe)
+    if (!await checkTenantRateLimit(tenant.id)) {
+      logger.warn(`Rate limit exceeded for tenant ${tenant.name}`, { tenantId: tenant.id });
+      return; // Already sent 200, just drop the message
+    }
+
+    // Per-phone rate limiting: max 5 messages/minute per phone number (Redis-backed)
+    if (!await checkPhoneRateLimit(phone)) {
+      logger.warn('Per-phone rate limit exceeded — dropping message', { phone: maskPhone(phone), tenant: tenant.slug });
+      return;
+    }
+
     // If message type is unsupported (image, audio, document, sticker, etc.), send a helpful reply
     if (unsupportedType) {
       logger.info('Unsupported message type received', { phone, type: unsupportedType, tenant: tenant.slug });
@@ -155,17 +239,22 @@ router.post('/webhook/whatsapp', async (req, res) => {
           logger.info('Duplicate message skipped', { msgId, phone });
           return;
         }
-      } catch (_) { /* if dedup fails, still process */ }
+      } catch (dupErr) {
+        // Non-conflict errors (e.g. DB down) — log and still process rather than silently drop
+        logger.warn('Message dedup check failed, processing anyway', { msgId, error: dupErr.message });
+      }
     }
 
-    logger.info('Incoming WhatsApp message', { phone, tenant: tenant.slug, text: text.slice(0, 50) });
+    logger.info('Incoming WhatsApp message', { phone: maskPhone(phone), tenant: tenant.slug, type: msg.type });
+    try { require('../utils/metrics').increment('webhook_messages_total'); } catch (_) {}
 
     if (botWorker.isQueueAvailable()) {
       // Backpressure check: fall back to sync if queue is saturated
       let waiting = 0;
       try { waiting = await botWorker.getQueue().getWaitingCount(); } catch (_) {}
 
-      if (waiting > 10000) {
+      const { LIMITS } = require('../utils/errors');
+      if (waiting > LIMITS.QUEUE_BACKPRESSURE_THRESHOLD) {
         logger.warn(`Bot queue backpressure: ${waiting} jobs waiting — processing synchronously`);
         botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
           logger.error('Sync bot processing error (backpressure fallback)', { error: err.message });

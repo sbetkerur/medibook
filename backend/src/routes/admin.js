@@ -65,6 +65,11 @@ router.get('/dashboard', async (req, res) => {
         LIMIT 10
       `),
     ]);
+    // Log any rejected queries so they don't silently disappear
+    const names = ['today', 'upcoming', 'patients', 'slots', 'recentAppts'];
+    [today, upcoming, patients, slots, recentAppts].forEach((r, i) => {
+      if (r.status === 'rejected') logger.warn(`Dashboard query "${names[i]}" failed`, { error: r.reason?.message });
+    });
     // Extract values gracefully — a failed metric returns null rather than crashing the whole dashboard
     const val = (r, field = 'count', fallback = null) =>
       r.status === 'fulfilled' ? (field === 'rows' ? r.value.rows : parseInt(r.value.rows[0]?.[field] ?? '0')) : fallback;
@@ -178,17 +183,33 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
 
 router.get('/appointments/:id', validateUUID(), async (req, res) => {
   try {
-    const r = await tenantQuery(req.tenant.schema_name, `
-      SELECT a.*, p.name as patient_name, p.phone as patient_phone,
-             d.name as doctor_name, h.name as hospital_name
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s, `
+      SELECT a.*,
+             p.name as patient_name, p.phone as patient_phone, p.email as patient_email,
+             p.date_of_birth, p.gender, p.visit_count, p.medical_history,
+             d.name as doctor_name, d.specialization, d.consultation_fee,
+             h.name as hospital_name, h.address as hospital_address,
+             dep.name as department_name
       FROM appointments a
       JOIN patients p ON p.id=a.patient_id
       JOIN doctors d ON d.id=a.doctor_id
       JOIN hospitals h ON h.id=a.hospital_id
+      LEFT JOIN departments dep ON dep.id=d.department_id
       WHERE a.id=$1
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
-    res.json({ appointment: r.rows[0] });
+
+    // Fetch patient's recent appointment history
+    const history = await tenantQuery(s, `
+      SELECT a2.booking_id, a2.appointment_date, a2.appointment_time, a2.status, d2.name as doctor_name
+      FROM appointments a2
+      JOIN doctors d2 ON d2.id=a2.doctor_id
+      WHERE a2.patient_id=$1 AND a2.id != $2
+      ORDER BY a2.appointment_date DESC LIMIT 5
+    `, [r.rows[0].patient_id, req.params.id]);
+
+    res.json({ appointment: r.rows[0], patient_history: history.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -720,23 +741,56 @@ router.get('/slots', async (req, res) => {
   try {
     const { doctor_id, date } = req.query;
     if (!doctor_id || !date) return res.status(400).json({ error: 'doctor_id and date required' });
-    const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT * FROM time_slots WHERE doctor_id=$1 AND slot_date=$2 ORDER BY start_time`,
-      [doctor_id, date]);
+    const UUID_RE = /^[0-9a-f-]{36}$/i;
+    if (!UUID_RE.test(doctor_id)) return res.status(400).json({ error: 'Invalid doctor_id' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Invalid date format' });
+    const r = await tenantQuery(req.tenant.schema_name, `
+      SELECT ts.*,
+             CASE WHEN a.id IS NOT NULL THEN a.booking_id END as booking_id,
+             CASE WHEN a.id IS NOT NULL THEN p.name END as patient_name
+      FROM time_slots ts
+      LEFT JOIN appointments a ON a.slot_id = ts.id AND a.status != 'cancelled'
+      LEFT JOIN patients p ON p.id = a.patient_id
+      WHERE ts.doctor_id=$1 AND ts.slot_date=$2
+      ORDER BY ts.start_time
+    `, [doctor_id, date]);
     res.json({ slots: r.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 router.patch('/slots/:id', validateUUID(), async (req, res) => {
   try {
-    const { status } = req.body;
-    if (!['available', 'blocked'].includes(status)) {
-      return res.status(400).json({ error: "status must be 'available' or 'blocked'" });
+    const { status, action } = req.body;
+    const s = req.tenant.schema_name;
+
+    // Support both `action: 'block'|'unblock'` and `status: 'available'|'blocked'` for compatibility
+    let newStatus;
+    if (action) {
+      if (!['block', 'unblock'].includes(action)) {
+        return res.status(400).json({ error: "action must be 'block' or 'unblock'" });
+      }
+      newStatus = action === 'block' ? 'blocked' : 'available';
+    } else if (status) {
+      if (!['available', 'blocked'].includes(status)) {
+        return res.status(400).json({ error: "status must be 'available' or 'blocked'" });
+      }
+      newStatus = status;
+    } else {
+      return res.status(400).json({ error: "Provide 'action' (block/unblock) or 'status' (available/blocked)" });
     }
-    const r = await tenantQuery(req.tenant.schema_name,
+
+    // Check slot exists and is not booked before blocking
+    const existing = await tenantQuery(s, `SELECT * FROM time_slots WHERE id=$1`, [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Slot not found' });
+    if (existing.rows[0].status === 'booked' && newStatus === 'blocked') {
+      return res.status(409).json({ error: 'Cannot block a booked slot' });
+    }
+
+    const r = await tenantQuery(s,
       `UPDATE time_slots SET status=$1 WHERE id=$2 AND status != 'booked' RETURNING *`,
-      [status, req.params.id]);
+      [newStatus, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Slot not found or is already booked' });
+    await writeAuditLog(s, req.user.id, req.user.role, `slot_${newStatus === 'blocked' ? 'block' : 'unblock'}`, 'time_slot', req.params.id, null, null, req.ip);
     res.json({ slot: r.rows[0] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1166,6 +1220,11 @@ router.delete('/doctors/:id/leaves/:date', adminOnly, validateUUID(), async (req
       `DELETE FROM doctor_leaves WHERE doctor_id=$1 AND leave_date=$2 RETURNING id`,
       [req.params.id, req.params.date]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Leave record not found' });
+    // Restore blocked slots for this leave date (only those not booked)
+    await tenantQuery(s,
+      `UPDATE time_slots SET status='available'
+       WHERE doctor_id=$1 AND slot_date=$2 AND status='blocked'`,
+      [req.params.id, req.params.date]);
     await writeAuditLog(s, req.user.id, req.user.role, 'REMOVE_DOCTOR_LEAVE', 'doctor', req.params.id,
       null, { date: req.params.date }, req.ip);
     res.json({ success: true });
@@ -1287,6 +1346,136 @@ router.delete('/bot-sessions/:phone', adminOnly, async (req, res) => {
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role, 'RESET_BOT_SESSION', 'bot_session', phone,
       null, null, req.ip);
     res.json({ success: true, message: `Bot session reset for ${phone}` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── BULK APPOINTMENT UPDATE ───────────────────────────────────
+router.patch('/appointments/bulk', adminOnly, async (req, res) => {
+  try {
+    const { ids, status } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids must be a non-empty array' });
+    if (ids.length > 100) return res.status(400).json({ error: 'Maximum 100 appointments per bulk update' });
+    if (!['completed', 'no_show', 'confirmed', 'cancelled'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    // Validate all ids are UUIDs
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (ids.some(id => !uuidRe.test(id))) return res.status(400).json({ error: 'Invalid appointment ID in list' });
+
+    const s = req.tenant.schema_name;
+    const placeholders = ids.map((_, i) => `$${i + 2}`).join(',');
+    const r = await tenantQuery(s,
+      `UPDATE appointments SET status=$1, updated_at=NOW()
+       WHERE id IN (${placeholders}) RETURNING id`,
+      [status, ...ids]);
+
+    // Release slots back to available if bulk-cancelling
+    if (status === 'cancelled') {
+      await tenantQuery(s,
+        `UPDATE time_slots SET status='available'
+         WHERE id IN (
+           SELECT slot_id FROM appointments WHERE id IN (${placeholders})
+         )`,
+        ids);
+    }
+
+    await writeAuditLog(s, req.user.id, req.user.role, 'BULK_UPDATE_APPOINTMENT', 'appointment',
+      null, null, { ids, status }, req.ip);
+
+    res.json({ updated: r.rows.length, status });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── SEND WHATSAPP MESSAGE FROM DASHBOARD ──────────────────────
+router.post('/messages/send', adminOnly, async (req, res) => {
+  try {
+    const { phone, message } = req.body;
+    if (!phone || !message) return res.status(400).json({ error: 'phone and message are required' });
+    if (message.length > 1000) return res.status(400).json({ error: 'Message too long (max 1000 chars)' });
+    if (!/^[0-9]{7,20}$/.test(phone.replace(/[+\s]/g, ''))) {
+      return res.status(400).json({ error: 'Invalid phone number' });
+    }
+    const { decrypt } = require('../utils/encryption');
+    const wa = require('../services/whatsapp');
+    const waToken = req.tenant.wa_access_token_enc ? decrypt(req.tenant.wa_access_token_enc) : null;
+    const waPhoneId = req.tenant.wa_phone_number_id;
+    if (!waToken || !waPhoneId) {
+      return res.status(400).json({ error: 'WhatsApp credentials not configured for this clinic' });
+    }
+    const normalised = phone.replace(/[+\s]/g, '');
+    await wa.sendText(normalised, message, waToken, waPhoneId);
+    await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
+      'SEND_WA_MESSAGE', 'patient', normalised, null, { message: message.slice(0, 100) }, req.ip);
+    res.json({ success: true, phone: normalised });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── AUDIT LOGS ────────────────────────────────────────────────
+router.get('/audit-logs', adminOnly, async (req, res) => {
+  try {
+    const { from, to, action, resource_type, page = 1, limit = 50, export: doExport } = req.query;
+    const safeLimit = Math.min(parseInt(limit) || 50, 200);
+    const offset = (Math.max(parseInt(page) || 1, 1) - 1) * safeLimit;
+    const s = req.tenant.schema_name;
+
+    const conditions = ['1=1'];
+    const params = [];
+
+    if (from) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) return res.status(400).json({ error: 'Invalid from date (YYYY-MM-DD)' });
+      params.push(from);
+      conditions.push(`created_at >= $${params.length}::date`);
+    }
+    if (to) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(to)) return res.status(400).json({ error: 'Invalid to date (YYYY-MM-DD)' });
+      params.push(to);
+      conditions.push(`created_at < ($${params.length}::date + INTERVAL '1 day')`);
+    }
+    if (action) {
+      params.push(action.toUpperCase());
+      conditions.push(`action = $${params.length}`);
+    }
+    if (resource_type) {
+      params.push(resource_type.toLowerCase());
+      conditions.push(`resource_type = $${params.length}`);
+    }
+
+    const where = conditions.join(' AND ');
+
+    // Total count for pagination
+    const countR = await tenantQuery(s, `SELECT COUNT(*) FROM audit_logs WHERE ${where}`, params);
+    const total = parseInt(countR.rows[0].count);
+
+    params.push(safeLimit, offset);
+    const r = await tenantQuery(s, `
+      SELECT id, actor_id, actor_role, action, resource_type, resource_id,
+             old_values, new_values, ip_address, created_at
+      FROM audit_logs
+      WHERE ${where}
+      ORDER BY created_at DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params);
+
+    // CSV export
+    if (doExport === 'csv') {
+      const headers = ['timestamp', 'actor_role', 'action', 'resource_type', 'resource_id', 'ip_address'];
+      const rows = r.rows.map(l => [
+        l.created_at?.toISOString() || '',
+        l.actor_role || '',
+        l.action || '',
+        l.resource_type || '',
+        l.resource_id || '',
+        l.ip_address || '',
+      ]);
+      const csv = [headers, ...rows].map(row =>
+        row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')
+      ).join('\n');
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="audit_logs_${new Date().toISOString().slice(0,10)}.csv"`);
+      return res.send(csv);
+    }
+
+    res.json({ logs: r.rows, total, page: parseInt(page), limit: safeLimit, has_more: offset + r.rows.length < total });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

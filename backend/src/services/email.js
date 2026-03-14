@@ -1,11 +1,38 @@
+const crypto = require('crypto');
 const logger = require('../utils/logger');
+const { LIMITS } = require('../utils/errors');
 
 // Prevent HTML injection in email templates from user-supplied data (doctor/patient names etc.)
 function h(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+/**
+ * Deduplication guard — prevents duplicate emails when BullMQ retries a job.
+ * Uses email_sent_log table with a content hash + time window.
+ * Returns true if the email was already sent recently (should be skipped).
+ */
+async function checkAndMarkEmailSent(hash) {
+  try {
+    const { query: dbQuery } = require('../db');
+    const windowHours = Math.max(1, parseInt(LIMITS.EMAIL_DEDUP_WINDOW_HOURS) || 2);
+    const existing = await dbQuery(
+      `SELECT 1 FROM email_sent_log WHERE content_hash=$1 AND sent_at > NOW() - (INTERVAL '1 hour' * $2)`,
+      [hash, windowHours]
+    );
+    if (existing.rows[0]) return true; // duplicate — skip
+    await dbQuery(
+      `INSERT INTO email_sent_log (content_hash) VALUES ($1) ON CONFLICT (content_hash) DO NOTHING`,
+      [hash]
+    );
+    return false;
+  } catch (_) {
+    return false; // DB unavailable — allow sending rather than silently drop
+  }
+}
+
 let resendClient = null;
+let emailQueue = null;
 
 function getResend() {
   if (!process.env.RESEND_API_KEY) return null;
@@ -16,11 +43,47 @@ function getResend() {
   return resendClient;
 }
 
+// Called by botWorker after the email BullMQ queue is initialized
+function setEmailQueue(q) {
+  emailQueue = q;
+}
+
+// Route email through queue if available (with retries), otherwise send directly
+async function queueEmail(type, payload) {
+  if (emailQueue) {
+    try {
+      await emailQueue.add(type, payload, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: { count: 100 },
+        removeOnFail: { count: 50 },
+      });
+      logger.info(`Email queued: ${type}`, { bookingId: payload.bookingId || payload.data?.bookingId });
+      return;
+    } catch (err) {
+      logger.warn(`Email queue failed, sending directly: ${err.message}`);
+    }
+  }
+  // Fallback: send immediately (no retry)
+  if (type === 'booking_confirmation') await sendBookingConfirmation(payload.toEmail, payload.data);
+  else if (type === 'reminder') await sendReminderEmail(payload.toEmail, payload.data);
+  else if (type === 'admin_booking_alert') await sendAdminBookingAlert(payload);
+}
+
 async function sendBookingConfirmation(toEmail, data) {
   const resend = getResend();
   if (!resend || !toEmail) return;
   const { bookingId, patientName, doctorName, date, time, hospitalName, visitType } = data;
   if (!toEmail) { logger.info(`Booking ${bookingId} has no patient email — skipping confirmation`); return; }
+
+  // Deduplication: skip if same booking confirmation sent within the window
+  const dedupHash = crypto.createHash('sha256')
+    .update(`booking_confirmation:${toEmail}:${bookingId}`).digest('hex');
+  if (await checkAndMarkEmailSent(dedupHash)) {
+    logger.info(`Booking confirmation email deduped (already sent): ${bookingId}`);
+    return;
+  }
+
   try {
     await resend.emails.send({
       from: process.env.RESEND_FROM_EMAIL || 'appointments@medibook.care',
@@ -45,8 +108,10 @@ async function sendBookingConfirmation(toEmail, data) {
       `,
     });
     logger.info(`Confirmation email sent to ${toEmail} for ${bookingId}`);
+    try { require('../utils/metrics').increment('emails_sent_total'); } catch (_) {}
   } catch (err) {
     logger.warn(`Email send failed for ${bookingId}`, { error: err.message });
+    try { require('../utils/metrics').increment('emails_failed_total'); } catch (_) {}
     // Non-fatal — don't throw
   }
 }
@@ -55,6 +120,12 @@ async function sendReminderEmail(toEmail, data) {
   const resend = getResend();
   if (!resend || !toEmail) return;
   const { bookingId, patientName, doctorName, date, time, hoursUntil } = data;
+
+  // Deduplication: skip if same reminder sent within the window
+  const dedupHash = crypto.createHash('sha256')
+    .update(`reminder:${toEmail}:${bookingId}:${hoursUntil}`).digest('hex');
+  if (await checkAndMarkEmailSent(dedupHash)) return;
+
   try {
     await resend.emails.send({
       from: process.env.RESEND_FROM_EMAIL || 'appointments@medibook.care',
@@ -78,4 +149,35 @@ async function sendReminderEmail(toEmail, data) {
   }
 }
 
-module.exports = { sendBookingConfirmation, sendReminderEmail };
+async function sendAdminBookingAlert({ toEmail, bookingId, patientName, doctorName, hospitalName, date, time, visitType }) {
+  const resend = getResend();
+  if (!resend) { logger.info('Email skipped (no RESEND_API_KEY): admin booking alert'); return; }
+  if (!toEmail) { logger.info('Admin booking alert skipped: no email address'); return; }
+  try {
+    const FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'appointments@medibook.care';
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: toEmail,
+      subject: `New Booking: ${h(bookingId)} — Dr. ${h(doctorName)}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:500px;margin:auto">
+          <h2 style="color:#2563eb">📅 New Appointment Booked</h2>
+          <table style="width:100%;border-collapse:collapse">
+            <tr><td style="padding:8px;color:#666">Booking ID</td><td style="padding:8px;font-weight:bold">${h(bookingId)}</td></tr>
+            <tr style="background:#f9fafb"><td style="padding:8px;color:#666">Patient</td><td style="padding:8px">${h(patientName)}</td></tr>
+            <tr><td style="padding:8px;color:#666">Doctor</td><td style="padding:8px">Dr. ${h(doctorName)}</td></tr>
+            <tr style="background:#f9fafb"><td style="padding:8px;color:#666">Hospital</td><td style="padding:8px">${h(hospitalName)}</td></tr>
+            <tr><td style="padding:8px;color:#666">Date</td><td style="padding:8px">${h(date)}</td></tr>
+            <tr style="background:#f9fafb"><td style="padding:8px;color:#666">Time</td><td style="padding:8px">${h(time ? String(time).slice(0,5) : '')}</td></tr>
+            <tr><td style="padding:8px;color:#666">Type</td><td style="padding:8px">${h(visitType || 'in_person')}</td></tr>
+          </table>
+          <p style="color:#9ca3af;font-size:12px;margin-top:24px">MediBook Admin Notification</p>
+        </div>
+      `
+    });
+  } catch (err) {
+    logger.error('sendAdminBookingAlert failed', { toEmail, error: err.message });
+  }
+}
+
+module.exports = { sendBookingConfirmation, sendReminderEmail, sendAdminBookingAlert, setEmailQueue, queueEmail };

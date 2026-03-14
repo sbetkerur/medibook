@@ -8,6 +8,7 @@ const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
 const emailService = require('../services/email');
 const logger = require('../utils/logger');
+const { handleError } = require('../utils/errors');
 
 // Strict limiters for unauthenticated sensitive endpoints
 const forgotPasswordLimiter = rateLimit({
@@ -44,7 +45,7 @@ router.post('/auth/superadmin/login', validate(schemas.loginStrict), async (req,
     const valid = await bcrypt.compare(password, r.rows[0].password_hash);
     if (!valid) {
       await query(`INSERT INTO admin_access_logs (email, event, ip_address, user_agent) VALUES ($1,'login_failed',$2,$3)`,
-        [normalizedEmail, req.ip, req.headers['user-agent']]).catch(() => {});
+        [normalizedEmail, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     const jti = crypto.randomUUID();
@@ -54,10 +55,11 @@ router.post('/auth/superadmin/login', validate(schemas.loginStrict), async (req,
       { expiresIn: '24h' }
     );
     await query(`INSERT INTO admin_access_logs (user_id, email, event, ip_address, user_agent) VALUES ($1,$2,'login_success',$3,$4)`,
-      [r.rows[0].id, r.rows[0].email, req.ip, req.headers['user-agent']]).catch(() => {});
-    res.json({ token, user: { email: r.rows[0].email, name: r.rows[0].name, role: 'super_admin' } });
+      [r.rows[0].id, r.rows[0].email, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
+    const refreshToken = await issueRefreshToken(r.rows[0].id, 'super_admin').catch(() => null);
+    res.json({ token, refresh_token: refreshToken, user: { email: r.rows[0].email, name: r.rows[0].name, role: 'super_admin' } });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -77,7 +79,7 @@ router.post('/auth/login', validate(schemas.login), async (req, res) => {
     const valid = await bcrypt.compare(password, userR.rows[0].password_hash);
     if (!valid) {
       await query(`INSERT INTO admin_access_logs (email, tenant_id, event, ip_address, user_agent) VALUES ($1,$2,'login_failed',$3,$4)`,
-        [normalizedEmail, tenant.id, req.ip, req.headers['user-agent']]).catch(() => {});
+        [normalizedEmail, tenant.id, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     const jti = crypto.randomUUID();
@@ -87,30 +89,122 @@ router.post('/auth/login', validate(schemas.login), async (req, res) => {
       { expiresIn: '24h' }
     );
     await query(`INSERT INTO admin_access_logs (user_id, email, tenant_id, event, ip_address, user_agent) VALUES ($1,$2,$3,'login_success',$4,$5)`,
-      [userR.rows[0].id, userR.rows[0].email, tenant.id, req.ip, req.headers['user-agent']]).catch(() => {});
+      [userR.rows[0].id, userR.rows[0].email, tenant.id, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
+    const refreshToken = await issueRefreshToken(userR.rows[0].id, userR.rows[0].role, tenant.id).catch(() => null);
     res.json({
       token,
+      refresh_token: refreshToken,
       user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err);
   }
 });
 
-// ── LOGOUT (blacklist token) ──────────────────────────────────
+// Helper: issue a refresh token (30-day, one-time-use)
+async function issueRefreshToken(userId, userRole, tenantId = null) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  await query(
+    `INSERT INTO refresh_tokens (user_id, user_role, tenant_id, token, expires_at) VALUES ($1,$2,$3,$4,$5)`,
+    [userId, userRole, tenantId, token, expiresAt]
+  );
+  return token;
+}
+
+// ── REFRESH TOKEN ─────────────────────────────────────────────
+router.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refresh_token } = req.body;
+    if (!refresh_token) return res.status(400).json({ error: 'refresh_token required' });
+
+    // SELECT FOR UPDATE inside a transaction prevents the race condition where two
+    // simultaneous refresh calls both see used=false before either writes used=true.
+    const { pool } = require('../db');
+    const client = await pool.connect();
+    let rt;
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(
+        `SELECT * FROM refresh_tokens WHERE token=$1 AND used=false AND expires_at > NOW() FOR UPDATE`,
+        [refresh_token]
+      );
+      if (!r.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({ error: 'Invalid or expired refresh token' });
+      }
+      rt = r.rows[0];
+      await client.query(`UPDATE refresh_tokens SET used=true WHERE id=$1`, [rt.id]);
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+
+    let tokenPayload = { id: rt.user_id, role: rt.user_role };
+
+    if (rt.user_role === 'super_admin') {
+      const adminR = await query(`SELECT email, name FROM super_admins WHERE id=$1`, [rt.user_id]);
+      if (!adminR.rows[0]) return res.status(401).json({ error: 'User not found' });
+      tokenPayload.email = adminR.rows[0].email;
+    } else {
+      if (!rt.tenant_id) return res.status(401).json({ error: 'Invalid refresh token' });
+      const tenantR = await query(`SELECT slug, schema_name, status FROM tenants WHERE id=$1`, [rt.tenant_id]);
+      if (!tenantR.rows[0] || tenantR.rows[0].status !== 'active') {
+        return res.status(401).json({ error: 'Tenant not found or inactive' });
+      }
+      const userR = await tenantQuery(tenantR.rows[0].schema_name,
+        `SELECT email, role FROM users WHERE id=$1 AND is_active=true`, [rt.user_id]);
+      if (!userR.rows[0]) return res.status(401).json({ error: 'User not found or deactivated' });
+      tokenPayload = {
+        ...tokenPayload,
+        email: userR.rows[0].email,
+        role: userR.rows[0].role,
+        tenant_id: rt.tenant_id,
+        tenant_slug: tenantR.rows[0].slug,
+      };
+    }
+
+    const jti = crypto.randomUUID();
+    const newAccessToken = jwt.sign(
+      { ...tokenPayload, jti },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    const newRefreshToken = await issueRefreshToken(rt.user_id, rt.user_role, rt.tenant_id);
+
+    res.json({ token: newAccessToken, refresh_token: newRefreshToken });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// ── LOGOUT (blacklist access token + revoke refresh tokens) ───
 router.post('/auth/logout', authMiddleware, async (req, res) => {
   try {
-    const { jti, exp } = req.user;
+    const { jti, exp, id: userId } = req.user;
+
+    // Blacklist the current access token so it can't be reused before expiry
     if (jti && exp) {
       const expiresAt = new Date(exp * 1000).toISOString();
       await query(
         `INSERT INTO token_blacklist (jti, expires_at) VALUES ($1, $2) ON CONFLICT (jti) DO NOTHING`,
         [jti, expiresAt]
-      );
+      ).catch(() => {});
     }
+
+    // Revoke all active refresh tokens for this user so an attacker who
+    // previously exfiltrated a refresh token can't issue new access tokens.
+    await query(
+      `UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`,
+      [userId]
+    ).catch(() => {});
+
     res.json({ success: true, message: 'Logged out successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -165,7 +259,7 @@ router.post('/auth/forgot-password', forgotPasswordLimiter, validate(schemas.for
       logger.error('Forgot password background error', { error: err.message });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -207,12 +301,12 @@ router.post('/auth/change-password', changePasswordLimiter, authMiddleware, vali
 
     // Audit log
     await query(`INSERT INTO admin_access_logs (user_id, email, event, ip_address, user_agent) VALUES ($1,$2,'password_changed',$3,$4)`,
-      [id, email || req.user.email, req.ip, req.headers['user-agent']]).catch(() => {});
+      [id, email || req.user.email, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
 
     logger.info('Password changed', { user_id: id, role });
     res.json({ success: true, message: 'Password changed successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -249,7 +343,7 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
     await query(`UPDATE password_resets SET used=true WHERE id=$1`, [reset.id]);
     res.json({ success: true, message: 'Password updated successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err);
   }
 });
 

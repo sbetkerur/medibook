@@ -1,5 +1,6 @@
 import './globals.css';
 import { Toaster } from 'react-hot-toast';
+import ErrorBoundary from '@/components/ErrorBoundary';
 
 export const metadata = {
   title: 'MediBook — WhatsApp Appointment System',
@@ -17,7 +18,7 @@ export default function RootLayout({ children }) {
             style: { fontSize: '14px' },
           }}
         />
-        {children}
+        <ErrorBoundary>{children}</ErrorBoundary>
       </body>
     </html>
   );

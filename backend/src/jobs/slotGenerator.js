@@ -6,6 +6,18 @@ const { CRON_LOOKAHEAD_DAYS } = require('../utils/errors');
 const { withCronLock } = require('../utils/cronLock');
 
 const BATCH_SIZE = 100;
+const PARALLEL_DOCTORS = 50;        // process up to 50 doctors concurrently
+const TENANT_TIMEOUT_MS = 30_000;   // 30 s max per tenant
+
+/** Wrap a promise with a hard timeout */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms)
+    ),
+  ]);
+}
 
 // Flush accumulated slot tuples in a single multi-value INSERT
 async function flushSlots(schema, batch) {
@@ -41,7 +53,7 @@ async function generateSlotsForTenant(schema) {
     if (!docMap[row.id]) {
       docMap[row.id] = {
         hospital_id: row.hospital_id,
-        duration: Math.max(5, row.slot_duration_minutes || 30),
+        duration: Math.max(5, Math.min(480, row.slot_duration_minutes || 30)),
         schedules: [],
       };
     }
@@ -54,11 +66,25 @@ async function generateSlotsForTenant(schema) {
     });
   }
 
+  // Fetch all doctor leaves for the lookahead window (single query, not per-doctor)
   const today = new Date();
-  let count = 0;
-  let batch = [];
+  const lookaheadEnd = format(addDays(today, CRON_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
+  const todayStr = format(today, 'yyyy-MM-dd');
+  let leaveSet = new Set(); // Set of "docId:dateStr"
+  try {
+    const leavesR = await tenantQuery(schema,
+      `SELECT doctor_id, leave_date::text as leave_date FROM doctor_leaves
+       WHERE leave_date BETWEEN $1 AND $2`, [todayStr, lookaheadEnd]);
+    for (const l of leavesR.rows) {
+      leaveSet.add(`${l.doctor_id}:${l.leave_date}`);
+    }
+  } catch (_) { /* doctor_leaves table may not exist in all schemas yet */ }
 
-  for (const [docId, doc] of Object.entries(docMap)) {
+  /** Generate slots for a single doctor and flush them. Returns slot count. */
+  async function generateForDoctor(docId, doc) {
+    let localBatch = [];
+    let localCount = 0;
+
     for (let i = 1; i <= CRON_LOOKAHEAD_DAYS; i++) {
       const date = addDays(today, i);
       const dow = date.getDay();
@@ -66,12 +92,13 @@ async function generateSlotsForTenant(schema) {
       if (!sched) continue;
 
       const dateStr = format(date, 'yyyy-MM-dd');
+      if (leaveSet.has(`${docId}:${dateStr}`)) continue;
+
       const [sh, sm] = sched.start.split(':').map(Number);
       const [eh, em] = sched.end.split(':').map(Number);
       let cur = sh * 60 + sm;
       const end = eh * 60 + em;
 
-      // Parse lunch window in minutes (null = no lunch break)
       let lunchStart = null, lunchEnd = null;
       if (sched.lunchStart && sched.lunchEnd) {
         const [lsh, lsm] = sched.lunchStart.split(':').map(Number);
@@ -81,29 +108,42 @@ async function generateSlotsForTenant(schema) {
       }
 
       while (cur + doc.duration <= end) {
-        // Skip slots that overlap the lunch window
         if (lunchStart !== null && cur < lunchEnd && cur + doc.duration > lunchStart) {
           cur = lunchEnd;
           continue;
         }
         const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
         const et = `${String(Math.floor((cur + doc.duration) / 60)).padStart(2, '0')}:${String((cur + doc.duration) % 60).padStart(2, '0')}`;
-        batch.push({ docId, hospitalId: doc.hospital_id, dateStr, st, et });
-        count++;
+        localBatch.push({ docId, hospitalId: doc.hospital_id, dateStr, st, et });
+        localCount++;
         cur += doc.duration;
 
-        // Flush every BATCH_SIZE rows
-        if (batch.length >= BATCH_SIZE) {
-          await flushSlots(schema, batch);
-          batch = [];
+        if (localBatch.length >= BATCH_SIZE) {
+          await flushSlots(schema, localBatch);
+          localBatch = [];
         }
       }
     }
+
+    if (localBatch.length) await flushSlots(schema, localBatch);
+    return localCount;
   }
 
-  // Flush any remaining rows
-  if (batch.length) {
-    await flushSlots(schema, batch);
+  // Process doctors in parallel batches (PARALLEL_DOCTORS at a time)
+  const doctorEntries = Object.entries(docMap);
+  let count = 0;
+
+  for (let i = 0; i < doctorEntries.length; i += PARALLEL_DOCTORS) {
+    const batch = doctorEntries.slice(i, i + PARALLEL_DOCTORS);
+    const counts = await Promise.all(
+      batch.map(([docId, doc]) =>
+        generateForDoctor(docId, doc).catch(err => {
+          logger.warn(`Slot gen failed for doctor ${docId}`, { error: err.message });
+          return 0;
+        })
+      )
+    );
+    count += counts.reduce((a, b) => a + b, 0);
   }
 
   return count;
@@ -149,19 +189,31 @@ async function cleanupTokenBlacklist() {
     // Trim admin_access_logs older than 6 months
     await query(`DELETE FROM admin_access_logs WHERE created_at < NOW() - INTERVAL '6 months'`);
   } catch (_) { /* non-fatal */ }
+  try {
+    // Remove used or expired refresh tokens older than 7 days
+    await query(`DELETE FROM refresh_tokens WHERE used=true OR expires_at < NOW() - INTERVAL '7 days'`);
+  } catch (_) { /* non-fatal */ }
+  try {
+    // Prune email dedup log older than 48 hours (keep a grace window beyond EMAIL_DEDUP_WINDOW_HOURS)
+    await query(`DELETE FROM email_sent_log WHERE sent_at < NOW() - INTERVAL '48 hours'`);
+  } catch (_) { /* non-fatal */ }
 }
 
 function startSlotGeneratorCron() {
   // Run daily at 11:30 PM IST (18:00 UTC)
   const slotTask = cron.schedule('0 18 * * *', async () => {
-    await withCronLock('cron:slot_generator', 3600, async () => {
+    await withCronLock('cron:slot_generator', 7200, async () => {
       logger.info('Starting nightly slot generation...');
       try {
         const tenants = await query(`SELECT schema_name, name FROM tenants WHERE status='active'`);
         let total = 0;
         for (const tenant of tenants.rows) {
           try {
-            const n = await generateSlotsForTenant(tenant.schema_name);
+            const n = await withTimeout(
+              generateSlotsForTenant(tenant.schema_name),
+              TENANT_TIMEOUT_MS,
+              tenant.name
+            );
             total += n;
             if (n > 0) logger.info(`Slots generated for ${tenant.name}: ${n}`);
           } catch (err) {
@@ -169,6 +221,39 @@ function startSlotGeneratorCron() {
           }
         }
         logger.info(`Nightly slot generation done: ${total} slots across ${tenants.rows.length} tenants`);
+
+        // Update stats cache for each tenant
+        const allTenants = await query(`SELECT id, schema_name, name FROM tenants WHERE status='active'`);
+        for (const tenant of allTenants.rows) {
+          try {
+            const s = tenant.schema_name;
+            const [todayAppts, monthAppts, totalPatients, activeSlots] = await Promise.allSettled([
+              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date = CURRENT_DATE AND status = 'confirmed'`),
+              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= date_trunc('month', CURRENT_DATE) AND status IN ('confirmed','completed')`),
+              tenantQuery(s, `SELECT COUNT(*) FROM patients`),
+              tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= CURRENT_DATE AND status = 'available'`),
+            ]);
+            await query(`
+              INSERT INTO tenant_stats_cache (tenant_id, stat_date, appointments_today, appointments_month, patients_total, active_slots, updated_at)
+              VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, NOW())
+              ON CONFLICT (tenant_id, stat_date) DO UPDATE SET
+                appointments_today = EXCLUDED.appointments_today,
+                appointments_month = EXCLUDED.appointments_month,
+                patients_total = EXCLUDED.patients_total,
+                active_slots = EXCLUDED.active_slots,
+                updated_at = NOW()
+            `, [
+              tenant.id,
+              todayAppts.status === 'fulfilled' ? parseInt(todayAppts.value.rows[0].count) : 0,
+              monthAppts.status === 'fulfilled' ? parseInt(monthAppts.value.rows[0].count) : 0,
+              totalPatients.status === 'fulfilled' ? parseInt(totalPatients.value.rows[0].count) : 0,
+              activeSlots.status === 'fulfilled' ? parseInt(activeSlots.value.rows[0].count) : 0,
+            ]);
+          } catch (e) {
+            logger.warn(`Stats cache update failed for ${tenant.name}`, { error: e.message });
+          }
+        }
+
         try {
           await query(
             `UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='slot_generator'`
@@ -210,4 +295,110 @@ function startSlotGeneratorCron() {
   return [slotTask, cleanupTask];
 }
 
-module.exports = { startSlotGeneratorCron, generateSlotsForTenant, cleanupExpiredSlots };
+function startBackupReminderCron() {
+  // Every Sunday at 2 AM IST (20:30 UTC Saturday)
+  const backupTask = cron.schedule('30 20 * * 6', async () => {
+    logger.info('WEEKLY BACKUP REMINDER: Run pg_dump on medibook database');
+    try {
+      const admins = await query(`SELECT email FROM super_admins LIMIT 1`);
+      if (admins.rows[0]) {
+        logger.info(`Backup reminder: would email ${admins.rows[0].email}`);
+      }
+    } catch (e) {
+      logger.warn('Backup reminder cron failed', { error: e.message });
+    }
+  });
+  logger.info('Backup reminder cron registered (weekly Sunday 2AM IST)');
+  return backupTask;
+}
+
+/**
+ * Regenerate slots for a single doctor after their schedule changes.
+ * Deletes future available/blocked slots then re-creates them from the new schedule.
+ *
+ * @param {string} schema   - Tenant schema name
+ * @param {string} doctorId - Doctor UUID
+ * @returns {number}        - Number of slots generated
+ */
+async function generateSlotsForDoctor(schema, doctorId) {
+  const docR = await tenantQuery(schema,
+    `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
+            s.day_of_week, s.start_time, s.end_time,
+            s.lunch_start_time, s.lunch_end_time
+     FROM doctors d
+     JOIN doctor_schedules s ON s.doctor_id=d.id
+     WHERE d.id=$1 AND d.is_active=true AND s.is_working=true`,
+    [doctorId]);
+
+  if (!docR.rows.length) return 0;
+
+  // Build schedule list from rows
+  const doc = {
+    hospital_id: docR.rows[0].hospital_id,
+    duration: Math.max(5, Math.min(480, docR.rows[0].slot_duration_minutes || 30)),
+    schedules: docR.rows.map(r => ({
+      dow: r.day_of_week,
+      start: r.start_time,
+      end: r.end_time,
+      lunchStart: r.lunch_start_time || null,
+      lunchEnd: r.lunch_end_time || null,
+    })),
+  };
+
+  // Fetch leaves for this doctor in the lookahead window
+  const today = new Date();
+  const lookaheadEnd = format(addDays(today, CRON_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
+  const todayStr = format(today, 'yyyy-MM-dd');
+  let leaveSet = new Set();
+  try {
+    const leavesR = await tenantQuery(schema,
+      `SELECT leave_date::text as leave_date FROM doctor_leaves
+       WHERE doctor_id=$1 AND leave_date BETWEEN $2 AND $3`,
+      [doctorId, todayStr, lookaheadEnd]);
+    for (const l of leavesR.rows) leaveSet.add(l.leave_date);
+  } catch (_) {}
+
+  let localBatch = [];
+  let count = 0;
+
+  for (let i = 1; i <= CRON_LOOKAHEAD_DAYS; i++) {
+    const date = addDays(today, i);
+    const dow = date.getDay();
+    const sched = doc.schedules.find(s => s.dow === dow);
+    if (!sched) continue;
+    const dateStr = format(date, 'yyyy-MM-dd');
+    if (leaveSet.has(dateStr)) continue;
+
+    const [sh, sm] = sched.start.split(':').map(Number);
+    const [eh, em] = sched.end.split(':').map(Number);
+    let cur = sh * 60 + sm;
+    const end = eh * 60 + em;
+    let lunchStart = null, lunchEnd = null;
+    if (sched.lunchStart && sched.lunchEnd) {
+      const [lsh, lsm] = sched.lunchStart.split(':').map(Number);
+      const [leh, lem] = sched.lunchEnd.split(':').map(Number);
+      lunchStart = lsh * 60 + lsm;
+      lunchEnd   = leh * 60 + lem;
+    }
+
+    while (cur + doc.duration <= end) {
+      if (lunchStart !== null && cur < lunchEnd && cur + doc.duration > lunchStart) {
+        cur = lunchEnd;
+        continue;
+      }
+      const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
+      const et = `${String(Math.floor((cur + doc.duration) / 60)).padStart(2, '0')}:${String((cur + doc.duration) % 60).padStart(2, '0')}`;
+      localBatch.push({ docId: doctorId, hospitalId: doc.hospital_id, dateStr, st, et });
+      count++;
+      cur += doc.duration;
+      if (localBatch.length >= BATCH_SIZE) {
+        await flushSlots(schema, localBatch);
+        localBatch = [];
+      }
+    }
+  }
+  if (localBatch.length) await flushSlots(schema, localBatch);
+  return count;
+}
+
+module.exports = { startSlotGeneratorCron, generateSlotsForTenant, generateSlotsForDoctor, cleanupExpiredSlots, startBackupReminderCron };

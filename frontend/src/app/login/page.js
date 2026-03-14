@@ -1,7 +1,7 @@
 'use client';
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import api, { getApiError } from '@/lib/api';
+import api, { getApiError, resetSessionTimers } from '@/lib/api';
 import toast from 'react-hot-toast';
 
 export default function LoginPage() {
@@ -26,7 +26,9 @@ export default function LoginPage() {
 
       const { data } = await api.post(endpoint, payload);
       localStorage.setItem('token', data.token);
+      if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
       localStorage.setItem('user', JSON.stringify(data.user));
+      resetSessionTimers();
       toast.success(`Welcome, ${data.user.name || data.user.email}!`);
       router.push(isSuperAdmin ? '/superadmin' : '/dashboard');
     } catch (err) {

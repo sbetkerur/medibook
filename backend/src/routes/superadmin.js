@@ -9,6 +9,11 @@ const { validate, schemas } = require('../middleware/validate');
 const { encrypt } = require('../utils/encryption');
 const { validateUUID } = require('../utils/errors');
 const logger = require('../utils/logger');
+const { handleError } = require('../utils/errors');
+const { getClient: getRedisClient } = require('../utils/redisClient');
+
+const STATS_CACHE_KEY = 'superadmin:stats:v1';
+const STATS_CACHE_TTL_S = 60; // 1 minute
 
 // Strict limiter for tenant creation — each call provisions a full DB schema
 const createTenantLimiter = rateLimit({
@@ -29,77 +34,104 @@ router.use(authMiddleware, superAdminOnly);
 // ── PLATFORM STATS ────────────────────────────────────────────
 router.get('/stats', async (req, res) => {
   try {
-    const [total, active, plans, monthly] = await Promise.all([
+    // Return cached result if fresh (60s TTL) — this endpoint runs 6+ DB queries
+    const redis = getRedisClient();
+    try {
+      const cached = await redis.get(STATS_CACHE_KEY);
+      if (cached) return res.json({ ...JSON.parse(cached), from_cache: true });
+    } catch (_) {}
+
+    const [total, active, plans, monthly, mrrR, newMonth] = await Promise.all([
       query(`SELECT COUNT(*) FROM tenants`),
       query(`SELECT COUNT(*) FROM tenants WHERE status='active'`),
       query(`SELECT plan, COUNT(*) as count FROM tenants GROUP BY plan ORDER BY count DESC`),
       query(`SELECT COUNT(*) as new_tenants FROM tenants WHERE created_at >= NOW() - INTERVAL '30 days'`),
+      query(`SELECT COALESCE(SUM(p.price_monthly), 0) as mrr FROM tenants t LEFT JOIN plans p ON p.id=t.plan WHERE t.status='active'`),
+      query(`SELECT COUNT(*) FROM tenants WHERE created_at >= date_trunc('month', NOW())`),
     ]);
+    const mrr = parseInt(mrrR.rows[0].mrr) || 0;
 
-    // Cross-tenant counts — single UNION ALL query per metric (avoid N+1)
-    // Schema names are server-generated as 'tenant_<slug>' — validate before interpolating
-    const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
-    const tenantSchemas = await query(`SELECT schema_name FROM tenants WHERE status='active'`);
-    const validSchemas = tenantSchemas.rows.filter(t => SCHEMA_RE.test(t.schema_name));
-    // Limit UNION size to prevent excessively large query strings on large deployments
-    const schemasForUnion = validSchemas.slice(0, 100);
-    let totalAppointments = 0;
-    let totalPatients = 0;
-
-    if (schemasForUnion.length > 0) {
-      try {
-        const apptParts = schemasForUnion.map(t =>
-          `SELECT COUNT(*) FROM "${t.schema_name}".appointments WHERE created_at >= NOW() - INTERVAL '30 days'`
-        );
-        const apptR = await query(
-          `SELECT SUM(cnt)::bigint as total FROM (${apptParts.map(q => `(${q}) cnt`).join(' UNION ALL ')}) x`
-        );
-        totalAppointments = parseInt(apptR.rows[0].total) || 0;
-      } catch (err) {
-        logger.warn('Cross-tenant appointment count failed', { error: err.message });
+    // Use stats cache for cross-tenant aggregates (populated nightly by slotGenerator cron)
+    let cachedStats = { appointments_today: 0, appointments_month: 0, patients_total: 0 };
+    let cacheHit = false;
+    try {
+      const cached = await query(`
+        SELECT
+          SUM(appointments_today) as appointments_today,
+          SUM(appointments_month) as appointments_month,
+          SUM(patients_total) as patients_total
+        FROM tenant_stats_cache
+        WHERE stat_date = CURRENT_DATE
+      `);
+      if (cached.rows[0] && cached.rows[0].appointments_today !== null) {
+        cachedStats = {
+          appointments_today: parseInt(cached.rows[0].appointments_today || 0),
+          appointments_month: parseInt(cached.rows[0].appointments_month || 0),
+          patients_total: parseInt(cached.rows[0].patients_total || 0),
+        };
+        cacheHit = true;
       }
+    } catch (_) {}
 
-      try {
-        const patientParts = schemasForUnion.map(t =>
-          `SELECT COUNT(*) FROM "${t.schema_name}".patients`
-        );
-        const patientR = await query(
-          `SELECT SUM(cnt)::bigint as total FROM (${patientParts.map(q => `(${q}) cnt`).join(' UNION ALL ')}) x`
-        );
-        totalPatients = parseInt(patientR.rows[0].total) || 0;
-      } catch (err) {
-        logger.warn('Cross-tenant patient count failed', { error: err.message });
+    // Fall back to UNION ALL if cache is empty (first run before nightly cron)
+    let totalAppointments = cachedStats.appointments_month;
+    let totalPatients = cachedStats.patients_total;
+    if (!cacheHit) {
+      const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
+      const tenantSchemas = await query(`SELECT schema_name FROM tenants WHERE status='active'`);
+      const schemasForUnion = tenantSchemas.rows.filter(t => SCHEMA_RE.test(t.schema_name)).slice(0, 100);
+      if (schemasForUnion.length > 0) {
+        try {
+          const apptParts = schemasForUnion.map(t =>
+            `SELECT COUNT(*) FROM "${t.schema_name}".appointments WHERE created_at >= NOW() - INTERVAL '30 days'`
+          );
+          const apptR = await query(
+            `SELECT SUM(cnt)::bigint as total FROM (${apptParts.map(q => `(${q}) cnt`).join(' UNION ALL ')}) x`
+          );
+          totalAppointments = parseInt(apptR.rows[0].total) || 0;
+        } catch (err) {
+          logger.warn('Cross-tenant appointment count failed', { error: err.message });
+        }
+        try {
+          const patientParts = schemasForUnion.map(t =>
+            `SELECT COUNT(*) FROM "${t.schema_name}".patients`
+          );
+          const patientR = await query(
+            `SELECT SUM(cnt)::bigint as total FROM (${patientParts.map(q => `(${q}) cnt`).join(' UNION ALL ')}) x`
+          );
+          totalPatients = parseInt(patientR.rows[0].total) || 0;
+        } catch (err) {
+          logger.warn('Cross-tenant patient count failed', { error: err.message });
+        }
       }
     }
 
-    // MRR — sum of price_monthly for all active tenants (COALESCE prevents NULL when no rows)
-    let mrr = 0;
-    try {
-      const mrrR = await query(`
-        SELECT COALESCE(SUM(p.price_monthly), 0) as mrr
-        FROM tenants t LEFT JOIN plans p ON p.id=t.plan
-        WHERE t.status='active'
-      `);
-      mrr = parseInt(mrrR.rows[0].mrr) || 0;
-    } catch (_) {}
-
-    res.json({
+    const result = {
       total_tenants: parseInt(total.rows[0].count),
       active_tenants: parseInt(active.rows[0].count),
+      new_tenants_this_month: parseInt(newMonth.rows[0].count),
       monthly_growth: parseInt(monthly.rows[0].new_tenants),
       by_plan: plans.rows,
       total_appointments_30d: totalAppointments,
       total_patients: totalPatients,
+      appointments_today: cachedStats.appointments_today,
+      appointments_this_month: cachedStats.appointments_month,
       mrr,
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+      stats_cache_hit: cacheHit,
+    };
+
+    // Cache result for 60 seconds
+    try { await redis.set(STATS_CACHE_KEY, JSON.stringify(result), 'EX', STATS_CACHE_TTL_S); } catch (_) {}
+
+    res.json(result);
+  } catch (err) { handleError(res, err, 'GET /superadmin/stats'); }
 });
 
 // ── LIST ALL TENANTS ──────────────────────────────────────────
 router.get('/tenants', async (req, res) => {
   try {
     const { page = 1, search, limit } = req.query;
-    const safeLimit = Math.min(parseInt(limit) || 20, 50);
+    const safeLimit = Math.max(1, Math.min(parseInt(limit) || 20, 50));
     const offset = (Math.max(parseInt(page), 1) - 1) * safeLimit;
 
     let where = '';
@@ -127,7 +159,7 @@ router.get('/tenants', async (req, res) => {
       page: parseInt(page),
       limit: safeLimit,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── GET SINGLE TENANT ─────────────────────────────────────────
@@ -136,7 +168,7 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
     const r = await query(`SELECT * FROM tenants WHERE id=$1`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
     res.json({ tenant: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── CREATE TENANT ─────────────────────────────────────────────
@@ -184,7 +216,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
         VALUES ($1,$2,$3,$4,$5,$6,$7)
       `, [req.user.id, 'super_admin', 'CREATE_TENANT', 'tenant', tenant.id,
           JSON.stringify({ name, slug, plan: plan || 'starter' }), req.ip]);
-    } catch (_) {}
+    } catch (auditErr) { logger.warn('Audit log failed (CREATE_TENANT)', { error: auditErr.message }); }
 
     res.json({
       tenant,
@@ -197,7 +229,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
       message: 'Tenant created successfully'
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err, 'POST /superadmin/tenants');
   }
 });
 
@@ -225,6 +257,10 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
         updates.push('suspension_reason=NULL', 'suspended_at=NULL');
       }
     }
+    const VALID_PLANS = ['starter', 'growth', 'professional', 'enterprise'];
+    if (plan && !VALID_PLANS.includes(plan)) {
+      return res.status(400).json({ error: `Invalid plan. Must be one of: ${VALID_PLANS.join(', ')}` });
+    }
     if (plan) { params.push(plan); updates.push(`plan=$${params.length}`); }
     if (wa_phone_number_id) { params.push(wa_phone_number_id); updates.push(`wa_phone_number_id=$${params.length}`); }
     if (wa_access_token) { params.push(encrypt(wa_access_token)); updates.push(`wa_access_token_enc=$${params.length}`); }
@@ -247,10 +283,10 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
         VALUES ($1,$2,$3,$4,$5,$6,$7)
       `, [req.user.id, 'super_admin', 'UPDATE_TENANT', 'tenant', req.params.id,
           JSON.stringify({ status, plan, name, suspension_reason }), req.ip]);
-    } catch (_) {}
+    } catch (auditErr) { logger.warn('Audit log failed (UPDATE_TENANT)', { error: auditErr.message }); }
 
     res.json({ tenant: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── TENANT USAGE STATS ────────────────────────────────────────
@@ -270,7 +306,7 @@ router.get('/tenants/:id/stats', validateUUID(), async (req, res) => {
       total_patients: parseInt(patients.rows[0].count),
       active_doctors: parseInt(doctors.rows[0].count),
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── TENANT HEALTH ──────────────────────────────────────────────
@@ -316,7 +352,7 @@ router.get('/tenants/:id/health', validateUUID(), async (req, res) => {
         no_whatsapp: !t.wa_phone_number_id,
       },
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── LIST PLANS ────────────────────────────────────────────────
@@ -324,7 +360,7 @@ router.get('/plans', async (req, res) => {
   try {
     const r = await query(`SELECT * FROM plans ORDER BY price_monthly`);
     res.json({ plans: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 module.exports = router;
