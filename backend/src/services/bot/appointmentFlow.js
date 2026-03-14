@@ -2,7 +2,7 @@
 
 const { tenantQuery, tenantTransaction } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
-const { fromZonedTime } = require('date-fns-tz');
+const { zonedTimeToUtc } = require('date-fns-tz');
 const logger = require('../../utils/logger');
 const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 
@@ -95,7 +95,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
   // 2-hour minimum notice check — appointment_time is stored in IST; parse it
   // as IST before comparing to the current UTC wall-clock time.
   const nowDateR = new Date();
-  const apptDateTimeR = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
+  const apptDateTimeR = zonedTimeToUtc(`${a.appointment_date}T${a.appointment_time}`, IST);
   const hoursUntilR = (apptDateTimeR - nowDateR) / (1000 * 60 * 60);
   if (hoursUntilR < 2 && hoursUntilR >= 0) {
     await send.text(`⚠️ Rescheduling must be done at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
@@ -270,7 +270,7 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
   // 2-hour minimum notice check — appointment_time is stored in IST; parse it
   // as IST before comparing to the current UTC wall-clock time.
   const nowDate = new Date();
-  const apptDateTime = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
+  const apptDateTime = zonedTimeToUtc(`${a.appointment_date}T${a.appointment_time}`, IST);
   const hoursUntilAppt = (apptDateTime - nowDate) / (1000 * 60 * 60);
   if (hoursUntilAppt < 2 && hoursUntilAppt >= 0) {
     await send.text(`⚠️ Cancellations must be made at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);

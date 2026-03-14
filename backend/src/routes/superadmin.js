@@ -83,10 +83,10 @@ router.get('/stats', async (req, res) => {
       if (schemasForUnion.length > 0) {
         try {
           const apptParts = schemasForUnion.map(t =>
-            `SELECT COUNT(*) FROM "${t.schema_name}".appointments WHERE created_at >= NOW() - INTERVAL '30 days'`
+            `SELECT COUNT(*) AS cnt FROM "${t.schema_name}".appointments WHERE created_at >= NOW() - INTERVAL '30 days'`
           );
           const apptR = await query(
-            `SELECT SUM(cnt)::bigint as total FROM (${apptParts.map(q => `(${q}) cnt`).join(' UNION ALL ')}) x`
+            `SELECT SUM(cnt)::bigint AS total FROM (${apptParts.join(' UNION ALL ')}) x`
           );
           totalAppointments = parseInt(apptR.rows[0].total) || 0;
         } catch (err) {
@@ -94,10 +94,10 @@ router.get('/stats', async (req, res) => {
         }
         try {
           const patientParts = schemasForUnion.map(t =>
-            `SELECT COUNT(*) FROM "${t.schema_name}".patients`
+            `SELECT COUNT(*) AS cnt FROM "${t.schema_name}".patients`
           );
           const patientR = await query(
-            `SELECT SUM(cnt)::bigint as total FROM (${patientParts.map(q => `(${q}) cnt`).join(' UNION ALL ')}) x`
+            `SELECT SUM(cnt)::bigint AS total FROM (${patientParts.join(' UNION ALL ')}) x`
           );
           totalPatients = parseInt(patientR.rows[0].total) || 0;
         } catch (err) {

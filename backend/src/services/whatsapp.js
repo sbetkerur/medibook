@@ -4,7 +4,7 @@ const logger = require('../utils/logger');
 function getClient(accessToken, phoneNumberId) {
   const token = accessToken || process.env.META_ACCESS_TOKEN;
   const phoneId = phoneNumberId || process.env.META_PHONE_NUMBER_ID;
-  const base = `https://graph.facebook.com/v18.0/${phoneId}/messages`;
+  const base = `https://graph.facebook.com/v21.0/${phoneId}/messages`;
   const headers = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
@@ -105,7 +105,7 @@ async function markRead(messageId, accessToken, phoneNumberId) {
   const token = accessToken || process.env.META_ACCESS_TOKEN;
   try {
     await axios.post(
-      `https://graph.facebook.com/v18.0/${phoneId}/messages`,
+      `https://graph.facebook.com/v21.0/${phoneId}/messages`,
       { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
       { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
     );

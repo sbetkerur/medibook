@@ -245,6 +245,12 @@ router.post('/webhook/whatsapp', async (req, res) => {
       }
     }
 
+    // Mark message as read — shows blue double tick to user
+    if (msgId) {
+      const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
+      wa.markRead(msgId, waToken, tenant.wa_phone_number_id).catch(() => {});
+    }
+
     logger.info('Incoming WhatsApp message', { phone: maskPhone(phone), tenant: tenant.slug, type: msg.type });
     try { require('../utils/metrics').increment('webhook_messages_total'); } catch (_) {}
 

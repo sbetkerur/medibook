@@ -72,7 +72,7 @@ async function queueEmail(type, payload) {
 
 async function sendBookingConfirmation(toEmail, data) {
   const resend = getResend();
-  if (!resend || !toEmail) return;
+  if (!resend) return;
   const { bookingId, patientName, doctorName, date, time, hospitalName, visitType } = data;
   if (!toEmail) { logger.info(`Booking ${bookingId} has no patient email — skipping confirmation`); return; }
 
@@ -180,4 +180,33 @@ async function sendAdminBookingAlert({ toEmail, bookingId, patientName, doctorNa
   }
 }
 
-module.exports = { sendBookingConfirmation, sendReminderEmail, sendAdminBookingAlert, setEmailQueue, queueEmail };
+async function sendPasswordReset(toEmail, resetUrl) {
+  const resend = getResend();
+  if (!resend) { logger.info('Password reset email skipped (no RESEND_API_KEY)'); return; }
+  if (!toEmail) { logger.info('Password reset email skipped: no email address'); return; }
+  try {
+    await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'appointments@medibook.care',
+      to: toEmail,
+      subject: 'Reset Your MediBook Password',
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px;background:#f8fafc;border-radius:12px;">
+          <h2 style="color:#2563eb;">🔐 Password Reset</h2>
+          <p>You requested a password reset for your MediBook account.</p>
+          <p>Click the button below to set a new password. This link expires in <strong>1 hour</strong>.</p>
+          <a href="${h(resetUrl)}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:white;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0;">
+            Reset Password
+          </a>
+          <p style="font-size:13px;color:#94a3b8;">If you didn't request this, you can safely ignore this email.</p>
+          <p style="font-size:12px;color:#cbd5e1;">Or copy this link: ${h(resetUrl)}</p>
+        </div>
+      `,
+    });
+    logger.info(`Password reset email sent to ${toEmail}`);
+  } catch (err) {
+    logger.warn(`Password reset email failed for ${toEmail}`, { error: err.message });
+    throw err; // re-throw so caller knows email failed
+  }
+}
+
+module.exports = { sendBookingConfirmation, sendReminderEmail, sendAdminBookingAlert, sendPasswordReset, setEmailQueue, queueEmail };

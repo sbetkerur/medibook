@@ -119,7 +119,7 @@ async function testAuth() {
   await test('Wrong password returns 401', async () => {
     const { status } = await req('POST', '/api/auth/superadmin/login', {
       email: 'admin@medibook.com',
-      password: 'wrongpassword123',
+      password: 'WrongPass@123',  // valid format, wrong credentials
     });
     assert(status === 401, `Expected 401, got ${status}`);
   });
@@ -344,13 +344,24 @@ async function testBotFlow() {
     assert(hasNext, `Expected gender or confirmation. Got: ${JSON.stringify(r)}`);
   });
 
-  await test('Selecting gender shows booking summary', async () => {
+  await test('Selecting gender prompts for email (or shows summary)', async () => {
     const { data } = await bot('Male');
     const r = data.responses;
     assert(r?.length > 0, 'No response');
+    const hasNext = r.some(m =>
+      m.text?.includes('Email') || m.text?.includes('Booking Summary') ||
+      m.text?.includes('Confirm') || m.text?.includes('Doctor')
+    );
+    assert(hasNext, `Expected email prompt or booking summary. Got: ${JSON.stringify(r)}`);
+  });
+
+  await test('Skipping email shows booking summary', async () => {
+    const { data } = await bot('Skip');
+    const r = data.responses;
+    assert(r?.length > 0, 'No response');
     const hasSummary = r.some(m =>
-      m.text?.includes('Booking Summary') || m.text?.includes('Confirm') ||
-      m.text?.includes('Doctor')
+      m.text?.includes('Booking Summary') || m.text?.includes('review') ||
+      m.text?.includes('Confirm') || m.text?.includes('Doctor')
     );
     assert(hasSummary, `Expected booking summary. Got: ${JSON.stringify(r)}`);
   });
@@ -387,16 +398,24 @@ async function testBotFlow() {
       assert(hasPrompt, `Expected booking ID prompt. Got: ${JSON.stringify(r)}`);
     });
 
-    await test('Entering Booking ID shows cancel confirmation', async () => {
+    await test('Entering Booking ID prompts for cancellation reason', async () => {
       const { data } = await bot(bookingId);
       const r = data.responses;
       assert(r?.length > 0, 'No response');
       const hasConfirm = r.some(m => m.text?.includes(bookingId) || m.text?.includes('Cancel'));
-      assert(hasConfirm, `Expected cancel confirm. Got: ${JSON.stringify(r)}`);
+      assert(hasConfirm, `Expected cancel prompt. Got: ${JSON.stringify(r)}`);
+    });
+
+    await test('Selecting reason shows final confirmation', async () => {
+      const { data } = await bot('', 'btn_1'); // Schedule conflict
+      const r = data.responses;
+      assert(r?.length > 0, 'No response');
+      const hasConfirm = r.some(m => m.text?.toLowerCase().includes('sure') || m.text?.toLowerCase().includes('confirm'));
+      assert(hasConfirm, `Expected final confirm. Got: ${JSON.stringify(r)}`);
     });
 
     await test('Confirming cancellation cancels the appointment', async () => {
-      const { data } = await bot('Yes, Cancel');
+      const { data } = await bot('Yes, Cancel It');
       const r = data.responses;
       assert(r?.length > 0, 'No response');
       const cancelled = r.some(m =>

@@ -315,13 +315,31 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
   try {
     const { token, password } = req.body;
 
-    const r = await query(
-      `SELECT * FROM password_resets WHERE token=$1 AND used=false AND expires_at > NOW()`,
-      [token]
-    );
-    if (!r.rows[0]) return res.status(400).json({ error: 'Invalid or expired reset token' });
+    // Use SELECT FOR UPDATE inside a transaction to prevent two simultaneous
+    // reset requests from both consuming the same token.
+    const { pool } = require('../db');
+    const client = await pool.connect();
+    let reset;
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(
+        `SELECT * FROM password_resets WHERE token=$1 AND used=false AND expires_at > NOW() FOR UPDATE`,
+        [token]
+      );
+      if (!r.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Invalid or expired reset token' });
+      }
+      reset = r.rows[0];
+      await client.query(`UPDATE password_resets SET used=true WHERE id=$1`, [reset.id]);
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
 
-    const reset = r.rows[0];
     const hash = await bcrypt.hash(password, 12);
 
     if (reset.tenant_id) {
@@ -340,7 +358,6 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
       await query(`UPDATE super_admins SET password_hash=$1 WHERE email=$2`, [hash, reset.email]);
     }
 
-    await query(`UPDATE password_resets SET used=true WHERE id=$1`, [reset.id]);
     res.json({ success: true, message: 'Password updated successfully' });
   } catch (err) {
     handleError(res, err);
