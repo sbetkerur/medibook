@@ -9,6 +9,7 @@ let dlQueue = null;  // dead-letter queue for failed jobs
 let emailQueue = null;
 let emailWorker = null;
 let queueAvailable = false;
+let workerStarted = false;
 
 function createConnection() {
   const conn = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
@@ -62,6 +63,10 @@ async function setup() {
     queueAvailable = true;
     logger.info('BullMQ queues initialized (bot + email, with dead-letter queue)');
 
+    // Start worker immediately now that queue is ready (avoids race condition
+    // where startBotWorker() is called from index.js before setup() completes)
+    startBotWorker();
+
     // Alert if dead-letter queue grows too large (check every 5 minutes)
     const DLQ_ALERT_THRESHOLD = 50;
     setInterval(async () => {
@@ -89,6 +94,8 @@ function startBotWorker() {
     logger.info('BullMQ not available — bot messages processed synchronously');
     return null;
   }
+  if (workerStarted) return null; // already running — called from both setup() and index.js
+  workerStarted = true;
 
   const connection = createConnection();
   const worker = new Worker('bot-messages', async (job) => {
