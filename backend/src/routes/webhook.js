@@ -254,7 +254,8 @@ router.post('/webhook/whatsapp', async (req, res) => {
     logger.info('Incoming WhatsApp message', { phone: maskPhone(phone), tenant: tenant.slug, type: msg.type });
     try { require('../utils/metrics').increment('webhook_messages_total'); } catch (_) {}
 
-    if (botWorker.isQueueAvailable()) {
+    const forceSync = process.env.DISABLE_QUEUE === 'true';
+    if (!forceSync && botWorker.isQueueAvailable()) {
       // Backpressure check: fall back to sync if queue is saturated
       let waiting = 0;
       try { waiting = await botWorker.getQueue().getWaitingCount(); } catch (_) {}
