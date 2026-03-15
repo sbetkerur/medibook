@@ -7,6 +7,7 @@ const { format, parseISO } = require('date-fns');
 const { toZonedTime } = require('date-fns-tz');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
+const { FEEDBACK_BATCH_LIMIT } = require('../utils/errors');
 
 // Allow timezone override via env var so multi-region deployments work without code changes
 const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
@@ -140,8 +141,8 @@ async function sendFeedbackRequests() {
         AND NOT EXISTS (
           SELECT 1 FROM appointment_feedback af WHERE af.appointment_id=a.id
         )
-      LIMIT 10
-    `);
+      LIMIT $1
+    `, [FEEDBACK_BATCH_LIMIT]);
 
     for (const appt of appts.rows) {
       try {

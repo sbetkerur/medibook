@@ -77,6 +77,20 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   const lowerInput = input.toLowerCase();
   const choice = buttonId || lowerInput;
 
+  // ── OPTED-OUT check — silently drop all messages from opted-out patients ──
+  // We check opted_out before any state handling so opted-out patients can
+  // still send STOP/START but get no other bot responses.
+  if (!/^(stop|unsubscribe|opt.?out|block|start)$/i.test(input)) {
+    try {
+      const optedR = await tenantQuery(schema,
+        `SELECT opted_out FROM patients WHERE phone=$1`, [phone]);
+      if (optedR.rows[0]?.opted_out === true) {
+        logger.info(`Dropped message from opted-out patient`, { phone });
+        return;
+      }
+    } catch (_) {} // non-fatal — proceed if table or column missing
+  }
+
   // ── OPT-OUT handler ─────────────────────────────────────────
   if (/^(stop|unsubscribe|opt.?out|block)$/i.test(input)) {
     await tenantQuery(schema,
@@ -109,7 +123,6 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
       : {};
     // Decrypt context if stored encrypted (see bot/utils.js updateSession)
     if (raw && raw._enc) {
-      const { decrypt } = require('../utils/encryption');
       const decrypted = decrypt(raw._enc);
       ctx = decrypted ? JSON.parse(decrypted) : {};
     } else {
@@ -313,7 +326,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   }
   if (session.state === STATES.COLLECT_GENDER) {
     ctx.patient_gender = /male|btn_0/i.test(choice) ? 'male' : /female|btn_1/i.test(choice) ? 'female' : 'other';
-    await send.text('📧 *Email Address* _(optional)_\n\nShare your email to receive a booking confirmation:\n\nOr reply *Skip* to continue without it.');
+    await send.buttons('📧 *Email Address* _(optional)_\n\nShare your email to receive a booking confirmation, or tap Skip to continue:', ['⏭ Skip']);
     await updateSession(schema, phone, STATES.COLLECT_EMAIL, ctx);
     return;
   }
@@ -322,7 +335,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
       if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input)) {
         ctx.patient_email = input.toLowerCase();
       } else {
-        await send.text('Invalid email format. Please enter a valid email or reply *Skip* to skip.');
+        await send.buttons('Invalid email format. Please enter a valid email address, or tap Skip:', ['⏭ Skip']);
         return;
       }
     }
@@ -410,8 +423,12 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
-  const ratingMap = { btn_0: 1, btn_1: 2, btn_2: 3, btn_3: 4, btn_4: 5 };
-  let rating = ratingMap[choice] || parseInt(input);
+  // Buttons are ['⭐ 1 — Poor', '⭐⭐⭐ 3 — Okay', '⭐⭐⭐⭐⭐ 5 — Great'] (3 buttons).
+  // WhatsApp button IDs include a timestamp suffix (e.g. btn_0_1712345678),
+  // so we match by prefix rather than exact key.
+  const ratingMap = { btn_0: 1, btn_1: 3, btn_2: 5 };
+  const matchedKey = Object.keys(ratingMap).find(k => (choice || '').startsWith(k + '_') || choice === k);
+  let rating = matchedKey ? ratingMap[matchedKey] : parseInt(input, 10);
   if (!rating || rating < 1 || rating > 5) {
     await send.buttons(
       `Please reply with a number from *1 to 5*:\n\n1 ⭐ — Poor\n3 ⭐⭐⭐ — Average\n5 ⭐⭐⭐⭐⭐ — Excellent`,

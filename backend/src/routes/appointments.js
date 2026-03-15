@@ -44,7 +44,8 @@ router.get('/appointments', async (req, res) => {
       tenantQuery(s, `SELECT COUNT(*) FROM appointments a WHERE ${where.join(' AND ')}`, countParams),
     ]);
     const total = parseInt(countR.rows[0]?.count || 0);
-    res.json({ appointments: r.rows, total, page: safePage, limit: safeLimit, has_more: r.rows.length === safeLimit });
+    const offset = (safePage - 1) * safeLimit;
+    res.json({ appointments: r.rows, total, page: safePage, limit: safeLimit, has_more: offset + r.rows.length < total });
   } catch (err) { handleError(res, err); }
 });
 
@@ -80,6 +81,78 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
         .catch(e => logger.warn('Medical history audit log failed', { error: e.message }));
     }
     res.json({ appointment: r.rows[0], patient_history: history.rows });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── BULK STATUS UPDATE ────────────────────────────────────────
+// IMPORTANT: this route must be declared before /appointments/:id so Express
+// does not treat the literal string "bulk" as a UUID parameter.
+router.patch('/appointments/bulk', adminOnly, async (req, res) => {
+  try {
+    const { ids, status, cancellation_reason } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids array required' });
+    if (!status || !VALID_APPOINTMENT_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_APPOINTMENT_STATUSES.join(', ')}` });
+    }
+    if (status === 'cancelled' && !cancellation_reason) {
+      return res.status(400).json({ error: 'cancellation_reason required when bulk cancelling' });
+    }
+    if (ids.length > 50) return res.status(400).json({ error: 'Cannot bulk update more than 50 appointments at once' });
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!ids.every(id => UUID_RE.test(id))) return res.status(400).json({ error: 'All ids must be valid UUIDs' });
+    const s = req.tenant.schema_name;
+
+    let updated;
+    if (status === 'cancelled') {
+      // Wrap cancel + slot releases in a single transaction to avoid partial state
+      // (e.g. some appointments cancelled but their slots still locked) on DB error.
+      updated = await tenantTransaction(s, async (client) => {
+        const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+        const statusParam = ids.length + 1;
+        const r = await client.query(`
+          UPDATE appointments SET status=$${statusParam}, updated_at=NOW(),
+            cancellation_reason=$${statusParam + 1}, cancelled_at=NOW(), cancelled_by_user_id=$${statusParam + 2}
+          WHERE id IN (${placeholders}) AND status='confirmed' RETURNING id, slot_id, doctor_id
+        `, [...ids, status, cancellation_reason, req.user.id]);
+
+        const slotIds = r.rows.map(a => a.slot_id).filter(Boolean);
+        if (slotIds.length) {
+          const slotPlaceholders = slotIds.map((_, i) => `$${i + 1}`).join(',');
+          await client.query(
+            `UPDATE time_slots SET status='available' WHERE id IN (${slotPlaceholders}) AND status='booked'`,
+            slotIds
+          );
+        }
+        return r;
+      });
+    } else {
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+      const statusParam = ids.length + 1;
+      updated = await tenantQuery(s, `
+        UPDATE appointments SET status=$${statusParam}, updated_at=NOW()
+        WHERE id IN (${placeholders}) RETURNING id, slot_id, doctor_id
+      `, [...ids, status]);
+    }
+
+    if (status === 'cancelled') {
+      // Notify waitlist for each unique doctor
+      try {
+        const { notifyWaitlistForDoctor } = require('../services/bot/utils');
+        const seen = new Set();
+        for (const appt of updated.rows) {
+          if (appt.doctor_id && !seen.has(appt.doctor_id)) {
+            seen.add(appt.doctor_id);
+            notifyWaitlistForDoctor(s, appt.doctor_id, req.tenant)
+              .catch(e => logger.warn('Bulk waitlist notification failed', { error: e.message }));
+          }
+        }
+      } catch (e) {
+        logger.warn('Bulk waitlist notification skipped', { error: e.message });
+      }
+    }
+    await writeAuditLog(s, req.user.id, req.user.role, 'BULK_UPDATE_APPOINTMENTS', 'appointment', null,
+      null, { ids, status }, req.ip);
+    res.json({ updated: updated.rows.length, ids: updated.rows.map(a => a.id) });
   } catch (err) { handleError(res, err); }
 });
 
@@ -197,9 +270,13 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
     `, [patient_phone, patient_name || null]);
     const patientId = patientR.rows[0].id;
     if (slot_id) {
+      // Verify slot belongs to the specified doctor AND hospital before locking it
       const slotR = await tenantQuery(s,
-        `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`, [slot_id]);
-      if (!slotR.rows[0]) return res.status(409).json({ error: 'Slot is no longer available' });
+        `UPDATE time_slots SET status='booked'
+         WHERE id=$1 AND status='available' AND doctor_id=$2 AND hospital_id=$3
+         RETURNING id`,
+        [slot_id, doctor_id, hospital_id]);
+      if (!slotR.rows[0]) return res.status(409).json({ error: 'Slot is no longer available or does not belong to the specified doctor' });
     }
     const bookingId = 'MB' + Date.now().toString(36).toUpperCase().slice(-6);
     const r = await tenantQuery(s, `
@@ -210,56 +287,6 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_APPOINTMENT', 'appointment', r.rows[0].id,
       null, { booking_id: bookingId, doctor_id, appointment_date }, req.ip);
     res.status(201).json({ appointment: r.rows[0], booking_id: bookingId });
-  } catch (err) { handleError(res, err); }
-});
-
-// ── BULK STATUS UPDATE ────────────────────────────────────────
-router.patch('/appointments/bulk', adminOnly, async (req, res) => {
-  try {
-    const { ids, status, cancellation_reason } = req.body;
-    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids array required' });
-    if (!status || !VALID_APPOINTMENT_STATUSES.includes(status)) {
-      return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_APPOINTMENT_STATUSES.join(', ')}` });
-    }
-    if (status === 'cancelled' && !cancellation_reason) {
-      return res.status(400).json({ error: 'cancellation_reason required when bulk cancelling' });
-    }
-    if (ids.length > 50) return res.status(400).json({ error: 'Cannot bulk update more than 50 appointments at once' });
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (!ids.every(id => UUID_RE.test(id))) return res.status(400).json({ error: 'All ids must be valid UUIDs' });
-    const s = req.tenant.schema_name;
-    const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
-    const statusParam = ids.length + 1;
-    const extraUpdates = status === 'cancelled' ? `, cancellation_reason=$${statusParam + 1}, cancelled_at=NOW(), cancelled_by_user_id=$${statusParam + 2}` : '';
-    const extraParams = status === 'cancelled' ? [cancellation_reason, req.user.id] : [];
-    const r = await tenantQuery(s, `
-      UPDATE appointments SET status=$${statusParam}, updated_at=NOW()${extraUpdates}
-      WHERE id IN (${placeholders}) RETURNING id, slot_id
-    `, [...ids, status, ...extraParams]);
-    if (status === 'cancelled') {
-      const slotIds = r.rows.map(a => a.slot_id).filter(Boolean);
-      for (const slotId of slotIds) {
-        await tenantQuery(s, `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`, [slotId])
-          .catch(() => {});
-      }
-      // Notify waitlist for each unique doctor/date combination
-      try {
-        const { notifyWaitlistForDoctor } = require('../services/bot/utils');
-        const seen = new Set();
-        for (const appt of r.rows) {
-          if (appt.doctor_id && !seen.has(appt.doctor_id)) {
-            seen.add(appt.doctor_id);
-            notifyWaitlistForDoctor(s, appt.doctor_id, req.tenant)
-              .catch(e => logger.warn('Bulk waitlist notification failed', { error: e.message }));
-          }
-        }
-      } catch (e) {
-        logger.warn('Bulk waitlist notification skipped', { error: e.message });
-      }
-    }
-    await writeAuditLog(s, req.user.id, req.user.role, 'BULK_UPDATE_APPOINTMENTS', 'appointment', null,
-      null, { ids, status }, req.ip);
-    res.json({ updated: r.rows.length, ids: r.rows.map(a => a.id) });
   } catch (err) { handleError(res, err); }
 });
 

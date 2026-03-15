@@ -218,6 +218,7 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
+       AND (slot_date > CURRENT_DATE OR start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time)
      ORDER BY start_time`,
     [ctx.doctor_id, choice]);
 
@@ -299,7 +300,6 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
   let feeText = '';
   if (ctx.doctor_id && ctx.hospital_name) {
     try {
-      const { tenantQuery } = require('../../db');
       const feeR = await tenantQuery(schema,
         `SELECT consultation_fee FROM doctors WHERE id=$1`, [ctx.doctor_id]);
       const fee = feeR.rows[0]?.consultation_fee;
@@ -418,7 +418,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       `👨‍⚕️ Dr. ${ctx.doctor_name}\n` +
       `🏥 ${ctx.hospital_name}\n` +
       `📅 ${dateLabel}\n` +
-      `⏰ ${ctx.appointment_time.slice(0, 5)}\n\n` +
+      `⏰ ${(ctx.appointment_time || '').slice(0, 5)}\n\n` +
       `📌 *Please save your Booking ID.* You'll need it to reschedule or cancel.\n\n` +
       `We'll remind you 24 hours before. See you then! 😊`
     ),

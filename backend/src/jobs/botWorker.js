@@ -7,6 +7,7 @@ const logger = require('../utils/logger');
 let botQueue = null;
 let dlQueue = null;  // dead-letter queue for failed jobs
 let emailQueue = null;
+let botWorkerInstance = null; // stored so shutdown() can close it
 let emailWorker = null;
 let queueAvailable = false;
 let workerStarted = false;
@@ -25,6 +26,10 @@ function createConnection() {
 }
 
 async function initQueue() {
+  if (process.env.DISABLE_QUEUE === 'true') {
+    logger.info('DISABLE_QUEUE=true — skipping BullMQ, using synchronous bot processing');
+    return false;
+  }
   try {
     const connection = createConnection();
     await connection.connect();
@@ -98,7 +103,7 @@ function startBotWorker() {
   workerStarted = true;
 
   const connection = createConnection();
-  const worker = new Worker('bot-messages', async (job) => {
+  botWorkerInstance = new Worker('bot-messages', async (job) => {
     const { phone, text, buttonId, tenantId } = job.data;
     const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [tenantId]);
     if (!r.rows[0]) return;
@@ -108,7 +113,7 @@ function startBotWorker() {
     concurrency: 5,
   });
 
-  worker.on('failed', async (job, err) => {
+  botWorkerInstance.on('failed', async (job, err) => {
     logger.error('Bot job failed', { jobId: job?.id, attempts: job?.attemptsMade, error: err.message });
     // Move to dead-letter queue after all retries exhausted
     if (job && job.attemptsMade >= (job.opts?.attempts || 3) && dlQueue) {
@@ -131,7 +136,7 @@ function startBotWorker() {
     const emailConn = createConnection();
     const emailSvc = require('../services/email');
     emailWorker = new Worker('email-jobs', async (job) => {
-      const { type, data: jobData } = job;
+      const type = job.name;
       if (type === 'booking_confirmation') {
         await emailSvc.sendBookingConfirmation(job.data.toEmail, job.data.data);
       } else if (type === 'reminder') {
@@ -153,7 +158,7 @@ function startBotWorker() {
   }
 
   logger.info('BullMQ bot worker started (concurrency: 5)');
-  return worker;
+  return botWorkerInstance;
 }
 
 function isQueueAvailable() {
@@ -183,13 +188,15 @@ async function getQueueStats() {
 
 async function shutdown() {
   try {
+    // Close workers first so in-flight jobs finish before queues are torn down
+    if (botWorkerInstance) await botWorkerInstance.close();
     if (emailWorker) await emailWorker.close();
     if (botQueue) await botQueue.close();
     if (dlQueue) await dlQueue.close();
     if (emailQueue) await emailQueue.close();
-    logger.info('BullMQ queues closed');
+    logger.info('BullMQ workers and queues closed');
   } catch (err) {
-    logger.warn('Error closing BullMQ queues on shutdown', { error: err.message });
+    logger.warn('Error closing BullMQ on shutdown', { error: err.message });
   }
 }
 

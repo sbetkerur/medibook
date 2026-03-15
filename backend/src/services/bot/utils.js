@@ -139,8 +139,10 @@ async function notifyWaitlistForDoctor(schema, doctorId, tenant) {
         );
         await tenantQuery(schema,
           `UPDATE bot_sessions SET state='main_menu', context='{}', last_activity=NOW() WHERE phone=$1`, [entry.phone]);
+        // Remove entry from waiting list after notifying — this lets the patient
+        // re-join if they miss this slot and want notifications for future openings.
         await tenantQuery(schema,
-          `UPDATE waiting_list SET notified=true WHERE id=$1`, [entry.id]);
+          `DELETE FROM waiting_list WHERE id=$1`, [entry.id]);
       } catch (_) {}
     }
   } catch (_) {}
