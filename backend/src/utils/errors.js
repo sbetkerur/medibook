@@ -28,7 +28,7 @@ const VALID_ROLES = ['admin', 'staff'];
 const VALID_APPOINTMENT_STATUSES = ['confirmed', 'completed', 'cancelled', 'no_show'];
 
 const SLOT_LOOKAHEAD_DAYS = 14;
-const CRON_LOOKAHEAD_DAYS = 7;
+const CRON_LOOKAHEAD_DAYS = 60; // must be >= SLOT_LOOKAHEAD_DAYS to keep a rolling buffer
 const FEEDBACK_BATCH_LIMIT = 10;
 
 // Centralised magic-number constants — import from here instead of hard-coding

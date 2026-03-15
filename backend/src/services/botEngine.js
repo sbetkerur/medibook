@@ -95,13 +95,13 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   if (/^(stop|unsubscribe|opt.?out|block)$/i.test(input)) {
     await tenantQuery(schema,
       `UPDATE patients SET opted_out=true, updated_at=NOW() WHERE phone=$1`, [phone])
-      .catch(() => {});
+      .catch(err => logger.warn('Opt-out patient update failed', { phone, error: err.message }));
     await tenantQuery(schema,
       `UPDATE bot_sessions SET state='idle', context='{}' WHERE phone=$1`, [phone])
-      .catch(() => {});
+      .catch(err => logger.warn('Opt-out session reset failed', { phone, error: err.message }));
     await wa.sendText(phone,
       `You have been unsubscribed from ${tenant.name} WhatsApp notifications.\n\nTo re-subscribe, reply *START*.`,
-      waToken, waPhoneId).catch(() => {});
+      waToken, waPhoneId).catch(err => logger.warn('Opt-out reply failed to send', { phone, error: err.message }));
     logger.info(`Patient ${phone} opted out from ${tenant.name}`);
     return;
   }
@@ -332,7 +332,9 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   }
   if (session.state === STATES.COLLECT_EMAIL) {
     if (!/skip/i.test(input) && input.length > 0) {
-      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input)) {
+      // Stricter email regex: requires valid local part, domain with at least one dot,
+      // and a TLD of 2+ chars. Rejects `test@.com`, `a@b.c`, consecutive dots in domain.
+      if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(input) && !/\.{2,}/.test(input)) {
         ctx.patient_email = input.toLowerCase();
       } else {
         await send.buttons('Invalid email format. Please enter a valid email address, or tap Skip:', ['⏭ Skip']);
@@ -463,15 +465,17 @@ async function handleFeedbackComment(phone, schema, send, ctx, input) {
 
 async function triggerFeedback(schemaName, phone, appointmentId, patientId, doctorName) {
   try {
-    await tenantQuery(schemaName,
-      `UPDATE bot_sessions SET state=$1, context=$2, last_activity=NOW() WHERE phone=$3`,
-      [
-        STATES.COLLECT_FEEDBACK_RATING,
-        JSON.stringify({ feedback_appointment_id: appointmentId, feedback_patient_id: patientId, doctor_name: doctorName }),
-        phone
-      ]
-    );
-  } catch (_) {}
+    // Use updateSession() so the context is encrypted (protects appointment/patient IDs)
+    // and the session size check is applied consistently.
+    const { updateSession: _updateSession } = require('./bot/utils');
+    await _updateSession(schemaName, phone, STATES.COLLECT_FEEDBACK_RATING, {
+      feedback_appointment_id: appointmentId,
+      feedback_patient_id: patientId,
+      doctor_name: doctorName,
+    });
+  } catch (err) {
+    logger.warn('triggerFeedback failed', { phone, error: err.message });
+  }
 }
 
 module.exports = { handle, triggerFeedback };

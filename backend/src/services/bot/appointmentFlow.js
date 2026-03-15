@@ -2,7 +2,7 @@
 
 const { tenantQuery, tenantTransaction } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
-const { zonedTimeToUtc } = require('date-fns-tz');
+const { fromZonedTime } = require('date-fns-tz');
 const logger = require('../../utils/logger');
 const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 
@@ -95,7 +95,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
   // 2-hour minimum notice check — appointment_time is stored in IST; parse it
   // as IST before comparing to the current UTC wall-clock time.
   const nowDateR = new Date();
-  const apptDateTimeR = zonedTimeToUtc(`${a.appointment_date}T${a.appointment_time}`, IST);
+  const apptDateTimeR = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
   const hoursUntilR = (apptDateTimeR - nowDateR) / (1000 * 60 * 60);
   if (hoursUntilR < 2 && hoursUntilR >= 0) {
     await send.text(`⚠️ Rescheduling must be done at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
@@ -270,7 +270,7 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
   // 2-hour minimum notice check — appointment_time is stored in IST; parse it
   // as IST before comparing to the current UTC wall-clock time.
   const nowDate = new Date();
-  const apptDateTime = zonedTimeToUtc(`${a.appointment_date}T${a.appointment_time}`, IST);
+  const apptDateTime = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
   const hoursUntilAppt = (apptDateTime - nowDate) / (1000 * 60 * 60);
   if (hoursUntilAppt < 2 && hoursUntilAppt >= 0) {
     await send.text(`⚠️ Cancellations must be made at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
@@ -299,7 +299,9 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
 
 async function handleCancelReason(phone, schema, tenant, send, ctx, input, buttonId) {
   const reasonMap = { btn_0: 'Doctor not available', btn_1: 'Schedule conflict', btn_2: 'Other' };
-  ctx.cancel_reason = reasonMap[buttonId] || input || 'Not specified';
+  // WhatsApp button IDs include a timestamp suffix (e.g. btn_0_1712345678), so match by prefix
+  const matchedKey = Object.keys(reasonMap).find(k => (buttonId || '').startsWith(k + '_') || buttonId === k);
+  ctx.cancel_reason = (matchedKey ? reasonMap[matchedKey] : null) || input || 'Not specified';
   let confirmDateLabel = ctx.cancel_date;
   try { confirmDateLabel = format(parseISO(ctx.cancel_date), 'EEE, d MMM'); } catch {}
   await send.buttons(

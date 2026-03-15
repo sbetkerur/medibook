@@ -1,4 +1,12 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// Return DATE columns as ISO date strings (e.g. "2024-03-15") instead of
+// JavaScript Date objects. Without this, node-pg returns Date objects at
+// midnight UTC, which when used in template literals like
+// `${a.appointment_date}T${a.appointment_time}` produces invalid ISO strings
+// that cause fromZonedTime() to return Invalid Date — breaking the 2-hour
+// cancel/reschedule notice check.
+types.setTypeParser(1082, (val) => val); // OID 1082 = date
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -13,12 +21,15 @@ pool.on('error', (err) => {
   console.error('Unexpected DB pool error', err.message);
 });
 
-// Log a warning when the pool is nearly exhausted (≥ 80% of max connections in use)
-// so operators have early warning before requests start timing out.
+// Log a warning when the pool is nearly exhausted (≥ 80% of max connections in use).
+// Debounce to 30s to avoid log spam when connections churn rapidly under load.
 const POOL_WARN_THRESHOLD = Math.floor((parseInt(process.env.DB_POOL_MAX || '20')) * 0.8);
+let _lastPoolWarnTime = 0;
 pool.on('connect', () => {
   const total = pool.totalCount;
-  if (total >= POOL_WARN_THRESHOLD) {
+  const now = Date.now();
+  if (total >= POOL_WARN_THRESHOLD && now - _lastPoolWarnTime > 30000) {
+    _lastPoolWarnTime = now;
     console.warn(`DB pool nearing capacity: ${total}/${pool.options.max} connections in use`);
   }
 });

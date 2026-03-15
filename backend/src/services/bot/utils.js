@@ -143,9 +143,13 @@ async function notifyWaitlistForDoctor(schema, doctorId, tenant) {
         // re-join if they miss this slot and want notifications for future openings.
         await tenantQuery(schema,
           `DELETE FROM waiting_list WHERE id=$1`, [entry.id]);
-      } catch (_) {}
+      } catch (err) {
+        logger.warn('Waitlist notification failed for entry', { phone: entry.phone, waitlistId: entry.id, error: err.message });
+      }
     }
-  } catch (_) {}
+  } catch (err) {
+    logger.warn('notifyWaitlistForDoctor failed', { schema, doctorId, error: err.message });
+  }
 }
 
 module.exports = {

@@ -312,11 +312,13 @@ if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT ==
       waModule.sendButtons = async (to, text, buttons) => { responses.push({ type: 'buttons', text, buttons }); };
       waModule.sendList = async (to, text, label, sections) => { responses.push({ type: 'list', text, label, sections }); };
 
-      await botEngine.handle({ phone, text: message, buttonId: button_id, tenant });
-
-      waModule.sendText = origSendText;
-      waModule.sendButtons = origSendButtons;
-      waModule.sendList = origSendList;
+      try {
+        await botEngine.handle({ phone, text: message, buttonId: button_id, tenant });
+      } finally {
+        waModule.sendText = origSendText;
+        waModule.sendButtons = origSendButtons;
+        waModule.sendList = origSendList;
+      }
 
       res.json({ ok: true, phone, message, tenant: tenant.name, responses });
     } catch (err) {

@@ -30,6 +30,8 @@ async function startBooking(phone, schema, tenant, send, ctx) {
     return askVisitType(phone, schema, send, ctx);
   }
 
+  // Cache hospital list in context to avoid a DB re-fetch on every user input
+  ctx._hospitals = hospitals.rows;
   const sections = [{
     title: 'Our Locations',
     rows: hospitals.rows.map(h => ({ id: h.id, title: h.name, description: h.city || '' }))
@@ -47,8 +49,14 @@ async function askVisitType(phone, schema, send, ctx) {
 }
 
 async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, input) {
-  const hospitals = await tenantQuery(schema, `SELECT id, name FROM hospitals WHERE is_active=true`);
-  const h = hospitals.rows.find(r =>
+  // Use the hospital list cached in ctx._hospitals (set during startBooking).
+  // Fall back to a DB fetch only if cache is missing (e.g. old session before this change).
+  let hospitalRows = ctx._hospitals;
+  if (!hospitalRows) {
+    const r = await tenantQuery(schema, `SELECT id, name FROM hospitals WHERE is_active=true`);
+    hospitalRows = r.rows;
+  }
+  const h = hospitalRows.find(r =>
     r.id === choice || r.name.toLowerCase().includes(input.toLowerCase())
   );
   if (!h) { await send.text('Please select a location from the options.'); return; }
