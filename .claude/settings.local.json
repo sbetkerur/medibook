@@ -57,7 +57,14 @@
       "Bash(PROJECT_ID=\"6529dea0-f461-4ba6-8e0d-3b1c158888ef\")",
       "Bash(python3 -m json.tool)",
       "Bash(grep -E '\\\\.js$')",
-      "Bash(grep -r \"TODO\\\\|FIXME\\\\|HACK\\\\|XXX\" /c/Users/sande/WhatsAppHospitalProject/medibook/backend/src --include=*.js)"
+      "Bash(grep -r \"TODO\\\\|FIXME\\\\|HACK\\\\|XXX\" /c/Users/sande/WhatsAppHospitalProject/medibook/backend/src --include=*.js)",
+      "Bash(python3:*)",
+      "Bash(python -c \"import sys,json; lines=[l for l in sys.stdin if l.strip\\(\\)]; last=json.loads\\(lines[-1]\\) if lines else {}; print\\(''''DONE'''' if last.get\\(''''message'''',{}\\).get\\(''''stop_reason''''\\)==''''end_turn'''' else ''''RUNNING''''\\)\")",
+      "Bash(where chrome:*)",
+      "Bash(where chromium:*)",
+      "Bash(where \"Google Chrome\")",
+      "Read(//c/Users/sande/WhatsAppHospitalProject/medibook/$LOCALAPPDATA/Google/Chrome/Application/**)",
+      "Read(//c/Program Files/Chromium/Application/**)"
     ]
   }
 }

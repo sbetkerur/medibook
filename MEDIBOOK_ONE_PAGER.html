@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MediBook — One Pager | Available for Acquisition</title>
+  <title>MediBook — One Pager | WhatsApp Booking SaaS for Dental Clinics</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
@@ -107,7 +107,7 @@
       margin-top: 2px;
     }
 
-    .acquisition-badge {
+    .saas-badge {
       display: flex;
       align-items: center;
       gap: 6px;
@@ -121,7 +121,7 @@
       text-transform: uppercase;
     }
 
-    .acq-dot {
+    .saas-dot {
       width: 6px;
       height: 6px;
       background: var(--blue);
@@ -620,24 +620,24 @@
   <!-- ── HEADER ── -->
   <div class="header">
     <div class="header-left">
-      <div class="logo-box">🏥</div>
+      <div class="logo-box">🦷</div>
       <div class="logo-text">
         <div class="name">MediBook</div>
-        <div class="tagline">WhatsApp Appointment SaaS for Hospitals &amp; Clinics · India</div>
+        <div class="tagline">WhatsApp Appointment SaaS for Dental Clinics · India</div>
       </div>
     </div>
-    <div class="acquisition-badge">
-      <div class="acq-dot"></div>
-      Available for Acquisition
+    <div class="saas-badge">
+      <div class="saas-dot"></div>
+      Now Live · Free Trial Available
     </div>
   </div>
 
   <!-- ── PITCH STRIP ── -->
   <div class="pitch-strip">
     <p>
-      WhatsApp-native appointment booking SaaS for Indian hospitals and clinics —
-      <span>fully built, production-tested, and ready to deploy on day one.</span>
-      Complete IP transfer · Multi-tenant · Full source code included.
+      WhatsApp-native appointment booking SaaS for Indian dental clinics —
+      <span>no app downloads, no missed calls, no no-shows.</span>
+      Get your clinic live on WhatsApp in under 24 hours. Free trial included.
     </p>
   </div>
 
@@ -651,31 +651,31 @@
       <ul class="feature-list">
         <li>
           <span class="feat-icon">💬</span>
-          <span>Patients book appointments by chatting on WhatsApp — no app download, no forms, no hold music. Powered by Meta WhatsApp Cloud API with interactive buttons and list pickers.</span>
+          <span>Patients book appointments by chatting on WhatsApp — no app download, no forms, no hold music. Dental intent detection lets patients type "root canal", "braces", or "whitening" and the bot auto-selects the right specialty. Voice messages are transcribed via OpenAI Whisper and processed as text. Natural date shortcuts ("tomorrow", "Monday") are resolved automatically.</span>
         </li>
         <li>
-          <span class="feat-icon">🏥</span>
-          <span>Each hospital or clinic gets their own WhatsApp bot, admin dashboard, and isolated PostgreSQL schema. True multi-tenant SaaS — one platform serving hundreds of practices simultaneously.</span>
+          <span class="feat-icon">🦷</span>
+          <span>Each dental clinic or chain gets their own WhatsApp bot, admin dashboard, and isolated PostgreSQL schema. True multi-tenant SaaS — one platform serving hundreds of dental practices simultaneously. Incomplete bookings are saved and resumed within 24 hours; when slots are full, patients join a waitlist and are notified via WhatsApp when a slot opens.</span>
         </li>
         <li>
           <span class="feat-icon">🔔</span>
-          <span>Automated appointment reminders via WhatsApp at 24 hours and 2 hours before the visit, plus booking confirmation emails via Resend — reducing no-shows without any staff effort.</span>
+          <span>Automated WhatsApp reminders at 24 hours and 2 hours before every visit, with department-specific pre-visit checklists. Bot tracks patient YES/NO confirmation replies. Post-appointment 5-star rating and comment collected automatically via WhatsApp — no staff effort required.</span>
         </li>
         <li>
           <span class="feat-icon">📊</span>
-          <span>Clinic admins manage doctors, schedules, appointments, and patients via a Next.js dashboard with real-time SSE updates, analytics, CSV export, and slot generation.</span>
+          <span>Clinic admins manage doctors, schedules, appointments, and patients via a Next.js dashboard with real-time SSE live updates, analytics (no-show rates, revenue per dentist, average feedback rating), CSV export, bulk actions, and calendar view.</span>
         </li>
         <li>
           <span class="feat-icon">👨‍⚕️</span>
-          <span>Dedicated portals for doctors (today's schedule) and reception staff (check-in), plus a service catalog and holiday management — ready to deploy across any medical specialty.</span>
+          <span>Dedicated portals for dentists (today's schedule) and reception staff (check-in). Dental service catalog with custom pricing (cleanings, root canals, implants, braces). Holiday and doctor leave management auto-blocks affected slots. Role-based access (admin/staff/doctor) with full audit logs.</span>
         </li>
       </ul>
 
       <div class="sec-header">Market Opportunity</div>
       <div class="stats-grid">
         <div class="stat-box">
-          <div class="snum">70K+</div>
-          <div class="slabel">Hospitals &amp; clinics in India</div>
+          <div class="snum">30K+</div>
+          <div class="slabel">Dental Clinics in India (IDA)</div>
         </div>
         <div class="stat-box">
           <div class="snum">500M</div>
@@ -688,8 +688,8 @@
       </div>
       <div style="background: #FFF8E8; border: 1px solid #FDE68A; border-radius: 7px; padding: 9px 12px; margin-bottom: 16px;">
         <p style="font-size: 10.5px; font-weight: 600; color: #92400E; line-height: 1.5;">
-          TAM: 0.3% of 70K clinics × ₹1,999/mo = <strong>₹4.2 Cr ARR</strong> at 210 clinics.
-          At 3% penetration = <strong>₹42 Cr ARR.</strong>
+          TAM: 0.3% of 30K dental clinics × ₹1,999/mo = <strong>₹1.8 Cr ARR</strong> at 90 clinics.
+          At 3% penetration = <strong>₹18 Cr ARR.</strong>
         </p>
       </div>
 
@@ -700,6 +700,7 @@
         <span class="pill blue">PostgreSQL 15</span>
         <span class="pill blue">Redis + BullMQ</span>
         <span class="pill blue">Meta WhatsApp API</span>
+        <span class="pill blue">OpenAI Whisper</span>
         <span class="pill">Resend Email API</span>
         <span class="pill">SSE Real-time</span>
         <span class="pill">Tailwind CSS</span>
@@ -712,28 +713,28 @@
         <span class="pill">Sentry-compatible</span>
       </div>
 
-      <div class="sec-header">Why Buy vs. Build</div>
+      <div class="sec-header">Why MediBook vs. Building In-House</div>
       <div class="why-box">
-        <div class="wb-title">Time and cost comparison</div>
+        <div class="wb-title">What clinics save by choosing MediBook</div>
         <div class="why-row">
-          <div class="why-label">Dev Time</div>
+          <div class="why-label">Save Dev Time</div>
           <div class="why-bar"><div class="why-bar-fill" style="width: 92%;"></div></div>
           <div class="why-val">12–18 mo saved</div>
         </div>
         <div class="why-row">
-          <div class="why-label">Dev Cost</div>
+          <div class="why-label">Save Dev Cost</div>
           <div class="why-bar"><div class="why-bar-fill" style="width: 85%;"></div></div>
           <div class="why-val">₹25–40L saved</div>
         </div>
         <div class="why-row">
-          <div class="why-label">WA API</div>
+          <div class="why-label">WA Integration</div>
           <div class="why-bar"><div class="why-bar-fill" style="width: 78%;"></div></div>
-          <div class="why-val">100s of hrs saved</div>
+          <div class="why-val">100s hrs saved</div>
         </div>
         <div class="why-row">
-          <div class="why-label">Execution Risk</div>
+          <div class="why-label">Go Live In</div>
           <div class="why-bar"><div class="why-bar-fill" style="width: 95%; background: linear-gradient(90deg, #16A34A, #22C55E);"></div></div>
-          <div class="why-val" style="color: #16A34A;">Eliminated</div>
+          <div class="why-val" style="color: #16A34A;">Under 24 hrs</div>
         </div>
       </div>
 
@@ -742,47 +743,55 @@
     <!-- ── RIGHT COLUMN ── -->
     <div class="col col-right">
 
-      <div class="sec-header">What's Included in the Sale</div>
+      <div class="sec-header">What's Included in Your Plan</div>
       <ul class="checklist">
         <li>
           <div class="chk">✓</div>
-          <span><strong>Full backend source code</strong> — Node.js + Express API, 10+ route files, middleware, services, background jobs</span>
+          <span><strong>WhatsApp booking bot</strong> — Patients book, reschedule, and cancel by messaging your clinic. Dental intent detection, voice message support (Whisper), session resumption, emergency shortcut, and STOP/START opt-out built in</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>Complete frontend app</strong> — Next.js 14 admin, doctor portal, reception portal, super admin panel, tenant wizard</span>
+          <span><strong>Admin dashboard</strong> — Real-time SSE live updates, calendar view, bulk appointment actions, bot tester, and audit logs — all in one web portal</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>WhatsApp bot engine</strong> — 15-state conversational flow with booking, cancel, reschedule via BullMQ queue</span>
+          <span><strong>Doctor &amp; reception portals</strong> — Dentist sees today's schedule; reception staff handles walk-in check-ins with role-based permissions</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>Email + SMS notifications</strong> — Booking confirmations via Resend, open tracking, bounce handling, SMS service stub</span>
+          <span><strong>Automated reminders + feedback</strong> — WhatsApp reminders at 24h and 2h with department-specific pre-visit checklists; 5-star post-appointment rating collected automatically</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>Real-time dashboard</strong> — SSE (Server-Sent Events) stream via Redis pub/sub; live appointment updates across tabs</span>
+          <span><strong>Slot generation engine</strong> — Schedules auto-generate from each doctor's working hours; holiday and doctor leave management auto-blocks affected slots</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>PostgreSQL schemas &amp; migrations</strong> — Multi-tenant schema-per-tenant architecture; service catalog; nightly pg_dump backup cron</span>
+          <span><strong>Waiting list management</strong> — When slots fill up, patients auto-join a waitlist and receive a WhatsApp notification the moment a slot becomes available</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>Super admin panel</strong> — Manage all tenants, plans, WhatsApp credentials; new tenant creation wizard</span>
+          <span><strong>Patient feedback system</strong> — 5-star ratings and comments collected via WhatsApp after every appointment; viewable in the analytics dashboard</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>Marketing strategy</strong> — 50+ page go-to-market plan (HTML + PDF + PPTX)</span>
+          <span><strong>Dental service catalog</strong> — Define your services, durations, and fees (General Cleaning, Root Canal, Braces, Implants, Whitening, etc.) for accurate booking and pricing</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>Full technical documentation</strong> — Architecture, API reference, deployment guides</span>
+          <span><strong>Audit logs &amp; staff roles</strong> — Role-based access for admin, staff, and doctor; every login, edit, and cancellation is logged for compliance</span>
         </li>
         <li>
           <div class="chk">✓</div>
-          <span><strong>IP Transfer Agreement</strong> — All rights transferred: code, brand, trademarks</span>
+          <span><strong>Multi-branch support</strong> — Manage multiple clinic locations under one account on Growth plan and above</span>
+        </li>
+        <li>
+          <div class="chk">✓</div>
+          <span><strong>Booking confirmations</strong> — Instant WhatsApp + email confirmation via Resend sent to every patient on booking</span>
+        </li>
+        <li>
+          <div class="chk">✓</div>
+          <span><strong>Analytics &amp; CSV export</strong> — No-show rates, revenue per dentist, average feedback rating, appointment trends by doctor/day/status; export patient lists anytime</span>
         </li>
       </ul>
 
@@ -825,23 +834,28 @@
       </table>
       <p style="font-size: 9.5px; color: var(--gray-400); margin-bottom: 16px;">★ 100 Growth clinics = ₹1,99,900 MRR = ₹23,98,800 ARR</p>
 
-      <div class="sec-header">Acquisition Pricing</div>
+      <div class="sec-header">Get Started Today</div>
       <div class="deal-box">
-        <div class="db-title">Choose Your Deal Structure</div>
+        <div class="db-title">Start Free · Scale As You Grow</div>
         <div class="deal-row">
-          <div class="dr-name">Tier 1 · Strategy + Docs Only</div>
-          <div class="dr-price">₹75,000</div>
+          <div class="dr-name">Starter · Up to 3 dentists</div>
+          <div class="dr-price">Free Forever</div>
         </div>
         <div class="deal-row featured">
-          <div class="dr-name">Tier 2 · Full Product + IP Transfer ★</div>
-          <div class="dr-price">₹8,00,000</div>
+          <div class="dr-name">Growth · Up to 10 dentists ★</div>
+          <div class="dr-price">₹1,999/mo</div>
         </div>
         <div class="deal-row">
-          <div class="dr-name">Tier 3 · Full Product + 30-Day Support</div>
-          <div class="dr-price">₹10,00,000</div>
+          <div class="dr-name">Professional · Up to 25 dentists</div>
+          <div class="dr-price">₹4,999/mo</div>
+        </div>
+        <div class="deal-row">
+          <div class="dr-name">Enterprise · Unlimited</div>
+          <div class="dr-price">₹9,999/mo</div>
         </div>
       </div>
-      <p style="font-size: 9.5px; color: var(--gray-400); margin-bottom: 0;">Open to equity discussions, revenue-share, or joint venture structures.</p>
+      <p style="font-size: 9.5px; color: var(--gray-400); margin-bottom: 0;">★ Most popular — 100 Growth clinics = ₹1,99,900 MRR. 14-day free trial on all paid plans.</p>
+      <p style="font-size: 9.5px; color: var(--gray-400); margin-top: 6px; margin-bottom: 0;">No contracts, no setup fees. Cancel anytime. WhatsApp + email support included.</p>
 
     </div>
   </div>
@@ -850,7 +864,7 @@
   <div class="footer-strip">
 
     <div class="contact-block">
-      <div class="cb-title">Contact Seller</div>
+      <div class="cb-title">Get Started / Contact Us</div>
       <div class="cb-line">
         <span class="cb-icon">📧</span>
         <span class="cb-placeholder">[your-email@domain.com]</span>
@@ -885,14 +899,8 @@
     </div>
 
     <div class="nda-note">
-      <div class="nn-badge">
-        🔒 NDA Available on Request
-      </div>
-      <p>
-        Full codebase access provided after signing<br>
-        a mutual NDA. Confidential — not for redistribution.<br>
-        March 2026 · All rights reserved.
-      </p>
+      <div class="nn-badge">🔒 Data stays yours</div>
+      <p>Your patient data is encrypted, schema-isolated, and never shared across clinics. Hosted on Railway + Neon.</p>
     </div>
 
   </div>

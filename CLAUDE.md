@@ -1,4 +1,4 @@
-# MediBook — WhatsApp Appointment SaaS
+# MediBook — WhatsApp Appointment SaaS for Dental Clinics
 ## Claude Code Master Instruction File
 ## WhatsApp Cloud API (Meta) Edition
 
@@ -10,7 +10,7 @@
 
 ## PROJECT OVERVIEW
 
-Multi-tenant WhatsApp appointment booking SaaS for Indian hospitals and clinics.
+Multi-tenant WhatsApp appointment booking SaaS for Indian dental clinics and chains.
 - Patients book appointments by chatting on WhatsApp
 - Each clinic gets its own WhatsApp bot powered by Meta Cloud API
 - Clinic admins manage everything via a web dashboard
@@ -783,7 +783,7 @@ async function handleBook(phone, schema, tenant, send, ctx, waToken, waPhoneId) 
     `SELECT id, name, city FROM hospitals WHERE is_active=true ORDER BY name`);
 
   if (hospitals.rows.length === 0) {
-    await send.text('No hospitals are currently available. Please try again later.');
+    await send.text('No dental clinics are currently available. Please try again later.');
     await tenantQuery(schema,
       `UPDATE bot_sessions SET state='idle' WHERE phone=$1`, [phone]);
     return;
@@ -799,15 +799,15 @@ async function handleBook(phone, schema, tenant, send, ctx, waToken, waPhoneId) 
     title: 'Our Locations',
     rows: hospitals.rows.map(h => ({ id: h.id, title: h.name, description: h.city || '' }))
   }];
-  await send.list('🏥 *Select a Hospital/Clinic*\n\nChoose your preferred location:', 'View Locations', sections);
+  await send.list('🦷 *Select a Dental Clinic/Branch*\n\nChoose your preferred location:', 'View Locations', sections);
   await tenantQuery(schema, `UPDATE bot_sessions SET state=$1, context=$2 WHERE phone=$3`,
     [STATES.SELECT_HOSPITAL, JSON.stringify(ctx), phone]);
 }
 
 async function askVisitType(phone, schema, send, ctx) {
   await send.buttons(
-    '🩺 *Type of Visit*\n\nWhat type of consultation do you need?',
-    ['🏥 In-Person Visit', '📱 Video Consultation']
+    '🦷 *Type of Visit*\n\nWhat type of dental consultation do you need?',
+    ['🦷 In-Clinic Visit', '📱 Video Consultation']
   );
   await tenantQuery(schema, `UPDATE bot_sessions SET state=$1, context=$2 WHERE phone=$3`,
     [STATES.SELECT_VISIT_TYPE, JSON.stringify(ctx), phone]);
@@ -833,7 +833,7 @@ async function handleBookingStep(phone, schema, tenant, send, state, ctx, input,
   if (state === STATES.SELECT_VISIT_TYPE) {
     const isVideo = /video|online|digital|btn_1/i.test(choice);
     ctx.visit_type = isVideo ? 'video' : 'in_person';
-    ctx.visit_label = isVideo ? 'Video Consultation' : 'In-Person Visit';
+    ctx.visit_label = isVideo ? 'Video Consultation' : 'In-Clinic Visit';
 
     // Fetch departments
     const depts = await tenantQuery(schema,
@@ -843,19 +843,19 @@ async function handleBookingStep(phone, schema, tenant, send, state, ctx, input,
        ORDER BY d.name`, [ctx.hospital_id]);
 
     if (depts.rows.length === 0) {
-      await send.text('No specialties available right now. Please contact the clinic directly.');
+      await send.text('No dental services available right now. Please contact the clinic directly.');
       await tenantQuery(schema, `UPDATE bot_sessions SET state='idle' WHERE phone=$1`, [phone]);
       return;
     }
 
     if (depts.rows.length <= 3) {
       await send.buttons(
-        '🏥 *Select Specialty*\n\nWhat type of doctor do you need?',
+        '🦷 *Select Treatment Type*\n\nWhat dental service do you need?',
         depts.rows.map(d => d.name)
       );
     } else {
-      const sections = [{ title: 'Specialties', rows: depts.rows.map(d => ({ id: d.id, title: d.name })) }];
-      await send.list('🏥 *Select Specialty*\n\nWhat type of doctor do you need?', 'View Specialties', sections);
+      const sections = [{ title: 'Dental Specialties', rows: depts.rows.map(d => ({ id: d.id, title: d.name })) }];
+      await send.list('🦷 *Select Treatment Type*\n\nWhat dental service do you need?', 'View Services', sections);
     }
     await tenantQuery(schema, `UPDATE bot_sessions SET state=$1, context=$2 WHERE phone=$3`,
       [STATES.SELECT_DEPARTMENT, JSON.stringify({ ...ctx, _depts: depts.rows }), phone]);
@@ -878,25 +878,25 @@ async function handleBookingStep(phone, schema, tenant, send, state, ctx, input,
       [dept.id, ctx.hospital_id]);
 
     if (doctors.rows.length === 0) {
-      await send.text(`No doctors available in ${dept.name}. Please choose another specialty.\n\nReply *Hi* to start over.`);
+      await send.text(`No dentists available for ${dept.name}. Please choose another service.\n\nReply *Hi* to start over.`);
       return;
     }
 
     if (doctors.rows.length <= 3) {
       await send.buttons(
-        `👨‍⚕️ *Select Doctor*\n\nAvailable ${dept.name} doctors:`,
+        `🦷 *Select Dentist*\n\nAvailable ${dept.name} dentists:`,
         doctors.rows.map(d => `Dr. ${d.name}`)
       );
     } else {
       const sections = [{
-        title: `${dept.name} Doctors`,
+        title: `${dept.name} Dentists`,
         rows: doctors.rows.map(d => ({
           id: d.id,
           title: `Dr. ${d.name}`,
           description: `${d.qualification || ''} ${d.consultation_fee ? '• ₹' + d.consultation_fee : ''}`.trim()
         }))
       }];
-      await send.list(`👨‍⚕️ *Select Doctor*`, 'View Doctors', sections);
+      await send.list(`🦷 *Select Dentist*`, 'View Dentists', sections);
     }
     await tenantQuery(schema, `UPDATE bot_sessions SET state=$1, context=$2 WHERE phone=$3`,
       [STATES.SELECT_DOCTOR, JSON.stringify({ ...ctx, _doctors: doctors.rows }), phone]);
@@ -1060,9 +1060,9 @@ async function showConfirmation(phone, schema, send, ctx) {
   const date = format(parseISO(ctx.appointment_date), 'EEEE, d MMMM yyyy');
   const time = ctx.appointment_time.slice(0, 5);
   const summary = `📋 *Booking Summary*\n\n` +
-    `🏥 Hospital: ${ctx.hospital_name}\n` +
-    `👨‍⚕️ Doctor: Dr. ${ctx.doctor_name}\n` +
-    `🏷 Specialty: ${ctx.department_name}\n` +
+    `🦷 Clinic: ${ctx.hospital_name}\n` +
+    `👨‍⚕️ Dentist: Dr. ${ctx.doctor_name}\n` +
+    `🏷 Service: ${ctx.department_name}\n` +
     `📅 Date: ${date}\n` +
     `⏰ Time: ${time}\n` +
     `🩺 Type: ${ctx.visit_label}\n` +
@@ -1120,7 +1120,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     `Booking ID: *${bookingId}*\n` +
     `👨‍⚕️ Dr. ${ctx.doctor_name}\n` +
     `📅 ${date} at ${time}\n` +
-    `🏥 ${ctx.hospital_name}\n\n` +
+    `🦷 ${ctx.hospital_name}\n\n` +
     `We'll send you a reminder 24 hours before your appointment.\n\n` +
     `Reply *Hi* to book another appointment.`
   );
@@ -1875,7 +1875,7 @@ async function sendReminders() {
             `🔔 *Appointment Reminder*\n\nYou have an appointment tomorrow!\n\n` +
             `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
             `📅 ${format(parseISO(appt.appointment_date), 'EEE, d MMM')} at ${appt.appointment_time.slice(0,5)}\n` +
-            `🏥 ${appt.hospital_name}\n\n` +
+            `🦷 ${appt.hospital_name}\n\n` +
             `Reply *Hi* to reschedule or cancel.`,
             waToken, waPhoneId
           );
@@ -2026,7 +2026,7 @@ import { Toaster } from 'react-hot-toast'
 
 const inter = Inter({ subsets: ['latin'] })
 
-export const metadata = { title: 'MediBook Admin', description: 'WhatsApp Appointment Management' }
+export const metadata = { title: 'MediBook Admin', description: 'Dental Clinic WhatsApp Appointment Management' }
 
 export default function RootLayout({ children }) {
   return (
@@ -2113,9 +2113,9 @@ export default function LoginPage() {
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
         <div className="text-center mb-8">
-          <div className="text-4xl mb-3">🏥</div>
+          <div className="text-4xl mb-3">🦷</div>
           <h1 className="text-2xl font-bold text-gray-900">MediBook</h1>
-          <p className="text-gray-500 text-sm mt-1">WhatsApp Appointment System</p>
+          <p className="text-gray-500 text-sm mt-1">Dental Clinic WhatsApp Booking</p>
         </div>
 
         <div className="flex rounded-lg bg-gray-100 p-1 mb-6">
@@ -2177,7 +2177,7 @@ import { format } from 'date-fns'
 const NAV = [
   { id: 'overview', label: 'Overview', icon: '📊' },
   { id: 'appointments', label: 'Appointments', icon: '📅' },
-  { id: 'doctors', label: 'Doctors', icon: '👨‍⚕️' },
+  { id: 'doctors', label: 'Dentists', icon: '🦷' },
   { id: 'patients', label: 'Patients', icon: '👥' },
   { id: 'analytics', label: 'Analytics', icon: '📈' },
 ]
@@ -2283,7 +2283,7 @@ export default function Dashboard() {
       {/* Sidebar */}
       <aside className="w-56 bg-white border-r border-gray-200 flex flex-col">
         <div className="p-5 border-b border-gray-100">
-          <div className="text-xl font-bold text-blue-600">🏥 MediBook</div>
+          <div className="text-xl font-bold text-blue-600">🦷 MediBook</div>
           <div className="text-xs text-gray-400 mt-1">{user?.tenant || 'Admin Portal'}</div>
         </div>
         <nav className="flex-1 p-3 space-y-1">
@@ -2330,7 +2330,7 @@ export default function Dashboard() {
                     <h3 className="font-semibold text-gray-800 mb-3">Quick Actions</h3>
                     <div className="flex gap-3 flex-wrap">
                       <button onClick={() => setTab('appointments')} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">View Appointments</button>
-                      <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Doctors</button>
+                      <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Dentists</button>
                       <button onClick={() => { setTab('appointments'); setTimeout(exportCSV, 500); }} className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">Export CSV</button>
                     </div>
                   </div>
@@ -2384,7 +2384,7 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* DOCTORS */}
+          {/* DENTISTS */}
           {tab === 'doctors' && (
             <div className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -2395,7 +2395,7 @@ export default function Dashboard() {
                         <h3 className="font-semibold text-gray-900">Dr. {d.name}</h3>
                         <p className="text-sm text-blue-600">{d.specialization}</p>
                       </div>
-                      <span className="text-2xl">👨‍⚕️</span>
+                      <span className="text-2xl">🦷</span>
                     </div>
                     <p className="text-xs text-gray-500">{d.qualification}</p>
                     <p className="text-xs text-gray-500 mt-1">{d.hospital_name}</p>
@@ -2502,7 +2502,7 @@ async function seed() {
     `, [slug, schema]);
     tenant = r.rows[0];
     await createTenantSchema(schema);
-    console.log('✅ Tenant created: Demo Clinic Hyderabad');
+    console.log('✅ Tenant created: Smile Dental Clinic Hyderabad');
   } else {
     console.log('✅ Tenant already exists, skipping...');
   }
@@ -2515,19 +2515,19 @@ async function seed() {
     ON CONFLICT (email) DO NOTHING
   `, [hash]);
 
-  // Create hospital
+  // Create dental clinic
   let hospital = (await tenantQuery(schema, `SELECT * FROM hospitals LIMIT 1`)).rows[0];
   if (!hospital) {
     const r = await tenantQuery(schema, `
       INSERT INTO hospitals (name, address, city, phone)
-      VALUES ('Demo Clinic Hyderabad', 'Banjara Hills, Road No. 12', 'Hyderabad', '040-12345678')
+      VALUES ('Smile Dental Clinic Hyderabad', 'Banjara Hills, Road No. 12', 'Hyderabad', '040-12345678')
       RETURNING *
     `);
     hospital = r.rows[0];
   }
 
-  // Create departments
-  const deptNames = ['Cardiology', 'General Medicine', 'Orthopedics'];
+  // Create dental departments/specialties
+  const deptNames = ['General Dentistry', 'Orthodontics', 'Oral Surgery'];
   const deptIds = {};
   for (const name of deptNames) {
     const existing = await tenantQuery(schema, `SELECT id FROM departments WHERE name=$1`, [name]);
@@ -2538,11 +2538,11 @@ async function seed() {
     deptIds[name] = r.rows[0].id;
   }
 
-  // Create doctors
+  // Create dental doctors
   const doctorDefs = [
-    { name: 'Priya Sharma', spec: 'Cardiologist', qual: 'MBBS, MD (Cardiology)', dept: 'Cardiology', fee: 800, duration: 30 },
-    { name: 'Rajesh Kumar', spec: 'General Physician', qual: 'MBBS, MD', dept: 'General Medicine', fee: 400, duration: 20 },
-    { name: 'Anita Reddy', spec: 'Orthopaedic Surgeon', qual: 'MBBS, MS (Ortho)', dept: 'Orthopedics', fee: 600, duration: 30 },
+    { name: 'Priya Sharma', spec: 'General Dentist', qual: 'BDS, MDS', dept: 'General Dentistry', fee: 500, duration: 30 },
+    { name: 'Rajesh Kumar', spec: 'Orthodontist', qual: 'BDS, MDS (Orthodontics)', dept: 'Orthodontics', fee: 800, duration: 30 },
+    { name: 'Anita Reddy', spec: 'Oral & Maxillofacial Surgeon', qual: 'BDS, MDS (Oral Surgery)', dept: 'Oral Surgery', fee: 1000, duration: 45 },
   ];
 
   const doctorIds = [];
@@ -2682,7 +2682,7 @@ async function runTests() {
   });
 
   // Test 2: Book flow starts
-  await test('Book button starts hospital/visit type selection', async () => {
+  await test('Book button starts dental clinic/visit type selection', async () => {
     await resetSession();
     await sendMsg('Hi');
     const r = await sendMsg('', 'btn_0_test');
