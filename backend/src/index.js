@@ -24,6 +24,26 @@ const { version: APP_VERSION } = require('../package.json');
 // Importing encryption validates ENCRYPTION_KEY and exits in production if default
 require('./utils/encryption');
 
+// JWT_SECRET is required for all token signing/verification — fail fast in production
+// rather than issuing tokens that can be forged with an empty/default secret.
+if (!process.env.JWT_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    logger.error('FATAL: JWT_SECRET environment variable is not set. All authentication will fail. Exiting.');
+    process.exit(1);
+  } else {
+    const insecureDefault = 'dev-only-insecure-jwt-secret-change-before-production';
+    logger.warn(`JWT_SECRET not set — using insecure default for local dev. DO NOT use in production.`);
+    process.env.JWT_SECRET = insecureDefault;
+  }
+} else if (process.env.JWT_SECRET.length < 32) {
+  if (process.env.NODE_ENV === 'production') {
+    logger.error('FATAL: JWT_SECRET is too short (minimum 32 characters). Use a strong random value. Exiting.');
+    process.exit(1);
+  } else {
+    logger.warn(`JWT_SECRET is short (${process.env.JWT_SECRET.length} chars) — use at least 32 characters in production.`);
+  }
+}
+
 // Warn about optional services that are not configured
 if (!process.env.RESEND_API_KEY) {
   logger.warn('RESEND_API_KEY not set — booking confirmation emails will not be sent');
@@ -89,19 +109,20 @@ app.use(cors({
 // Metrics counters
 const metrics = require('./utils/metrics');
 
-// Request ID — attach to every request for log correlation (M4)
+// Request ID + AsyncLocalStorage context propagation
+const { runWithContext } = require('./utils/requestContext');
 app.use((req, res, next) => {
   req.id = crypto.randomUUID();
   res.setHeader('X-Request-Id', req.id);
   metrics.increment('requests_total');
-  next();
+  runWithContext({ requestId: req.id }, next);
 });
 
 // Raw body for webhook signature verification
 app.use('/api/webhook', express.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '12mb' })); // increased for document base64 uploads (Enhancement 6)
 app.use(express.urlencoded({ extended: true }));
 
 // Rate limiting
@@ -110,8 +131,16 @@ const webhookLimiter = rateLimit({ windowMs: 60 * 1000, max: 2000 });
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many login attempts' }, skip: () => process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development' });
 
 app.use('/api/auth', authLimiter);
+const webhookIpLimiter = rateLimit({ windowMs: 60 * 1000, max: 100, keyGenerator: (req) => req.ip, message: { error: 'Too many requests from this IP' } });
+app.use('/api/webhook', webhookIpLimiter);
 app.use('/api/webhook', webhookLimiter);
 app.use('/api', globalLimiter);
+
+// ── PER-TENANT RATE LIMITING (Enhancement 15) ────────────────
+// Applied globally to all admin routes — runs after auth+tenant middleware set req.user and req.tenant
+const tenantRateLimit = require('./middleware/tenantRateLimit');
+const { authMiddleware: _auth, tenantMiddleware: _tenant } = require('./middleware/auth');
+app.use('/api/admin', _auth, _tenant, tenantRateLimit);
 
 // ── ROUTES ────────────────────────────────────────────────────
 app.use('/api', require('./routes/auth'));
@@ -122,9 +151,69 @@ app.use('/api/admin', require('./routes/doctors'));
 app.use('/api/admin', require('./routes/hospitals'));
 app.use('/api/admin', require('./routes/patients'));
 app.use('/api/admin', require('./routes/analytics'));
-// admin.js: dashboard, staff, settings, waitlist, feedback, audit-logs, bot-tester, calendar
+// admin.js: dashboard, staff, settings, feedback, audit-logs, bot-tester, calendar
 app.use('/api/admin', require('./routes/admin'));
+app.use('/api/admin', require('./routes/services'));  // A1 service catalog + A4 holidays
+app.use('/api/admin', require('./routes/events'));    // SSE real-time dashboard
 app.use('/api/superadmin', require('./routes/superadmin'));
+
+// ── EMAIL TRACKING ────────────────────────────────────────────
+// GET /api/track/open?h=<hash> — 1×1 transparent pixel, increments open_count
+app.get('/api/track/open', async (req, res) => {
+  // Transparent 1×1 GIF
+  const pixel = Buffer.from(
+    'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'
+  );
+  res.setHeader('Content-Type', 'image/gif');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.end(pixel);
+
+  // Update open count in background (non-blocking)
+  const token = req.query.h;
+  if (token) {
+    const { query: dbQuery } = require('./db');
+    dbQuery(
+      `UPDATE email_sent_log SET open_count = open_count + 1
+       WHERE content_hash = $1`,
+      [token]
+    ).catch(() => {});
+  }
+});
+
+// POST /api/webhook/resend — Resend bounce/complaint webhook
+app.post('/api/webhook/resend', express.json(), async (req, res) => {
+  // Verify Resend webhook signature if secret is configured
+  if (process.env.RESEND_WEBHOOK_SECRET) {
+    const sig = req.headers['resend-signature'];
+    if (!sig) { logger.warn('Unsigned Resend webhook rejected'); return res.sendStatus(403); }
+    const expected = crypto.createHmac('sha256', process.env.RESEND_WEBHOOK_SECRET)
+      .update(JSON.stringify(req.body)).digest('hex');
+    if (sig !== expected) { logger.warn('Invalid Resend webhook signature'); return res.sendStatus(403); }
+  }
+
+  res.sendStatus(200);
+  try {
+    const { type, data } = req.body || {};
+    if (type === 'email.bounced' || type === 'email.complained') {
+      const email = data?.to?.[0] || data?.email_address;
+      if (!email) return;
+      // Mark patient email as bounced across all active tenant schemas
+      const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
+      const { pool: dbPool } = require('./db');
+      const tenants = await dbPool.query(`SELECT schema_name FROM tenants WHERE status='active'`);
+      for (const t of tenants.rows) {
+        if (!SCHEMA_RE.test(t.schema_name)) continue; // skip invalid schema names
+        await dbPool.query(
+          `UPDATE "${t.schema_name}".patients SET email_status='bounced' WHERE email=$1`,
+          [email]
+        ).catch(() => {});
+      }
+      logger.info('Resend bounce handled', { type });
+    }
+  } catch (err) {
+    logger.warn('Resend webhook handler error', { error: err.message });
+  }
+});
 
 // ── API v1 ALIASES ────────────────────────────────────────────
 // Mount the same routers under /api/v1/ so clients can adopt the versioned
@@ -137,12 +226,14 @@ app.use('/api/v1/admin',    require('./routes/hospitals'));
 app.use('/api/v1/admin',    require('./routes/patients'));
 app.use('/api/v1/admin',    require('./routes/analytics'));
 app.use('/api/v1/admin',    require('./routes/admin'));
+app.use('/api/v1/admin',    require('./routes/services'));
+app.use('/api/v1/admin',    require('./routes/events'));
 app.use('/api/v1/superadmin', require('./routes/superadmin'));
 
 // ── HEALTH CHECK ──────────────────────────────────────────────
 app.get('/health', async (req, res) => {
   try {
-    const { pool, query: dbQuery } = require('./db');
+    const { pool, query: dbQuery } = require('./db'); // pool needed for stats in response
     await pool.query('SELECT 1');
 
     // Check Redis / queue status with write round-trip
@@ -163,19 +254,42 @@ app.get('/health', async (req, res) => {
     } catch (_) {} // non-fatal — cron_jobs table may not exist yet
 
     const isDegraded = cronAlerts.length > 0;
-    res.status(isDegraded ? 503 : 200).json({
-      status: isDegraded ? 'degraded' : 'ok',
+    const mem = process.memoryUsage();
+    const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
+    const heapTotalMb = Math.round(mem.heapTotal / 1024 / 1024);
+    const heapPercent = Math.round((mem.heapUsed / mem.heapTotal) * 100);
+    const isMemoryHigh = heapPercent > 85;
+    const isAnyDegraded = isDegraded || isMemoryHigh;
+
+    res.status(isAnyDegraded ? 503 : 200).json({
+      status: isAnyDegraded ? 'degraded' : 'ok',
       service: 'medibook-api',
       version: APP_VERSION,
       timestamp: new Date().toISOString(),
       environment: process.env.NODE_ENV || 'development',
-      db: 'ok',
+      uptime_seconds: Math.floor(process.uptime()),
+      db: {
+        status: 'ok',
+        pool: {
+          total: pool.totalCount,
+          idle: pool.idleCount,
+          waiting: pool.waitingCount,
+          max: pool.options.max,
+          utilization_percent: Math.round((pool.totalCount / pool.options.max) * 100),
+        },
+      },
       redis: redisStatus,
-      redis_write: redisStatus,
       queue: queueUp ? 'async' : 'sync-fallback',
+      memory: {
+        heap_used_mb: heapUsedMb,
+        heap_total_mb: heapTotalMb,
+        heap_percent: heapPercent,
+        rss_mb: Math.round(mem.rss / 1024 / 1024),
+        status: isMemoryHigh ? 'high' : 'ok',
+      },
       cron_alerts: isDegraded ? cronAlerts : undefined,
       backup_hint: process.env.NODE_ENV !== 'production'
-        ? `pg_dump "${process.env.DATABASE_URL}" > medibook_$(date +%Y%m%d).sql`
+        ? `pg_dump $DATABASE_URL > medibook_$(date +%Y%m%d).sql`
         : undefined,
     });
   } catch (err) {
@@ -243,11 +357,15 @@ const server = app.listen(PORT, () => {
     const { startSlotGeneratorCron, startBackupReminderCron } = require('./jobs/slotGenerator');
     const { startReminderCron } = require('./jobs/reminders');
     const { startBotWorker } = require('./jobs/botWorker');
+    const { startWebhookRetryCron } = require('./jobs/retryWebhooks');
+    const { startBackupCron } = require('./jobs/backupManager');
     // Track cron tasks so we can stop them gracefully before DB closes
     cronTasks = [
       ...startSlotGeneratorCron(),
       ...startReminderCron(),
       startBackupReminderCron(),
+      startWebhookRetryCron(),
+      startBackupCron(),
     ];
     startBotWorker();
   }

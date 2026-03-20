@@ -4,7 +4,8 @@ const wa = require('./whatsapp');
 const { decrypt } = require('../utils/encryption');
 const { tenantQuery, tenantTransaction } = require('../db');
 const logger = require('../utils/logger');
-const { format, parseISO } = require('date-fns');
+const { format, parseISO, addDays: _addDays } = require('date-fns');
+const { toZonedTime: _toZonedTime } = require('date-fns-tz');
 
 // ── Sub-module imports ────────────────────────────────────────
 const {
@@ -13,18 +14,17 @@ const {
   updateSession,
   getPatient,
   logMessage,
-  notifyWaitlistForDoctor,
 } = require('./bot/utils');
 
 const {
   startBooking,
   handleSelectHospital,
-  handleSelectVisitType,
   handleSelectDept,
   handleSelectDoctor,
-  handleWaitlistConfirm,
   handleSelectDate,
   handleSelectSlot,
+  askChiefComplaint,
+  handleChiefComplaint,
   showConfirmation,
   completeBooking,
 } = require('./bot/bookingFlow');
@@ -39,6 +39,51 @@ const {
   handleCancelReason,
   handleCancelConfirm,
 } = require('./bot/appointmentFlow');
+
+// ── SMART INTENT DETECTION ────────────────────────────────────
+// Detects shortcuts in free-text to skip bot flow steps.
+// Returns an object with detected intent hints, or null.
+function detectIntent(input) {
+  if (!input || input.length > 200) return null;
+  const lower = input.toLowerCase();
+  const hints = {};
+
+  // Dental-specific department shortcuts
+  const deptPatterns = [
+    { pattern: /root canal|rct|nerve pain|throbbing|pulp/i,               dept: 'Root Canal Treatment' },
+    { pattern: /brace|aligner|crooked|gap|spacing|malocclus|ortho/i,      dept: 'Orthodontics & Braces' },
+    { pattern: /implant|missing tooth|missing teeth|replace tooth/i,       dept: 'Dental Implants' },
+    { pattern: /whiten|veneer|smile makeover|cosmetic|bleach/i,            dept: 'Cosmetic Dentistry' },
+    { pattern: /child|kids? dent|baby teeth|paed|pediat/i,                 dept: 'Pediatric Dentistry' },
+    { pattern: /wisdom|extract|removal|jaw|oral surg|maxillo/i,            dept: 'Oral Surgery' },
+    { pattern: /checkup|clean|scaling|cavity|decay|filling|toothache|tooth pain|gum|general/i, dept: 'General Dentistry' },
+  ];
+  for (const { pattern, dept } of deptPatterns) {
+    if (pattern.test(lower)) { hints.department_hint = dept; break; }
+  }
+
+  // Date shortcuts — use IST "now" so "today" and "tomorrow" are correct for
+  // Indian users during the 5.5-hour window where UTC date ≠ IST date.
+  const nowIST = _toZonedTime(new Date(), 'Asia/Kolkata');
+  if (/\btoday\b/i.test(lower)) {
+    hints.date_hint = format(nowIST, 'yyyy-MM-dd');
+  } else if (/\btomorrow\b/i.test(lower)) {
+    hints.date_hint = format(_addDays(nowIST, 1), 'yyyy-MM-dd');
+  } else {
+    const dayMap = { monday:1, tuesday:2, wednesday:3, thursday:4, friday:5, saturday:6, sunday:0 };
+    for (const [day, dow] of Object.entries(dayMap)) {
+      if (lower.includes(day)) {
+        const todayDow = nowIST.getDay();
+        let daysAhead = (dow - todayDow + 7) % 7;
+        if (daysAhead === 0) daysAhead = 7; // next week same day
+        hints.date_hint = format(_addDays(nowIST, daysAhead), 'yyyy-MM-dd');
+        break;
+      }
+    }
+  }
+
+  return Object.keys(hints).length > 0 ? hints : null;
+}
 
 // ── MAIN HANDLER ──────────────────────────────────────────────
 async function handle({ phone, text, buttonId, tenant, waMessageId }) {
@@ -124,7 +169,15 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     // Decrypt context if stored encrypted (see bot/utils.js updateSession)
     if (raw && raw._enc) {
       const decrypted = decrypt(raw._enc);
-      ctx = decrypted ? JSON.parse(decrypted) : {};
+      if (!decrypted) {
+        // Decryption failed (key rotation or corrupted data) — reset session entirely
+        // so the bot doesn't stay stuck in a broken mid-flow state with empty context.
+        logger.warn('Session context decryption failed, resetting to idle', { phone });
+        await updateSession(schema, phone, STATES.IDLE, {});
+        await send.text('Sorry, something went wrong. Let\'s start over — reply *Hi* to continue.');
+        return;
+      }
+      ctx = JSON.parse(decrypted);
     } else {
       // Legacy unencrypted session — accept for backwards compat but log so
       // operators know these exist. They'll be re-encrypted on next updateSession.
@@ -138,6 +191,61 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     await updateSession(schema, phone, STATES.IDLE, {});
     await send.text('Sorry, something went wrong. Let\'s start over — reply *Hi* to continue.');
     return;
+  }
+
+  // ── SESSION EXPIRY & 24H RESUME ──────────────────────────────
+  const SESSION_FLOW_EXPIRY_MS = 30 * 60 * 1000;       // 30 min — reset idle mid-flows
+  const SESSION_RESUME_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h — offer to resume
+  if (!isGreeting && session.state !== STATES.IDLE && session.state !== STATES.MAIN_MENU) {
+    const elapsed = Date.now() - new Date(session.last_activity).getTime();
+    if (elapsed > SESSION_FLOW_EXPIRY_MS) {
+      if (elapsed < SESSION_RESUME_WINDOW_MS && ctx.doctor_name && ctx.appointment_date) {
+        // Offer to resume incomplete booking
+        await send.buttons(
+          `👋 Welcome back! You were booking an appointment with *Dr. ${ctx.doctor_name}* on *${ctx.appointment_date}*.\n\nWould you like to continue?`,
+          ['✅ Yes, continue', '🔄 Start fresh']
+        );
+        await updateSession(schema, phone, STATES.RESUME_CONFIRM, ctx);
+        return;
+      }
+      // Beyond 24h or no resumable context — reset to idle
+      await updateSession(schema, phone, STATES.IDLE, {});
+      session.state = STATES.IDLE;
+    }
+  }
+
+  // ── RESUME CONFIRM ───────────────────────────────────────────
+  if (session.state === STATES.RESUME_CONFIRM) {
+    const resumeChoice = buttonId || lowerInput;
+    if (/yes|continue|btn_0/i.test(resumeChoice)) {
+      // Resume from where they left off — go to the appropriate state
+      const resumeState = ctx.slot_id ? STATES.CONFIRM_BOOKING
+        : ctx.appointment_date ? STATES.SELECT_SLOT
+        : ctx.doctor_id ? STATES.SELECT_DATE
+        : STATES.IDLE;
+      session.state = resumeState;
+      await updateSession(schema, phone, resumeState, ctx);
+      if (resumeState === STATES.CONFIRM_BOOKING) {
+        return showConfirmation(phone, schema, send, ctx, updateSession);
+      }
+      if (resumeState === STATES.SELECT_SLOT) {
+        // Re-fetch and re-render the slot list for the cached date so the user
+        // actually sees something to tap — a text hint alone leaves them stuck.
+        return handleSelectDate(phone, schema, tenant, send, ctx, ctx.appointment_date);
+      }
+      if (resumeState === STATES.SELECT_DATE) {
+        // Re-render the date list for the cached doctor. Populate _doctors so
+        // handleSelectDoctor can locate the doc by ID without a DB re-fetch.
+        ctx._doctors = [{ id: ctx.doctor_id, name: ctx.doctor_name }];
+        return handleSelectDoctor(phone, schema, tenant, send, ctx, ctx.doctor_id, ctx.doctor_name);
+      }
+      await send.text('Reply *Hi* to start over.');
+      return;
+    }
+    // Start fresh
+    await updateSession(schema, phone, STATES.IDLE, {});
+    session.state = STATES.IDLE;
+    // Fall through to greeting handler below
   }
 
   // ── FEEDBACK FLOW ────────────────────────────────────────────
@@ -172,6 +280,18 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     return;
   }
 
+  // ── DENTAL EMERGENCY SHORTCUT ────────────────────────────────
+  if (/^(emergency|toothache|tooth ache|dental emergency|urgent)$/i.test(input) && !isGreeting) {
+    await send.text(
+      `🚨 *Dental Emergency*\n\n` +
+      `We'll get you seen as soon as possible!\n\n` +
+      `Please reply *Hi* and tap *Book Appointment* to find the earliest available slot.\n\n` +
+      `If you need immediate assistance, please call the clinic directly.`
+    );
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
+
   // ── GREETING → MAIN MENU ─────────────────────────────────────
   if (isGreeting || session.state === STATES.IDLE) {
     const patient = await getPatient(schema, phone);
@@ -179,9 +299,9 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     const isReturning = !!patient?.name;
     const subtitle = isReturning
       ? 'How can I help you today?'
-      : 'I can help you book appointments, check your status, or manage existing bookings.';
+      : 'Book a dental appointment, check your status, or manage existing bookings.';
     await send.buttons(
-      `👋 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
+      `🦷 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
       ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
     );
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
@@ -191,7 +311,8 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   // ── MAIN MENU ────────────────────────────────────────────────
   if (session.state === STATES.MAIN_MENU) {
     if (/book|btn_0/i.test(choice) || choice === '1') {
-      return startBooking(phone, schema, tenant, send, ctx);
+      const intents = detectIntent(input);
+      return startBooking(phone, schema, tenant, send, intents ? { ...ctx, ...intents } : ctx);
     }
     if (/appointment|my|btn_1/i.test(choice) || choice === '2') {
       return showMyAppointments(phone, schema, tenant, send);
@@ -242,8 +363,8 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
       `${statusEmoji} Status: *${a.status.replace('_', ' ').toUpperCase()}*\n\n` +
       `👤 ${a.patient_name}\n` +
       `👨‍⚕️ Dr. ${a.doctor_name}\n` +
-      `🏥 ${a.hospital_name}\n` +
-      `📅 ${dt} at ${a.appointment_time.slice(0, 5)}\n\n` +
+      `🦷 ${a.hospital_name}\n` +
+      `📅 ${dt} at ${(a.appointment_time || '').slice(0, 5)}\n\n` +
       `Reply *Hi* for the main menu.`
     );
     await updateSession(schema, phone, STATES.IDLE, {});
@@ -253,9 +374,6 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   // ── BOOKING FLOW ─────────────────────────────────────────────
   if (session.state === STATES.SELECT_HOSPITAL) {
     return handleSelectHospital(phone, schema, tenant, send, ctx, choice, input);
-  }
-  if (session.state === STATES.SELECT_VISIT_TYPE) {
-    return handleSelectVisitType(phone, schema, tenant, send, ctx, choice);
   }
   if (session.state === STATES.SELECT_DEPARTMENT) {
     return handleSelectDept(phone, schema, tenant, send, ctx, choice, input);
@@ -269,38 +387,12 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   if (session.state === STATES.SELECT_SLOT) {
     return handleSelectSlot(phone, schema, tenant, send, ctx, choice, input);
   }
-  if (session.state === STATES.WAITLIST_CONFIRM) {
-    return handleWaitlistConfirm(phone, schema, tenant, send, ctx, choice);
-  }
   if (session.state === STATES.COLLECT_NAME) {
     if (input.length < 2 || input.length > 100) {
       await send.text('Please enter your full name (between 2 and 100 characters).');
       return;
     }
     ctx.patient_name = input;
-
-    // _waitlist_pending is set when a new patient tries to join the waitlist
-    // before they have an account — upsert patient and join waitlist directly.
-    if (ctx._waitlist_pending) {
-      const patientR = await tenantQuery(schema,
-        `INSERT INTO patients (phone, name, visit_count) VALUES ($1, $2, 0)
-         ON CONFLICT (phone) DO UPDATE SET name=EXCLUDED.name, updated_at=NOW()
-         RETURNING id`,
-        [phone, input]);
-      const patientId = patientR.rows[0].id;
-      await tenantQuery(schema,
-        `INSERT INTO waiting_list (patient_id, doctor_id, hospital_id) VALUES ($1,$2,$3)
-         ON CONFLICT (patient_id, doctor_id) DO NOTHING`,
-        [patientId, ctx.doctor_id, ctx.hospital_id]);
-      await send.text(
-        `✅ *You've joined the waiting list!*\n\n` +
-        `We'll notify you on WhatsApp as soon as Dr. ${ctx.doctor_name} has a free slot.\n\n` +
-        `Reply *Hi* for the main menu.`
-      );
-      await updateSession(schema, phone, STATES.IDLE, {});
-      return;
-    }
-
     await send.text('🎂 *Date of Birth*\n\nEnter your DOB in DD/MM/YYYY format:\nExample: 15/08/1990');
     await updateSession(schema, phone, STATES.COLLECT_DOB, ctx);
     return;
@@ -325,7 +417,8 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     return;
   }
   if (session.state === STATES.COLLECT_GENDER) {
-    ctx.patient_gender = /male|btn_0/i.test(choice) ? 'male' : /female|btn_1/i.test(choice) ? 'female' : 'other';
+      // Check female BEFORE male — 'female' contains 'male' so order matters
+    ctx.patient_gender = /female|btn_1/i.test(choice) ? 'female' : /male|btn_0/i.test(choice) ? 'male' : 'other';
     await send.buttons('📧 *Email Address* _(optional)_\n\nShare your email to receive a booking confirmation, or tap Skip to continue:', ['⏭ Skip']);
     await updateSession(schema, phone, STATES.COLLECT_EMAIL, ctx);
     return;
@@ -341,7 +434,10 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
         return;
       }
     }
-    return showConfirmation(phone, schema, send, ctx, updateSession);
+    return askChiefComplaint(phone, schema, send, ctx);
+  }
+  if (session.state === STATES.COLLECT_CHIEF_COMPLAINT) {
+    return handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSession);
   }
   if (session.state === STATES.CONFIRM_BOOKING) {
     if (/yes|confirm|ok|sure|haan|btn_0/i.test(choice)) {
@@ -358,18 +454,31 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
 
   // ── MY APPOINTMENTS FLOW ─────────────────────────────────────
   if (session.state === STATES.MY_APPOINTMENTS) {
-    if (/reschedule|btn_0/i.test(choice)) {
+    // Guard: only offer reschedule/cancel when there are actually upcoming appointments.
+    // Without this check, the "🏠 Main Menu" button (btn_0 when no upcoming appointments)
+    // would erroneously match /btn_0/ and trigger the reschedule prompt.
+    const hasUpcoming = Array.isArray(ctx._appts) && ctx._appts.length > 0;
+    if (hasUpcoming && /reschedule|btn_0/i.test(choice)) {
       await send.text('Enter the *Booking ID* to reschedule (e.g. MB12AB3):');
       await updateSession(schema, phone, STATES.RESCHEDULE_SELECT, ctx);
       return;
     }
-    if (/cancel|btn_1/i.test(choice)) {
+    if (hasUpcoming && /cancel|btn_1/i.test(choice)) {
       await send.text('Enter the *Booking ID* to cancel (e.g. MB12AB3):');
       await updateSession(schema, phone, STATES.CANCEL_SELECT, ctx);
       return;
     }
-    await updateSession(schema, phone, STATES.IDLE, {});
-    await handle({ phone, text: 'hi', buttonId: null, tenant });
+    const patient = await getPatient(schema, phone);
+    const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
+    const isReturning = !!patient?.name;
+    const subtitle = isReturning
+      ? 'How can I help you today?'
+      : 'I can help you book appointments, check your status, or manage existing bookings.';
+    await send.buttons(
+      `👋 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
+    );
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
   if (session.state === STATES.RESCHEDULE_SELECT) {
@@ -465,9 +574,16 @@ async function handleFeedbackComment(phone, schema, send, ctx, input) {
 
 async function triggerFeedback(schemaName, phone, appointmentId, patientId, doctorName) {
   try {
+    const { getSession, updateSession: _updateSession } = require('./bot/utils');
+    // Don't interrupt an active booking/cancel/reschedule flow — only set
+    // feedback state when the patient is idle or at the main menu.
+    const session = await getSession(schemaName, phone);
+    if (session && session.state !== STATES.IDLE && session.state !== STATES.MAIN_MENU) {
+      logger.info(`Skipping feedback for ${phone} — active session state: ${session.state}`);
+      return;
+    }
     // Use updateSession() so the context is encrypted (protects appointment/patient IDs)
     // and the session size check is applied consistently.
-    const { updateSession: _updateSession } = require('./bot/utils');
     await _updateSession(schemaName, phone, STATES.COLLECT_FEEDBACK_RATING, {
       feedback_appointment_id: appointmentId,
       feedback_patient_id: patientId,
@@ -478,4 +594,63 @@ async function triggerFeedback(schemaName, phone, appointmentId, patientId, doct
   }
 }
 
-module.exports = { handle, triggerFeedback };
+/**
+ * Handle a voice/audio message by transcribing it (Whisper API) and processing as text.
+ * Called by webhook.js when msg.type === 'audio' and voice_transcription_enabled feature flag is set.
+ */
+async function handleVoiceMessage({ phone, audioId, tenant }) {
+  const schema = tenant.schema_name;
+  const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
+  const waPhoneId = tenant.wa_phone_number_id;
+
+  if (!process.env.OPENAI_API_KEY) {
+    await wa.sendText(phone,
+      'Sorry, I can only process text messages. Please type your request.',
+      waToken, waPhoneId);
+    return;
+  }
+
+  try {
+    const axios = require('axios');
+    const FormData = require('form-data');
+
+    // Step 1: Get media URL from Meta
+    const mediaRes = await axios.get(
+      `https://graph.facebook.com/v21.0/${audioId}`,
+      { headers: { Authorization: `Bearer ${waToken || process.env.META_ACCESS_TOKEN}` } }
+    );
+    const mediaUrl = mediaRes.data?.url;
+    if (!mediaUrl) throw new Error('No media URL returned');
+
+    // Step 2: Download audio
+    const audioRes = await axios.get(mediaUrl, {
+      responseType: 'arraybuffer',
+      headers: { Authorization: `Bearer ${waToken || process.env.META_ACCESS_TOKEN}` },
+    });
+
+    // Step 3: Transcribe via Whisper
+    const form = new FormData();
+    form.append('file', Buffer.from(audioRes.data), { filename: 'audio.ogg', contentType: 'audio/ogg' });
+    form.append('model', 'whisper-1');
+    const whisperRes = await axios.post('https://api.openai.com/v1/audio/transcriptions', form, {
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+    });
+
+    const transcribed = whisperRes.data?.text?.trim();
+    if (!transcribed) {
+      await wa.sendText(phone, 'Sorry, I couldn\'t understand the audio. Please type your message.', waToken, waPhoneId);
+      return;
+    }
+
+    logger.info('Audio transcribed', { phone, length: transcribed.length });
+    // Process transcribed text through bot engine
+    await handle({ phone, text: transcribed, buttonId: null, tenant });
+  } catch (err) {
+    logger.warn('Voice transcription failed', { phone, error: err.message });
+    await wa.sendText(phone,
+      'Sorry, I couldn\'t process your audio. Please type *Hi* to start.',
+      waToken, waPhoneId).catch(() => {});
+  }
+}
+
+module.exports = { handle, triggerFeedback, handleVoiceMessage };

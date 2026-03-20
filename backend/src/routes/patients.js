@@ -131,4 +131,150 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
   } catch (err) { handleError(res, err); }
 });
 
+// ── PATIENT DOCUMENTS (Enhancement 6) ────────────────────────
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_FILE_BASE64_LEN = 14 * 1024 * 1024; // ~10 MB after base64 overhead
+
+router.get('/patients/:id/documents', validateUUID(), async (req, res) => {
+  try {
+    const r = await tenantQuery(req.tenant.schema_name,
+      `SELECT id, file_name, file_type, file_size_bytes, notes, appointment_id, created_at
+       FROM documents WHERE patient_id=$1 ORDER BY created_at DESC`,
+      [req.params.id]);
+    res.json({ documents: r.rows });
+  } catch (err) { handleError(res, err); }
+});
+
+router.get('/patients/:id/documents/:docId', validateUUID(), async (req, res) => {
+  try {
+    if (!UUID_RE.test(req.params.docId)) return res.status(400).json({ error: 'Invalid document ID' });
+    const r = await tenantQuery(req.tenant.schema_name,
+      `SELECT * FROM documents WHERE id=$1 AND patient_id=$2`,
+      [req.params.docId, req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Document not found' });
+    res.json({ document: r.rows[0] });
+  } catch (err) { handleError(res, err); }
+});
+
+router.post('/patients/:id/documents', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const { file_name, file_type, file_data, file_size_bytes, notes, appointment_id } = req.body;
+    if (!file_name || !file_data) return res.status(400).json({ error: 'file_name and file_data are required' });
+    if (typeof file_data !== 'string') return res.status(400).json({ error: 'file_data must be a base64 string' });
+    if (file_data.length > MAX_FILE_BASE64_LEN) return res.status(413).json({ error: 'File too large. Maximum 10 MB.' });
+    if (appointment_id && !UUID_RE.test(appointment_id)) return res.status(400).json({ error: 'Invalid appointment_id' });
+
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s,
+      `INSERT INTO documents (patient_id, appointment_id, file_name, file_type, file_data, file_size_bytes, notes, uploaded_by_user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, file_name, file_type, file_size_bytes, notes, appointment_id, created_at`,
+      [req.params.id, appointment_id || null, file_name.slice(0, 255), file_type || null,
+       file_data, file_size_bytes || null, notes || null, req.user.id]);
+
+    await writeAuditLog(s, req.user.id, req.user.role, 'UPLOAD_DOCUMENT', 'patient', req.params.id,
+      null, { file_name, file_type }, req.ip);
+    res.status(201).json({ document: r.rows[0] });
+  } catch (err) { handleError(res, err); }
+});
+
+router.delete('/patients/:id/documents/:docId', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    if (!UUID_RE.test(req.params.docId)) return res.status(400).json({ error: 'Invalid document ID' });
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s,
+      `DELETE FROM documents WHERE id=$1 AND patient_id=$2 RETURNING id, file_name`,
+      [req.params.docId, req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Document not found' });
+    await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_DOCUMENT', 'patient', req.params.id,
+      { file_name: r.rows[0].file_name }, null, req.ip);
+    res.json({ success: true });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── BULK IMPORT PATIENTS via CSV ──────────────────────────────
+const { parse } = require('csv-parse/sync');
+
+router.post('/patients/import', adminOnly, async (req, res) => {
+  try {
+    const { csv_data } = req.body; // base64 or raw CSV string
+    if (!csv_data) return res.status(400).json({ error: 'csv_data is required (raw CSV or base64)' });
+
+    let rawCsv = csv_data;
+    // Detect base64
+    if (!csv_data.includes('\n') && !csv_data.includes(',')) {
+      try { rawCsv = Buffer.from(csv_data, 'base64').toString('utf8'); } catch (_) {}
+    }
+
+    const records = parse(rawCsv, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+    });
+
+    if (!records.length) return res.status(400).json({ error: 'No records found in CSV' });
+    if (records.length > 500) return res.status(400).json({ error: 'Maximum 500 records per import' });
+
+    const s = req.tenant.schema_name;
+    let imported = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (const row of records) {
+      try {
+        const phone = (row.phone || row.Phone || row.PHONE || '').toString().trim().replace(/\s+/g, '').replace(/^\+/, '');
+        const name = (row.name || row.Name || row.NAME || '').toString().trim();
+        const email = (row.email || row.Email || row.EMAIL || '').toString().trim() || null;
+        const gender = (row.gender || row.Gender || row.GENDER || '').toString().trim().toLowerCase() || null;
+        const dob = (row.date_of_birth || row.dob || row.DOB || row['Date of Birth'] || '').toString().trim() || null;
+
+        if (!phone || !/^[+]?[0-9]{7,20}$/.test(phone)) {
+          skipped++;
+          errors.push(`Row ${imported + skipped}: invalid phone "${phone}"`);
+          continue;
+        }
+        if (!name || name.length < 1) {
+          skipped++;
+          errors.push(`Row ${imported + skipped}: missing name`);
+          continue;
+        }
+
+        const validGenders = ['male', 'female', 'other', null];
+        const safeGender = validGenders.includes(gender) ? gender : null;
+
+        // Normalize DOB to YYYY-MM-DD
+        let safeDob = null;
+        if (dob) {
+          const ddmmyyyy = dob.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+          const yyyymmdd = dob.match(/^\d{4}-\d{2}-\d{2}$/);
+          if (ddmmyyyy) {
+            safeDob = `${ddmmyyyy[3]}-${ddmmyyyy[2].padStart(2,'0')}-${ddmmyyyy[1].padStart(2,'0')}`;
+          } else if (yyyymmdd) {
+            safeDob = dob;
+          }
+        }
+
+        await tenantQuery(s, `
+          INSERT INTO patients (phone, name, email, gender, date_of_birth)
+          VALUES ($1, $2, $3, $4, $5)
+          ON CONFLICT (phone) DO UPDATE SET
+            name=EXCLUDED.name, email=COALESCE(EXCLUDED.email, patients.email),
+            gender=COALESCE(EXCLUDED.gender, patients.gender),
+            date_of_birth=COALESCE(EXCLUDED.date_of_birth, patients.date_of_birth),
+            updated_at=NOW()
+        `, [phone, name, email, safeGender, safeDob]);
+        imported++;
+      } catch (rowErr) {
+        skipped++;
+        errors.push(`Row ${imported + skipped}: ${rowErr.message}`);
+      }
+    }
+
+    await writeAuditLog(s, req.user.id, req.user.role, 'IMPORT_PATIENTS', 'patients', null,
+      null, { imported, skipped }, req.ip);
+
+    res.json({ imported, skipped, errors: errors.slice(0, 20) });
+  } catch (err) { handleError(res, err); }
+});
+
 module.exports = router;

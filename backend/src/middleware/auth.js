@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const { query } = require('../db');
 const { ERRORS } = require('../utils/errors');
+const logger = require('../utils/logger');
 
 // ── In-memory tenant cache (5s TTL) ──────────────────────────
 // Avoids a DB round-trip on every authenticated request.
@@ -10,7 +11,8 @@ const TENANT_CACHE_TTL_MS = 5000;
 const tenantCache = new Map(); // key: tenantId → { tenant, expiresAt }
 
 async function authMiddleware(req, res, next) {
-  const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+  // Support token in Authorization header (normal) or ?token= query param (SSE, EventSource)
+  const token = ((req.headers.authorization || '').replace('Bearer ', '') || req.query.token || '').trim();
   if (!token) return res.status(401).json({ error: ERRORS.NO_TOKEN });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -39,7 +41,8 @@ async function authMiddleware(req, res, next) {
     req.user = decoded;
     req.token = token;
     next();
-  } catch {
+  } catch (err) {
+    logger.warn('JWT verification failed', { error: err.message });
     res.status(401).json({ error: ERRORS.TOKEN_INVALID });
   }
 }
@@ -57,6 +60,17 @@ async function tenantMiddleware(req, res, next) {
         return res.status(403).json({ error: 'Tenant not found or inactive' });
       }
       req.tenant = cached.tenant;
+
+      // IP allowlist check (only if tenant has allowlist configured)
+      const clientIp = (req.ip || req.connection?.remoteAddress || '').replace('::ffff:', '');
+      const allowed = await checkIPAllowlist(req.tenant.id, clientIp);
+      if (!allowed) {
+        return res.status(403).json({
+          error: 'Access denied: your IP address is not in the allowed list for this account.',
+          ip: clientIp,
+        });
+      }
+
       return next();
     }
 
@@ -65,6 +79,17 @@ async function tenantMiddleware(req, res, next) {
 
     req.tenant = r.rows[0];
     tenantCache.set(tenantId, { tenant: r.rows[0], expiresAt: Date.now() + TENANT_CACHE_TTL_MS });
+
+    // IP allowlist check (only if tenant has allowlist configured)
+    const clientIp = (req.ip || req.connection?.remoteAddress || '').replace('::ffff:', '');
+    const allowed = await checkIPAllowlist(req.tenant.id, clientIp);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Access denied: your IP address is not in the allowed list for this account.',
+        ip: clientIp,
+      });
+    }
+
     next();
   } catch (err) {
     res.status(500).json({ error: 'Tenant lookup failed' });
@@ -75,4 +100,42 @@ function invalidateTenantCache(tenantId) {
   tenantCache.delete(tenantId);
 }
 
-module.exports = { authMiddleware, tenantMiddleware, invalidateTenantCache };
+async function checkIPAllowlist(tenantId, clientIp) {
+  if (!tenantId || !clientIp) return true; // no tenant or no IP — allow
+  try {
+    // Normalise IPv4-mapped IPv6 addresses (e.g. "::ffff:192.168.1.1" → "192.168.1.1")
+    const normalizedIp = clientIp.replace(/^::ffff:/i, '');
+
+    // Delegate CIDR matching to PostgreSQL's built-in inet/cidr operators.
+    // <<= means "is contained within or equal to" (handles both exact IPs and CIDR ranges).
+    // We also check whether any allowlist exists at all in the same query to avoid
+    // an extra round-trip.
+    const r = await query(
+      `SELECT
+         COUNT(*) AS total,
+         COUNT(*) FILTER (WHERE $2::inet <<= cidr::inet) AS matched
+       FROM tenant_ip_allowlist
+       WHERE tenant_id=$1`,
+      [tenantId, normalizedIp]
+    );
+
+    const total = parseInt(r.rows[0]?.total || 0);
+    if (total === 0) return true; // no allowlist configured — allow all
+
+    const matched = parseInt(r.rows[0]?.matched || 0);
+    return matched > 0;
+  } catch (err) {
+    // If the IP string is not valid inet format, PostgreSQL throws a cast error.
+    // Treat invalid client IPs as blocked (fail closed) to prevent bypass via
+    // malformed X-Forwarded-For headers.
+    if (err.message && err.message.includes('invalid input syntax for type inet')) {
+      logger.warn('checkIPAllowlist: invalid client IP format', { clientIp });
+      return false;
+    }
+    // Other DB errors — fail open so a DB blip doesn't lock out all admins
+    logger.warn('checkIPAllowlist DB error, allowing through', { error: err.message });
+    return true;
+  }
+}
+
+module.exports = { authMiddleware, tenantMiddleware, invalidateTenantCache, checkIPAllowlist };

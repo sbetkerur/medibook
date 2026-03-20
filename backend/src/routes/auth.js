@@ -10,6 +10,18 @@ const emailService = require('../services/email');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
 
+// ── Login rate limiter — 10 attempts per 15 minutes per IP ────
+// Prevents brute-force and credential-stuffing attacks against both
+// tenant admin and super admin login endpoints.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: { error: 'Too many login attempts. Please wait 15 minutes and try again.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true, // only count failed/all requests toward the limit
+});
+
 // Strict limiters for unauthenticated sensitive endpoints
 const forgotPasswordLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
@@ -36,7 +48,7 @@ const changePasswordLimiter = rateLimit({
 });
 
 // ── SUPER ADMIN LOGIN ─────────────────────────────────────────
-router.post('/auth/superadmin/login', validate(schemas.loginStrict), async (req, res) => {
+router.post('/auth/superadmin/login', loginLimiter, validate(schemas.loginStrict), async (req, res) => {
   try {
     const { email, password } = req.body;
     const normalizedEmail = (email || '').trim().toLowerCase();
@@ -52,7 +64,7 @@ router.post('/auth/superadmin/login', validate(schemas.loginStrict), async (req,
     const token = jwt.sign(
       { id: r.rows[0].id, email: r.rows[0].email, role: 'super_admin', jti },
       process.env.JWT_SECRET,
-      { expiresIn: '24h' }
+      { expiresIn: '1h' }
     );
     await query(`INSERT INTO admin_access_logs (user_id, email, event, ip_address, user_agent) VALUES ($1,$2,'login_success',$3,$4)`,
       [r.rows[0].id, r.rows[0].email, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
@@ -64,7 +76,7 @@ router.post('/auth/superadmin/login', validate(schemas.loginStrict), async (req,
 });
 
 // ── TENANT ADMIN LOGIN ────────────────────────────────────────
-router.post('/auth/login', validate(schemas.login), async (req, res) => {
+router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, res) => {
   try {
     const { email, password, tenant_slug } = req.body;
     const normalizedEmail = (email || '').trim().toLowerCase();
@@ -86,7 +98,7 @@ router.post('/auth/login', validate(schemas.login), async (req, res) => {
     const token = jwt.sign(
       { id: userR.rows[0].id, email: userR.rows[0].email, role: userR.rows[0].role, tenant_id: tenant.id, tenant_slug: normalizedSlug, jti },
       process.env.JWT_SECRET,
-      { expiresIn: '24h' }
+      { expiresIn: '1h' }
     );
     await query(`INSERT INTO admin_access_logs (user_id, email, tenant_id, event, ip_address, user_agent) VALUES ($1,$2,$3,'login_success',$4,$5)`,
       [userR.rows[0].id, userR.rows[0].email, tenant.id, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
@@ -171,7 +183,7 @@ router.post('/auth/refresh', async (req, res) => {
     const newAccessToken = jwt.sign(
       { ...tokenPayload, jti },
       process.env.JWT_SECRET,
-      { expiresIn: '24h' }
+      { expiresIn: '1h' }
     );
     const newRefreshToken = await issueRefreshToken(rt.user_id, rt.user_role, rt.tenant_id);
 

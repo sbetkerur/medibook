@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MediBook — Outreach Email Templates</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+  :root {
+    --primary: #1E3A8A;
+    --accent: #F59E0B;
+    --green: #059669;
+    --purple: #7C3AED;
+    --red: #DC2626;
+    --text: #111827;
+    --text-muted: #6B7280;
+    --border: #E5E7EB;
+    --bg: #F9FAFB;
+    --white: #FFFFFF;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', sans-serif; color: var(--text); background: var(--bg); line-height: 1.7; }
+
+  /* ── HEADER ──────────────────────────────────────────────── */
+  .header {
+    background: var(--primary);
+    color: white;
+    padding: 3rem 2rem;
+    text-align: center;
+  }
+  .header-badge {
+    display: inline-block;
+    background: rgba(245,158,11,0.2);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 0.3rem 1rem;
+    border-radius: 50px;
+    margin-bottom: 1rem;
+  }
+  .header h1 { font-size: clamp(1.5rem, 3vw, 2.2rem); font-weight: 800; margin-bottom: 0.5rem; }
+  .header p { font-size: 0.9rem; opacity: 0.75; max-width: 520px; margin: 0 auto; }
+
+  /* ── LAYOUT ──────────────────────────────────────────────── */
+  .container { max-width: 900px; margin: 0 auto; padding: 2.5rem 1.5rem; }
+
+  /* ── INTRO BOX ───────────────────────────────────────────── */
+  .intro-box {
+    background: white;
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 0 12px 12px 0;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 2rem;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+  }
+  .intro-box strong { color: var(--text); }
+
+  /* ── EMAIL CARD ──────────────────────────────────────────── */
+  .email-card {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+    margin-bottom: 2rem;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+
+  .email-header {
+    padding: 1.25rem 1.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .email-header-left { display: flex; align-items: center; gap: 1rem; }
+
+  .email-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.25rem;
+    flex-shrink: 0;
+  }
+
+  .email-title { font-size: 0.95rem; font-weight: 700; color: var(--text); }
+  .email-target { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.1rem; }
+
+  .email-badge {
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 0.3rem 0.75rem;
+    border-radius: 50px;
+  }
+
+  /* ── EMAIL META ──────────────────────────────────────────── */
+  .email-meta {
+    padding: 1rem 1.75rem;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.4rem 1rem;
+    font-size: 0.8rem;
+  }
+  .meta-label { font-weight: 700; color: var(--text-muted); text-transform: uppercase; font-size: 0.65rem; letter-spacing: 0.08em; align-self: center; }
+  .meta-value { color: var(--text); font-weight: 500; }
+  .meta-value.subject { font-weight: 700; color: var(--primary); font-size: 0.875rem; }
+
+  /* ── EMAIL BODY ──────────────────────────────────────────── */
+  .email-body {
+    padding: 1.75rem;
+    font-size: 0.875rem;
+    color: var(--text);
+    line-height: 1.85;
+    white-space: pre-wrap;
+    font-family: 'Inter', sans-serif;
+  }
+
+  .placeholder {
+    background: #FEF3C7;
+    border: 1px solid #FCD34D;
+    border-radius: 4px;
+    padding: 0 0.35rem;
+    font-weight: 600;
+    color: #92400E;
+    font-size: 0.8rem;
+  }
+
+  /* ── TIPS BOX ────────────────────────────────────────────── */
+  .tips-box {
+    background: #F0FDF4;
+    border: 1px solid #86EFAC;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin: 0 1.75rem 1.75rem;
+    font-size: 0.8rem;
+  }
+  .tips-box h4 { font-size: 0.75rem; font-weight: 700; color: #065F46; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .tips-box ul { padding-left: 1.25rem; }
+  .tips-box li { color: #065F46; margin-bottom: 0.25rem; }
+
+  /* ── FOLLOW-UP SECTION ───────────────────────────────────── */
+  .followup-section {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 1.75rem;
+    margin-bottom: 2rem;
+  }
+  .followup-section h2 { font-size: 1rem; font-weight: 700; color: var(--primary); margin-bottom: 1.25rem; }
+
+  .followup-timeline { display: flex; flex-direction: column; gap: 0; position: relative; padding-left: 2rem; }
+  .followup-timeline::before { content: ''; position: absolute; left: 0.6rem; top: 0.5rem; bottom: 0.5rem; width: 2px; background: var(--border); }
+
+  .followup-item { position: relative; margin-bottom: 1.25rem; }
+  .followup-dot { position: absolute; left: -1.7rem; top: 0.3rem; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 2px var(--border); }
+  .followup-day { font-size: 0.65rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); margin-bottom: 0.2rem; }
+  .followup-action { font-size: 0.875rem; font-weight: 600; color: var(--text); }
+  .followup-detail { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.1rem; }
+
+  /* ── NDA SECTION ─────────────────────────────────────────── */
+  .nda-section {
+    background: #F5F3FF;
+    border: 1px solid #DDD6FE;
+    border-radius: 16px;
+    padding: 1.75rem;
+    margin-bottom: 2rem;
+  }
+  .nda-section h2 { font-size: 1rem; font-weight: 700; color: #5B21B6; margin-bottom: 1rem; }
+  .nda-section p { font-size: 0.875rem; color: #4C1D95; margin-bottom: 0.75rem; }
+  .nda-section .nda-email { background: white; border: 1px solid #DDD6FE; border-radius: 10px; padding: 1.25rem; font-size: 0.875rem; white-space: pre-wrap; line-height: 1.8; }
+
+  /* ── PRICING GUIDANCE ────────────────────────────────────── */
+  .pricing-section {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 1.75rem;
+    margin-bottom: 2rem;
+  }
+  .pricing-section h2 { font-size: 1rem; font-weight: 700; color: var(--primary); margin-bottom: 1rem; }
+
+  .negotiation-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  .negotiation-table th { background: var(--bg); padding: 0.6rem 0.75rem; text-align: left; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); border-bottom: 2px solid var(--border); }
+  .negotiation-table td { padding: 0.65rem 0.75rem; border-bottom: 1px solid var(--border); color: var(--text); vertical-align: top; }
+  .negotiation-table tr:last-child td { border-bottom: none; }
+  .negotiation-table .walk { color: #DC2626; font-weight: 600; }
+  .negotiation-table .ideal { color: #059669; font-weight: 600; }
+  .negotiation-table .accept { color: #D97706; font-weight: 600; }
+
+  /* ── FOOTER ──────────────────────────────────────────────── */
+  .doc-footer { text-align: center; padding: 2rem; font-size: 0.75rem; color: var(--text-muted); border-top: 1px solid var(--border); }
+
+  /* ── PRINT ───────────────────────────────────────────────── */
+  @page { size: A4; margin: 1.5cm; }
+  @media print {
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    .header { padding: 1.5rem; }
+    .email-card { break-inside: avoid; box-shadow: none; }
+    .followup-section { break-inside: avoid; }
+    .nda-section { break-inside: avoid; }
+    .pricing-section { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-badge">Sales Outreach Kit</div>
+  <h1>MediBook — Cold Outreach Email Templates</h1>
+  <p>Four targeted email templates for different buyer types, plus follow-up sequence, NDA request, and negotiation guidance.</p>
+</div>
+
+<div class="container">
+
+  <!-- INTRO -->
+  <div class="intro-box">
+    <strong>How to use this kit:</strong> Replace all <span style="background:#FEF3C7;border:1px solid #FCD34D;border-radius:4px;padding:0 4px;font-weight:600;color:#92400E;font-size:0.8rem;">[BRACKETS]</span> with your actual details before sending. Send the one-pager PDF as an attachment. Use Template 1 for WhatsApp BSPs, Template 2 for health-tech companies, Template 3 for agencies, Template 4 for investors. Always personalise the opening line with something specific about the recipient's company.
+  </div>
+
+  <!-- ══ TEMPLATE 1: WhatsApp BSPs ══════════════════════════════ -->
+  <div class="email-card">
+    <div class="email-header">
+      <div class="email-header-left">
+        <div class="email-icon" style="background:#DCFCE7;">💬</div>
+        <div>
+          <div class="email-title">Template 1 — WhatsApp Business Solution Providers</div>
+          <div class="email-target">Best for: Interakt, Wati, Zoko, Gallabox, AiSensy, Respond.io, Twilio</div>
+        </div>
+      </div>
+      <span class="email-badge" style="background:#DCFCE7;color:#065F46;">Highest Fit</span>
+    </div>
+
+    <div class="email-meta">
+      <span class="meta-label">To</span>
+      <span class="meta-value">[Name], [Title] at [Company] — find via LinkedIn</span>
+      <span class="meta-label">Subject</span>
+      <span class="meta-value subject">Acquisition opportunity — WhatsApp appointment SaaS for Indian hospitals &amp; clinics (built &amp; ready)</span>
+      <span class="meta-label">Attach</span>
+      <span class="meta-value">MEDIBOOK_ONE_PAGER.pdf</span>
+    </div>
+
+    <div class="email-body">Hi [First Name],
+
+I noticed [Company] has been expanding into the healthcare vertical — [specific observation, e.g. "your recent case study with Apollo Pharmacy caught my attention"].
+
+I've built MediBook — a multi-tenant WhatsApp appointment booking SaaS for Indian hospitals and clinics — and I'm looking to sell it outright to the right buyer.
+
+Why this might interest [Company]:
+
+• Ready-made vertical product you can white-label or bundle with your existing BSP offering
+• Full Meta WhatsApp Cloud API integration — your team will find the codebase familiar
+• Schema-per-tenant PostgreSQL architecture supports thousands of clinics on one deployment
+• Works across any medical specialty (general medicine, cardiology, orthopaedics, and more)
+• Targeting 70,000+ hospitals and clinics in India, a segment with no dominant WhatsApp-native player yet
+
+What's included in the sale:
+→ Complete source code (Node.js backend, Next.js dashboards — admin, doctor, and reception portals)
+→ Email notifications (Resend), SSE real-time dashboard, BullMQ async queue
+→ Marketing strategy, sales playbook, and positioning docs
+→ Full IP transfer — no strings attached
+
+Asking price for the full product: ₹8,00,000 (negotiable).
+
+I've attached a one-pager with the full details. Happy to share the sale deck and arrange a technical walkthrough under NDA.
+
+Would a 20-minute call this week make sense?
+
+Best,
+[Your Name]
+[Phone] | [Email]</div>
+
+    <div class="tips-box">
+      <h4>Personalisation Tips</h4>
+      <ul>
+        <li>Mention a specific clinic or hospital they've worked with in India</li>
+        <li>Reference their pricing — explain how MediBook would add a new revenue line for them</li>
+        <li>If they have a marketplace/app store, mention MediBook as a vertical add-on</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ══ TEMPLATE 2: Health-Tech Companies ══════════════════════ -->
+  <div class="email-card">
+    <div class="email-header">
+      <div class="email-header-left">
+        <div class="email-icon" style="background:#DBEAFE;">🏥</div>
+        <div>
+          <div class="email-title">Template 2 — Indian Health-Tech Companies</div>
+          <div class="email-target">Best for: Practo, mfine, HealthPlix, DocPrime, Clinikk, Lybrate, Tata 1mg</div>
+        </div>
+      </div>
+      <span class="email-badge" style="background:#DBEAFE;color:#1E40AF;">Strategic Fit</span>
+    </div>
+
+    <div class="email-meta">
+      <span class="meta-label">To</span>
+      <span class="meta-value">[Name], VP Product / CTO / Head of Partnerships at [Company]</span>
+      <span class="meta-label">Subject</span>
+      <span class="meta-value subject">WhatsApp-native hospital &amp; clinic booking module — ready to acquire &amp; integrate</span>
+      <span class="meta-label">Attach</span>
+      <span class="meta-value">MEDIBOOK_ONE_PAGER.pdf</span>
+    </div>
+
+    <div class="email-body">Hi [First Name],
+
+[Company] has done impressive work bringing [specific feature/market] to Indian healthcare. I'm reaching out because I've built something that could slot directly into your stack — or give you a fast entry into a segment you may not yet serve.
+
+MediBook is a complete WhatsApp appointment booking SaaS for hospitals and clinics in India. It's fully built and available for outright acquisition.
+
+The core insight: India has 500M+ WhatsApp users and 70,000+ hospitals and clinics. Most still take bookings by phone call. MediBook gives them a WhatsApp bot that handles the entire booking flow — specialty selection, doctor, date, time slot, confirmation, and automated reminders — with zero app download required for the patient.
+
+Technical highlights relevant to your team:
+• Multi-tenant architecture (schema-per-tenant PostgreSQL) — drop into your existing infra
+• Meta WhatsApp Cloud API — compliant, scalable, no third-party dependency
+• BullMQ async bot queue + SSE real-time dashboard powered by Redis pub/sub
+• Admin dashboard, doctor portal, reception portal, and super-admin panel for white-labelling
+• Email notifications via Resend (deduplicated, open-tracked) + SMS service stub
+• Appointment reminders, slot generation, service catalog, and analytics out of the box
+
+This is a buy vs. build decision. Rebuilding this would take 12+ months and ₹30–40L in engineering cost. I'm selling for ₹8,00,000 with full IP transfer.
+
+One-pager attached. I can share the full technical deck under a standard NDA.
+
+Open to a conversation?
+
+Best regards,
+[Your Name]
+[Phone] | [Email]</div>
+
+    <div class="tips-box">
+      <h4>Personalisation Tips</h4>
+      <ul>
+        <li>If they have a clinic management product, position MediBook as their WhatsApp channel layer</li>
+        <li>If they're B2C (patient-facing), position it as a B2B2C clinic acquisition tool</li>
+        <li>Mention their geography — if they're strong in Tier 1 cities, note MediBook works for Tier 2/3 too</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ══ TEMPLATE 3: Digital Marketing Agencies ═════════════════ -->
+  <div class="email-card">
+    <div class="email-header">
+      <div class="email-header-left">
+        <div class="email-icon" style="background:#FEF3C7;">📣</div>
+        <div>
+          <div class="email-title">Template 3 — Digital Marketing Agencies (Healthcare Focus)</div>
+          <div class="email-target">Best for: agencies with healthcare clients looking to productise their offering</div>
+        </div>
+      </div>
+      <span class="email-badge" style="background:#FEF3C7;color:#92400E;">Good Fit</span>
+    </div>
+
+    <div class="email-meta">
+      <span class="meta-label">To</span>
+      <span class="meta-value">[Name], Founder / MD / Head of Digital at [Agency]</span>
+      <span class="meta-label">Subject</span>
+      <span class="meta-value subject">Turn your healthcare clients into recurring SaaS revenue — WhatsApp booking product for sale</span>
+      <span class="meta-label">Attach</span>
+      <span class="meta-value">MEDIBOOK_ONE_PAGER.pdf</span>
+    </div>
+
+    <div class="email-body">Hi [First Name],
+
+Agencies that serve dental clinics often face the same ceiling — you deliver a campaign, the client sees results, then the engagement ends. What if you could offer them a product they pay for monthly?
+
+I've built MediBook — a WhatsApp appointment booking SaaS for Indian hospitals and clinics — and I'm selling it outright. This could be the product that transforms [Agency] from a service business into a recurring-revenue one.
+
+Here's what your clients get:
+• A WhatsApp bot that books, reschedules, and cancels appointments automatically
+• Multi-portal dashboard: admin, doctor, and reception views
+• Email confirmations + automated 24-hour and 2-hour WhatsApp reminders to reduce no-shows
+• Real-time appointment dashboard via SSE — no page refresh needed
+• No app download — patients just WhatsApp the clinic number
+
+Here's what you get:
+• A white-label SaaS product to sell to every healthcare client in your portfolio
+• ₹1,999–₹9,999/month per clinic in recurring revenue
+• Full source code, IP, and marketing strategy — yours to own and operate
+
+With just 20 clinics on the Growth plan, that's ₹40,000/month in MRR from a product you own outright.
+
+Selling price: ₹8,00,000. Full IP transfer included.
+
+One-pager is attached. Happy to walk you through the product in detail.
+
+Worth a conversation?
+
+[Your Name]
+[Phone] | [Email]</div>
+
+    <div class="tips-box">
+      <h4>Personalisation Tips</h4>
+      <ul>
+        <li>If you know their client list, name-drop 1–2 clinic types they already serve</li>
+        <li>Offer to do a live demo using the built-in test endpoint — no Meta credentials needed</li>
+        <li>Emphasise white-labelling: they can brand it as their own product entirely</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ══ TEMPLATE 4: Investors / Angel Buyers ═══════════════════ -->
+  <div class="email-card">
+    <div class="email-header">
+      <div class="email-header-left">
+        <div class="email-icon" style="background:#F5F3FF;">💼</div>
+        <div>
+          <div class="email-title">Template 4 — Investors / Micro-PE / Asset Buyers</div>
+          <div class="email-target">Best for: angel investors, micro-PE, SaaS asset marketplaces (Acquire.com, MicroAcquire)</div>
+        </div>
+      </div>
+      <span class="email-badge" style="background:#F5F3FF;color:#5B21B6;">Asset Play</span>
+    </div>
+
+    <div class="email-meta">
+      <span class="meta-label">To</span>
+      <span class="meta-value">Individual investor / Acquire.com listing / cold LinkedIn DM</span>
+      <span class="meta-label">Subject</span>
+      <span class="meta-value subject">Profitable-path SaaS for sale — WhatsApp clinic booking, India, ₹8L asking</span>
+      <span class="meta-label">Attach</span>
+      <span class="meta-value">MEDIBOOK_ONE_PAGER.pdf</span>
+    </div>
+
+    <div class="email-body">Hi [First Name],
+
+I'm selling MediBook — a fully built, deployment-ready WhatsApp appointment booking SaaS targeting hospitals and clinics in India.
+
+The opportunity in brief:
+
+Market: 70,000+ hospitals and clinics in India. Zero dominant WhatsApp-native booking tool.
+Product: Complete — backend, frontend (admin + doctor + reception portals), bot engine, email service, real-time SSE dashboard, super admin panel. Ready to deploy in under a week.
+Revenue model: ₹1,999–₹9,999/month per clinic (SaaS). 100 clinics = ₹24L ARR.
+Tech: Node.js, Next.js, PostgreSQL, Redis + BullMQ, Meta WhatsApp Cloud API, Resend email. No proprietary lock-in.
+Status: No revenue yet — priced accordingly. This is a buy-and-operate or buy-and-flip asset.
+
+What makes this interesting as an acquisition:
+• The build cost was 12–18 months of engineering work (40,000+ lines of production code)
+• Selling for ₹8,00,000 — a fraction of replacement cost
+• Full IP transfer, source code, marketing strategy, and documentation included
+• Works for any medical specialty, not just one vertical
+• Seller available for 30-day handover support at buyer's request
+
+This suits an operator who wants to run a lean B2B SaaS, or a strategic buyer who can plug this into an existing distribution channel.
+
+One-pager attached. Full sale deck and technical documentation available under NDA.
+
+Keen to explore?
+
+[Your Name]
+[Phone] | [Email]</div>
+
+    <div class="tips-box">
+      <h4>Where to post this template (adapted):</h4>
+      <ul>
+        <li><strong>Acquire.com</strong> — list as a digital asset, category: SaaS</li>
+        <li><strong>MicroAcquire</strong> — good for pre-revenue SaaS assets</li>
+        <li><strong>IndiaMART / Tradekey</strong> — for domestic Indian buyers</li>
+        <li><strong>LinkedIn</strong> — DM investors who post about India SaaS / health-tech</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ══ FOLLOW-UP SEQUENCE ══════════════════════════════════════ -->
+  <div class="followup-section">
+    <h2>📅 Follow-Up Sequence — After Sending the Cold Email</h2>
+
+    <div class="followup-timeline">
+
+      <div class="followup-item">
+        <div class="followup-dot" style="background:#3B82F6;"></div>
+        <div class="followup-day">Day 0 — Send</div>
+        <div class="followup-action">Send cold email with one-pager attached</div>
+        <div class="followup-detail">No call to action beyond "worth a conversation?" — keep it low pressure.</div>
+      </div>
+
+      <div class="followup-item">
+        <div class="followup-dot" style="background:#10B981;"></div>
+        <div class="followup-day">Day 4 — First Follow-Up</div>
+        <div class="followup-action">Short bump email</div>
+        <div class="followup-detail">Subject: "Re: [original subject]" — just reply to the same thread.<br><br>
+Body: "Hi [Name], wanted to make sure this didn't get buried. Happy to share the full technical deck if you'd like a closer look — no commitment needed. Let me know either way."</div>
+      </div>
+
+      <div class="followup-item">
+        <div class="followup-dot" style="background:#F59E0B;"></div>
+        <div class="followup-day">Day 10 — Value-Add Follow-Up</div>
+        <div class="followup-action">Add something new — don't just chase</div>
+        <div class="followup-detail">Share a relevant stat or news item. Example: "Saw that WhatsApp Business API users in India crossed 500M active sessions last quarter — thought it added context to what I shared. Still happy to do a quick walkthrough."</div>
+      </div>
+
+      <div class="followup-item">
+        <div class="followup-dot" style="background:#8B5CF6;"></div>
+        <div class="followup-day">Day 18 — Final Nudge</div>
+        <div class="followup-action">One last short message, then let go</div>
+        <div class="followup-detail">Body: "Hi [Name], I'll keep this brief — I'm in active conversations with a couple of interested parties and expect to finalise something in the next few weeks. If MediBook was something you wanted to explore, now would be the right time. No pressure either way — happy to connect."</div>
+      </div>
+
+      <div class="followup-item">
+        <div class="followup-dot" style="background:#6B7280;"></div>
+        <div class="followup-day">Day 30+ — Move On</div>
+        <div class="followup-action">No response after 4 touches = not interested</div>
+        <div class="followup-detail">Move them to a low-priority list. Try a different contact at the same company, or revisit in 60 days if still unsold.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══ NDA REQUEST ═════════════════════════════════════════════ -->
+  <div class="nda-section">
+    <h2>🔒 NDA Request — When They Show Interest</h2>
+    <p>When a buyer asks to see the sale deck or codebase, send this before sharing anything detailed:</p>
+
+    <div class="nda-email">Subject: NDA for MediBook — [Your Name]
+
+Hi [Name],
+
+Great to hear from you. Before I share the sale deck and technical documentation, I'd like to put a standard NDA in place — this is just to protect both sides during the review process.
+
+I'll keep it simple: a one-page mutual NDA. You can use your own template if you prefer, or I'm happy to send mine.
+
+Once signed, I'll share:
+→ Full sale deck (product, market, financials, architecture)
+→ Technical documentation
+→ Live demo walkthrough (I can show the bot in action)
+
+Does that work for you?
+
+[Your Name]</div>
+  </div>
+
+  <!-- ══ NEGOTIATION GUIDANCE ════════════════════════════════════ -->
+  <div class="pricing-section">
+    <h2>💰 Negotiation Guidance — Know Your Numbers Before You Talk</h2>
+
+    <table class="negotiation-table">
+      <thead>
+        <tr>
+          <th>Deal Type</th>
+          <th>Walk Away (Min)</th>
+          <th>Accept</th>
+          <th>Ideal Target</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Strategy docs only</strong></td>
+          <td class="walk">₹25,000</td>
+          <td class="accept">₹50,000</td>
+          <td class="ideal">₹75,000 – ₹1,00,000</td>
+          <td>If they only want the marketing strategy PDF/PPTX without code</td>
+        </tr>
+        <tr>
+          <td><strong>Full product, no support</strong></td>
+          <td class="walk">₹4,00,000</td>
+          <td class="accept">₹6,00,000</td>
+          <td class="ideal">₹8,00,000</td>
+          <td>Code + strategy + IP transfer. Buyer self-deploys.</td>
+        </tr>
+        <tr>
+          <td><strong>Full product + 30-day support</strong></td>
+          <td class="walk">₹5,00,000</td>
+          <td class="accept">₹8,00,000</td>
+          <td class="ideal">₹10,00,000</td>
+          <td>You help them set up Meta API, deploy, onboard first clinic</td>
+        </tr>
+        <tr>
+          <td><strong>Equity / revenue share</strong></td>
+          <td>—</td>
+          <td class="accept">Min 15% equity</td>
+          <td class="ideal">20–25% equity</td>
+          <td>Only consider if buyer has clear distribution (existing clinic clients)</td>
+        </tr>
+        <tr>
+          <td><strong>License (not full transfer)</strong></td>
+          <td class="walk">₹30,000/year</td>
+          <td class="accept">₹60,000/year</td>
+          <td class="ideal">₹1,00,000/year + royalty</td>
+          <td>You retain IP, they pay to use. Complex to manage — only if you want ongoing income.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div style="margin-top:1.25rem; padding:1rem; background:#FEF2F2; border:1px solid #FCA5A5; border-radius:10px; font-size:0.8rem; color:#7F1D1D;">
+      <strong>Never reveal your walk-away price.</strong> If pushed on pricing, say: "I'm open to a conversation about structure — what matters to me is that the product goes to someone who can scale it. What works on your end?" Then listen.
+    </div>
+  </div>
+
+  <!-- ══ QUICK REFERENCE ═════════════════════════════════════════ -->
+  <div style="background:var(--primary); color:white; border-radius:16px; padding:1.75rem; margin-bottom:2rem;">
+    <h2 style="font-size:1rem; font-weight:700; margin-bottom:1rem; color:white;">Quick Reference — What to Send at Each Stage</h2>
+    <div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:1rem;">
+      <div style="background:rgba(255,255,255,0.1); border-radius:10px; padding:1rem;">
+        <div style="font-size:0.65rem; font-weight:800; text-transform:uppercase; letter-spacing:0.1em; color:var(--accent); margin-bottom:0.4rem;">Stage 1 — Cold</div>
+        <div style="font-size:0.8rem;">Cold email + MEDIBOOK_ONE_PAGER.pdf</div>
+      </div>
+      <div style="background:rgba(255,255,255,0.1); border-radius:10px; padding:1rem;">
+        <div style="font-size:0.65rem; font-weight:800; text-transform:uppercase; letter-spacing:0.1em; color:var(--accent); margin-bottom:0.4rem;">Stage 2 — Interest</div>
+        <div style="font-size:0.8rem;">NDA email → get NDA signed</div>
+      </div>
+      <div style="background:rgba(255,255,255,0.1); border-radius:10px; padding:1rem;">
+        <div style="font-size:0.65rem; font-weight:800; text-transform:uppercase; letter-spacing:0.1em; color:var(--accent); margin-bottom:0.4rem;">Stage 3 — Under NDA</div>
+        <div style="font-size:0.8rem;">MEDIBOOK_SALE_DECK.pdf + live demo</div>
+      </div>
+      <div style="background:rgba(255,255,255,0.1); border-radius:10px; padding:1rem;">
+        <div style="font-size:0.65rem; font-weight:800; text-transform:uppercase; letter-spacing:0.1em; color:var(--accent); margin-bottom:0.4rem;">Stage 4 — Negotiation</div>
+        <div style="font-size:0.8rem;">Technical Q&A + code review access</div>
+      </div>
+      <div style="background:rgba(255,255,255,0.1); border-radius:10px; padding:1rem;">
+        <div style="font-size:0.65rem; font-weight:800; text-transform:uppercase; letter-spacing:0.1em; color:var(--accent); margin-bottom:0.4rem;">Stage 5 — Closing</div>
+        <div style="font-size:0.8rem;">MEDIBOOK_IP_TRANSFER_AGREEMENT.pdf</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="doc-footer">
+    <strong>MediBook — Outreach Email Templates & Sales Kit</strong><br>
+    For use by the seller only · Not for distribution · March 2026
+  </div>
+
+</div>
+</body>
+</html>

@@ -3,7 +3,7 @@ const router = require('express').Router();
 const { tenantQuery } = require('../db');
 const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const { validateUUID } = require('../utils/errors');
+const { validateUUID, handleError } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 
 router.use(authMiddleware, tenantMiddleware);
@@ -14,7 +14,7 @@ router.get('/hospitals', async (req, res) => {
     const r = await tenantQuery(req.tenant.schema_name,
       `SELECT * FROM hospitals WHERE is_active=true ORDER BY name`);
     res.json({ hospitals: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (req, res) => {
@@ -27,7 +27,7 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_HOSPITAL', 'hospital', r.rows[0].id,
       null, { name, city }, req.ip);
     res.json({ hospital: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/hospitals/:id', adminOnly, validateUUID(), validate(schemas.createHospital), async (req, res) => {
@@ -44,7 +44,7 @@ router.patch('/hospitals/:id', adminOnly, validateUUID(), validate(schemas.creat
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_HOSPITAL', 'hospital', req.params.id,
       null, { name, city }, req.ip);
     res.json({ hospital: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/hospitals/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -73,7 +73,7 @@ router.delete('/hospitals/:id', adminOnly, validateUUID(), async (req, res) => {
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_HOSPITAL', 'hospital', req.params.id,
       null, null, req.ip);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── DEPARTMENTS ───────────────────────────────────────────────
@@ -91,7 +91,7 @@ router.get('/departments', async (req, res) => {
        ORDER BY d.name`,
       hospital_id ? [hospital_id] : []);
     res.json({ departments: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/departments', adminOnly, validate(schemas.createDepartment), async (req, res) => {
@@ -104,7 +104,7 @@ router.post('/departments', adminOnly, validate(schemas.createDepartment), async
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_DEPARTMENT', 'department', r.rows[0].id,
       null, { name, hospital_id }, req.ip);
     res.json({ department: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/departments/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -117,7 +117,7 @@ router.patch('/departments/:id', adminOnly, validateUUID(), async (req, res) => 
     `, [name || null, description || null, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Department not found' });
     res.json({ department: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/departments/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -130,7 +130,7 @@ router.delete('/departments/:id', adminOnly, validateUUID(), async (req, res) =>
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_DEPARTMENT', 'department', req.params.id,
       null, null, req.ip);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 module.exports = router;

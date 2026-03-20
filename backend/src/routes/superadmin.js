@@ -267,11 +267,28 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
 
     if (!updates.length) return res.json({ message: 'Nothing to update' });
 
+    // Fetch current plan before update so we can log the change
+    let oldPlan = null;
+    if (plan) {
+      const cur = await query(`SELECT plan FROM tenants WHERE id=$1`, [req.params.id]);
+      oldPlan = cur.rows[0]?.plan || null;
+    }
+
     params.push(req.params.id);
     const r = await query(
       `UPDATE tenants SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`,
       params
     );
+
+    // Log plan change for billing dashboard (Enhancement 13)
+    if (plan && oldPlan && plan !== oldPlan) {
+      query(`
+        INSERT INTO plan_changes (tenant_id, old_plan, new_plan, changed_by)
+        VALUES ($1,$2,$3,$4)
+      `, [req.params.id, oldPlan, plan, req.user.id]).catch(err =>
+        logger.warn('plan_changes insert failed', { error: err.message })
+      );
+    }
 
     // Immediately evict from tenant middleware cache so status changes (e.g. suspension) take effect without delay
     invalidateTenantCache(req.params.id);
@@ -360,6 +377,321 @@ router.get('/plans', async (req, res) => {
   try {
     const r = await query(`SELECT * FROM plans ORDER BY price_monthly`);
     res.json({ plans: r.rows });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── BILLING DASHBOARD (Enhancement 13) ───────────────────────
+router.get('/billing', async (req, res) => {
+  try {
+    const [planBreakdown, recentChanges] = await Promise.all([
+      query(`
+        SELECT p.id, p.name, p.price_monthly,
+               COUNT(t.id) AS tenant_count,
+               (COUNT(t.id) * p.price_monthly) AS subtotal
+        FROM plans p
+        LEFT JOIN tenants t ON t.plan = p.id AND t.status = 'active'
+        GROUP BY p.id, p.name, p.price_monthly
+        ORDER BY p.price_monthly DESC
+      `),
+      query(`
+        SELECT pc.id, pc.old_plan, pc.new_plan, pc.changed_at,
+               t.name AS tenant_name, t.slug
+        FROM plan_changes pc
+        JOIN tenants t ON t.id = pc.tenant_id
+        ORDER BY pc.changed_at DESC
+        LIMIT 50
+      `).catch(() => ({ rows: [] })), // graceful if table doesn't exist yet on old deployments
+    ]);
+
+    const mrr = planBreakdown.rows.reduce((sum, p) => sum + parseInt(p.subtotal || 0), 0);
+
+    res.json({
+      mrr_total: mrr,
+      by_plan: planBreakdown.rows.map(p => ({
+        ...p,
+        tenant_count: parseInt(p.tenant_count),
+        subtotal: parseInt(p.subtotal || 0),
+      })),
+      recent_changes: recentChanges.rows,
+    });
+  } catch (err) { handleError(res, err, 'GET /superadmin/billing'); }
+});
+
+// ── TENANT IMPERSONATION ──────────────────────────────────────
+router.post('/tenants/:id/impersonate', validateUUID(), async (req, res) => {
+  try {
+    const tenantR = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [req.params.id]);
+    if (!tenantR.rows[0]) return res.status(404).json({ error: 'Tenant not found or inactive' });
+    const tenant = tenantR.rows[0];
+
+    // Get the admin user for this tenant
+    const adminR = await tenantQuery(tenant.schema_name,
+      `SELECT id, email, name, role FROM users WHERE role='admin' AND is_active=true LIMIT 1`);
+    if (!adminR.rows[0]) return res.status(404).json({ error: 'No admin user found for this tenant' });
+    const adminUser = adminR.rows[0];
+
+    const jwt = require('jsonwebtoken');
+    // Short-lived 15-minute impersonation token
+    const token = jwt.sign(
+      {
+        id: adminUser.id,
+        email: adminUser.email,
+        role: adminUser.role,
+        tenant_id: tenant.id,
+        tenant_slug: tenant.slug,
+        impersonated_by: req.user.id,
+        impersonation: true,
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    // Audit log
+    try {
+      await query(`
+        INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
+        VALUES ($1,'super_admin','IMPERSONATE_TENANT','tenant',$2,$3,$4)
+      `, [req.user.id, tenant.id, JSON.stringify({ tenant_name: tenant.name, admin_email: adminUser.email }), req.ip]);
+    } catch (_) {}
+
+    res.json({
+      token,
+      tenant: { id: tenant.id, name: tenant.name, slug: tenant.slug },
+      user: { email: adminUser.email, name: adminUser.name, role: adminUser.role },
+      expires_in: '15m',
+      warning: 'This token grants full admin access to the tenant. Use responsibly.',
+    });
+  } catch (err) { handleError(res, err, 'POST /superadmin/tenants/:id/impersonate'); }
+});
+
+// ── ONBOARDING STATUS ─────────────────────────────────────────
+router.get('/tenants/:id/onboarding', validateUUID(), async (req, res) => {
+  try {
+    const tenantR = await query(`SELECT * FROM tenants WHERE id=$1`, [req.params.id]);
+    if (!tenantR.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
+    const t = tenantR.rows[0];
+    const s = t.schema_name;
+
+    const [hospitals, doctors, slots, bookings] = await Promise.allSettled([
+      tenantQuery(s, `SELECT COUNT(*) FROM hospitals WHERE is_active=true`),
+      tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
+      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= CURRENT_DATE AND status='available'`),
+      tenantQuery(s, `SELECT COUNT(*) FROM appointments`),
+    ]);
+    const v = (r) => r.status === 'fulfilled' ? parseInt(r.value.rows[0]?.count || 0) : 0;
+
+    const steps = [
+      { id: 'wa_configured', label: 'WhatsApp Connected', done: !!t.wa_phone_number_id },
+      { id: 'hospital_added', label: 'Hospital/Clinic Added', done: v(hospitals) > 0 },
+      { id: 'doctor_added', label: 'Doctor Added', done: v(doctors) > 0 },
+      { id: 'slots_generated', label: 'Appointment Slots Generated', done: v(slots) > 0 },
+      { id: 'test_booking_made', label: 'First Booking Received', done: v(bookings) > 0 },
+    ];
+
+    const done = steps.filter(s => s.done).length;
+    const percent = Math.round((done / steps.length) * 100);
+
+    res.json({
+      tenant_id: t.id,
+      onboarding_completed: t.onboarding_completed || percent === 100,
+      percent_complete: percent,
+      steps,
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+router.patch('/tenants/:id/onboarding', validateUUID(), async (req, res) => {
+  try {
+    await query(`UPDATE tenants SET onboarding_completed=true WHERE id=$1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── RATE LIMIT DASHBOARD ──────────────────────────────────────
+router.get('/rate-limits', async (req, res) => {
+  try {
+    const blocked = await query(`
+      SELECT ip, blocked_until, reason, offense_count, blocked_at
+      FROM rate_limit_blocks
+      WHERE blocked_until > NOW()
+      ORDER BY offense_count DESC, blocked_at DESC
+      LIMIT 100
+    `);
+
+    const redis = getRedisClient();
+    let liveTraffic = [];
+    try {
+      const window = Math.floor(Date.now() / 60000);
+      const tenants = await query(`SELECT id, name, slug, plan FROM tenants WHERE status='active'`);
+      const keys = tenants.rows.map(t => `ratelimit:tenant:${t.id}:${window}`);
+      if (keys.length > 0) {
+        const counts = await redis.mget(...keys);
+        liveTraffic = tenants.rows.map((t, i) => ({
+          tenant_id: t.id,
+          tenant_name: t.name,
+          tenant_slug: t.slug,
+          plan: t.plan,
+          requests_this_minute: parseInt(counts[i] || 0),
+        })).filter(t => t.requests_this_minute > 0).sort((a, b) => b.requests_this_minute - a.requests_this_minute);
+      }
+    } catch (_) {}
+
+    res.json({
+      blocked_ips: blocked.rows,
+      live_traffic: liveTraffic,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+router.delete('/rate-limits/:ip', async (req, res) => {
+  try {
+    const ip = req.params.ip;
+    if (!ip || ip.length > 45) return res.status(400).json({ error: 'Invalid IP' });
+    await query(`DELETE FROM rate_limit_blocks WHERE ip=$1`, [ip]);
+    res.json({ success: true, unblocked_ip: ip });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── DATABASE BACKUPS ──────────────────────────────────────────
+router.get('/backups', async (req, res) => {
+  try {
+    const r = await query(`
+      SELECT id, started_at, completed_at, status, file_path, size_bytes, duration_ms, error_message
+      FROM backup_log ORDER BY started_at DESC LIMIT 30
+    `);
+    res.json({ backups: r.rows });
+  } catch (err) { handleError(res, err); }
+});
+
+router.post('/backups/trigger', async (req, res) => {
+  try {
+    res.json({ message: 'Backup started', started_at: new Date().toISOString() });
+    setImmediate(async () => {
+      try {
+        const { runBackup } = require('../jobs/backupManager');
+        await runBackup();
+        logger.info('Manual backup triggered by super admin');
+      } catch (err) {
+        logger.error('Manual backup failed', { error: err.message });
+      }
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+router.get('/backups/restore-instructions', async (req, res) => {
+  try {
+    const latest = await query(`
+      SELECT file_path, size_bytes, started_at FROM backup_log WHERE status='success' ORDER BY started_at DESC LIMIT 1
+    `);
+    const latestBackup = latest.rows[0] || null;
+    res.json({
+      instructions: [
+        '1. Download the backup file from the server (use SSH/SFTP)',
+        '2. Run: psql $DATABASE_URL < <backup_file>',
+        '3. Or for production: psql $DATABASE_URL -f medibook_backup_YYYYMMDD.sql',
+      ],
+      latest_backup: latestBackup,
+      warning: 'Restore will overwrite ALL data. Create a fresh backup before restoring.',
+      pg_restore_command: latestBackup ? `psql $DATABASE_URL < ${latestBackup.file_path}` : null,
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── FAILED WEBHOOKS MANAGEMENT ────────────────────────────────
+router.get('/webhooks/failed', async (req, res) => {
+  try {
+    const { limit = 20, status = 'failed' } = req.query;
+    const safeLimit = Math.min(parseInt(limit) || 20, 100);
+    const VALID_STATUSES = ['pending', 'processing', 'succeeded', 'failed'];
+    if (!VALID_STATUSES.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+
+    const r = await query(`
+      SELECT fw.id, fw.phone, fw.message_type, fw.error_message, fw.attempts,
+             fw.max_attempts, fw.status, fw.created_at, fw.next_retry_at,
+             fw.sanitized_payload,
+             t.name as tenant_name, t.slug as tenant_slug
+      FROM failed_webhooks fw
+      JOIN tenants t ON t.id = fw.tenant_id
+      WHERE fw.status = $1
+      ORDER BY fw.created_at DESC
+      LIMIT $2
+    `, [status, safeLimit]);
+
+    // Mask phones for security
+    const rows = r.rows.map(r => ({
+      ...r,
+      phone: r.phone ? '*'.repeat(Math.max(0, r.phone.length - 4)) + r.phone.slice(-4) : '****',
+    }));
+
+    res.json({ webhooks: rows, count: rows.length });
+  } catch (err) { handleError(res, err); }
+});
+
+router.post('/webhooks/:id/retry', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await query(
+      `UPDATE failed_webhooks
+       SET status='pending', attempts=0, next_retry_at=NOW(), error_message=NULL
+       WHERE id=$1 AND status IN ('failed','pending')
+       RETURNING id`,
+      [id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Webhook not found or not in retryable state' });
+    res.json({ success: true, id });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── FEATURE FLAGS ─────────────────────────────────────────────
+router.get('/tenants/:id/feature-flags', validateUUID(), async (req, res) => {
+  try {
+    const { getAllFlags } = require('../utils/featureFlags');
+    const flags = await getAllFlags(req.params.id);
+    res.json({ flags });
+  } catch (err) { handleError(res, err); }
+});
+
+router.post('/tenants/:id/feature-flags', validateUUID(), async (req, res) => {
+  try {
+    const { flag_key, enabled } = req.body;
+    if (!flag_key || typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'flag_key (string) and enabled (boolean) required' });
+    }
+    const { setFlag } = require('../utils/featureFlags');
+    await setFlag(req.params.id, flag_key, enabled);
+    res.json({ success: true, flag_key, enabled });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── QUOTA MONITORING ──────────────────────────────────────────
+router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
+  try {
+    const tenantR = await query(
+      `SELECT t.*, p.max_appointments_per_month, p.max_doctors FROM tenants t JOIN plans p ON p.id=t.plan WHERE t.id=$1`,
+      [req.params.id]
+    );
+    if (!tenantR.rows[0]) return res.status(404).json({ error: 'Not found' });
+    const t = tenantR.rows[0];
+
+    const [apptCount, doctorCount] = await Promise.all([
+      tenantQuery(t.schema_name, `SELECT COUNT(*) FROM appointments WHERE created_at >= date_trunc('month', NOW())`),
+      tenantQuery(t.schema_name, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
+    ]);
+
+    const appts = parseInt(apptCount.rows[0].count);
+    const doctors = parseInt(doctorCount.rows[0].count);
+    const apptPct = Math.round((appts / t.max_appointments_per_month) * 100);
+    const doctorPct = Math.round((doctors / t.max_doctors) * 100);
+
+    res.json({
+      tenant_id: t.id,
+      plan: t.plan,
+      appointments: { used: appts, limit: t.max_appointments_per_month, percent: apptPct },
+      doctors: { used: doctors, limit: t.max_doctors, percent: doctorPct },
+      upgrade_recommended: apptPct >= 80 || doctorPct >= 80,
+      upgrade_prompt: t.upgrade_prompt,
+    });
   } catch (err) { handleError(res, err); }
 });
 

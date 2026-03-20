@@ -13,7 +13,7 @@ router.use(authMiddleware, tenantMiddleware);
 router.get('/appointments', async (req, res) => {
   try {
     const s = req.tenant.schema_name;
-    const { date, status, page = 1, limit = 25 } = req.query;
+    const { date, status, doctor_id, page = 1, limit = 25 } = req.query;
     const safeLimit = Math.min(Math.max(parseInt(limit) || 25, 1), 100);
     const safePage = Math.max(parseInt(page) || 1, 1);
 
@@ -22,10 +22,16 @@ router.get('/appointments', async (req, res) => {
       return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_APPOINTMENT_STATUSES.join(', ')}` });
     }
 
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (doctor_id && !UUID_RE.test(doctor_id)) {
+      return res.status(400).json({ error: 'Invalid doctor_id format' });
+    }
+
     const where = ['1=1'];
     const params = [];
     if (date) { params.push(date); where.push(`a.appointment_date=$${params.length}`); }
     if (status) { params.push(status); where.push(`a.status=$${params.length}`); }
+    if (doctor_id) { params.push(doctor_id); where.push(`a.doctor_id=$${params.length}`); }
     const countParams = params.slice();
     params.push(safeLimit, (safePage - 1) * safeLimit);
     const [r, countR] = await Promise.all([
@@ -56,7 +62,7 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
     const r = await tenantQuery(s, `
       SELECT a.*,
              p.name as patient_name, p.phone as patient_phone, p.email as patient_email,
-             p.date_of_birth, p.gender, p.visit_count, p.medical_history,
+             p.date_of_birth, p.gender, p.visit_count, p.dental_history,
              d.name as doctor_name, d.specialization, d.consultation_fee,
              h.name as hospital_name, h.address as hospital_address,
              dep.name as department_name
@@ -74,9 +80,9 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
       WHERE a2.patient_id=$1 AND a2.id != $2
       ORDER BY a2.appointment_date DESC LIMIT 5
     `, [r.rows[0].patient_id, req.params.id]);
-    // Audit medical history access for privacy compliance
-    if (r.rows[0].medical_history && Object.keys(r.rows[0].medical_history).length > 0) {
-      writeAuditLog(s, req.user.id, req.user.role, 'ACCESS_MEDICAL_HISTORY', 'patient',
+    // Audit dental history access for privacy compliance
+    if (r.rows[0].dental_history && Object.keys(r.rows[0].dental_history).length > 0) {
+      writeAuditLog(s, req.user.id, req.user.role, 'ACCESS_DENTAL_HISTORY', 'patient',
         r.rows[0].patient_id, null, null, req.ip)
         .catch(e => logger.warn('Medical history audit log failed', { error: e.message }));
     }
@@ -109,10 +115,11 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
       updated = await tenantTransaction(s, async (client) => {
         const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
         const statusParam = ids.length + 1;
+        // Only cancel appointments that are in a cancellable state ('confirmed' or 'no_show')
         const r = await client.query(`
           UPDATE appointments SET status=$${statusParam}, updated_at=NOW(),
             cancellation_reason=$${statusParam + 1}, cancelled_at=NOW(), cancelled_by_user_id=$${statusParam + 2}
-          WHERE id IN (${placeholders}) AND status='confirmed' RETURNING id, slot_id, doctor_id
+          WHERE id IN (${placeholders}) AND status IN ('confirmed','no_show') RETURNING id, slot_id, doctor_id
         `, [...ids, status, cancellation_reason, req.user.id]);
 
         const slotIds = r.rows.map(a => a.slot_id).filter(Boolean);
@@ -134,22 +141,6 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
       `, [...ids, status]);
     }
 
-    if (status === 'cancelled') {
-      // Notify waitlist for each unique doctor
-      try {
-        const { notifyWaitlistForDoctor } = require('../services/bot/utils');
-        const seen = new Set();
-        for (const appt of updated.rows) {
-          if (appt.doctor_id && !seen.has(appt.doctor_id)) {
-            seen.add(appt.doctor_id);
-            notifyWaitlistForDoctor(s, appt.doctor_id, req.tenant)
-              .catch(e => logger.warn('Bulk waitlist notification failed', { error: e.message }));
-          }
-        }
-      } catch (e) {
-        logger.warn('Bulk waitlist notification skipped', { error: e.message });
-      }
-    }
     await writeAuditLog(s, req.user.id, req.user.role, 'BULK_UPDATE_APPOINTMENTS', 'appointment', null,
       null, { ids, status }, req.ip);
     res.json({ updated: updated.rows.length, ids: updated.rows.map(a => a.id) });
@@ -173,6 +164,25 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     }
     const oldR = await tenantQuery(s, `SELECT status FROM appointments WHERE id=$1`, [req.params.id]);
     if (!oldR.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+
+    // Enforce valid state transitions to prevent data inconsistency
+    // (e.g. reverting a completed appointment back to confirmed)
+    if (status) {
+      const VALID_TRANSITIONS = {
+        confirmed: ['completed', 'cancelled', 'no_show'],
+        no_show:   ['confirmed'],   // allow re-confirmation if patient arrived late
+        completed: [],              // terminal — no further transitions
+        cancelled: [],              // terminal
+      };
+      const currentStatus = oldR.rows[0].status;
+      const allowed = VALID_TRANSITIONS[currentStatus] || [];
+      if (!allowed.includes(status)) {
+        return res.status(409).json({
+          error: `Invalid status transition: '${currentStatus}' → '${status}'. ` +
+            `Allowed transitions from '${currentStatus}': [${allowed.join(', ') || 'none'}]`,
+        });
+      }
+    }
 
     // Wrap cancel + slot release in a transaction to prevent a race where the
     // reminder cron marks reminder_Xh_sent=true on an appointment being cancelled.
@@ -223,28 +233,98 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
     }
 
-    if (status === 'cancelled' && r.rows[0].slot_id) {
-      // Notify waiting list patients that a slot has opened up
-      try {
-        const { notifyWaitlistForDoctor } = require('../services/bot/utils');
-        if (r.rows[0].doctor_id) {
-          notifyWaitlistForDoctor(s, r.rows[0].doctor_id, req.tenant)
-            .catch(e => logger.warn('Waitlist notification failed', { error: e.message }));
-        }
-      } catch (e) {
-        logger.warn('Waitlist notification skipped', { error: e.message });
-      }
-    }
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_APPOINTMENT', 'appointment', req.params.id,
       { status: oldR.rows[0].status }, { status, cancellation_reason }, req.ip);
     res.json({ appointment: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
 
+// ── PRINTABLE RECEIPT (A2) ────────────────────────────────────
+router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
+  try {
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s, `
+      SELECT a.booking_id, a.appointment_date, a.appointment_time, a.status,
+             a.visit_type, a.notes, a.note_category, a.created_at,
+             p.name AS patient_name, p.phone AS patient_phone, p.email AS patient_email,
+             p.date_of_birth, p.gender,
+             d.name AS doctor_name, d.qualification, d.consultation_fee,
+             dep.name AS treatment_type,
+             h.name AS clinic_name, h.address AS clinic_address, h.phone AS clinic_phone
+      FROM appointments a
+      JOIN patients p ON p.id=a.patient_id
+      JOIN doctors d ON d.id=a.doctor_id
+      LEFT JOIN departments dep ON dep.id=d.department_id
+      JOIN hospitals h ON h.id=a.hospital_id
+      WHERE a.id=$1
+    `, [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+    const a = r.rows[0];
+    // Escape HTML entities to prevent XSS from user-supplied data (names, addresses etc.)
+    const he = (str) => String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;');
+    const apptDate = a.appointment_date ? String(a.appointment_date).slice(0, 10) : '—';
+    const apptTime = a.appointment_time ? String(a.appointment_time).slice(0, 5) : '—';
+    const generatedOn = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+    const statusColors = { confirmed: '#065f46|#d1fae5', completed: '#1e40af|#dbeafe', cancelled: '#991b1b|#fee2e2', no_show: '#4b5563|#f3f4f6' };
+    const [statusTxt, statusBg] = (statusColors[a.status] || '#4b5563|#f3f4f6').split('|');
+    const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Receipt · ${he(a.booking_id)}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Helvetica Neue',Arial,sans-serif;color:#1a1a1a;padding:40px;max-width:680px;margin:0 auto}
+.hdr{text-align:center;border-bottom:2.5px solid #0066cc;padding-bottom:18px;margin-bottom:22px}
+.clinic{font-size:22px;font-weight:700;color:#0066cc}
+.sub{font-size:12px;color:#888;margin-top:3px;letter-spacing:.5px;text-transform:uppercase}
+.bid{background:#f0f7ff;border:1px solid #b3cfe8;border-radius:8px;padding:10px 18px;text-align:center;margin:16px 0}
+.bid span{font-size:20px;font-weight:700;color:#0066cc;letter-spacing:2px}
+.sec{margin:18px 0}.sec-title{font-size:11px;color:#999;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;font-weight:600}
+.row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #f0f0f0}
+.row:last-child{border-bottom:none}.lbl{color:#777;font-size:13px}.val{font-size:13px;font-weight:500;text-align:right;max-width:55%}
+.total{display:flex;justify-content:space-between;padding:14px 0;border-top:2px solid #1a1a1a;margin-top:6px}
+.t-lbl{font-size:15px;font-weight:700}.t-val{font-size:18px;font-weight:700;color:#0066cc}
+.badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;text-transform:uppercase;color:${statusTxt};background:${statusBg}}
+.ftr{text-align:center;margin-top:28px;padding-top:14px;border-top:1px solid #eee;color:#aaa;font-size:11px}
+@media print{body{padding:20px}}</style></head>
+<body>
+<div class="hdr">
+  <div class="clinic">🦷 ${he(a.clinic_name)}</div>
+  ${a.clinic_address ? `<div style="font-size:12px;color:#666;margin-top:3px">${he(a.clinic_address)}</div>` : ''}
+  ${a.clinic_phone ? `<div style="font-size:12px;color:#666">📞 ${he(a.clinic_phone)}</div>` : ''}
+  <div class="sub">Appointment Receipt</div>
+</div>
+<div class="bid">Booking ID: <span>${he(a.booking_id)}</span></div>
+<div class="sec">
+  <div class="sec-title">Patient</div>
+  <div class="row"><span class="lbl">Name</span><span class="val">${he(a.patient_name) || '—'}</span></div>
+  <div class="row"><span class="lbl">Phone</span><span class="val">${he(a.patient_phone)}</span></div>
+  ${a.patient_email ? `<div class="row"><span class="lbl">Email</span><span class="val">${he(a.patient_email)}</span></div>` : ''}
+  ${a.gender ? `<div class="row"><span class="lbl">Gender</span><span class="val" style="text-transform:capitalize">${he(a.gender)}</span></div>` : ''}
+</div>
+<div class="sec">
+  <div class="sec-title">Appointment</div>
+  <div class="row"><span class="lbl">Dentist</span><span class="val">Dr. ${he(a.doctor_name)}${a.qualification ? ` · ${he(a.qualification)}` : ''}</span></div>
+  <div class="row"><span class="lbl">Treatment</span><span class="val">${he(a.treatment_type) || '—'}</span></div>
+  <div class="row"><span class="lbl">Date</span><span class="val">${he(apptDate)}</span></div>
+  <div class="row"><span class="lbl">Time</span><span class="val">${he(apptTime)}</span></div>
+  <div class="row"><span class="lbl">Status</span><span class="val"><span class="badge">${he((a.status || '').replace('_', ' '))}</span></span></div>
+  ${a.notes ? `<div class="row"><span class="lbl">Notes</span><span class="val">${he(a.notes)}</span></div>` : ''}
+</div>
+<div class="total"><span class="t-lbl">Consultation Fee</span><span class="t-val">₹${parseInt(a.consultation_fee) || 0}</span></div>
+<div class="ftr">
+  <p>Generated on ${he(generatedOn)}</p>
+  <p style="margin-top:4px">Thank you for choosing ${he(a.clinic_name)} 😊</p>
+</div>
+<script>window.onload=function(){window.print();}</script>
+</body></html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (err) { handleError(res, err); }
+});
+
 // ── CREATE APPOINTMENT (walk-in) ──────────────────────────────
 router.post('/appointments', adminOnly, validate(schemas.createAppointment), async (req, res) => {
   try {
-    const { patient_phone, patient_name, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes } = req.body;
+    const { patient_phone: rawPhone, patient_name, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes } = req.body;
+    // Strip leading '+' to match DB CHECK constraint: phone ~ '^[0-9]{7,20}$'
+    const patient_phone = rawPhone.replace(/^\+/, '');
     const s = req.tenant.schema_name;
 
     // Reject appointments in the past
@@ -288,6 +368,123 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
       null, { booking_id: bookingId, doctor_id, appointment_date }, req.ip);
     res.status(201).json({ appointment: r.rows[0], booking_id: bookingId });
   } catch (err) { handleError(res, err); }
+});
+
+// ── FOLLOW-UP SCHEDULING ──────────────────────────────────────
+router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const { follow_up_days = 14, doctor_id, notes } = req.body;
+    if (follow_up_days < 1 || follow_up_days > 365) {
+      return res.status(400).json({ error: 'follow_up_days must be between 1 and 365' });
+    }
+    const s = req.tenant.schema_name;
+
+    // Get original appointment
+    const origR = await tenantQuery(s, `
+      SELECT a.*, d.consultation_fee, d.pricing_rules FROM appointments a
+      JOIN doctors d ON d.id = a.doctor_id
+      WHERE a.id = $1
+    `, [req.params.id]);
+    if (!origR.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+    const orig = origR.rows[0];
+
+    if (orig.follow_up_appointment_id) {
+      return res.status(409).json({ error: 'Follow-up already scheduled for this appointment' });
+    }
+
+    const targetDoctorId = doctor_id || orig.doctor_id;
+    const { addDays, format } = require('date-fns');
+    const followUpDate = format(addDays(new Date(orig.appointment_date), follow_up_days), 'yyyy-MM-dd');
+
+    // Find first available slot on or after follow-up date
+    const slotR = await tenantQuery(s, `
+      SELECT id, slot_date::text, start_time::text
+      FROM time_slots
+      WHERE doctor_id=$1
+        AND slot_date >= $2
+        AND status='available'
+      ORDER BY slot_date, start_time
+      LIMIT 1
+    `, [targetDoctorId, followUpDate]);
+
+    if (!slotR.rows[0]) {
+      return res.status(404).json({ error: `No available slots found after ${followUpDate} for the selected doctor` });
+    }
+    const slot = slotR.rows[0];
+
+    // Atomic slot lock
+    const lockR = await tenantQuery(s, `
+      UPDATE time_slots
+      SET status='booked'
+      WHERE id=$1 AND status='available'
+      RETURNING id
+    `, [slotR.rows[0].id]);
+    if (!lockR.rows[0]) {
+      return res.status(409).json({ error: 'Slot no longer available — please try again' });
+    }
+
+    // Create follow-up appointment
+    const bookingId = 'MB' + Date.now().toString(36).toUpperCase().slice(-6);
+    const newApptR = await tenantQuery(s, `
+      INSERT INTO appointments
+        (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, status, visit_type, notes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'confirmed',$8,$9)
+      RETURNING *
+    `, [bookingId, orig.patient_id, targetDoctorId, orig.hospital_id, slot.id,
+        slot.slot_date, slot.start_time, orig.visit_type, notes || 'Follow-up appointment']);
+
+    // Link back to original
+    await tenantQuery(s, `
+      UPDATE appointments SET follow_up_appointment_id=$1, follow_up_days=$2 WHERE id=$3
+    `, [newApptR.rows[0].id, follow_up_days, req.params.id]);
+
+    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_FOLLOWUP', 'appointment', newApptR.rows[0].id,
+      null, { original_id: req.params.id, follow_up_days, booking_id: bookingId }, req.ip);
+
+    res.json({
+      follow_up_appointment: newApptR.rows[0],
+      booking_id: bookingId,
+      date: slot.slot_date,
+      time: slot.start_time,
+    });
+  } catch (err) { handleError(res, err, 'POST /appointments/:id/followup'); }
+});
+
+// ── SMS FALLBACK ──────────────────────────────────────────────
+router.post('/appointments/:id/sms', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s, `
+      SELECT a.*, p.phone, p.name as patient_name, d.name as doctor_name, h.name as hospital_name
+      FROM appointments a
+      JOIN patients p ON p.id=a.patient_id
+      JOIN doctors d ON d.id=a.doctor_id
+      JOIN hospitals h ON h.id=a.hospital_id
+      WHERE a.id=$1
+    `, [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+    const appt = r.rows[0];
+    if (appt.sms_fallback_sent) {
+      return res.status(409).json({ error: 'SMS already sent for this appointment' });
+    }
+    const smsService = require('../services/sms');
+    const { format, parseISO } = require('date-fns');
+    let dateStr = appt.appointment_date;
+    try { dateStr = format(parseISO(String(appt.appointment_date).slice(0, 10)), 'EEE, d MMM yyyy'); } catch {}
+    const sent = await smsService.sendBookingConfirmationSMS(appt.phone, {
+      bookingId: appt.booking_id,
+      doctorName: appt.doctor_name,
+      date: dateStr,
+      time: (appt.appointment_time || '').slice(0, 5),
+      hospitalName: appt.hospital_name,
+    });
+    if (sent) {
+      await tenantQuery(s, `UPDATE appointments SET sms_fallback_sent=true WHERE id=$1`, [appt.id]);
+      res.json({ success: true, message: 'SMS sent successfully' });
+    } else {
+      res.status(503).json({ error: 'SMS service not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER.' });
+    }
+  } catch (err) { handleError(res, err, 'POST /appointments/:id/sms'); }
 });
 
 module.exports = router;

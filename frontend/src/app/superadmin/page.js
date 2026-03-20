@@ -28,6 +28,19 @@ export default function SuperAdminPage() {
   const [tenantHealth, setTenantHealth] = useState({}); // { [tenantId]: healthData }
   const [loadingHealth, setLoadingHealth] = useState(null);
 
+  // Billing dashboard state (Enhancement 13)
+  const [billing, setBilling] = useState(null);
+  const [billingLoading, setBillingLoading] = useState(false);
+
+  // Rate limits state (Feature 32)
+  const [rateLimits, setRateLimits] = useState(null);
+  const [rateLimitsLoading, setRateLimitsLoading] = useState(false);
+
+  // Backups state (Feature 33)
+  const [backups, setBackups] = useState(null);
+  const [backupsLoading, setBackupsLoading] = useState(false);
+  const [triggeringBackup, setTriggeringBackup] = useState(false);
+
   useEffect(() => {
     const u = localStorage.getItem('user');
     if (!u) { router.push('/login'); return; }
@@ -95,6 +108,51 @@ export default function SuperAdminPage() {
       fetchAll();
     } catch { toast.error('Failed to suspend tenant'); }
     finally { setSuspending(false); }
+  }
+
+  async function fetchBilling() {
+    setBillingLoading(true);
+    try {
+      const { data } = await api.get('/superadmin/billing');
+      setBilling(data);
+    } catch { toast.error('Failed to load billing data'); }
+    finally { setBillingLoading(false); }
+  }
+
+  async function fetchRateLimits() {
+    setRateLimitsLoading(true);
+    try {
+      const { data } = await api.get('/superadmin/rate-limits');
+      setRateLimits(data);
+    } catch { toast.error('Failed to load rate limit data'); }
+    finally { setRateLimitsLoading(false); }
+  }
+
+  async function unblockIp(ip) {
+    try {
+      await api.delete(`/superadmin/rate-limits/${encodeURIComponent(ip)}`);
+      toast.success(`Unblocked ${ip}`);
+      fetchRateLimits();
+    } catch { toast.error('Failed to unblock IP'); }
+  }
+
+  async function fetchBackups() {
+    setBackupsLoading(true);
+    try {
+      const { data } = await api.get('/superadmin/backups');
+      setBackups(data);
+    } catch { toast.error('Failed to load backups'); }
+    finally { setBackupsLoading(false); }
+  }
+
+  async function triggerBackup() {
+    setTriggeringBackup(true);
+    try {
+      await api.post('/superadmin/backups/trigger');
+      toast.success('Backup started in background');
+      setTimeout(fetchBackups, 3000);
+    } catch { toast.error('Failed to trigger backup'); }
+    finally { setTriggeringBackup(false); }
   }
 
   async function loadTenantHealth(tenantId) {
@@ -183,13 +241,29 @@ export default function SuperAdminPage() {
           </>
         )}
 
+        {/* Tab bar */}
+        <div className="flex gap-1 bg-white rounded-xl shadow-sm p-1 border border-gray-100">
+          {[
+            { id: 'tenants', label: '🏥 Tenants' },
+            { id: 'billing', label: '💰 Billing', onClick: () => { setTab('billing'); if (!billing) fetchBilling(); } },
+            { id: 'rate_limits', label: '🚦 Rate Limits', onClick: () => { setTab('rate_limits'); if (!rateLimits) fetchRateLimits(); } },
+            { id: 'backups', label: '💾 Backups', onClick: () => { setTab('backups'); if (!backups) fetchBackups(); } },
+          ].map(t => (
+            <button key={t.id}
+              onClick={() => { if (t.onClick) t.onClick(); else setTab(t.id); }}
+              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${tab === t.id ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-50'}`}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
         {/* Tenants table */}
-        <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+        {tab === 'tenants' && <div className="bg-white rounded-xl shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
             <h2 className="font-semibold text-gray-800">All Tenants ({tenants.length})</h2>
             <div className="flex gap-2">
               <button onClick={fetchAll} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>
-              <button onClick={() => setShowCreate(true)} className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">+ New Tenant</button>
+              <button onClick={() => router.push('/superadmin/new-tenant')} className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">+ New Tenant</button>
             </div>
           </div>
 
@@ -282,7 +356,272 @@ export default function SuperAdminPage() {
               </table>
             </div>
           )}
-        </div>
+        </div>}
+
+        {/* Billing Tab (Enhancement 13) */}
+        {tab === 'billing' && (
+          <div className="space-y-5">
+            {billingLoading ? (
+              <div className="bg-white rounded-xl p-12 text-center text-gray-400">Loading billing data...</div>
+            ) : billing ? (
+              <>
+                {/* MRR Summary */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="bg-white rounded-xl p-5 shadow-sm border-l-4 border-green-500">
+                    <p className="text-xs text-gray-500 uppercase tracking-wide">Total MRR</p>
+                    <p className="text-3xl font-bold text-gray-900 mt-1">₹{(billing.mrr_total || 0).toLocaleString('en-IN')}</p>
+                  </div>
+                  {billing.by_plan?.filter(p => parseInt(p.tenant_count) > 0).map(p => (
+                    <div key={p.id} className="bg-white rounded-xl p-5 shadow-sm border-l-4 border-blue-400">
+                      <p className="text-xs text-gray-500 uppercase tracking-wide capitalize">{p.name}</p>
+                      <p className="text-3xl font-bold text-gray-900 mt-1">{p.tenant_count}</p>
+                      <p className="text-sm text-gray-500">₹{(p.subtotal || 0).toLocaleString('en-IN')}/mo</p>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Plan breakdown chart */}
+                {billing.by_plan?.length > 0 && (
+                  <div className="bg-white rounded-xl p-5 shadow-sm">
+                    <h3 className="font-semibold text-gray-800 mb-4">Revenue by Plan</h3>
+                    <ResponsiveContainer width="100%" height={160}>
+                      <BarChart data={billing.by_plan.map(p => ({ name: p.name, subtotal: p.subtotal || 0, tenants: parseInt(p.tenant_count) }))} barSize={50}>
+                        <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                        <YAxis tick={{ fontSize: 12 }} width={60} tickFormatter={v => `₹${(v/1000).toFixed(0)}k`} />
+                        <Tooltip formatter={(v, n) => n === 'subtotal' ? [`₹${v.toLocaleString('en-IN')}`, 'Revenue'] : [v, 'Tenants']} />
+                        <Bar dataKey="subtotal" radius={[4,4,0,0]}>
+                          {billing.by_plan.map((_, i) => (
+                            <Cell key={i} fill={['#10b981','#3b82f6','#8b5cf6','#f59e0b'][i % 4]} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+
+                {/* Recent plan changes */}
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-5 py-4 border-b border-gray-100">
+                    <h3 className="font-semibold text-gray-800">Plan Change History</h3>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="bg-gray-50">
+                        <tr>{['Clinic', 'From', 'To', 'Date'].map(h => (
+                          <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>
+                        ))}</tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {billing.recent_changes?.map(c => (
+                          <tr key={c.id} className="hover:bg-gray-50">
+                            <td className="px-4 py-3 font-medium text-gray-900">{c.tenant_name}</td>
+                            <td className="px-4 py-3"><span className="px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full text-xs capitalize">{c.old_plan || '—'}</span></td>
+                            <td className="px-4 py-3"><span className="px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full text-xs capitalize">{c.new_plan}</span></td>
+                            <td className="px-4 py-3 text-gray-400 text-xs">{c.changed_at ? format(parseISO(c.changed_at), 'd MMM yyyy') : '—'}</td>
+                          </tr>
+                        ))}
+                        {!billing.recent_changes?.length && (
+                          <tr><td colSpan={4} className="px-4 py-8 text-center text-gray-400">No plan changes yet</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="bg-white rounded-xl p-12 text-center">
+                <button onClick={fetchBilling} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">Load Billing Data</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Rate Limits Tab (Feature 32) */}
+        {tab === 'rate_limits' && (
+          <div className="space-y-5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-gray-800">Rate Limit Dashboard</h2>
+              <button onClick={fetchRateLimits} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>
+            </div>
+
+            {rateLimitsLoading ? (
+              <div className="bg-white rounded-xl p-12 text-center text-gray-400">Loading rate limit data...</div>
+            ) : rateLimits ? (
+              <>
+                {/* Blocked IPs */}
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-5 py-4 border-b border-gray-100">
+                    <h3 className="font-semibold text-gray-800">Blocked IPs ({rateLimits.blocked_ips?.length || 0})</h3>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          {['IP Address', 'Offense Count', 'Blocked Until', 'Reason', 'Blocked At', 'Action'].map(h => (
+                            <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {rateLimits.blocked_ips?.map(row => (
+                          <tr key={row.ip} className="hover:bg-gray-50">
+                            <td className="px-4 py-3 font-mono text-sm text-gray-900">{row.ip}</td>
+                            <td className="px-4 py-3">
+                              <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded-full text-xs font-medium">{row.offense_count}</span>
+                            </td>
+                            <td className="px-4 py-3 text-xs text-gray-600">
+                              {row.blocked_until ? new Date(row.blocked_until).toLocaleString('en-IN') : '—'}
+                            </td>
+                            <td className="px-4 py-3 text-xs text-gray-500 max-w-xs truncate">{row.reason || '—'}</td>
+                            <td className="px-4 py-3 text-xs text-gray-400">
+                              {row.blocked_at ? new Date(row.blocked_at).toLocaleString('en-IN') : '—'}
+                            </td>
+                            <td className="px-4 py-3">
+                              <button
+                                onClick={() => unblockIp(row.ip)}
+                                className="text-xs px-2 py-1 text-green-600 hover:bg-green-50 rounded transition"
+                              >
+                                Unblock
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                        {!rateLimits.blocked_ips?.length && (
+                          <tr><td colSpan={6} className="px-4 py-8 text-center text-gray-400">No blocked IPs</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Live Traffic */}
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-5 py-4 border-b border-gray-100">
+                    <h3 className="font-semibold text-gray-800">Live Traffic — Current Minute</h3>
+                    <p className="text-xs text-gray-400 mt-0.5">As of {rateLimits.timestamp ? new Date(rateLimits.timestamp).toLocaleTimeString('en-IN') : '—'}</p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          {['Tenant', 'Slug', 'Plan', 'Requests This Minute'].map(h => (
+                            <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {rateLimits.live_traffic?.map(row => (
+                          <tr key={row.tenant_id} className="hover:bg-gray-50">
+                            <td className="px-4 py-3 font-medium text-gray-900">{row.tenant_name}</td>
+                            <td className="px-4 py-3 font-mono text-xs text-blue-600">{row.tenant_slug}</td>
+                            <td className="px-4 py-3">
+                              <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full capitalize">{row.plan}</span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className={`font-bold ${row.requests_this_minute > 50 ? 'text-red-600' : 'text-gray-900'}`}>
+                                {row.requests_this_minute}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                        {!rateLimits.live_traffic?.length && (
+                          <tr><td colSpan={4} className="px-4 py-8 text-center text-gray-400">No active traffic this minute</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="bg-white rounded-xl p-12 text-center">
+                <button onClick={fetchRateLimits} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">Load Rate Limit Data</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Backups Tab (Feature 33) */}
+        {tab === 'backups' && (
+          <div className="space-y-5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-gray-800">Database Backups</h2>
+              <div className="flex gap-2">
+                <button onClick={fetchBackups} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>
+                <button
+                  onClick={triggerBackup}
+                  disabled={triggeringBackup}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50"
+                >
+                  {triggeringBackup ? 'Starting...' : '▶ Trigger Backup'}
+                </button>
+              </div>
+            </div>
+
+            <div className="bg-yellow-50 border border-yellow-200 rounded-xl px-5 py-4 text-sm text-yellow-800">
+              <strong>Restore Instructions:</strong> Download the backup file from the server via SSH/SFTP, then run:
+              <code className="block bg-yellow-100 rounded px-3 py-2 mt-2 font-mono text-xs">psql $DATABASE_URL &lt; medibook_backup_YYYYMMDD.sql</code>
+            </div>
+
+            {backupsLoading ? (
+              <div className="bg-white rounded-xl p-12 text-center text-gray-400">Loading backup history...</div>
+            ) : backups ? (
+              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                <div className="px-5 py-4 border-b border-gray-100">
+                  <h3 className="font-semibold text-gray-800">Backup History (last 30)</h3>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        {['Started', 'Completed', 'Status', 'Size', 'Duration', 'File Path', 'Error'].map(h => (
+                          <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                      {backups.backups?.map(b => (
+                        <tr key={b.id} className="hover:bg-gray-50">
+                          <td className="px-4 py-3 text-xs text-gray-600">
+                            {b.started_at ? new Date(b.started_at).toLocaleString('en-IN') : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-gray-600">
+                            {b.completed_at ? new Date(b.completed_at).toLocaleString('en-IN') : '—'}
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${
+                              b.status === 'success' ? 'bg-green-100 text-green-700' :
+                              b.status === 'failed' ? 'bg-red-100 text-red-700' :
+                              'bg-yellow-100 text-yellow-700'
+                            }`}>{b.status}</span>
+                          </td>
+                          <td className="px-4 py-3 text-xs text-gray-600">
+                            {b.size_bytes ? `${Math.round(b.size_bytes / 1024)}KB` : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-gray-600">
+                            {b.duration_ms ? `${(b.duration_ms / 1000).toFixed(1)}s` : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-gray-400 max-w-xs truncate" title={b.file_path || ''}>
+                            {b.file_path ? b.file_path.split(/[/\\]/).pop() : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-red-500 max-w-xs truncate" title={b.error_message || ''}>
+                            {b.error_message || '—'}
+                          </td>
+                        </tr>
+                      ))}
+                      {!backups.backups?.length && (
+                        <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">No backups yet. Trigger one above.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : (
+              <div className="bg-white rounded-xl p-12 text-center">
+                <button onClick={fetchBackups} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">Load Backup History</button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Suspension Reason Modal */}

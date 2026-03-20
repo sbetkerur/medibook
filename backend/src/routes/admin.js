@@ -4,7 +4,7 @@ const rateLimit = require('express-rate-limit');
 const { query, tenantQuery } = require('../db');
 const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const { VALID_ROLES, VALID_APPOINTMENT_STATUSES, validateUUID } = require('../utils/errors');
+const { VALID_ROLES, VALID_APPOINTMENT_STATUSES, validateUUID, handleError } = require('../utils/errors');
 const logger = require('../utils/logger');
 
 router.use(authMiddleware, tenantMiddleware);
@@ -49,11 +49,30 @@ async function writeAuditLog(schema, actorId, actorRole, action, resourceType, r
 router.get('/dashboard', async (req, res) => {
   try {
     const s = req.tenant.schema_name;
-    const [today, upcoming, patients, slots, recentAppts] = await Promise.allSettled([
-      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date=CURRENT_DATE AND status='confirmed'`),
+    const tenantId = req.tenant.id;
+
+    // Try stats cache first (valid if updated within 15 minutes)
+    let cached = null;
+    try {
+      const cacheR = await query(`
+        SELECT * FROM tenant_stats_cache
+        WHERE tenant_id=$1 AND stat_date=CURRENT_DATE AND updated_at > NOW() - INTERVAL '15 minutes'
+      `, [tenantId]);
+      cached = cacheR.rows[0] || null;
+    } catch (_) { /* cache miss */ }
+
+    let statsData;
+    if (cached) {
+      statsData = {
+        today_appointments: cached.appointments_today,
+        total_patients: cached.patients_total,
+        available_slots: cached.active_slots,
+      };
+    }
+
+    // Always run upcoming (time-sensitive) and today's schedule live
+    const [upcoming, recentAppts, ...liveStats] = await Promise.allSettled([
       tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date>CURRENT_DATE AND status='confirmed'`),
-      tenantQuery(s, `SELECT COUNT(*) FROM patients`),
-      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date>=CURRENT_DATE AND status='available'`),
       tenantQuery(s, `
         SELECT a.booking_id, a.appointment_date, a.appointment_time, a.status,
                p.name as patient_name, d.name as doctor_name
@@ -64,23 +83,48 @@ router.get('/dashboard', async (req, res) => {
         ORDER BY a.appointment_time
         LIMIT 10
       `),
+      // Only run heavy queries if cache miss
+      ...(cached ? [] : [
+        tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date=CURRENT_DATE AND status='confirmed'`),
+        tenantQuery(s, `SELECT COUNT(*) FROM patients`),
+        tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date>=CURRENT_DATE AND status='available'`),
+      ]),
     ]);
-    // Log any rejected queries so they don't silently disappear
-    const names = ['today', 'upcoming', 'patients', 'slots', 'recentAppts'];
-    [today, upcoming, patients, slots, recentAppts].forEach((r, i) => {
-      if (r.status === 'rejected') logger.warn(`Dashboard query "${names[i]}" failed`, { error: r.reason?.message });
-    });
-    // Extract values gracefully — a failed metric returns null rather than crashing the whole dashboard
+
     const val = (r, field = 'count', fallback = null) =>
       r.status === 'fulfilled' ? (field === 'rows' ? r.value.rows : parseInt(r.value.rows[0]?.[field] ?? '0')) : fallback;
-    res.json({
-      today_appointments: val(today),
-      upcoming_appointments: val(upcoming),
-      total_patients: val(patients),
-      available_slots: val(slots),
-      todays_schedule: val(recentAppts, 'rows', []),
+
+    if (!cached && liveStats.length >= 3) {
+      statsData = {
+        today_appointments: val(liveStats[0]),
+        total_patients: val(liveStats[1]),
+        available_slots: val(liveStats[2]),
+      };
+      // Async update cache (non-blocking)
+      query(`
+        INSERT INTO tenant_stats_cache (tenant_id, stat_date, appointments_today, patients_total, active_slots, updated_at)
+        VALUES ($1, CURRENT_DATE, $2, $3, $4, NOW())
+        ON CONFLICT (tenant_id, stat_date) DO UPDATE SET
+          appointments_today=EXCLUDED.appointments_today, patients_total=EXCLUDED.patients_total,
+          active_slots=EXCLUDED.active_slots, updated_at=NOW()
+      `, [tenantId, statsData.today_appointments, statsData.total_patients, statsData.available_slots])
+        .catch(() => {});
+    }
+
+    // Log any rejected queries
+    [upcoming, recentAppts, ...liveStats].forEach((r, i) => {
+      if (r.status === 'rejected') logger.warn(`Dashboard query [${i}] failed`, { error: r.reason?.message });
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    res.json({
+      today_appointments: statsData?.today_appointments ?? null,
+      upcoming_appointments: val(upcoming),
+      total_patients: statsData?.total_patients ?? null,
+      available_slots: statsData?.available_slots ?? null,
+      todays_schedule: val(recentAppts, 'rows', []),
+      cache_hit: !!cached,
+    });
+  } catch (err) { handleError(res, err); }
 });
 
 // ── APPOINTMENTS ──────────────────────────────────────────────
@@ -123,7 +167,7 @@ router.get('/appointments', async (req, res) => {
       limit: safeLimit,
       has_more: r.rows.length === safeLimit,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/appointments/:id', validateUUID(), async (req, res) => {
@@ -178,7 +222,7 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       { status: oldR.rows[0].status }, { status, cancellation_reason }, req.ip);
 
     res.json({ appointment: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.get('/appointments/:id', validateUUID(), async (req, res) => {
@@ -210,7 +254,7 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
     `, [r.rows[0].patient_id, req.params.id]);
 
     res.json({ appointment: r.rows[0], patient_history: history.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/appointments', adminOnly, validate(schemas.createAppointment), async (req, res) => {
@@ -251,7 +295,7 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
       null, { booking_id: bookingId, doctor_id, appointment_date }, req.ip);
 
     res.status(201).json({ appointment: r.rows[0], booking_id: bookingId });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── HOSPITALS ─────────────────────────────────────────────────
@@ -260,7 +304,7 @@ router.get('/hospitals', async (req, res) => {
     const r = await tenantQuery(req.tenant.schema_name,
       `SELECT * FROM hospitals WHERE is_active=true ORDER BY name`);
     res.json({ hospitals: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (req, res) => {
@@ -273,7 +317,7 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_HOSPITAL', 'hospital', r.rows[0].id,
       null, { name, city }, req.ip);
     res.json({ hospital: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/hospitals/:id', adminOnly, validateUUID(), validate(schemas.createHospital), async (req, res) => {
@@ -290,7 +334,7 @@ router.patch('/hospitals/:id', adminOnly, validateUUID(), validate(schemas.creat
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_HOSPITAL', 'hospital', req.params.id,
       null, { name, city }, req.ip);
     res.json({ hospital: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/hospitals/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -321,7 +365,7 @@ router.delete('/hospitals/:id', adminOnly, validateUUID(), async (req, res) => {
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_HOSPITAL', 'hospital', req.params.id,
       null, null, req.ip);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── DEPARTMENTS ───────────────────────────────────────────────
@@ -339,7 +383,7 @@ router.get('/departments', async (req, res) => {
        ORDER BY d.name`,
       hospital_id ? [hospital_id] : []);
     res.json({ departments: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/departments', adminOnly, validate(schemas.createDepartment), async (req, res) => {
@@ -352,7 +396,7 @@ router.post('/departments', adminOnly, validate(schemas.createDepartment), async
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_DEPARTMENT', 'department', r.rows[0].id,
       null, { name, hospital_id }, req.ip);
     res.json({ department: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/departments/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -366,7 +410,7 @@ router.patch('/departments/:id', adminOnly, validateUUID(), async (req, res) => 
     `, [name || null, description || null, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Department not found' });
     res.json({ department: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/departments/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -379,7 +423,7 @@ router.delete('/departments/:id', adminOnly, validateUUID(), async (req, res) =>
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_DEPARTMENT', 'department', req.params.id,
       null, null, req.ip);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── DOCTORS ───────────────────────────────────────────────────
@@ -407,7 +451,7 @@ router.get('/doctors', async (req, res) => {
       ORDER BY d.is_active DESC, d.name
     `);
     res.json({ doctors: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, res) => {
@@ -443,7 +487,7 @@ router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, r
       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
     `, [name, specialization, qualification, department_id, hospital_id, consultation_fee || 0, slot_duration_minutes || 30]);
     res.json({ doctor: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.get('/doctors/:id', validateUUID(), async (req, res) => {
@@ -465,7 +509,7 @@ router.get('/doctors/:id', validateUUID(), async (req, res) => {
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
     res.json({ doctor: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -499,7 +543,7 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
       oldR.rows[0], { name, is_active }, req.ip);
 
     res.json({ doctor: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -530,7 +574,7 @@ router.delete('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_DOCTOR', 'doctor', req.params.id,
       null, null, req.ip);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // Doctor schedule
@@ -539,7 +583,7 @@ router.get('/doctors/:id/schedule', validateUUID(), async (req, res) => {
     const r = await tenantQuery(req.tenant.schema_name,
       `SELECT * FROM doctor_schedules WHERE doctor_id=$1 ORDER BY day_of_week`, [req.params.id]);
     res.json({ schedule: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -586,7 +630,7 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
       `, [req.params.id, s.day_of_week, s.start_time, s.end_time, s.is_working !== false, lunchStart, lunchEnd]);
     }
     res.json({ success: true, updated: schedules.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── PATIENTS ──────────────────────────────────────────────────
@@ -619,7 +663,7 @@ router.get('/patients', patientLimiter, async (req, res) => {
       limit: 25,
       has_more: r.rows.length === 25,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.get('/patients/:id/appointments', validateUUID(), async (req, res) => {
@@ -630,7 +674,7 @@ router.get('/patients/:id/appointments', validateUUID(), async (req, res) => {
       WHERE a.patient_id=$1 ORDER BY a.appointment_date DESC LIMIT 20
     `, [req.params.id]);
     res.json({ appointments: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -656,7 +700,7 @@ router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_PATIENT', 'patient', req.params.id,
       null, { name, email, gender }, req.ip);
     res.json({ patient: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.get('/patients/:id', validateUUID(), async (req, res) => {
@@ -666,7 +710,7 @@ router.get('/patients/:id', validateUUID(), async (req, res) => {
       [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -693,7 +737,7 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_PATIENT', 'patient', req.params.id,
       null, null, req.ip);
     res.json({ success: true, message: 'Patient record anonymised (GDPR)' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── ANALYTICS ─────────────────────────────────────────────────
@@ -733,7 +777,7 @@ router.get('/analytics', analyticsLimiter, async (req, res) => {
       by_status: byStatus.rows,
       by_department: byDept.rows,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── SLOTS ─────────────────────────────────────────────────────
@@ -755,7 +799,7 @@ router.get('/slots', async (req, res) => {
       ORDER BY ts.start_time
     `, [doctor_id, date]);
     res.json({ slots: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/slots/:id', validateUUID(), async (req, res) => {
@@ -792,7 +836,7 @@ router.patch('/slots/:id', validateUUID(), async (req, res) => {
     if (!r.rows[0]) return res.status(404).json({ error: 'Slot not found or is already booked' });
     await writeAuditLog(s, req.user.id, req.user.role, `slot_${newStatus === 'blocked' ? 'block' : 'unblock'}`, 'time_slot', req.params.id, null, null, req.ip);
     res.json({ slot: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res) => {
@@ -868,7 +912,7 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
       }
     }
     res.json({ success: true, generated, days: safeDays });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── STAFF CRUD ────────────────────────────────────────────────
@@ -877,7 +921,7 @@ router.get('/staff', async (req, res) => {
     const r = await tenantQuery(req.tenant.schema_name,
       `SELECT id, email, name, role, is_active, created_at FROM users ORDER BY created_at DESC`);
     res.json({ staff: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/staff', adminOnly, validate(schemas.createStaff), async (req, res) => {
@@ -891,7 +935,7 @@ router.post('/staff', adminOnly, validate(schemas.createStaff), async (req, res)
     res.json({ staff: r.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Email already exists' });
-    res.status(500).json({ error: err.message });
+    return handleError(res, err);
   }
 });
 
@@ -915,7 +959,7 @@ router.patch('/staff/:id', adminOnly, validateUUID(), validate(schemas.updateSta
       'UPDATE_STAFF', 'user', req.params.id, null, { role, is_active }, req.ip);
 
     res.json({ staff: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/staff/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -942,7 +986,7 @@ router.delete('/staff/:id', adminOnly, validateUUID(), async (req, res) => {
       'DEACTIVATE_STAFF', 'user', req.params.id, null, null, req.ip);
 
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── SETTINGS ──────────────────────────────────────────────────
@@ -983,7 +1027,7 @@ router.get('/settings', async (req, res) => {
         appointments_this_month: apptCount ? parseInt(apptCount.rows[0].count) : null,
       },
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/settings', adminOnly, validate(schemas.updateSettings), async (req, res) => {
@@ -1014,7 +1058,7 @@ router.patch('/settings', adminOnly, validate(schemas.updateSettings), async (re
       req.ip);
 
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── BLOCK SLOT RANGE ──────────────────────────────────────────
@@ -1032,7 +1076,7 @@ router.post('/slots/block-range', adminOnly, validate(schemas.blockRange), async
       null, { doctor_id, start_date, end_date, count: r.rows.length, reason }, req.ip);
 
     res.json({ blocked: r.rows.length, reason: reason || null });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── NOTIFICATIONS ─────────────────────────────────────────────
@@ -1050,52 +1094,7 @@ router.get('/notifications/recent', async (req, res) => {
       LIMIT 10
     `);
     res.json({ notifications: r.rows, count: r.rows.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ── WAITING LIST ──────────────────────────────────────────────
-router.get('/waiting-list', async (req, res) => {
-  try {
-    const s = req.tenant.schema_name;
-    const { page = 1, limit = 50 } = req.query;
-    const safeLimit = Math.min(Math.max(parseInt(limit) || 50, 1), 200);
-    const offset = (Math.max(parseInt(page) || 1, 1) - 1) * safeLimit;
-    const r = await tenantQuery(s, `
-      SELECT wl.*, p.name as patient_name, p.phone as patient_phone,
-             d.name as doctor_name
-      FROM waiting_list wl
-      JOIN patients p ON p.id=wl.patient_id
-      JOIN doctors d ON d.id=wl.doctor_id
-      WHERE wl.notified=false
-      ORDER BY wl.created_at ASC
-      LIMIT $1 OFFSET $2
-    `, [safeLimit, offset]);
-    res.json({ waiting_list: r.rows, page: parseInt(page), has_more: r.rows.length === safeLimit });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-router.patch('/waiting-list/:id', adminOnly, validateUUID(), async (req, res) => {
-  try {
-    const { notified } = req.body;
-    if (typeof notified !== 'boolean') {
-      return res.status(400).json({ error: 'notified (boolean) required' });
-    }
-    const r = await tenantQuery(req.tenant.schema_name,
-      `UPDATE waiting_list SET notified=$1 WHERE id=$2 RETURNING id`,
-      [notified, req.params.id]);
-    if (!r.rows[0]) return res.status(404).json({ error: 'Waiting list entry not found' });
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-router.delete('/waiting-list/:id', adminOnly, validateUUID(), async (req, res) => {
-  try {
-    const r = await tenantQuery(req.tenant.schema_name,
-      `DELETE FROM waiting_list WHERE id=$1 RETURNING id`,
-      [req.params.id]);
-    if (!r.rows[0]) return res.status(404).json({ error: 'Waiting list entry not found' });
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── FEEDBACK ──────────────────────────────────────────────────
@@ -1134,7 +1133,7 @@ router.get('/feedback', async (req, res) => {
       total: parseInt(avgR.rows[0]?.total || 0),
       distribution: distR.rows,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── ANALYTICS SUMMARY ─────────────────────────────────────────
@@ -1143,7 +1142,7 @@ router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
     const s = req.tenant.schema_name;
     // Clamp days to safe range
     const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
-    const [rev, noShow, total, waitlist, feedbackAvg] = await Promise.allSettled([
+    const [rev, noShow, total, feedbackAvg] = await Promise.allSettled([
       tenantQuery(s, `
         SELECT COALESCE(SUM(doc.consultation_fee), 0) as revenue
         FROM appointments a JOIN doctors doc ON doc.id=a.doctor_id
@@ -1158,7 +1157,6 @@ router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
         WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
       `, [d]),
       tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL`, [d]),
-      tenantQuery(s, `SELECT COUNT(*) FROM waiting_list WHERE notified=false`),
       tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg FROM appointment_feedback`),
     ]);
     const safeVal = (r, fn) => r.status === 'fulfilled' ? fn(r.value.rows[0]) : null;
@@ -1171,10 +1169,9 @@ router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
       no_show_rate: noShowRate,
       no_show_count: ns ? parseInt(ns.no_show_count) : 0,
       total_appointments: safeVal(total, r => parseInt(r?.count) || 0) ?? 0,
-      waiting_list_count: safeVal(waitlist, r => parseInt(r?.count) || 0) ?? 0,
       avg_feedback_rating: safeVal(feedbackAvg, r => r?.avg ? parseFloat(r.avg) : null),
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── DOCTOR LEAVES ─────────────────────────────────────────────
@@ -1184,7 +1181,7 @@ router.get('/doctors/:id/leaves', validateUUID(), async (req, res) => {
       SELECT * FROM doctor_leaves WHERE doctor_id=$1 ORDER BY leave_date
     `, [req.params.id]);
     res.json({ leaves: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/doctors/:id/leaves', adminOnly, validateUUID(), async (req, res) => {
@@ -1210,7 +1207,7 @@ router.post('/doctors/:id/leaves', adminOnly, validateUUID(), async (req, res) =
     await writeAuditLog(s, req.user.id, req.user.role, 'ADD_DOCTOR_LEAVE', 'doctor', req.params.id,
       null, { dates, reason }, req.ip);
     res.json({ success: true, added });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.delete('/doctors/:id/leaves/:date', adminOnly, validateUUID(), async (req, res) => {
@@ -1228,7 +1225,7 @@ router.delete('/doctors/:id/leaves/:date', adminOnly, validateUUID(), async (req
     await writeAuditLog(s, req.user.id, req.user.role, 'REMOVE_DOCTOR_LEAVE', 'doctor', req.params.id,
       null, { date: req.params.date }, req.ip);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── PATIENT MEDICAL HISTORY ───────────────────────────────────
@@ -1238,7 +1235,7 @@ router.get('/patients/:id/medical-history', validateUUID(), async (req, res) => 
       `SELECT id, name, phone, medical_history FROM patients WHERE id=$1`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (req, res) => {
@@ -1255,7 +1252,7 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_MEDICAL_HISTORY', 'patient', req.params.id,
       null, { fields: Object.keys(medical_history) }, req.ip);
     res.json({ patient: r.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── SLOT HEATMAP ───────────────────────────────────────────────
@@ -1276,7 +1273,7 @@ router.get('/analytics/heatmap', analyticsLimiter, async (req, res) => {
       ORDER BY day_of_week, hour
     `, [d]);
     res.json({ heatmap: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── ONBOARDING ────────────────────────────────────────────────
@@ -1299,14 +1296,14 @@ router.get('/onboarding/status', async (req, res) => {
       { id: 'whatsapp', label: 'Configure WhatsApp', done: !!req.tenant.wa_phone_number_id },
     ];
     res.json({ steps, all_done: steps.every(s => s.done), onboarding_completed: completed });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 router.post('/onboarding/complete', adminOnly, async (req, res) => {
   try {
     await query(`UPDATE tenants SET onboarding_completed=true WHERE id=$1`, [req.tenant.id]);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── ACCESS LOGS ────────────────────────────────────────────────
@@ -1322,7 +1319,7 @@ router.get('/access-logs', adminOnly, async (req, res) => {
       LIMIT $2 OFFSET $3
     `, [req.tenant.id, safeLimit, offset]);
     res.json({ logs: r.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── QUEUE STATS ───────────────────────────────────────────────
@@ -1331,7 +1328,7 @@ router.get('/queue/stats', adminOnly, async (req, res) => {
     const { getQueueStats } = require('../jobs/botWorker');
     const stats = await getQueueStats();
     res.json(stats);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── BOT SESSION MANAGEMENT ────────────────────────────────────
@@ -1346,7 +1343,7 @@ router.delete('/bot-sessions/:phone', adminOnly, async (req, res) => {
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role, 'RESET_BOT_SESSION', 'bot_session', phone,
       null, null, req.ip);
     res.json({ success: true, message: `Bot session reset for ${phone}` });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── BULK APPOINTMENT UPDATE ───────────────────────────────────
@@ -1383,7 +1380,7 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
       null, null, { ids, status }, req.ip);
 
     res.json({ updated: r.rows.length, status });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── SEND WHATSAPP MESSAGE FROM DASHBOARD ──────────────────────
@@ -1407,7 +1404,7 @@ router.post('/messages/send', adminOnly, async (req, res) => {
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
       'SEND_WA_MESSAGE', 'patient', normalised, null, { message: message.slice(0, 100) }, req.ip);
     res.json({ success: true, phone: normalised });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 // ── AUDIT LOGS ────────────────────────────────────────────────
@@ -1476,7 +1473,7 @@ router.get('/audit-logs', adminOnly, async (req, res) => {
     }
 
     res.json({ logs: r.rows, total, page: parseInt(page), limit: safeLimit, has_more: offset + r.rows.length < total });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { handleError(res, err); }
 });
 
 module.exports = router;

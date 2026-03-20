@@ -16,19 +16,100 @@ async function checkAndMarkEmailSent(hash) {
   try {
     const { query: dbQuery } = require('../db');
     const windowHours = Math.max(1, parseInt(LIMITS.EMAIL_DEDUP_WINDOW_HOURS) || 2);
+    // INSERT-first: atomically claim the slot. If another process already inserted
+    // (ON CONFLICT), check whether the existing record is within the dedup window.
+    // This eliminates the SELECT-then-INSERT race where two concurrent retries both
+    // see no row and both proceed to send.
+    const inserted = await dbQuery(
+      `INSERT INTO email_sent_log (content_hash) VALUES ($1)
+       ON CONFLICT (content_hash) DO NOTHING
+       RETURNING id`,
+      [hash]
+    );
+    if (inserted.rows[0]) return false; // fresh insert — not a duplicate, send it
+
+    // Hash already existed — check if it's within the dedup window
     const existing = await dbQuery(
       `SELECT 1 FROM email_sent_log WHERE content_hash=$1 AND sent_at > NOW() - (INTERVAL '1 hour' * $2)`,
       [hash, windowHours]
     );
-    if (existing.rows[0]) return true; // duplicate — skip
-    await dbQuery(
-      `INSERT INTO email_sent_log (content_hash) VALUES ($1) ON CONFLICT (content_hash) DO NOTHING`,
-      [hash]
-    );
-    return false;
+    return !!existing.rows[0]; // true = within window (skip), false = stale (allow re-send)
   } catch (_) {
     return false; // DB unavailable — allow sending rather than silently drop
   }
+}
+
+// ── DB-STORED TEMPLATE SUPPORT ────────────────────────────────
+async function getTemplate(schemaName, templateId) {
+  if (!schemaName) return null;
+  try {
+    const { tenantQuery } = require('../db');
+    const r = await tenantQuery(schemaName,
+      `SELECT subject, html_body FROM email_templates WHERE id=$1`, [templateId]);
+    return r.rows[0] || null;
+  } catch (_) {
+    return null; // table may not exist in older schemas
+  }
+}
+
+// ── UNSUBSCRIBE TOKEN ─────────────────────────────────────────
+async function generateUnsubscribeUrl(schemaName, patientId) {
+  if (!schemaName || !patientId) return null;
+  try {
+    const { tenantQuery } = require('../db');
+    // Reuse existing token if one exists
+    const existing = await tenantQuery(schemaName,
+      `SELECT token FROM email_unsubscribes WHERE patient_id=$1 AND unsubscribed_at IS NULL LIMIT 1`,
+      [patientId]);
+    let token = existing.rows[0]?.token;
+    if (!token) {
+      token = crypto.randomBytes(32).toString('hex');
+      await tenantQuery(schemaName,
+        `INSERT INTO email_unsubscribes (patient_id, token) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [patientId, token]);
+    }
+    const base = process.env.FRONTEND_URL || 'http://localhost:3000';
+    return `${base}/unsubscribe?token=${token}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ── OPEN TRACKING ─────────────────────────────────────────────
+async function trackEmailOpen(contentHash) {
+  try {
+    const { query: dbQuery } = require('../db');
+    await dbQuery(
+      `UPDATE email_sent_log SET open_count = open_count + 1 WHERE content_hash = $1`,
+      [contentHash]
+    );
+  } catch (_) {}
+}
+
+// ── BOUNCE HANDLER (called by Resend webhook route) ───────────
+async function handleResendBounce(toEmail, schemaName) {
+  if (!toEmail || !schemaName) return;
+  try {
+    const { tenantQuery } = require('../db');
+    await tenantQuery(schemaName,
+      `UPDATE patients SET email_status='bounced', updated_at=NOW() WHERE email=$1`,
+      [toEmail.toLowerCase()]);
+    logger.info(`Email bounced — marked patient email invalid: ${toEmail}`);
+  } catch (_) {}
+}
+
+// Helper to build tracking pixel HTML
+function trackingPixel(contentHash) {
+  const base = process.env.API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+  return `<img src="${base}/api/track/open?h=${encodeURIComponent(contentHash)}" width="1" height="1" alt="" style="display:none">`;
+}
+
+// Helper to build unsubscribe footer
+function unsubscribeFooter(unsubUrl) {
+  if (!unsubUrl) return '';
+  return `<p style="font-size:11px;color:#cbd5e1;margin-top:16px;text-align:center">
+    <a href="${h(unsubUrl)}" style="color:#94a3b8;text-decoration:underline">Unsubscribe from these emails</a>
+  </p>`;
 }
 
 let resendClient = null;
@@ -73,7 +154,7 @@ async function queueEmail(type, payload) {
 async function sendBookingConfirmation(toEmail, data) {
   const resend = getResend();
   if (!resend) return;
-  const { bookingId, patientName, doctorName, date, time, hospitalName, visitType } = data;
+  const { bookingId, patientName, doctorName, date, time, hospitalName, visitType, patientId, schemaName } = data;
   if (!toEmail) { logger.info(`Booking ${bookingId} has no patient email — skipping confirmation`); return; }
 
   // Deduplication: skip if same booking confirmation sent within the window
@@ -83,6 +164,11 @@ async function sendBookingConfirmation(toEmail, data) {
     logger.info(`Booking confirmation email deduped (already sent): ${bookingId}`);
     return;
   }
+
+  // Generate unsubscribe URL and tracking pixel (non-blocking — failures ignored)
+  const unsubUrl = await generateUnsubscribeUrl(schemaName, patientId);
+  const pixel = trackingPixel(dedupHash);
+  const footer = unsubscribeFooter(unsubUrl);
 
   try {
     await resend.emails.send({
@@ -97,13 +183,15 @@ async function sendBookingConfirmation(toEmail, data) {
             <table style="width:100%;border-collapse:collapse;font-size:14px;">
               <tr><td style="padding:6px 0;color:#64748b;">Booking ID</td><td style="font-weight:600;font-family:monospace;">${h(bookingId)}</td></tr>
               <tr><td style="padding:6px 0;color:#64748b;">Doctor</td><td style="font-weight:600;">Dr. ${h(doctorName)}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;">Hospital</td><td>${h(hospitalName)}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;">Clinic</td><td>${h(hospitalName)}</td></tr>
               <tr><td style="padding:6px 0;color:#64748b;">Date</td><td style="font-weight:600;">${h(date)}</td></tr>
               <tr><td style="padding:6px 0;color:#64748b;">Time</td><td style="font-weight:600;">${h(time)}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;">Type</td><td>${visitType === 'video' ? '📱 Video Consultation' : '🏥 In-Person'}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;">Type</td><td>🦷 In-Clinic Visit</td></tr>
             </table>
           </div>
           <p style="font-size:13px;color:#94a3b8;">You'll receive a WhatsApp reminder 24 hours before your appointment. Reply <strong>Hi</strong> on WhatsApp to reschedule or cancel.</p>
+          ${footer}
+          ${pixel}
         </div>
       `,
     });
@@ -119,12 +207,17 @@ async function sendBookingConfirmation(toEmail, data) {
 async function sendReminderEmail(toEmail, data) {
   const resend = getResend();
   if (!resend || !toEmail) return;
-  const { bookingId, patientName, doctorName, date, time, hoursUntil } = data;
+  const { bookingId, patientName, doctorName, date, time, hoursUntil, patientId, schemaName } = data;
 
   // Deduplication: skip if same reminder sent within the window
   const dedupHash = crypto.createHash('sha256')
     .update(`reminder:${toEmail}:${bookingId}:${hoursUntil}`).digest('hex');
   if (await checkAndMarkEmailSent(dedupHash)) return;
+
+  // Generate unsubscribe URL and tracking pixel (non-blocking — failures ignored)
+  const unsubUrl = await generateUnsubscribeUrl(schemaName, patientId);
+  const pixel = trackingPixel(dedupHash);
+  const footer = unsubscribeFooter(unsubUrl);
 
   try {
     await resend.emails.send({
@@ -141,6 +234,8 @@ async function sendReminderEmail(toEmail, data) {
             <p style="margin:8px 0 0;font-family:monospace;font-size:12px;color:#94a3b8;">${h(bookingId)}</p>
           </div>
           <p style="font-size:13px;color:#94a3b8;">Please arrive 10 minutes early with any relevant reports.</p>
+          ${footer}
+          ${pixel}
         </div>
       `,
     });
@@ -166,7 +261,7 @@ async function sendAdminBookingAlert({ toEmail, bookingId, patientName, doctorNa
             <tr><td style="padding:8px;color:#666">Booking ID</td><td style="padding:8px;font-weight:bold">${h(bookingId)}</td></tr>
             <tr style="background:#f9fafb"><td style="padding:8px;color:#666">Patient</td><td style="padding:8px">${h(patientName)}</td></tr>
             <tr><td style="padding:8px;color:#666">Doctor</td><td style="padding:8px">Dr. ${h(doctorName)}</td></tr>
-            <tr style="background:#f9fafb"><td style="padding:8px;color:#666">Hospital</td><td style="padding:8px">${h(hospitalName)}</td></tr>
+            <tr style="background:#f9fafb"><td style="padding:8px;color:#666">Clinic</td><td style="padding:8px">${h(hospitalName)}</td></tr>
             <tr><td style="padding:8px;color:#666">Date</td><td style="padding:8px">${h(date)}</td></tr>
             <tr style="background:#f9fafb"><td style="padding:8px;color:#666">Time</td><td style="padding:8px">${h(time ? String(time).slice(0,5) : '')}</td></tr>
             <tr><td style="padding:8px;color:#666">Type</td><td style="padding:8px">${h(visitType || 'in_person')}</td></tr>
@@ -209,4 +304,66 @@ async function sendPasswordReset(toEmail, resetUrl) {
   }
 }
 
-module.exports = { sendBookingConfirmation, sendReminderEmail, sendAdminBookingAlert, sendPasswordReset, setEmailQueue, queueEmail };
+// ── WEEKLY DENTIST PERFORMANCE DIGEST (Q6) ────────────────────
+async function sendWeeklyDigest(toEmail, tenantName, stats) {
+  const resend = getResend();
+  if (!resend || !toEmail) return;
+  const { weekStart, weekEnd, doctors } = stats;
+  const totalAppts = doctors.reduce((s, d) => s + d.total, 0);
+  const totalRevenue = doctors.reduce((s, d) => s + d.revenue, 0);
+  const rows = doctors.map(d => `
+    <tr>
+      <td style="padding:8px;border-bottom:1px solid #eee">Dr. ${h(d.name)}</td>
+      <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">${d.total}</td>
+      <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;color:#22c55e">${d.completed}</td>
+      <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;color:#ef4444">${d.no_show}</td>
+      <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;color:#f59e0b">${d.cancelled}</td>
+      <td style="padding:8px;border-bottom:1px solid #eee;text-align:right;font-weight:600">₹${d.revenue.toLocaleString('en-IN')}</td>
+    </tr>`).join('');
+  try {
+    await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'appointments@medibook.care',
+      to: toEmail,
+      subject: `📊 Weekly Digest — ${h(tenantName)} (${weekStart} to ${weekEnd})`,
+      html: `
+        <div style="font-family:sans-serif;max-width:640px;margin:0 auto;padding:24px;background:#f8fafc;border-radius:12px">
+          <h2 style="color:#0066cc;margin-bottom:4px">🦷 Weekly Performance Digest</h2>
+          <p style="color:#64748b;margin-top:0">${h(tenantName)} · ${weekStart} – ${weekEnd}</p>
+          <div style="display:flex;gap:12px;margin:16px 0">
+            <div style="flex:1;background:white;border-radius:8px;padding:14px;text-align:center;border:1px solid #e2e8f0">
+              <div style="font-size:24px;font-weight:700;color:#0066cc">${totalAppts}</div>
+              <div style="font-size:12px;color:#94a3b8">Total Appointments</div>
+            </div>
+            <div style="flex:1;background:white;border-radius:8px;padding:14px;text-align:center;border:1px solid #e2e8f0">
+              <div style="font-size:24px;font-weight:700;color:#22c55e">₹${totalRevenue.toLocaleString('en-IN')}</div>
+              <div style="font-size:12px;color:#94a3b8">Total Revenue</div>
+            </div>
+          </div>
+          <table style="width:100%;border-collapse:collapse;background:white;border-radius:8px;overflow:hidden;border:1px solid #e2e8f0">
+            <thead>
+              <tr style="background:#f0f7ff">
+                <th style="padding:10px 8px;text-align:left;font-size:12px;color:#64748b;text-transform:uppercase">Dentist</th>
+                <th style="padding:10px 8px;text-align:center;font-size:12px;color:#64748b;text-transform:uppercase">Total</th>
+                <th style="padding:10px 8px;text-align:center;font-size:12px;color:#64748b;text-transform:uppercase">Done</th>
+                <th style="padding:10px 8px;text-align:center;font-size:12px;color:#64748b;text-transform:uppercase">No-show</th>
+                <th style="padding:10px 8px;text-align:center;font-size:12px;color:#64748b;text-transform:uppercase">Cancelled</th>
+                <th style="padding:10px 8px;text-align:right;font-size:12px;color:#64748b;text-transform:uppercase">Revenue</th>
+              </tr>
+            </thead>
+            <tbody>${rows || '<tr><td colspan="6" style="padding:16px;text-align:center;color:#94a3b8">No appointments this week</td></tr>'}</tbody>
+          </table>
+          <p style="font-size:12px;color:#94a3b8;margin-top:20px;text-align:center">MediBook · Weekly Auto-Digest every Monday 8 AM IST</p>
+        </div>
+      `,
+    });
+    logger.info(`Weekly digest sent to ${toEmail} for ${tenantName}`);
+  } catch (err) {
+    logger.warn(`Weekly digest email failed for ${tenantName}`, { error: err.message });
+  }
+}
+
+module.exports = {
+  sendBookingConfirmation, sendReminderEmail, sendAdminBookingAlert,
+  sendPasswordReset, sendWeeklyDigest, setEmailQueue, queueEmail,
+  getTemplate, generateUnsubscribeUrl, trackEmailOpen, handleResendBounce,
+};

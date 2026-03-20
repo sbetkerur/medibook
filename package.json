@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "pptxgenjs": "^4.0.1",
+    "puppeteer-core": "^24.39.1"
+  }
+}

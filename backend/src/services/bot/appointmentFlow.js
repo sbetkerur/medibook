@@ -2,7 +2,7 @@
 
 const { tenantQuery, tenantTransaction } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
-const { fromZonedTime } = require('date-fns-tz');
+const { fromZonedTime, toZonedTime } = require('date-fns-tz');
 const logger = require('../../utils/logger');
 const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 
@@ -11,7 +11,6 @@ const {
   STATES,
   getPatient,
   updateSession,
-  notifyWaitlistForDoctor,
 } = require('./utils');
 
 async function showMyAppointments(phone, schema, tenant, send) {
@@ -74,7 +73,10 @@ async function showMyAppointments(phone, schema, tenant, send) {
 
   bodyText += '\n\nWhat would you like to do?';
 
-  await send.buttons(bodyText, ['🔄 Reschedule', '❌ Cancel Appointment', '🏠 Main Menu']);
+  const buttons = upcomingR.rows.length
+    ? ['🔄 Reschedule', '❌ Cancel Appointment', '🏠 Main Menu']
+    : ['🏠 Main Menu'];
+  await send.buttons(bodyText, buttons);
   await updateSession(schema, phone, STATES.MY_APPOINTMENTS, { _appts: upcomingR.rows });
 }
 
@@ -94,16 +96,22 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
   const a = appt.rows[0];
   // 2-hour minimum notice check — appointment_time is stored in IST; parse it
   // as IST before comparing to the current UTC wall-clock time.
-  const nowDateR = new Date();
-  const apptDateTimeR = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
-  const hoursUntilR = (apptDateTimeR - nowDateR) / (1000 * 60 * 60);
-  if (hoursUntilR < 2 && hoursUntilR >= 0) {
-    await send.text(`⚠️ Rescheduling must be done at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
-    await updateSession(schema, phone, STATES.IDLE, {});
-    return;
+  // Guard against null appointment_time (legacy rows) — skip the check rather
+  // than producing an Invalid Date that makes hoursUntilR NaN (always falsy).
+  if (a.appointment_time) {
+    const nowDateR = new Date();
+    const apptDateTimeR = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
+    const hoursUntilR = (apptDateTimeR - nowDateR) / (1000 * 60 * 60);
+    if (!isNaN(hoursUntilR) && hoursUntilR < 2 && hoursUntilR >= 0) {
+      await send.text(`⚠️ Rescheduling must be done at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
   }
 
-  const today = new Date();
+  // Use IST "today" so the date range is correct during the 5.5-hour window
+  // between UTC midnight and IST midnight (new Date() would give yesterday in IST).
+  const today = toZonedTime(new Date(), IST);
   const startStr = format(addDays(today, 1), 'yyyy-MM-dd');
   const endStr = format(addDays(today, SLOT_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
 
@@ -114,6 +122,12 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
       AND slot_date BETWEEN $2 AND $3
       AND slot_date != $4
       AND status = 'available'
+      AND NOT EXISTS (
+        SELECT 1 FROM doctor_leaves dl WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date
+      )
     GROUP BY slot_date
     ORDER BY slot_date
     LIMIT 7
@@ -218,7 +232,7 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       );
       if (!lock.rows.length) return null; // slot taken
       await client.query(
-        `UPDATE time_slots SET status='available' WHERE id=$1`,
+        `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`,
         [ctx.reschedule_old_slot_id]
       );
       await client.query(
@@ -269,13 +283,17 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
   const a = appt.rows[0];
   // 2-hour minimum notice check — appointment_time is stored in IST; parse it
   // as IST before comparing to the current UTC wall-clock time.
-  const nowDate = new Date();
-  const apptDateTime = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
-  const hoursUntilAppt = (apptDateTime - nowDate) / (1000 * 60 * 60);
-  if (hoursUntilAppt < 2 && hoursUntilAppt >= 0) {
-    await send.text(`⚠️ Cancellations must be made at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
-    await updateSession(schema, phone, STATES.IDLE, {});
-    return;
+  // Guard against null appointment_time (legacy rows) to avoid an Invalid Date
+  // that makes hoursUntilAppt NaN and silently skips the notice check.
+  if (a.appointment_time) {
+    const nowDate = new Date();
+    const apptDateTime = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
+    const hoursUntilAppt = (apptDateTime - nowDate) / (1000 * 60 * 60);
+    if (!isNaN(hoursUntilAppt) && hoursUntilAppt < 2 && hoursUntilAppt >= 0) {
+      await send.text(`⚠️ Cancellations must be made at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
   }
   ctx.cancel_appt_id = a.id;
   ctx.cancel_slot_id = a.slot_id;
@@ -318,16 +336,24 @@ async function handleCancelReason(phone, schema, tenant, send, ctx, input, butto
 
 async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
   if (/yes|cancel|btn_0/i.test(choice)) {
-    await tenantTransaction(schema, async (client) => {
-      await client.query(
-        `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed'`,
+    const cancelled = await tenantTransaction(schema, async (client) => {
+      const r = await client.query(
+        `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,
         [ctx.cancel_reason || null, ctx.cancel_appt_id]);
-      await client.query(
-        `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`, [ctx.cancel_slot_id]);
+      // Only release the slot if the appointment was actually cancelled — prevents
+      // releasing a slot that now belongs to a different booking (e.g. admin already
+      // cancelled and the slot was re-booked by someone else between state transitions).
+      if (r.rows.length > 0) {
+        await client.query(
+          `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`, [ctx.cancel_slot_id]);
+        return true;
+      }
+      return false;
     });
-    // Notify waitlist since a slot opened up
-    if (ctx.cancel_doctor_id) {
-      notifyWaitlistForDoctor(schema, ctx.cancel_doctor_id, tenant).catch(() => {});
+    if (!cancelled) {
+      await send.text('⚠️ This appointment has already been cancelled or modified. Reply *Hi* to check your appointments.');
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
     }
     await send.text(
       '✅ *Appointment Cancelled*\n\n' +

@@ -75,13 +75,13 @@ async function createTenantSchema(schemaName) {
 
       CREATE TABLE IF NOT EXISTS patients (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        phone VARCHAR(20) UNIQUE NOT NULL CHECK (phone ~ '^[+]?[0-9]{7,20}$'),
+        phone VARCHAR(20) UNIQUE NOT NULL CHECK (phone ~ '^[0-9]{7,20}$'),
         name VARCHAR(255),
         date_of_birth DATE,
         gender VARCHAR(20),
         email VARCHAR(255),
         visit_count INTEGER DEFAULT 0,
-        medical_history JSONB DEFAULT '{}',
+        dental_history JSONB DEFAULT '{}',
         opted_out BOOLEAN DEFAULT false,
         deleted_at TIMESTAMPTZ DEFAULT NULL,
         created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -131,6 +131,30 @@ async function createTenantSchema(schemaName) {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS clinic_services (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        hospital_id UUID REFERENCES hospitals(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        category VARCHAR(100),
+        duration_minutes INTEGER DEFAULT 30,
+        price INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS clinic_holidays (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        hospital_id UUID REFERENCES hospitals(id) ON DELETE CASCADE,
+        holiday_date DATE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        created_by_user_id UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(hospital_id, holiday_date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_holidays_date ON clinic_holidays(holiday_date);
+      CREATE INDEX IF NOT EXISTS idx_services_hospital ON clinic_services(hospital_id, is_active);
+
       CREATE TABLE IF NOT EXISTS waiting_list (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         patient_id UUID REFERENCES patients(id),
@@ -174,6 +198,21 @@ async function createTenantSchema(schemaName) {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      -- Enhancement 6: Patient documents / prescriptions
+      CREATE TABLE IF NOT EXISTS documents (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        patient_id UUID REFERENCES patients(id) ON DELETE CASCADE,
+        appointment_id UUID REFERENCES appointments(id) ON DELETE SET NULL,
+        file_name VARCHAR(255) NOT NULL,
+        file_type VARCHAR(100),
+        file_size_bytes INTEGER,
+        file_data TEXT NOT NULL,
+        uploaded_by_user_id UUID,
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_documents_patient ON documents(patient_id, created_at DESC);
+
       -- Core indexes
       CREATE INDEX IF NOT EXISTS idx_slots_date_status ON time_slots(slot_date, status);
       CREATE INDEX IF NOT EXISTS idx_slots_doctor ON time_slots(doctor_id);
@@ -206,6 +245,8 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_hospitals_active ON hospitals(id) WHERE is_active=true AND deleted_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_patients_active ON patients(created_at DESC) WHERE deleted_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(id) WHERE is_active=true;
+      -- Email index for bounce handler (UPDATE patients SET email_status WHERE email=$1)
+      CREATE INDEX IF NOT EXISTS idx_patients_email ON patients(email) WHERE email IS NOT NULL;
     `);
 
     // Append-only trigger for tenant-schema audit_logs
@@ -255,9 +296,19 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_by VARCHAR(20) DEFAULT 'user';
     `);
 
-    // Add medical_history to patients
+    // Rename medical_history → dental_history (idempotent)
     await client.query(`
-      ALTER TABLE patients ADD COLUMN IF NOT EXISTS medical_history JSONB DEFAULT '{}';
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'patients'
+            AND column_name = 'medical_history'
+        ) THEN
+          ALTER TABLE patients RENAME COLUMN medical_history TO dental_history;
+        END IF;
+      END $$;
+      ALTER TABLE patients ADD COLUMN IF NOT EXISTS dental_history JSONB DEFAULT '{}';
     `);
 
     // Create doctor_leaves table
@@ -274,11 +325,14 @@ async function runTenantMigrations(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_doctor_leaves_doctor ON doctor_leaves(doctor_id, leave_date);
     `);
 
-    // Add phone format constraint to patients (idempotent)
+    // Fix phone format constraint: digits-only (no + prefix) to match VARCHAR(20) column width.
+    // The webhook layer strips any leading + before storage, so + is never present in DB.
     await client.query(`
       DO $$ BEGIN
+        -- Drop old constraint if it exists (old regex allowed + prefix which can exceed VARCHAR(20))
+        ALTER TABLE patients DROP CONSTRAINT IF EXISTS patients_phone_format;
         ALTER TABLE patients
-          ADD CONSTRAINT patients_phone_format CHECK (phone ~ '^[+]?[0-9]{7,20}$');
+          ADD CONSTRAINT patients_phone_format CHECK (phone ~ '^[0-9]{7,20}$');
       EXCEPTION WHEN duplicate_object THEN NULL;
       END $$;
     `);
@@ -292,6 +346,8 @@ async function runTenantMigrations(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_wa_messages_phone ON wa_messages(phone);
       DROP INDEX IF EXISTS idx_wa_messages_msg_id;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
+      -- Email index for bounce handler (UPDATE patients SET email_status WHERE email=$1)
+      CREATE INDEX IF NOT EXISTS idx_patients_email ON patients(email) WHERE email IS NOT NULL;
     `);
 
     // Create audit_logs table if not exists
@@ -309,6 +365,32 @@ async function runTenantMigrations(schemaName) {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, created_at DESC);
+    `);
+
+    // Service catalog and holiday tables
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS clinic_services (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        hospital_id UUID REFERENCES hospitals(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        category VARCHAR(100),
+        duration_minutes INTEGER DEFAULT 30,
+        price INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS clinic_holidays (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        hospital_id UUID REFERENCES hospitals(id) ON DELETE CASCADE,
+        holiday_date DATE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        created_by_user_id UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(hospital_id, holiday_date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_holidays_date ON clinic_holidays(holiday_date);
+      CREATE INDEX IF NOT EXISTS idx_services_hospital ON clinic_services(hospital_id, is_active);
     `);
 
     // Add lunch_start_time and lunch_end_time to doctor_schedules if missing
@@ -374,6 +456,23 @@ async function runTenantMigrations(schemaName) {
       END $$;
     `).catch(() => {}); // Non-fatal if constraint already exists with different method
 
+    // Enhancement 6: documents table for patient prescriptions/reports
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS documents (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        patient_id UUID REFERENCES patients(id) ON DELETE CASCADE,
+        appointment_id UUID REFERENCES appointments(id) ON DELETE SET NULL,
+        file_name VARCHAR(255) NOT NULL,
+        file_type VARCHAR(100),
+        file_size_bytes INTEGER,
+        file_data TEXT NOT NULL,
+        uploaded_by_user_id UUID,
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_documents_patient ON documents(patient_id, created_at DESC);
+    `);
+
     // Add unique constraint on waiting_list to prevent duplicate entries per patient+doctor
     await client.query(`
       DO $$ BEGIN
@@ -386,6 +485,112 @@ async function runTenantMigrations(schemaName) {
         END IF;
       END $$;
     `).catch(() => {});
+
+    // Email templates (admin-editable)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_templates (
+        id VARCHAR(100) PRIMARY KEY,
+        subject TEXT NOT NULL,
+        html_body TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_by UUID
+      );
+    `);
+
+    // Email unsubscribe tokens
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_unsubscribes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        patient_id UUID REFERENCES patients(id) ON DELETE CASCADE,
+        token VARCHAR(64) UNIQUE NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        unsubscribed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_email_unsub_token ON email_unsubscribes(token);
+      CREATE INDEX IF NOT EXISTS idx_email_unsub_patient ON email_unsubscribes(patient_id);
+    `);
+
+    // WhatsApp message status tracking
+    await client.query(`
+      ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS status VARCHAR(20);
+      ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ;
+      ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS reaction VARCHAR(20);
+    `);
+
+    // Group session capacity on time_slots
+    await client.query(`
+      ALTER TABLE time_slots ADD COLUMN IF NOT EXISTS max_capacity INTEGER DEFAULT 1;
+      ALTER TABLE time_slots ADD COLUMN IF NOT EXISTS booked_count INTEGER DEFAULT 0;
+    `);
+
+    // Appointment enhancements for follow-up, SMS, pricing
+    await client.query(`
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS follow_up_appointment_id UUID REFERENCES appointments(id);
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS follow_up_days INTEGER;
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sms_fallback_sent BOOLEAN DEFAULT false;
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS follow_up_sent BOOLEAN DEFAULT false;
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS effective_fee INTEGER DEFAULT 0;
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS payment_status VARCHAR(20) DEFAULT 'pending';
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS payment_collected_at TIMESTAMPTZ;
+    `);
+
+    // Patient cohort tracking
+    await client.query(`
+      ALTER TABLE patients ADD COLUMN IF NOT EXISTS first_appointment_date DATE;
+      ALTER TABLE patients ADD COLUMN IF NOT EXISTS patient_type VARCHAR(20) DEFAULT 'new';
+      ALTER TABLE patients ADD COLUMN IF NOT EXISTS email_status VARCHAR(20) DEFAULT 'valid';
+    `);
+
+    // Doctor dynamic pricing and no-show score
+    await client.query(`
+      ALTER TABLE doctors ADD COLUMN IF NOT EXISTS pricing_rules JSONB DEFAULT '{}';
+      ALTER TABLE doctors ADD COLUMN IF NOT EXISTS no_show_score NUMERIC(4,2) DEFAULT 0;
+    `);
+
+    // Multi-location doctor support
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS doctor_hospitals (
+        doctor_id UUID REFERENCES doctors(id) ON DELETE CASCADE,
+        hospital_id UUID REFERENCES hospitals(id) ON DELETE CASCADE,
+        day_of_week INTEGER CHECK (day_of_week BETWEEN 0 AND 6),
+        start_time TIME,
+        end_time TIME,
+        PRIMARY KEY (doctor_id, hospital_id, day_of_week)
+      );
+      CREATE INDEX IF NOT EXISTS idx_doctor_hospitals_doctor ON doctor_hospitals(doctor_id);
+      CREATE INDEX IF NOT EXISTS idx_doctor_hospitals_hospital ON doctor_hospitals(hospital_id);
+    `);
+
+    // Reminder confirmations (patient YES/NO replies)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reminder_confirmations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        appointment_id UUID REFERENCES appointments(id) ON DELETE CASCADE,
+        phone VARCHAR(20) NOT NULL,
+        response VARCHAR(10),
+        responded_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_reminder_conf_appt ON reminder_confirmations(appointment_id);
+      CREATE INDEX IF NOT EXISTS idx_reminder_conf_phone ON reminder_confirmations(phone);
+    `);
+
+    // Department pre-visit checklist
+    await client.query(`
+      ALTER TABLE departments ADD COLUMN IF NOT EXISTS pre_visit_checklist TEXT;
+    `);
+
+    // New analytics indexes
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_appt_patient_created ON appointments(patient_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_appt_followup_sent ON appointments(appointment_date, follow_up_sent) WHERE status='confirmed' AND follow_up_sent=false;
+    `);
+
+    // Feature 21: Link users to doctor records
+    await client.query(`
+      ALTER TABLE doctors ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+      CREATE INDEX IF NOT EXISTS idx_doctors_user_id ON doctors(user_id) WHERE user_id IS NOT NULL;
+    `);
 
   } finally {
     await client.query('RESET search_path').catch(() => {});

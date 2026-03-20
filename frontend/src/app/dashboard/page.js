@@ -28,8 +28,8 @@ const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
 const NAV = [
   { id: 'overview', label: 'Overview', icon: '📊' },
   { id: 'appointments', label: 'Appointments', icon: '📅' },
-  { id: 'doctors', label: 'Doctors', icon: '👨‍⚕️' },
-  { id: 'hospitals', label: 'Hospitals', icon: '🏥' },
+  { id: 'doctors', label: 'Dentists', icon: '🦷' },
+  { id: 'hospitals', label: 'Clinics', icon: '🏥' },
   { id: 'patients', label: 'Patients', icon: '👥' },
   { id: 'waitinglist', label: 'Waiting List', icon: '⏳' },
   { id: 'feedback', label: 'Feedback', icon: '⭐' },
@@ -37,7 +37,9 @@ const NAV = [
   { id: 'calendar', label: 'Calendar', icon: '📆' },
   { id: 'slots', label: 'Slots', icon: '🕐' },
   { id: 'staff', label: 'Staff', icon: '👤' },
-  { id: 'leaves', label: 'Doctor Leaves', icon: '🏖️' },
+  { id: 'leaves', label: 'Dentist Leaves', icon: '🏖️' },
+  { id: 'services', label: 'Services', icon: '💊' },
+  { id: 'holidays', label: 'Holidays', icon: '🗓️' },
   { id: 'settings', label: 'Settings', icon: '⚙️' },
   { id: 'test', label: 'Bot Tester', icon: '🤖' },
   { id: 'audit', label: 'Audit Logs', icon: '📋' },
@@ -56,6 +58,9 @@ export default function Dashboard() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [tabLoading, setTabLoading] = useState(false);
+  const [statsLastUpdated, setStatsLastUpdated] = useState(null);
+  const [statsRefreshing, setStatsRefreshing] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [filterDate, setFilterDate] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [patientSearch, setPatientSearch] = useState('');
@@ -113,6 +118,10 @@ export default function Dashboard() {
   const [selectedPatient, setSelectedPatient] = useState(null);
   const [patientHistory, setPatientHistory] = useState([]);
   const [patientHistoryLoading, setPatientHistoryLoading] = useState(false);
+
+  // Patient documents state (Enhancement 6)
+  const [patientDocuments, setPatientDocuments] = useState([]);
+  const [docUploading, setDocUploading] = useState(false);
 
   // Staff management state
   const [staff, setStaff] = useState([]);
@@ -193,6 +202,8 @@ export default function Dashboard() {
   const [editingPatient, setEditingPatient] = useState(null);
   const [patientEditForm, setPatientEditForm] = useState({ name: '', email: '', gender: '', date_of_birth: '' });
   const [patientEditSaving, setPatientEditSaving] = useState(false);
+  const [importingPatients, setImportingPatients] = useState(false);
+  const [importingDoctors, setImportingDoctors] = useState(false);
 
   // Change password state
   const [changePwdForm, setChangePwdForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
@@ -234,6 +245,27 @@ export default function Dashboard() {
   const [waMessageText, setWaMessageText] = useState('');
   const [waSending, setWaSending] = useState(false);
 
+  // Services (treatment catalog) state — A1
+  const [services, setServices] = useState([]);
+  const [showServiceModal, setShowServiceModal] = useState(false);
+  const [editingService, setEditingService] = useState(null);
+  const [serviceForm, setServiceForm] = useState({ name: '', description: '', category: '', duration_minutes: '30', price: '', hospital_id: '' });
+  const [serviceSaving, setServiceSaving] = useState(false);
+
+  // Holidays state — A4
+  const [holidays, setHolidays] = useState([]);
+  const [holidayForm, setHolidayForm] = useState({ hospital_id: '', holiday_date: '', name: '' });
+  const [holidaySaving, setHolidaySaving] = useState(false);
+
+  // Revenue analytics state — A6
+  const [revenueData, setRevenueData] = useState(null);
+  const [revenueMonths, setRevenueMonths] = useState(6);
+
+  // Appointment notes inline editing — A5
+  const [editingNotesId, setEditingNotesId] = useState(null);
+  const [notesText, setNotesText] = useState('');
+  const [notesSaving, setNotesSaving] = useState(false);
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     const u = localStorage.getItem('user');
@@ -252,8 +284,68 @@ export default function Dashboard() {
       });
     };
     window.addEventListener('medibook:session-warning', onSessionWarning);
+
+    // ── SSE real-time dashboard updates ──────────────────────────
+    const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+    const es = new EventSource(`${API_URL}/api/admin/events?token=${encodeURIComponent(token)}`);
+    es.onmessage = (e) => {
+      try {
+        const { type, payload } = JSON.parse(e.data);
+        if (type === 'new_booking') {
+          toast.success(`New booking: ${payload?.patientName || 'Patient'} → Dr. ${payload?.doctorName || ''}`, {
+            duration: 5000, icon: '📅',
+          });
+          // Silently refresh stats so counters update
+          fetchStats(true);
+          setNotifications(prev => [
+            { id: Date.now(), message: `New booking: ${payload?.patientName} at ${payload?.time}`, read: false, created_at: new Date().toISOString() },
+            ...prev.slice(0, 19),
+          ]);
+        }
+      } catch (_) {}
+    };
+    es.onerror = () => {}; // silent reconnect handled by browser
+
+    // ── Keyboard shortcuts ────────────────────────────────────────
+    const onKeyDown = (e) => {
+      // Ignore when typing in an input/textarea
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+      const map = {
+        'g o': 'overview', 'g a': 'appointments', 'g d': 'doctors',
+        'g p': 'patients', 'g n': 'analytics', 'g s': 'settings',
+        'g t': 'test', 'g l': 'audit',
+      };
+      // Single-key shortcuts
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.key === '?') {
+          toast('Keyboard shortcuts: g+o Overview · g+a Appointments · g+d Doctors · g+p Patients · g+s Settings · g+t Bot Tester', {
+            duration: 6000, icon: '⌨️',
+          });
+        }
+      }
+    };
+    let gPressed = false;
+    let gTimer = null;
+    const onKeyDownG = (e) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+      if (e.key === 'g') { gPressed = true; clearTimeout(gTimer); gTimer = setTimeout(() => { gPressed = false; }, 1000); return; }
+      if (gPressed) {
+        const navMap = { o: 'overview', a: 'appointments', d: 'doctors', p: 'patients', n: 'analytics', s: 'settings', t: 'test', l: 'audit' };
+        if (navMap[e.key]) { setTab(navMap[e.key]); gPressed = false; }
+      }
+      if (e.key === '?') {
+        toast('Shortcuts: g+o Overview · g+a Appointments · g+d Doctors · g+p Patients · g+n Analytics · g+s Settings', {
+          duration: 5000, icon: '⌨️',
+        });
+      }
+    };
+    window.addEventListener('keydown', onKeyDownG);
+
     return () => {
       window.removeEventListener('medibook:session-warning', onSessionWarning);
+      window.removeEventListener('keydown', onKeyDownG);
+      clearTimeout(gTimer);
+      es.close();
     };
   }, []);
 
@@ -262,13 +354,19 @@ export default function Dashboard() {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
 
-  const fetchStats = useCallback(async () => {
-    setLoading(true);
+  const fetchStats = useCallback(async (silent = false) => {
+    if (silent) setStatsRefreshing(true);
+    else setLoading(true);
     try {
       const { data } = await api.get('/admin/dashboard');
       setStats(data);
-    } catch { toast.error('Failed to load dashboard stats'); }
-    finally { setLoading(false); }
+      setStatsLastUpdated(new Date());
+    } catch (err) {
+      if (!silent) toast.error('Failed to load dashboard stats');
+    } finally {
+      setLoading(false);
+      setStatsRefreshing(false);
+    }
   }, []);
 
   const fetchAppointments = useCallback(async (page = apptPage) => {
@@ -303,6 +401,47 @@ export default function Dashboard() {
       if (data.total != null) setPatientTotal(data.total);
     } catch { toast.error('Failed to load patients'); }
   }, [patientSearch, patientPage]);
+
+  async function importPatientsCSV(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImportingPatients(true);
+    try {
+      const text = await file.text();
+      const { data } = await api.post('/admin/patients/import', { csv_data: text });
+      toast.success(`Imported ${data.imported} patients${data.skipped ? `, ${data.skipped} skipped` : ''}`);
+      if (data.errors?.length) {
+        console.warn('Import warnings:', data.errors);
+        toast.error(`${data.errors.length} rows had issues — check console`, { duration: 5000 });
+      }
+      fetchPatients();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Import failed');
+    } finally {
+      setImportingPatients(false);
+      e.target.value = '';
+    }
+  }
+
+  async function importDoctorsCSV(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImportingDoctors(true);
+    try {
+      const text = await file.text();
+      const { data } = await api.post('/admin/doctors/import', { csv_data: text });
+      toast.success(`Imported ${data.imported} doctors${data.skipped ? `, ${data.skipped} skipped` : ''}`);
+      if (data.errors?.length) {
+        console.warn('Import warnings:', data.errors);
+      }
+      fetchDoctors();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Import failed');
+    } finally {
+      setImportingDoctors(false);
+      e.target.value = '';
+    }
+  }
 
   const fetchAnalytics = useCallback(async () => {
     try {
@@ -371,6 +510,28 @@ export default function Dashboard() {
       setAuditTotal(data.total || 0);
     } catch { toast.error('Failed to load audit logs'); }
   }, [auditFrom, auditTo, auditAction]);
+
+  const fetchServices = useCallback(async () => {
+    try {
+      const { data } = await api.get('/admin/services');
+      setServices(data.services || []);
+    } catch { toast.error('Failed to load services'); }
+  }, []);
+
+  const fetchHolidays = useCallback(async () => {
+    try {
+      const { data } = await api.get('/admin/holidays');
+      setHolidays(data.holidays || []);
+    } catch { toast.error('Failed to load holidays'); }
+  }, []);
+
+  const fetchRevenue = useCallback(async (months) => {
+    try {
+      const m = months || revenueMonths;
+      const { data } = await api.get(`/admin/analytics/revenue?months=${m}`);
+      setRevenueData(data);
+    } catch { /* silent — revenue section shows no-data state */ }
+  }, [revenueMonths]);
 
   const fetchOnboarding = useCallback(async () => {
     try {
@@ -607,19 +768,22 @@ export default function Dashboard() {
   async function openPatientHistory(patient) {
     setSelectedPatient(patient);
     setPatientHistory([]);
+    setPatientDocuments([]);
     setPatientHistoryLoading(true);
     setMedHistoryEditing(false);
     setShowPatientHistory(true);
     try {
-      const [histData, medData] = await Promise.allSettled([
+      const [histData, medData, docsData] = await Promise.allSettled([
         api.get(`/admin/patients/${patient.id}/appointments`),
         api.get(`/admin/patients/${patient.id}/medical-history`),
+        api.get(`/admin/patients/${patient.id}/documents`),
       ]);
       if (histData.status === 'fulfilled') setPatientHistory(histData.value.data.appointments || []);
       if (medData.status === 'fulfilled') {
         const mh = medData.value.data.patient?.medical_history || {};
         setMedHistory({ blood_type: mh.blood_type || '', allergies: mh.allergies || '', conditions: mh.conditions || '', medications: mh.medications || '', notes: mh.notes || '' });
       }
+      if (docsData.status === 'fulfilled') setPatientDocuments(docsData.value.data.documents || []);
     } catch { toast.error('Failed to load history'); }
     finally { setPatientHistoryLoading(false); }
   }
@@ -828,7 +992,9 @@ export default function Dashboard() {
         else if (tab === 'patients') await fetchPatients();
         else if (tab === 'waitinglist') await fetchWaitingList(1);
         else if (tab === 'feedback') await fetchFeedback(1);
-        else if (tab === 'analytics') { await fetchAnalytics(); await fetchAnalyticsSummary(); }
+        else if (tab === 'analytics') { await fetchAnalytics(); await fetchAnalyticsSummary(); await fetchRevenue(); }
+        else if (tab === 'services') { await fetchServices(); if (!hospitals.length) await fetchHospitals(); }
+        else if (tab === 'holidays') { await fetchHolidays(); if (!hospitals.length) await fetchHospitals(); }
         else if (tab === 'hospitals') {
           const data = await fetchHospitals();
           if (data) await fetchAllHospitalDepts(data);
@@ -848,13 +1014,13 @@ export default function Dashboard() {
     load();
   }, [tab]);
 
-  // Auto-refresh: Overview stats every 30s, Appointments every 60s
+  // Auto-refresh: Overview stats every 60s, Appointments every 60s
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) return;
     const statsInterval = setInterval(() => {
-      if (tab === 'overview') fetchStats();
-    }, 30000);
+      if (tab === 'overview') fetchStats(true);
+    }, 60000);
     const apptInterval = setInterval(() => {
       if (tab === 'appointments') fetchAppointments();
     }, 60000);
@@ -996,6 +1162,109 @@ export default function Dashboard() {
     } finally { setWaSending(false); }
   }
 
+  async function saveService(e) {
+    e.preventDefault();
+    if (!serviceForm.name.trim()) return toast.error('Service name is required');
+    setServiceSaving(true);
+    try {
+      const payload = { ...serviceForm, duration_minutes: Number(serviceForm.duration_minutes) || 30, price: Number(serviceForm.price) || 0 };
+      if (editingService) {
+        await api.patch(`/admin/services/${editingService.id}`, payload);
+        toast.success('Service updated');
+      } else {
+        await api.post('/admin/services', payload);
+        toast.success('Service added');
+      }
+      setShowServiceModal(false);
+      setEditingService(null);
+      setServiceForm({ name: '', description: '', category: '', duration_minutes: '30', price: '', hospital_id: '' });
+      fetchServices();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to save service');
+    } finally { setServiceSaving(false); }
+  }
+
+  function openEditService(svc) {
+    setEditingService(svc);
+    setServiceForm({ name: svc.name || '', description: svc.description || '', category: svc.category || '', duration_minutes: String(svc.duration_minutes || 30), price: String(svc.price || ''), hospital_id: svc.hospital_id || '' });
+    setShowServiceModal(true);
+  }
+
+  function deleteService(svc) {
+    setConfirmModal({
+      title: `Remove "${svc.name}"?`,
+      message: 'This service will be deactivated and hidden from bookings.',
+      danger: true,
+      onConfirm: async () => {
+        setConfirmModal(null);
+        try {
+          await api.delete(`/admin/services/${svc.id}`);
+          toast.success('Service removed');
+          fetchServices();
+        } catch (err) { toast.error(err.response?.data?.error || 'Failed to remove'); }
+      },
+    });
+  }
+
+  async function addHoliday(e) {
+    e.preventDefault();
+    if (!holidayForm.holiday_date || !holidayForm.name.trim()) return toast.error('Date and name are required');
+    setHolidaySaving(true);
+    try {
+      await api.post('/admin/holidays', holidayForm);
+      toast.success('Holiday added');
+      setHolidayForm(f => ({ ...f, holiday_date: '', name: '' }));
+      fetchHolidays();
+    } catch (err) {
+      const msg = err.response?.data?.error || 'Failed to add holiday';
+      toast.error(msg.includes('already') ? 'A holiday already exists on that date' : msg);
+    } finally { setHolidaySaving(false); }
+  }
+
+  function deleteHoliday(holiday) {
+    setConfirmModal({
+      title: `Remove holiday "${holiday.name}"?`,
+      message: `This will remove the closure on ${holiday.holiday_date} and allow new bookings on that day.`,
+      danger: false,
+      onConfirm: async () => {
+        setConfirmModal(null);
+        try {
+          await api.delete(`/admin/holidays/${holiday.id}`);
+          toast.success('Holiday removed');
+          fetchHolidays();
+        } catch (err) { toast.error(err.response?.data?.error || 'Failed to remove'); }
+      },
+    });
+  }
+
+  async function saveApptNotes(apptId) {
+    setNotesSaving(true);
+    try {
+      await api.patch(`/admin/appointments/${apptId}`, { notes: notesText });
+      setAppointments(prev => prev.map(a => a.id === apptId ? { ...a, notes: notesText } : a));
+      toast.success('Notes saved');
+      setEditingNotesId(null);
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to save notes');
+    } finally { setNotesSaving(false); }
+  }
+
+  async function printReceipt(apptId) {
+    try {
+      const token = localStorage.getItem('token');
+      const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+      const resp = await fetch(`${apiBase}/api/admin/appointments/${apptId}/receipt`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!resp.ok) { toast.error('Receipt not available'); return; }
+      const html = await resp.text();
+      const blob = new Blob([html], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      const w = window.open(url, '_blank');
+      if (w) setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch { toast.error('Failed to load receipt'); }
+  }
+
   async function exportCSV() {
     if (!appointments.length) { toast.error('No data to export'); return; }
     const h = ['Booking ID', 'Patient', 'Phone', 'Doctor', 'Department', 'Date', 'Time', 'Type', 'Status'];
@@ -1115,15 +1384,28 @@ export default function Dashboard() {
   return (
     <>
     <div className="flex h-screen bg-gray-50 overflow-hidden">
+      {/* Mobile sidebar overlay */}
+      {sidebarOpen && (
+        <div className="fixed inset-0 z-40 bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} />
+      )}
+
       {/* Sidebar */}
-      <aside className="w-56 bg-white border-r border-gray-200 flex flex-col shrink-0">
-        <div className="p-5 border-b border-gray-100">
-          <div className="text-xl font-bold text-blue-600">🏥 MediBook</div>
-          <div className="text-xs text-gray-400 mt-1 truncate">{user?.tenant || 'Admin Portal'}</div>
+      <aside className={`
+        fixed md:relative z-50 md:z-auto inset-y-0 left-0
+        w-56 bg-white border-r border-gray-200 flex flex-col shrink-0
+        transform transition-transform duration-200 ease-in-out
+        ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}
+      `}>
+        <div className="p-5 border-b border-gray-100 flex items-center justify-between">
+          <div>
+            <div className="text-xl font-bold text-blue-600">🏥 MediBook</div>
+            <div className="text-xs text-gray-400 mt-1 truncate">{user?.tenant || 'Admin Portal'}</div>
+          </div>
+          <button className="md:hidden text-gray-400 hover:text-gray-600 p-1" onClick={() => setSidebarOpen(false)}>✕</button>
         </div>
         <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
           {NAV.map(item => (
-            <button key={item.id} onClick={() => setTab(item.id)}
+            <button key={item.id} onClick={() => { setTab(item.id); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                 tab === item.id ? 'bg-blue-50 text-blue-600' : 'text-gray-600 hover:bg-gray-50'
               }`}>
@@ -1143,10 +1425,17 @@ export default function Dashboard() {
 
       {/* Main content */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <header className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between shrink-0">
-          <h1 className="text-lg font-semibold text-gray-900">
-            {NAV.find(n => n.id === tab)?.icon} {NAV.find(n => n.id === tab)?.label}
-          </h1>
+        <header className="bg-white border-b border-gray-200 px-4 md:px-6 py-4 flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-3">
+            <button className="md:hidden p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 transition" onClick={() => setSidebarOpen(true)}>
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+            <h1 className="text-lg font-semibold text-gray-900">
+              {NAV.find(n => n.id === tab)?.icon} {NAV.find(n => n.id === tab)?.label}
+            </h1>
+          </div>
           <div className="flex items-center gap-2">
             {tab === 'analytics' && (
               <button onClick={printAnalytics}
@@ -1281,6 +1570,17 @@ export default function Dashboard() {
                   ))}
                 </div>
               ) : (
+                <>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs text-gray-400">
+                    {statsLastUpdated ? `Updated ${statsLastUpdated.toLocaleTimeString()}` : ''}
+                    {statsRefreshing && <span className="ml-2 text-blue-500 animate-pulse">↻ Refreshing...</span>}
+                  </span>
+                  <button onClick={() => fetchStats(true)} disabled={statsRefreshing}
+                    className="text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50 transition">
+                    ↻ Refresh
+                  </button>
+                </div>
                 <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-4">
                   <StatCard label="Today" value={stats?.today_appointments} icon="📅" color="border-blue-500" />
                   <StatCard label="Upcoming" value={stats?.upcoming_appointments} icon="🗓" color="border-green-500" />
@@ -1294,6 +1594,7 @@ export default function Dashboard() {
                     sub={analyticsSummary ? `${analyticsSummary.no_show_rate || 0}% no-show` : undefined}
                   />
                 </div>
+                </>
               )}
 
               {/* Today's schedule skeleton */}
@@ -1346,7 +1647,7 @@ export default function Dashboard() {
                 <h3 className="font-semibold text-gray-800 mb-3">Quick Actions</h3>
                 <div className="flex flex-wrap gap-3">
                   <button onClick={() => setTab('appointments')} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">View All Appointments</button>
-                  <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Doctors</button>
+                  <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Dentists</button>
                   <button onClick={() => setTab('test')} className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700 transition">Test WhatsApp Bot</button>
                   <button onClick={() => { setTab('appointments'); setTimeout(exportCSV, 500); }} className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">Export CSV</button>
                 </div>
@@ -1455,8 +1756,8 @@ export default function Dashboard() {
                           <td className="px-4 py-3 text-xs text-gray-500 capitalize">{a.visit_type?.replace('_', ' ')}</td>
                           <td className="px-4 py-3"><Badge status={a.status} /></td>
                           <td className="px-4 py-3">
-                            {a.status === 'confirmed' && (
-                              <div className="flex gap-1">
+                            <div className="flex flex-wrap gap-1">
+                              {a.status === 'confirmed' && (<>
                                 <button onClick={() => updateApptStatus(a.id, 'completed')}
                                   className="px-2 py-1 text-xs bg-blue-50 text-blue-600 border border-blue-200 rounded hover:bg-blue-100 transition whitespace-nowrap">
                                   ✅ Done
@@ -1469,8 +1770,16 @@ export default function Dashboard() {
                                   className="px-2 py-1 text-xs bg-red-50 text-red-600 border border-red-200 rounded hover:bg-red-100 transition whitespace-nowrap">
                                   ✕ Cancel
                                 </button>
-                              </div>
-                            )}
+                              </>)}
+                              <button onClick={() => printReceipt(a.id)} title="Print receipt"
+                                className="px-2 py-1 text-xs bg-purple-50 text-purple-600 border border-purple-200 rounded hover:bg-purple-100 transition whitespace-nowrap">
+                                🖨️ Receipt
+                              </button>
+                              <button onClick={() => { setEditingNotesId(a.id); setNotesText(a.notes || ''); }} title="Edit clinical notes"
+                                className={`px-2 py-1 text-xs border rounded hover:bg-gray-100 transition whitespace-nowrap ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                                📝 {a.notes ? 'Notes' : 'Add Note'}
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -1511,14 +1820,14 @@ export default function Dashboard() {
                 <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 flex items-center gap-3">
                   <span className="text-xl">⚠️</span>
                   <div>
-                    <p className="text-sm font-medium text-amber-800">Doctor limit reached ({settings.usage.active_doctors}/{settings.plan_limits.max_doctors})</p>
-                    <p className="text-xs text-amber-600">Upgrade your plan to add more doctors.</p>
+                    <p className="text-sm font-medium text-amber-800">Dentist limit reached ({settings.usage.active_doctors}/{settings.plan_limits.max_doctors})</p>
+                    <p className="text-xs text-amber-600">Upgrade your plan to add more dentists.</p>
                   </div>
                 </div>
               )}
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
-                  <p className="text-sm text-gray-500">{doctors.length} doctor{doctors.length !== 1 ? 's' : ''}</p>
+                  <p className="text-sm text-gray-500">{doctors.length} dentist{doctors.length !== 1 ? 's' : ''}</p>
                   <label className="flex items-center gap-2 cursor-pointer select-none">
                     <div className="relative">
                       <input type="checkbox" className="sr-only" checked={showInactive}
@@ -1529,10 +1838,16 @@ export default function Dashboard() {
                     <span className="text-sm text-gray-500">Show inactive</span>
                   </label>
                 </div>
-                <button onClick={openAddDoctor}
-                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
-                  + Add Doctor
-                </button>
+                <div className="flex items-center gap-2">
+                  <label className={`px-3 py-2 text-sm border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition whitespace-nowrap ${importingDoctors ? 'opacity-50 pointer-events-none' : ''}`}>
+                    {importingDoctors ? '⏳ Importing...' : '📤 Import CSV'}
+                    <input type="file" accept=".csv" className="hidden" onChange={importDoctorsCSV} disabled={importingDoctors} />
+                  </label>
+                  <button onClick={openAddDoctor}
+                    className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
+                    + Add Doctor
+                  </button>
+                </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                 {doctors.map(d => (
@@ -1579,9 +1894,9 @@ export default function Dashboard() {
                 ))}
                 {!doctors.length && (
                   <div className="col-span-3 text-center py-16">
-                    <div className="text-4xl mb-3">👨‍⚕️</div>
-                    <p className="text-gray-500 font-medium">No doctors yet</p>
-                    <p className="text-gray-400 text-sm mt-1">Click "Add Doctor" to get started</p>
+                    <div className="text-4xl mb-3">🦷</div>
+                    <p className="text-gray-500 font-medium">No dentists yet</p>
+                    <p className="text-gray-400 text-sm mt-1">Click "Add Dentist" to get started</p>
                   </div>
                 )}
               </div>
@@ -1591,13 +1906,19 @@ export default function Dashboard() {
           {/* ── PATIENTS ── */}
           {tab === 'patients' && !tabLoading && (
             <div className="space-y-4">
-              <input
-                type="text"
-                placeholder="Search by name, phone or email..."
-                value={patientSearch}
-                onChange={e => setPatientSearch(e.target.value)}
-                className="w-full max-w-sm border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
+              <div className="flex items-center gap-3">
+                <input
+                  type="text"
+                  placeholder="Search by name, phone or email..."
+                  value={patientSearch}
+                  onChange={e => setPatientSearch(e.target.value)}
+                  className="w-full max-w-sm border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <label className={`px-3 py-1.5 text-sm border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition whitespace-nowrap ${importingPatients ? 'opacity-50 pointer-events-none' : ''}`}>
+                  {importingPatients ? '⏳ Importing...' : '📤 Import CSV'}
+                  <input type="file" accept=".csv" className="hidden" onChange={importPatientsCSV} disabled={importingPatients} />
+                </label>
+              </div>
               {patientTotal > 0 && (
                 <p className="text-sm text-gray-400">{patientTotal} patient{patientTotal !== 1 ? 's' : ''} total</p>
               )}
@@ -1930,7 +2251,7 @@ export default function Dashboard() {
                     </div>
                     {/* By Doctor — BarChart */}
                     <div className="bg-white rounded-xl p-5 shadow-sm">
-                      <h3 className="font-semibold text-gray-800 mb-4">Top Doctors (30 days)</h3>
+                      <h3 className="font-semibold text-gray-800 mb-4">Top Dentists (30 days)</h3>
                       {analytics.by_doctor?.length > 0 ? (
                         <ResponsiveContainer width="100%" height={200}>
                           <BarChart data={analytics.by_doctor.slice(0, 6).map(d => ({ name: d.name.split(' ')[0], count: parseInt(d.count) }))} layout="vertical">
@@ -1979,6 +2300,227 @@ export default function Dashboard() {
               ) : (
                 <div className="text-center text-gray-400 py-12">Loading analytics...</div>
               )}
+
+              {/* ── REVENUE SECTION (A6) ── */}
+              <div className="bg-white rounded-xl p-5 shadow-sm">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="font-semibold text-gray-800">💰 Revenue Analytics</h3>
+                  <select value={revenueMonths}
+                    onChange={e => { const m = Number(e.target.value); setRevenueMonths(m); fetchRevenue(m); }}
+                    className="border border-gray-300 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    {[3, 6, 12, 24].map(m => <option key={m} value={m}>Last {m} months</option>)}
+                  </select>
+                </div>
+                {revenueData ? (
+                  <div className="space-y-5">
+                    {/* KPI cards */}
+                    <div className="grid grid-cols-3 gap-4">
+                      <div className="bg-green-50 rounded-lg p-4 text-center">
+                        <div className="text-2xl font-bold text-green-700">₹{(revenueData.total_revenue || 0).toLocaleString('en-IN')}</div>
+                        <div className="text-xs text-green-600 mt-1">Total Revenue ({revenueMonths}m)</div>
+                      </div>
+                      <div className="bg-blue-50 rounded-lg p-4 text-center">
+                        <div className="text-2xl font-bold text-blue-700">{revenueData.monthly?.length || 0}</div>
+                        <div className="text-xs text-blue-600 mt-1">Active Months</div>
+                      </div>
+                      <div className="bg-purple-50 rounded-lg p-4 text-center">
+                        <div className="text-2xl font-bold text-purple-700">
+                          ₹{revenueData.monthly?.length ? Math.round((revenueData.total_revenue || 0) / revenueData.monthly.length).toLocaleString('en-IN') : 0}
+                        </div>
+                        <div className="text-xs text-purple-600 mt-1">Avg Monthly</div>
+                      </div>
+                    </div>
+                    {/* Monthly revenue bar chart */}
+                    {revenueData.monthly?.length > 0 && (
+                      <div>
+                        <h4 className="text-sm font-semibold text-gray-700 mb-3">Monthly Revenue (₹)</h4>
+                        <ResponsiveContainer width="100%" height={180}>
+                          <BarChart data={revenueData.monthly.map(m => ({ month: m.month?.slice(0, 7), revenue: parseInt(m.revenue) || 0 }))}>
+                            <XAxis dataKey="month" tick={{ fontSize: 10 }} />
+                            <YAxis tick={{ fontSize: 10 }} tickFormatter={v => `₹${(v/1000).toFixed(0)}k`} width={50} />
+                            <Tooltip formatter={(v) => [`₹${v.toLocaleString('en-IN')}`, 'Revenue']} />
+                            <Bar dataKey="revenue" fill="#22c55e" radius={[4, 4, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+                    {/* Top earning dentists */}
+                    {revenueData.by_doctor?.length > 0 && (
+                      <div>
+                        <h4 className="text-sm font-semibold text-gray-700 mb-3">Top Earning Dentists</h4>
+                        <div className="space-y-2">
+                          {revenueData.by_doctor.slice(0, 5).map((d, i) => {
+                            const maxRev = revenueData.by_doctor[0]?.revenue || 1;
+                            const pct = Math.round((d.revenue / maxRev) * 100);
+                            return (
+                              <div key={d.name} className="flex items-center gap-3">
+                                <span className="text-xs font-bold text-gray-400 w-4">#{i + 1}</span>
+                                <span className="text-sm text-gray-700 w-28 truncate">Dr. {d.name}</span>
+                                <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
+                                  <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${pct}%` }} />
+                                </div>
+                                <span className="text-sm font-semibold text-gray-800 w-24 text-right">₹{parseInt(d.revenue).toLocaleString('en-IN')}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {/* Revenue by treatment */}
+                    {revenueData.by_treatment?.length > 0 && (
+                      <div>
+                        <h4 className="text-sm font-semibold text-gray-700 mb-3">Revenue by Treatment</h4>
+                        <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                          {revenueData.by_treatment.slice(0, 6).map(t => (
+                            <div key={t.treatment} className="bg-gray-50 rounded-lg p-3">
+                              <div className="text-xs text-gray-500 truncate">{t.treatment}</div>
+                              <div className="text-sm font-bold text-gray-800 mt-1">₹{parseInt(t.revenue).toLocaleString('en-IN')}</div>
+                              <div className="text-xs text-gray-400">{t.count} appts</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-center text-gray-400 py-8 text-sm">
+                    Revenue data will appear here once you have completed appointments with consultation fees set.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── SERVICES (A1) ── */}
+          {tab === 'services' && !tabLoading && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <p className="text-sm text-gray-500">{services.length} treatment{services.length !== 1 ? 's' : ''} in catalog</p>
+                <button onClick={() => { setEditingService(null); setServiceForm({ name: '', description: '', category: '', duration_minutes: '30', price: '', hospital_id: hospitals[0]?.id || '' }); setShowServiceModal(true); }}
+                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition">
+                  + Add Service
+                </button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                {services.map(svc => (
+                  <div key={svc.id} className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 hover:shadow-md transition">
+                    <div className="flex items-start justify-between mb-2">
+                      <div className="flex-1 min-w-0">
+                        <h3 className="font-semibold text-gray-900 text-sm truncate">{svc.name}</h3>
+                        {svc.category && <span className="text-xs text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">{svc.category}</span>}
+                      </div>
+                      <div className="flex gap-1 ml-2 shrink-0">
+                        <button onClick={() => openEditService(svc)}
+                          className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition">✏️</button>
+                        <button onClick={() => deleteService(svc)}
+                          className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition">🗑️</button>
+                      </div>
+                    </div>
+                    {svc.description && <p className="text-xs text-gray-500 mb-3 line-clamp-2">{svc.description}</p>}
+                    <div className="flex items-center gap-3 text-xs text-gray-600">
+                      <span className="bg-gray-100 px-2 py-1 rounded">⏱ {svc.duration_minutes} min</span>
+                      {svc.price > 0 && <span className="bg-green-50 text-green-700 px-2 py-1 rounded font-semibold">₹{svc.price.toLocaleString('en-IN')}</span>}
+                      {svc.hospital_name && <span className="text-gray-400 truncate">{svc.hospital_name}</span>}
+                    </div>
+                  </div>
+                ))}
+                {!services.length && (
+                  <div className="col-span-3 text-center py-16 bg-white rounded-xl shadow-sm">
+                    <div className="text-4xl mb-3">💊</div>
+                    <p className="text-gray-500 font-medium">No services yet</p>
+                    <p className="text-gray-400 text-sm mt-1">Add treatments like Root Canal, Cleaning, Braces consultation, etc.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── HOLIDAYS (A4) ── */}
+          {tab === 'holidays' && !tabLoading && (
+            <div className="space-y-4">
+              {/* Add holiday form */}
+              <div className="bg-white rounded-xl p-5 shadow-sm">
+                <h3 className="font-semibold text-gray-800 mb-4">Add Clinic Holiday / Closure</h3>
+                <form onSubmit={addHoliday} className="flex flex-wrap gap-3 items-end">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Clinic Branch</label>
+                    <select value={holidayForm.hospital_id}
+                      onChange={e => setHolidayForm(f => ({ ...f, hospital_id: e.target.value }))}
+                      className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                      <option value="">— All Branches —</option>
+                      {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Date <span className="text-red-400">*</span></label>
+                    <input type="date" value={holidayForm.holiday_date}
+                      onChange={e => setHolidayForm(f => ({ ...f, holiday_date: e.target.value }))}
+                      className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+                  </div>
+                  <div className="flex-1 min-w-[180px]">
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Holiday Name <span className="text-red-400">*</span></label>
+                    <input value={holidayForm.name}
+                      onChange={e => setHolidayForm(f => ({ ...f, name: e.target.value }))}
+                      placeholder="e.g. Diwali, Republic Day, Clinic Renovation"
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+                  </div>
+                  <button type="submit" disabled={holidaySaving}
+                    className="px-4 py-2 bg-orange-600 text-white text-sm font-medium rounded-lg hover:bg-orange-700 disabled:opacity-50 transition whitespace-nowrap">
+                    {holidaySaving ? 'Adding...' : '+ Add Holiday'}
+                  </button>
+                </form>
+                <p className="text-xs text-gray-400 mt-3">
+                  ⚠️ Holidays block new slot generation and hide available slots on that day. Already-confirmed appointments are not affected.
+                </p>
+              </div>
+
+              {/* Holidays list */}
+              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+                  <h3 className="font-medium text-gray-800">Scheduled Holidays</h3>
+                  <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">{holidays.length} date{holidays.length !== 1 ? 's' : ''}</span>
+                </div>
+                {holidays.length === 0 ? (
+                  <div className="px-5 py-12 text-center">
+                    <div className="text-3xl mb-2">🗓️</div>
+                    <p className="text-gray-500 font-medium text-sm">No holidays scheduled</p>
+                    <p className="text-gray-400 text-xs mt-1">Add clinic closures to prevent bookings on those days</p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="bg-gray-50 border-b border-gray-200">
+                        <tr>
+                          {['Date', 'Holiday', 'Branch', 'Added'].map(h => (
+                            <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
+                          ))}
+                          <th className="px-4 py-3 w-20" />
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {holidays.map(h => (
+                          <tr key={h.id} className="hover:bg-gray-50 transition-colors">
+                            <td className="px-4 py-3 font-medium text-gray-900 whitespace-nowrap">
+                              {(() => { try { return format(parseISO(h.holiday_date), 'EEE, d MMM yyyy'); } catch { return h.holiday_date; } })()}
+                            </td>
+                            <td className="px-4 py-3 text-gray-700">{h.name}</td>
+                            <td className="px-4 py-3 text-gray-500 text-xs">{h.hospital_name || <span className="text-gray-400 italic">All branches</span>}</td>
+                            <td className="px-4 py-3 text-gray-400 text-xs">
+                              {h.created_at ? (() => { try { return format(parseISO(h.created_at), 'd MMM yy'); } catch { return '—'; } })() : '—'}
+                            </td>
+                            <td className="px-4 py-3">
+                              <button onClick={() => deleteHoliday(h)}
+                                className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition">
+                                Remove
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -2112,10 +2654,10 @@ export default function Dashboard() {
                         )}
                       </h3>
                       <div className="grid grid-cols-2 gap-4">
-                        {/* Doctors */}
+                        {/* Dentists */}
                         <div>
                           <div className="flex justify-between text-sm mb-1">
-                            <span className="text-gray-600">Doctors</span>
+                            <span className="text-gray-600">Dentists</span>
                             <span className="font-medium text-gray-900">
                               {settings.usage?.active_doctors ?? '—'} / {settings.plan_limits.max_doctors === 999 ? '∞' : settings.plan_limits.max_doctors}
                             </span>
@@ -2315,8 +2857,8 @@ export default function Dashboard() {
                   <div className="space-y-1">
                     {leavesDoctorList.length === 0 ? (
                       <div className="text-sm text-gray-400 p-3 bg-white rounded-xl shadow-sm text-center">
-                        <div className="text-2xl mb-1">👨‍⚕️</div>
-                        No doctors found
+                        <div className="text-2xl mb-1">🦷</div>
+                        No dentists found
                       </div>
                     ) : leavesDoctorList.map(d => (
                       <button key={d.id}
@@ -2926,6 +3468,89 @@ export default function Dashboard() {
               )}
             </div>
           </div>
+
+          {/* Documents Section (Enhancement 6) */}
+          <div className="border-t border-gray-100 pt-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-gray-800">📎 Documents & Prescriptions</h3>
+              <label className={`cursor-pointer px-3 py-1.5 text-xs bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition ${docUploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                {docUploading ? 'Uploading...' : '+ Upload'}
+                <input type="file" className="hidden" accept=".pdf,.jpg,.jpeg,.png,.docx"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file || !selectedPatient) return;
+                    if (file.size > 10 * 1024 * 1024) { toast.error('File too large. Maximum 10 MB.'); return; }
+                    setDocUploading(true);
+                    try {
+                      const base64 = await new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result.split(',')[1]);
+                        reader.onerror = reject;
+                        reader.readAsDataURL(file);
+                      });
+                      const { data } = await api.post(`/admin/patients/${selectedPatient.id}/documents`, {
+                        file_name: file.name,
+                        file_type: file.type,
+                        file_size_bytes: file.size,
+                        file_data: base64,
+                      });
+                      setPatientDocuments(prev => [data.document, ...prev]);
+                      toast.success(`${file.name} uploaded`);
+                    } catch (err) {
+                      toast.error(err.response?.data?.error || 'Upload failed');
+                    } finally {
+                      setDocUploading(false);
+                      e.target.value = '';
+                    }
+                  }} />
+              </label>
+            </div>
+            {patientDocuments.length === 0 ? (
+              <div className="text-center text-gray-400 py-6 text-sm">No documents uploaded yet</div>
+            ) : (
+              <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                {patientDocuments.map(doc => (
+                  <div key={doc.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg group">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <span className="text-xl flex-shrink-0">
+                        {doc.file_type?.includes('pdf') ? '📄' : doc.file_type?.includes('image') ? '🖼️' : '📎'}
+                      </span>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-gray-900 truncate">{doc.file_name}</div>
+                        <div className="text-xs text-gray-400">
+                          {doc.file_size_bytes ? `${(doc.file_size_bytes / 1024).toFixed(0)} KB · ` : ''}
+                          {doc.created_at ? (() => { try { return format(parseISO(doc.created_at), 'd MMM yyyy'); } catch { return ''; } })() : ''}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 flex-shrink-0">
+                      <button
+                        onClick={async () => {
+                          try {
+                            const { data } = await api.get(`/admin/patients/${selectedPatient.id}/documents/${doc.id}`);
+                            const a = document.createElement('a');
+                            a.href = `data:${doc.file_type || 'application/octet-stream'};base64,${data.document.file_data}`;
+                            a.download = doc.file_name;
+                            a.click();
+                          } catch { toast.error('Download failed'); }
+                        }}
+                        className="text-xs text-blue-600 hover:underline px-2 py-1">Download</button>
+                      <button
+                        onClick={async () => {
+                          if (!window.confirm(`Delete "${doc.file_name}"?`)) return;
+                          try {
+                            await api.delete(`/admin/patients/${selectedPatient.id}/documents/${doc.id}`);
+                            setPatientDocuments(prev => prev.filter(d => d.id !== doc.id));
+                            toast.success('Document deleted');
+                          } catch { toast.error('Delete failed'); }
+                        }}
+                        className="text-xs text-red-400 hover:text-red-600 px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity">✕</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </Modal>
     )}
@@ -3163,6 +3788,98 @@ export default function Dashboard() {
             <button type="submit" disabled={patientEditSaving}
               className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
               {patientEditSaving ? 'Saving...' : 'Save Changes'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+    )}
+
+    {/* ── APPOINTMENT NOTES MODAL (A5) ── */}
+    {editingNotesId && (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+          <h3 className="text-base font-semibold text-gray-900 mb-1">Clinical Notes</h3>
+          <p className="text-xs text-gray-400 mb-4">Add observations, treatment details, or follow-up instructions for this appointment.</p>
+          <textarea
+            value={notesText}
+            onChange={e => setNotesText(e.target.value)}
+            rows={5}
+            placeholder="e.g. Patient presented with tooth sensitivity. Prescribed desensitizing toothpaste. Follow up in 2 weeks if pain persists..."
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+            autoFocus
+          />
+          <div className="flex gap-3 mt-4">
+            <button onClick={() => setEditingNotesId(null)}
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              Cancel
+            </button>
+            <button onClick={() => saveApptNotes(editingNotesId)} disabled={notesSaving}
+              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
+              {notesSaving ? 'Saving...' : '💾 Save Notes'}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {/* ── ADD / EDIT SERVICE MODAL (A1) ── */}
+    {showServiceModal && (
+      <Modal title={editingService ? `Edit "${editingService.name}"` : 'Add Treatment Service'} onClose={() => { setShowServiceModal(false); setEditingService(null); }}>
+        <form onSubmit={saveService} className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Service Name <span className="text-red-400">*</span></label>
+            <input value={serviceForm.name} onChange={e => setServiceForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="e.g. Root Canal Treatment, Teeth Cleaning"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Category</label>
+            <select value={serviceForm.category} onChange={e => setServiceForm(f => ({ ...f, category: e.target.value }))}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              <option value="">— Select category —</option>
+              {['Preventive', 'Restorative', 'Cosmetic', 'Orthodontics', 'Surgery', 'Endodontics', 'Periodontics', 'Pediatric', 'Other'].map(c => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Description</label>
+            <textarea value={serviceForm.description} onChange={e => setServiceForm(f => ({ ...f, description: e.target.value }))}
+              rows={2} placeholder="Brief description of the treatment"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Duration (minutes)</label>
+              <select value={serviceForm.duration_minutes} onChange={e => setServiceForm(f => ({ ...f, duration_minutes: e.target.value }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                {[15, 20, 30, 45, 60, 90, 120].map(m => <option key={m} value={m}>{m} min</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Price (₹)</label>
+              <input type="number" min="0" value={serviceForm.price}
+                onChange={e => setServiceForm(f => ({ ...f, price: e.target.value }))}
+                placeholder="0"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Branch (optional)</label>
+            <select value={serviceForm.hospital_id} onChange={e => setServiceForm(f => ({ ...f, hospital_id: e.target.value }))}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              <option value="">— All Branches —</option>
+              {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
+            </select>
+          </div>
+          <div className="flex gap-3 pt-2">
+            <button type="button" onClick={() => { setShowServiceModal(false); setEditingService(null); }}
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              Cancel
+            </button>
+            <button type="submit" disabled={serviceSaving}
+              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
+              {serviceSaving ? 'Saving...' : editingService ? 'Update Service' : 'Add Service'}
             </button>
           </div>
         </form>

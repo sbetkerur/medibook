@@ -118,7 +118,13 @@ const schemas = {
   blockRange: Joi.object({
     doctor_id: Joi.string().uuid().required(),
     start_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
-    end_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
+    end_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required()
+      .custom((value, helpers) => {
+        if (value < helpers.state.ancestors[0].start_date) {
+          return helpers.error('any.invalid');
+        }
+        return value;
+      }).messages({ 'any.invalid': 'end_date must be on or after start_date' }),
     reason: Joi.string().max(255).optional().allow('', null),
   }),
 
@@ -132,13 +138,16 @@ const schemas = {
     appointment_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required()
       .messages({ 'string.pattern.base': 'appointment_date must be YYYY-MM-DD' })
       .custom((value, helpers) => {
-        const d = new Date(value);
-        const today = new Date(); today.setHours(0, 0, 0, 0);
-        if (d < today) return helpers.error('any.invalid');
+        // Use IST (UTC+5:30) for the "today" boundary. Between 18:30–23:59 UTC
+        // the UTC date is one calendar day behind IST — without this adjustment,
+        // patients in IST could book appointments for yesterday's IST date.
+        const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+        const todayStr = new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
+        if (value < todayStr) return helpers.error('any.invalid');
         return value;
       }).messages({ 'any.invalid': 'appointment_date must be today or in the future' }),
-    appointment_time: Joi.string().pattern(/^\d{2}:\d{2}$/).required()
-      .messages({ 'string.pattern.base': 'appointment_time must be HH:MM' }),
+    appointment_time: Joi.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/).required()
+      .messages({ 'string.pattern.base': 'appointment_time must be HH:MM (valid 24-hour time, e.g. 09:30)' }),
     visit_type: Joi.string().valid('in_person', 'video').optional().default('in_person'),
     notes: Joi.string().max(500).optional().allow('', null),
   }),

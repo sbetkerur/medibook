@@ -2,8 +2,13 @@
 
 const { tenantQuery, pool } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
+const { toZonedTime } = require('date-fns-tz');
 const logger = require('../../utils/logger');
+
+const IST = 'Asia/Kolkata';
 const emailService = require('../email');
+const wa = require('../whatsapp');
+const { decrypt } = require('../../utils/encryption');
 const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 const {
   STATES,
@@ -11,7 +16,6 @@ const {
   fuzzyFind,
   getPatient,
   updateSession,
-  notifyWaitlistForDoctor,
 } = require('./utils');
 
 async function startBooking(phone, schema, tenant, send, ctx) {
@@ -19,7 +23,7 @@ async function startBooking(phone, schema, tenant, send, ctx) {
     `SELECT id, name, city FROM hospitals WHERE is_active=true ORDER BY name`);
 
   if (!hospitals.rows.length) {
-    await send.text('No hospitals available right now. Please try again later.');
+    await send.text('No clinics available right now. Please try again later.');
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
@@ -27,25 +31,17 @@ async function startBooking(phone, schema, tenant, send, ctx) {
   if (hospitals.rows.length === 1) {
     ctx.hospital_id = hospitals.rows[0].id;
     ctx.hospital_name = hospitals.rows[0].name;
-    return askVisitType(phone, schema, send, ctx);
+    return showDepartments(phone, schema, send, ctx);
   }
 
-  // Cache hospital list in context to avoid a DB re-fetch on every user input
+  // Cache clinic list in context to avoid a DB re-fetch on every user input
   ctx._hospitals = hospitals.rows;
   const sections = [{
     title: 'Our Locations',
     rows: hospitals.rows.map(h => ({ id: h.id, title: h.name, description: h.city || '' }))
   }];
-  await send.list('🏥 *Select a Hospital/Clinic*\n\nChoose your preferred location:', 'View Locations', sections);
+  await send.list('🦷 *Select a Clinic*\n\nChoose your preferred location:', 'View Locations', sections);
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
-}
-
-async function askVisitType(phone, schema, send, ctx) {
-  await send.buttons(
-    '🩺 *Type of Consultation*\n\nHow would you like to see the doctor?',
-    ['🏥 In-Person Visit', '📱 Video Consultation']
-  );
-  await updateSession(schema, phone, STATES.SELECT_VISIT_TYPE, ctx);
 }
 
 async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, input) {
@@ -62,12 +58,13 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
   if (!h) { await send.text('Please select a location from the options.'); return; }
   ctx.hospital_id = h.id;
   ctx.hospital_name = h.name;
-  return askVisitType(phone, schema, send, ctx);
+  return showDepartments(phone, schema, send, ctx);
 }
 
-async function handleSelectVisitType(phone, schema, tenant, send, ctx, choice) {
-  ctx.visit_type = /video|online|btn_1/i.test(choice) ? 'video' : 'in_person';
-  ctx.visit_label = ctx.visit_type === 'video' ? '📱 Video Consultation' : '🏥 In-Person Visit';
+// Dental is always in-person — skip the visit type question and go straight to treatments.
+async function showDepartments(phone, schema, send, ctx) {
+  ctx.visit_type = 'in_person';
+  ctx.visit_label = '🦷 In-Clinic Visit';
 
   const depts = await tenantQuery(schema,
     `SELECT DISTINCT d.id, d.name FROM departments d
@@ -76,7 +73,7 @@ async function handleSelectVisitType(phone, schema, tenant, send, ctx, choice) {
      ORDER BY d.name`, [ctx.hospital_id]);
 
   if (!depts.rows.length) {
-    await send.text('No specialties available right now. Please contact the clinic directly.\n\nReply *Hi* to start over.');
+    await send.text('No treatments available right now. Please contact the clinic directly.\n\nReply *Hi* to start over.');
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
@@ -84,11 +81,11 @@ async function handleSelectVisitType(phone, schema, tenant, send, ctx, choice) {
   ctx._depts = depts.rows;
 
   if (depts.rows.length <= 3) {
-    await send.buttons('🏥 *Select Specialty*\n\nWhat type of doctor do you need?',
+    await send.buttons('🦷 *Select Treatment*\n\nWhat dental treatment do you need?',
       depts.rows.map(d => d.name));
   } else {
-    const sections = [{ title: 'Specialties', rows: depts.rows.map(d => ({ id: d.id, title: d.name })) }];
-    await send.list('🏥 *Select Specialty*\n\nWhat type of doctor do you need?', 'View Specialties', sections);
+    const sections = [{ title: 'Treatments', rows: depts.rows.map(d => ({ id: d.id, title: d.name })) }];
+    await send.list('🦷 *Select Treatment*\n\nWhat dental treatment do you need?', 'View Treatments', sections);
   }
   await updateSession(schema, phone, STATES.SELECT_DEPARTMENT, ctx);
 }
@@ -96,7 +93,7 @@ async function handleSelectVisitType(phone, schema, tenant, send, ctx, choice) {
 async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input) {
   const depts = ctx._depts || [];
   const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input);
-  if (!dept) { await send.text('Please select a specialty from the options.'); return; }
+  if (!dept) { await send.text('Please select a treatment from the options.'); return; }
 
   ctx.department_id = dept.id;
   ctx.department_name = dept.name;
@@ -107,25 +104,37 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
     [dept.id, ctx.hospital_id]);
 
   if (!doctors.rows.length) {
-    await send.text(`No doctors available in ${dept.name}.\n\nReply *Hi* to choose another specialty.`);
+    await send.text(`No dentists available for ${dept.name}.\n\nReply *Hi* to choose another treatment.`);
     return;
   }
 
   ctx._doctors = doctors.rows;
 
+  // Treatment-specific advisory note
+  const treatmentNotes = {
+    'Root Canal Treatment':    'ℹ️ Root canal treatment typically requires *2–3 visits*. Please plan accordingly.',
+    'Dental Implants':         'ℹ️ Implant treatment is a *multi-stage process* spanning several months.',
+    'Orthodontics & Braces':   'ℹ️ This is an initial *braces/aligner consultation*. Treatment duration is assessed at first visit.',
+    'Oral Surgery':            'ℹ️ Please avoid eating or drinking *4 hours before* oral surgery procedures.',
+    'Cosmetic Dentistry':      'ℹ️ Cosmetic procedures may require *multiple visits* for best results.',
+    'Pediatric Dentistry':     'ℹ️ A parent or guardian must be present for patients under 18.',
+  };
+  const note = treatmentNotes[dept.name];
+  if (note) await send.text(note);
+
   if (doctors.rows.length <= 3) {
-    await send.buttons(`👨‍⚕️ *Select Doctor*\n\nAvailable ${dept.name} doctors:`,
+    await send.buttons(`🦷 *Select Dentist*\n\nAvailable ${dept.name} dentists:`,
       doctors.rows.map(d => `Dr. ${d.name}`));
   } else {
     const sections = [{
-      title: `${dept.name} Doctors`,
+      title: `${dept.name} Dentists`,
       rows: doctors.rows.map(d => ({
         id: d.id,
         title: `Dr. ${d.name}`,
         description: [d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : ''].filter(Boolean).join(' • ')
       }))
     }];
-    await send.list(`👨‍⚕️ *Select Doctor*`, 'View Doctors', sections);
+    await send.list(`🦷 *Select Dentist*`, 'View Dentists', sections);
   }
   await updateSession(schema, phone, STATES.SELECT_DOCTOR, ctx);
 }
@@ -139,10 +148,12 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   ctx.doctor_id = doc.id;
   ctx.doctor_name = doc.name;
 
-  // Single query for all available dates (avoids N+1 per-day COUNT loops)
-  const today = new Date();
-  const todayStr = format(today, 'yyyy-MM-dd');
-  const endStr = format(addDays(today, SLOT_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
+  // Single query for all available dates (avoids N+1 per-day COUNT loops).
+  // Use IST "today" — servers run in UTC so new Date() can be a day behind IST
+  // for the 5.5 hours after IST midnight, which would exclude today's slots.
+  const nowInIST = toZonedTime(new Date(), IST);
+  const todayStr = format(nowInIST, 'yyyy-MM-dd');
+  const endStr = format(addDays(nowInIST, SLOT_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
 
   const datesResult = await tenantQuery(schema, `
     SELECT slot_date::text AS date, COUNT(*) AS slots
@@ -158,6 +169,10 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
         SELECT 1 FROM doctor_leaves dl
         WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
       )
+      AND NOT EXISTS (
+        SELECT 1 FROM clinic_holidays ch
+        WHERE ch.holiday_date = slot_date
+      )
     GROUP BY slot_date
     ORDER BY slot_date
     LIMIT 7
@@ -165,17 +180,16 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
 
   const dates = datesResult.rows.map(r => ({
     date: r.date,
-    label: r.date === todayStr ? `Today (${format(today, 'd MMM')})` : format(parseISO(r.date), 'EEE, d MMM'),
+    label: r.date === todayStr ? `Today (${format(nowInIST, 'd MMM')})` : format(parseISO(r.date), 'EEE, d MMM'),
     slots: parseInt(r.slots),
   }));
 
   if (!dates.length) {
     await send.buttons(
-      `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\n` +
-      `🔔 *Join the waiting list* and we'll WhatsApp you the moment a slot opens up — no need to keep checking!`,
-      ['🔔 Join Waiting List', '🔙 Choose Another Doctor']
+      `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nPlease choose a different dentist or try again later.`,
+      ['🔙 Choose Another Dentist', '🏠 Main Menu']
     );
-    await updateSession(schema, phone, STATES.WAITLIST_CONFIRM, ctx);
+    await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
 
@@ -185,35 +199,6 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   }];
   await send.list(`📅 *Select Date*\n\nAvailable dates for Dr. ${doc.name}:`, 'Choose Date', sections);
   await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
-}
-
-async function handleWaitlistConfirm(phone, schema, tenant, send, ctx, choice) {
-  if (/join|waitlist|🔔|btn_0/i.test(choice)) {
-    const patient = await getPatient(schema, phone);
-    let patientId = patient?.id;
-
-    if (!patientId) {
-      await send.text('To join the waiting list, please provide your name first.\n\nEnter your full name:');
-      ctx._waitlist_pending = true;
-      await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
-      return;
-    }
-
-    await tenantQuery(schema,
-      `INSERT INTO waiting_list (patient_id, doctor_id, hospital_id) VALUES ($1,$2,$3)
-       ON CONFLICT (patient_id, doctor_id) DO NOTHING`,
-      [patientId, ctx.doctor_id, ctx.hospital_id]);
-
-    await send.text(
-      `✅ *You've joined the waiting list!*\n\n` +
-      `We'll send you a WhatsApp notification as soon as Dr. ${ctx.doctor_name} has an available slot.\n\n` +
-      `Reply *Hi* for the main menu.`
-    );
-    await updateSession(schema, phone, STATES.IDLE, {});
-  } else {
-    await send.text('Okay, let\'s choose a different doctor.\n\nReply *Hi* to start over.');
-    await updateSession(schema, phone, STATES.IDLE, {});
-  }
 }
 
 async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
@@ -226,7 +211,8 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
-       AND (slot_date > CURRENT_DATE OR start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time)
+       AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+            OR start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time)
      ORDER BY start_time`,
     [ctx.doctor_id, choice]);
 
@@ -240,6 +226,9 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
         AND status = 'available'
         AND NOT EXISTS (
           SELECT 1 FROM doctor_leaves dl WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date
         )
       GROUP BY slot_date
       ORDER BY slot_date
@@ -260,30 +249,32 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   }
 
   ctx._slots = slots.rows;
-  const sections = [{
-    title: 'Available Slots',
-    rows: slots.rows.map(s => ({
-      id: s.id,
-      title: s.start_time.slice(0, 5),
-      description: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`
-    }))
-  }];
 
   let dateLabel = choice;
   try { dateLabel = format(parseISO(choice), 'EEE, d MMM'); } catch {}
 
-  await send.list(`⏰ *Select Time*\n\nSlots on ${dateLabel}:`, 'Choose Time', sections);
+  const slotLines = slots.rows.map((s, i) =>
+    `${i + 1}. ${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`
+  ).join('\n');
+
+  await send.text(`⏰ *Select Time*\n\nSlots on ${dateLabel}:\n\n${slotLines}\n\nReply with the *number* of your preferred slot (e.g. 1):`);
   await updateSession(schema, phone, STATES.SELECT_SLOT, ctx);
 }
 
 async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input) {
   const slots = ctx._slots || [];
-  const slot = slots.find(s =>
-    s.id === choice ||
-    s.start_time.slice(0, 5) === input ||
-    s.start_time.slice(0, 5) === choice
-  );
-  if (!slot) { await send.text('Please select a time slot from the list.'); return; }
+  const num = parseInt(input, 10);
+  const slot = (!isNaN(num) && num >= 1 && num <= slots.length)
+    ? slots[num - 1]
+    : slots.find(s =>
+        s.id === choice ||
+        s.start_time.slice(0, 5) === input ||
+        s.start_time.slice(0, 5) === choice
+      );
+  if (!slot) {
+    await send.text(`Please reply with a number between 1 and ${slots.length} to select a time slot.`);
+    return;
+  }
 
   ctx.slot_id = slot.id;
   ctx.appointment_time = slot.start_time;
@@ -292,11 +283,28 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
   if (patient?.name) {
     ctx.patient_id = patient.id;
     ctx.patient_name = patient.name;
-    return showConfirmation(phone, schema, send, ctx, updateSession);
+    return askChiefComplaint(phone, schema, send, ctx);
   }
 
   await send.text('👤 *Your Name*\n\nPlease enter your full name:');
   await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
+}
+
+async function askChiefComplaint(phone, schema, send, ctx) {
+  await send.buttons(
+    '🦷 *Reason for Visit*\n\nWhat brings you in today?',
+    ['🚨 Pain / Emergency', '🔍 Checkup / Cleaning', '✨ Cosmetic / Other']
+  );
+  await updateSession(schema, phone, STATES.COLLECT_CHIEF_COMPLAINT, ctx);
+}
+
+async function handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSessionFn) {
+  const complaintMap = { btn_0: '🚨 Pain/Emergency', btn_1: '🔍 Checkup/Cleaning', btn_2: '✨ Cosmetic/Other' };
+  const matchedKey = Object.keys(complaintMap).find(k =>
+    (choice || '').startsWith(k + '_') || choice === k
+  );
+  ctx.chief_complaint = matchedKey ? complaintMap[matchedKey] : (input || null);
+  return showConfirmation(phone, schema, send, ctx, updateSessionFn);
 }
 
 async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
@@ -315,15 +323,16 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
     } catch (_) {}
   }
 
+  const complaintLine = ctx.chief_complaint ? `\n📝 *Reason:* ${ctx.chief_complaint}` : '';
   const summary =
     `📋 *Please review your booking*\n\n` +
-    `🏥 *Hospital:* ${ctx.hospital_name}\n` +
-    `🏷 *Specialty:* ${ctx.department_name}\n` +
-    `👨‍⚕️ *Doctor:* Dr. ${ctx.doctor_name}\n` +
+    `🦷 *Clinic:* ${ctx.hospital_name}\n` +
+    `🏷 *Treatment:* ${ctx.department_name}\n` +
+    `👨‍⚕️ *Dentist:* Dr. ${ctx.doctor_name}\n` +
     `📅 *Date:* ${dateLabel}\n` +
-    `⏰ *Time:* ${time}\n` +
-    `🩺 *Type:* ${ctx.visit_label}` +
+    `⏰ *Time:* ${time}` +
     feeText +
+    complaintLine +
     `\n👤 *Patient:* ${ctx.patient_name}\n\n` +
     `Tap *Confirm* to book your appointment.`;
 
@@ -341,7 +350,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
        WHERE p.phone=$1 AND a.status='confirmed' AND a.created_at >= NOW() - INTERVAL '1 hour'`,
       [phone]);
     if (parseInt(recentR.rows[0].count) >= LIMITS.MAX_BOOKINGS_PER_HOUR) {
-      await send.text('⚠️ You\'ve made 3 bookings in the last hour. Please wait before booking again.\n\nReply *Hi* for the main menu.');
+      await send.text(`⚠️ You've made ${LIMITS.MAX_BOOKINGS_PER_HOUR} bookings in the last hour. Please wait before booking again.\n\nReply *Hi* for the main menu.`);
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -390,13 +399,28 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
         `UPDATE patients SET visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`, [patientId]);
     }
 
-    bookingId = genBookingId();
-    await client.query(
-      `INSERT INTO appointments
-       (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed')`,
-      [bookingId, patientId, ctx.doctor_id, ctx.hospital_id, ctx.slot_id,
-       ctx.appointment_date, ctx.appointment_time, ctx.visit_type || 'in_person']);
+    // Retry up to 3 times on booking_id collision (unique constraint violation)
+    let insertAttempts = 0;
+    while (true) {
+      bookingId = genBookingId();
+      try {
+        await client.query(
+          `INSERT INTO appointments
+           (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed',$9)`,
+          [bookingId, patientId, ctx.doctor_id, ctx.hospital_id, ctx.slot_id,
+           ctx.appointment_date, ctx.appointment_time, ctx.visit_type || 'in_person',
+           ctx.chief_complaint || null]);
+        break; // success
+      } catch (insertErr) {
+        // 23505 = unique_violation in PostgreSQL
+        if (insertErr.code === '23505' && insertErr.constraint?.includes('booking_id') && ++insertAttempts < 3) {
+          logger.warn('booking_id collision, retrying', { attempt: insertAttempts });
+          continue;
+        }
+        throw insertErr; // re-throw if not a booking_id collision or max retries exceeded
+      }
+    }
 
     await client.query('COMMIT');
   } catch (err) {
@@ -417,20 +441,36 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
   let dateLabel = ctx.appointment_date;
   try { dateLabel = format(parseISO(ctx.appointment_date), 'EEE, d MMM yyyy'); } catch {}
 
-  // Send confirmation and post-transaction side-effects in parallel
+  // Send confirmation and post-transaction side-effects in parallel.
+  const confirmationText =
+    `🎉 *Appointment Confirmed!*\n\n` +
+    `🪪 Booking ID: *${bookingId}*\n` +
+    `👨‍⚕️ Dr. ${ctx.doctor_name}\n` +
+    `🦷 ${ctx.hospital_name}\n` +
+    `📅 ${dateLabel} at ${(ctx.appointment_time || '').slice(0, 5)}\n\n` +
+    `🦷 *Before your visit:*\n` +
+    `• Arrive 10 minutes early\n` +
+    `• Bring any previous dental X-rays or records\n` +
+    `• Inform us of any medications or allergies\n` +
+    `• Avoid eating 1 hour before the appointment\n\n` +
+    `📌 Save your Booking ID to reschedule or cancel.\n` +
+    `We'll send you a reminder 24 hours before. See you then! 😊`;
+
   await Promise.allSettled([
-    send.text(
-      `🎉 *Appointment Confirmed!*\n\n` +
-      `Your booking is all set. Here are your details:\n\n` +
-      `🪪 Booking ID: *${bookingId}*\n` +
-      `👨‍⚕️ Dr. ${ctx.doctor_name}\n` +
-      `🏥 ${ctx.hospital_name}\n` +
-      `📅 ${dateLabel}\n` +
-      `⏰ ${(ctx.appointment_time || '').slice(0, 5)}\n\n` +
-      `📌 *Please save your Booking ID.* You'll need it to reschedule or cancel.\n\n` +
-      `We'll remind you 24 hours before. See you then! 😊`
-    ),
-    notifyWaitlistForDoctor(schema, ctx.doctor_id, tenant),
+    // Enhancement 12: try approved WhatsApp template first (works outside 24h session window);
+    // fall back to regular session message if template is not approved yet.
+    (async () => {
+      const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
+      try {
+        await wa.sendBookingConfirmationTemplate(phone, {
+          bookingId, doctorName: ctx.doctor_name, hospitalName: ctx.hospital_name,
+          date: dateLabel, time: (ctx.appointment_time || '').slice(0, 5),
+        }, waToken, tenant.wa_phone_number_id);
+      } catch {
+        // Template not approved or Meta error — fall back to session text message
+        await send.text(confirmationText);
+      }
+    })(),
     (async () => {
       if (!patientId) return;
       try {
@@ -483,18 +523,33 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
   await updateSession(schema, phone, STATES.IDLE, {});
   logger.info(`✅ Booking confirmed: ${bookingId}`, { phone, tenant: tenant.name });
   try { require('../../utils/metrics').increment('appointments_booked_total'); } catch (_) {}
+
+  // Publish SSE event so dashboard updates in real-time without polling
+  try {
+    const { publish } = require('../../routes/events');
+    publish(tenant.id, {
+      type: 'new_booking',
+      payload: {
+        bookingId,
+        patientName: ctx.patient_name,
+        doctorName: ctx.doctor_name,
+        hospitalName: ctx.hospital_name,
+        date: ctx.appointment_date,
+        time: (ctx.appointment_time || '').slice(0, 5),
+      },
+    }).catch(() => {});
+  } catch (_) {}
 }
 
 module.exports = {
   startBooking,
-  askVisitType,
   handleSelectHospital,
-  handleSelectVisitType,
   handleSelectDept,
   handleSelectDoctor,
-  handleWaitlistConfirm,
   handleSelectDate,
   handleSelectSlot,
+  askChiefComplaint,
+  handleChiefComplaint,
   showConfirmation,
   completeBooking,
 };

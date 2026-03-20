@@ -1,0 +1,112 @@
+'use strict';
+/**
+ * Server-Sent Events (SSE) endpoint for real-time dashboard updates.
+ * Clients connect to GET /admin/events and receive a stream of JSON events.
+ * Events are published via Redis pub/sub so all backend instances can broadcast.
+ */
+
+const router = require('express').Router();
+const logger = require('../utils/logger');
+
+// In-process SSE client registry: tenantId -> Set<res>
+const _clients = new Map();
+
+// Redis subscriber connection (separate from the shared client to allow blocking subscribe)
+let _subscriber = null;
+
+function getSubscriber() {
+  if (_subscriber) return _subscriber;
+  try {
+    const { getClient } = require('../utils/redisClient');
+    // Duplicate the shared client for subscriber mode
+    _subscriber = getClient().duplicate();
+    _subscriber.subscribe('medibook:sse', (err) => {
+      if (err) logger.warn('SSE Redis subscribe error', { error: err.message });
+    });
+    _subscriber.on('message', (_channel, raw) => {
+      try {
+        const { tenantId, event } = JSON.parse(raw);
+        broadcastToTenant(tenantId, event);
+      } catch (_) {}
+    });
+    _subscriber.on('error', (err) => {
+      logger.warn('SSE Redis subscriber error', { error: err.message });
+    });
+  } catch (_) {
+    // Redis unavailable — SSE will work in-process only (single instance)
+  }
+  return _subscriber;
+}
+
+/**
+ * Broadcast an event to all connected SSE clients for a tenant.
+ * Called from within this process (in-process fan-out).
+ */
+function broadcastToTenant(tenantId, event) {
+  const clients = _clients.get(tenantId);
+  if (!clients || clients.size === 0) return;
+  const data = `data: ${JSON.stringify(event)}\n\n`;
+  for (const res of clients) {
+    try { res.write(data); } catch (_) {}
+  }
+}
+
+/**
+ * Publish an event to ALL backend instances via Redis pub/sub.
+ * Falls back to in-process broadcast if Redis is unavailable.
+ *
+ * @param {string} tenantId - UUID of the tenant whose dashboard should update
+ * @param {object} event    - { type: string, payload: object }
+ */
+async function publish(tenantId, event) {
+  if (!tenantId) return;
+  // Always do in-process broadcast (covers single-instance setups)
+  broadcastToTenant(tenantId, event);
+  // Cross-instance fan-out via Redis
+  try {
+    const { getClient } = require('../utils/redisClient');
+    await getClient().publish('medibook:sse', JSON.stringify({ tenantId, event }));
+  } catch (_) {}
+}
+
+// ── GET /admin/events ─────────────────────────────────────────
+// Auth + tenant middleware applied in index.js before this router
+router.get('/events', (req, res) => {
+  const tenantId = req.tenant?.id;
+  if (!tenantId) return res.status(403).json({ error: 'Tenant not found' });
+
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+  res.flushHeaders();
+
+  // Register client
+  if (!_clients.has(tenantId)) _clients.set(tenantId, new Set());
+  const clientSet = _clients.get(tenantId);
+  clientSet.add(res);
+  logger.info('SSE client connected', { tenantId, total: clientSet.size });
+
+  // Start Redis subscriber (lazy init) for cross-instance events
+  try { getSubscriber(); } catch (_) {}
+
+  // Send initial heartbeat so the browser doesn't wait for data
+  res.write(`data: ${JSON.stringify({ type: 'connected', tenantId })}\n\n`);
+
+  // Heartbeat every 30 seconds to keep the connection alive through proxies
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch (_) {}
+  }, 30 * 1000);
+
+  // Cleanup on disconnect
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    clientSet.delete(res);
+    if (clientSet.size === 0) _clients.delete(tenantId);
+    logger.info('SSE client disconnected', { tenantId, remaining: clientSet.size });
+  });
+});
+
+module.exports = router;
+module.exports.publish = publish;

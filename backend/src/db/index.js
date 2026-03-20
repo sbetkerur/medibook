@@ -34,8 +34,16 @@ pool.on('connect', () => {
   }
 });
 
+// Validate schema name to prevent SQL injection via interpolation
+function validateSchemaName(schemaName) {
+  if (!schemaName || !/^tenant_[a-z0-9_]+$/.test(schemaName)) {
+    throw new Error(`Invalid schema name: "${schemaName}"`);
+  }
+}
+
 // Safe tenant query — uses SET LOCAL (transaction-scoped, safe under pooling)
 async function tenantQuery(schemaName, sql, params = []) {
+  validateSchemaName(schemaName);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -59,6 +67,7 @@ async function query(sql, params = []) {
 // Run multiple queries in a single tenant-scoped transaction.
 // callback receives (client) and must call client.query() directly.
 async function tenantTransaction(schemaName, callback) {
+  validateSchemaName(schemaName);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');

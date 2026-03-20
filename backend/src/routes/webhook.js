@@ -7,6 +7,8 @@ const botWorker = require('../jobs/botWorker');
 const wa = require('../services/whatsapp');
 const { decrypt } = require('../utils/encryption');
 const logger = require('../utils/logger');
+const { handleReminderConfirmation } = require('../jobs/reminders');
+const { isEnabled } = require('../utils/featureFlags');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -140,46 +142,8 @@ router.post('/webhook/whatsapp', async (req, res) => {
     const change = entry?.changes?.[0];
     const value = change?.value;
 
-    // Ignore status updates (delivered, read)
-    if (value?.statuses) return;
-    if (!value?.messages?.length) return;
-
-    const msg = value.messages[0];
-    // Normalize phone: strip leading '+' so '919876543210' and '+919876543210' map to same user
-    const phone = (msg.from || '').replace(/^\+/, '');
-    if (!/^\d{7,20}$/.test(phone)) {
-      logger.warn('Webhook received invalid phone format', { phone: maskPhone(msg.from || '') });
-      return;
-    }
-    const msgId = msg.id;
-
-    // Parse message content — keep unsupported types for later graceful fallback
-    let text = '';
-    let buttonId = null;
-    let unsupportedType = null;
-
-    if (msg.type === 'text') {
-      text = msg.text?.body || '';
-    } else if (msg.type === 'interactive') {
-      const inter = msg.interactive;
-      if (inter.type === 'button_reply') {
-        buttonId = inter.button_reply.id;
-        text = inter.button_reply.title;
-      } else if (inter.type === 'list_reply') {
-        buttonId = inter.list_reply.id;
-        text = inter.list_reply.title;
-      }
-    } else if (msg.type === 'button') {
-      text = msg.button?.text || '';
-    } else {
-      // Track unsupported type — we'll send a helpful response after tenant lookup
-      unsupportedType = msg.type;
-    }
-
-    if (!text && !buttonId && !unsupportedType) return;
-
-    // Find tenant by WhatsApp Phone Number ID
-    const phoneNumberId = value.metadata?.phone_number_id;
+    // Handle both statuses and messages — need tenant for status tracking
+    const phoneNumberId = value?.metadata?.phone_number_id;
     let tenant = null;
 
     if (phoneNumberId) {
@@ -196,10 +160,62 @@ router.post('/webhook/whatsapp', async (req, res) => {
       tenant = r.rows[0] || null;
     }
 
+    // Process delivery/read status updates (track in wa_messages)
+    if (value?.statuses?.length) {
+      if (tenant) {
+        for (const status of value.statuses) {
+          if (status.id) {
+            wa.updateMessageStatus(tenant.schema_name, status.id, status.status).catch(() => {});
+          }
+        }
+      }
+      return;
+    }
+
+    if (!value?.messages?.length) return;
+
     if (!tenant) {
       logger.warn('No tenant found for webhook', { phoneNumberId });
       return;
     }
+
+    const msg = value.messages[0];
+    // Normalize phone: strip leading '+' so '919876543210' and '+919876543210' map to same user
+    const phone = (msg.from || '').replace(/^\+/, '');
+    if (!/^\d{7,20}$/.test(phone)) {
+      logger.warn('Webhook received invalid phone format', { phone: maskPhone(msg.from || '') });
+      return;
+    }
+    const msgId = msg.id;
+
+    // Parse message content — keep unsupported types for later graceful fallback
+    let text = '';
+    let buttonId = null;
+    let unsupportedType = null;
+    let audioId = null;
+
+    if (msg.type === 'text') {
+      text = msg.text?.body || '';
+    } else if (msg.type === 'interactive') {
+      const inter = msg.interactive;
+      if (inter.type === 'button_reply') {
+        buttonId = inter.button_reply.id;
+        text = inter.button_reply.title;
+      } else if (inter.type === 'list_reply') {
+        buttonId = inter.list_reply.id;
+        text = inter.list_reply.title;
+      }
+    } else if (msg.type === 'button') {
+      text = msg.button?.text || '';
+    } else if (msg.type === 'audio') {
+      audioId = msg.audio?.id || null;
+      unsupportedType = 'audio';
+    } else {
+      // Track unsupported type — we'll send a helpful response after tenant lookup
+      unsupportedType = msg.type;
+    }
+
+    if (!text && !buttonId && !unsupportedType) return;
 
     // Per-tenant rate limiting: max 60 messages/minute (Redis-backed, multi-instance safe)
     if (!await checkTenantRateLimit(tenant.id)) {
@@ -213,7 +229,20 @@ router.post('/webhook/whatsapp', async (req, res) => {
       return;
     }
 
-    // If message type is unsupported (image, audio, document, sticker, etc.), send a helpful reply
+    // Audio messages → Whisper transcription (if feature flag enabled)
+    if (unsupportedType === 'audio' && audioId) {
+      const voiceEnabled = await isEnabled(tenant.id, 'voice_transcription_enabled').catch(() => false);
+      if (voiceEnabled) {
+        logger.info('Audio message → dispatching to Whisper transcription', { phone, audioId, tenant: tenant.slug });
+        botEngine.handleVoiceMessage({ phone, audioId, tenant }).catch(err => {
+          logger.error('Voice transcription failed', { error: err.message });
+        });
+        return;
+      }
+      // Voice disabled — fall through to unsupported message reply
+    }
+
+    // If message type is unsupported (image, document, sticker, etc.), send a helpful reply
     if (unsupportedType) {
       logger.info('Unsupported message type received', { phone, type: unsupportedType, tenant: tenant.slug });
       const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
@@ -254,6 +283,30 @@ router.post('/webhook/whatsapp', async (req, res) => {
     logger.info('Incoming WhatsApp message', { phone: maskPhone(phone), tenant: tenant.slug, type: msg.type });
     try { require('../utils/metrics').increment('webhook_messages_total'); } catch (_) {}
 
+    // Reminder confirmation check: if user replied YES/NO to a 24h reminder,
+    // handle it directly without going through the full bot state machine.
+    if (text) {
+      const isConfirmReply = /^(yes|no|confirm|cancel|reschedule|haan|nahi|1|2)\b/i.test(text.trim());
+      if (isConfirmReply) {
+        const confirmResult = await handleReminderConfirmation(tenant.schema_name, phone, text).catch(() => false);
+        if (confirmResult) {
+          const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
+          if (confirmResult === 'yes') {
+            wa.sendText(phone,
+              `✅ Thank you for confirming! We'll see you at your appointment. 😊\n\nIf plans change, reply *Reschedule* or *Cancel Appointment*.`,
+              waToken, tenant.wa_phone_number_id
+            ).catch(() => {});
+          } else {
+            wa.sendText(phone,
+              `Got it! Reply *Cancel Appointment* to cancel your booking, or *Reschedule* to pick a new time. 🙏\n\nReply *Hi* for the main menu.`,
+              waToken, tenant.wa_phone_number_id
+            ).catch(() => {});
+          }
+          return;
+        }
+      }
+    }
+
     const forceSync = process.env.DISABLE_QUEUE === 'true';
     if (!forceSync && botWorker.isQueueAvailable()) {
       // Backpressure check: fall back to sync if queue is saturated
@@ -278,6 +331,12 @@ router.post('/webhook/whatsapp', async (req, res) => {
       // Sync fallback: process inline
       botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
         logger.error('Sync bot processing error', { error: err.message });
+        // Save to failed_webhooks for retry
+        query(`
+          INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, error_message, next_retry_at)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '2 minutes')
+        `, [phone, tenant.id, text || null, buttonId || null, msg?.type || 'text', err.message?.slice(0, 500)])
+          .catch(dbErr => logger.warn('Failed to save webhook to retry queue', { error: dbErr.message }));
       });
     }
 

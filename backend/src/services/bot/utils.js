@@ -1,15 +1,12 @@
 'use strict';
 
 const { tenantQuery } = require('../../db');
-const wa = require('../whatsapp');
-const { decrypt } = require('../../utils/encryption');
 const logger = require('../../utils/logger');
 
 const STATES = {
   IDLE: 'idle',
   MAIN_MENU: 'main_menu',
   SELECT_HOSPITAL: 'select_hospital',
-  SELECT_VISIT_TYPE: 'select_visit_type',
   SELECT_DEPARTMENT: 'select_department',
   SELECT_DOCTOR: 'select_doctor',
   SELECT_DATE: 'select_date',
@@ -27,15 +24,18 @@ const STATES = {
   CANCEL_REASON: 'cancel_reason',
   CANCEL_CONFIRM: 'cancel_confirm',
   COLLECT_EMAIL: 'collect_email',
+  COLLECT_CHIEF_COMPLAINT: 'collect_chief_complaint',
   CHECK_BOOKING_STATUS: 'check_booking_status',
-  WAITLIST_CONFIRM: 'waitlist_confirm',
   COLLECT_FEEDBACK_RATING: 'collect_feedback_rating',
   COLLECT_FEEDBACK_COMMENT: 'collect_feedback_comment',
+  RESUME_CONFIRM: 'resume_confirm',
 };
 
 function genBookingId() {
   const { randomUUID } = require('crypto');
-  return 'MB' + randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+  // 10 hex chars = 40 bits of entropy. Using 8 previously gave ~1-in-4-billion
+  // collision rate; 10 reduces it to ~1-in-trillion which is safe at scale.
+  return 'MB' + randomUUID().replace(/-/g, '').slice(0, 10).toUpperCase();
 }
 
 // Simple Levenshtein distance for fuzzy matching
@@ -60,10 +60,14 @@ function fuzzyFind(items, input, nameField = 'name') {
     item[nameField].toLowerCase().includes(lower)
   );
   if (exact) return exact;
+  // Guard: skip levenshtein for very long inputs to prevent O(m*n) DoS
+  if (lower.length > 50) return null;
   let best = null, bestDist = Infinity;
   for (const item of items) {
-    const dist = levenshtein(lower, item[nameField].toLowerCase());
-    const threshold = Math.max(2, Math.floor(item[nameField].length * 0.4));
+    // Truncate long item names so levenshtein stays bounded
+    const name = item[nameField].toLowerCase().slice(0, 50);
+    const dist = levenshtein(lower, name);
+    const threshold = Math.max(2, Math.floor(name.length * 0.4));
     if (dist < bestDist && dist <= threshold) {
       bestDist = dist;
       best = item;
@@ -88,15 +92,24 @@ async function getSession(schemaName, phone) {
 async function updateSession(schemaName, phone, state, context) {
   const { LIMITS } = require('../../utils/errors');
   const plainJson = JSON.stringify(context || {});
-  if (plainJson.length > LIMITS.SESSION_CONTEXT_MAX_BYTES) {
-    logger.warn(`Session context too large (${plainJson.length} bytes), resetting to idle`);
+  const byteLen = Buffer.byteLength(plainJson, 'utf8');
+  if (byteLen > LIMITS.SESSION_CONTEXT_MAX_BYTES) {
+    logger.warn(`Session context too large (${byteLen} bytes), resetting to idle`);
     await tenantQuery(schemaName,
       `UPDATE bot_sessions SET state='idle', context='{}', last_activity=NOW() WHERE phone=$1`, [phone]);
     return;
   }
   // Encrypt context before storage to protect PII (patient names, DOB, selected options)
   const { encrypt } = require('../../utils/encryption');
-  const encryptedContext = JSON.stringify({ _enc: encrypt(plainJson) });
+  let encryptedContext;
+  try {
+    encryptedContext = JSON.stringify({ _enc: encrypt(plainJson) });
+  } catch (encErr) {
+    logger.warn('Session context encryption failed, resetting to idle', { error: encErr.message });
+    await tenantQuery(schemaName,
+      `UPDATE bot_sessions SET state='idle', context='{}', last_activity=NOW() WHERE phone=$1`, [phone]);
+    return;
+  }
   await tenantQuery(schemaName,
     `UPDATE bot_sessions SET state=$1, context=$2::jsonb, last_activity=NOW() WHERE phone=$3`,
     [state, encryptedContext, phone]);
@@ -119,39 +132,6 @@ async function logMessage(schemaName, phone, direction, type, content, waMessage
   }
 }
 
-async function notifyWaitlistForDoctor(schema, doctorId, tenant) {
-  try {
-    const waToken = tenant?.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
-    const waPhoneId = tenant?.wa_phone_number_id;
-    if (!waToken || !waPhoneId) return;
-
-    const doctorR = await tenantQuery(schema, `SELECT name FROM doctors WHERE id=$1`, [doctorId]);
-    const doctorName = doctorR.rows[0]?.name || 'your doctor';
-
-    const wl = await tenantQuery(schema,
-      `SELECT wl.*, p.phone FROM waiting_list wl JOIN patients p ON p.id=wl.patient_id
-       WHERE wl.doctor_id=$1 AND wl.notified=false LIMIT 5`, [doctorId]);
-    for (const entry of wl.rows) {
-      try {
-        await wa.sendText(entry.phone,
-          `🎉 *Slot Available!*\n\nA slot has opened up with Dr. ${doctorName}.\n\nReply *Hi* to book your appointment now before it's taken!`,
-          waToken, waPhoneId
-        );
-        await tenantQuery(schema,
-          `UPDATE bot_sessions SET state='main_menu', context='{}', last_activity=NOW() WHERE phone=$1`, [entry.phone]);
-        // Remove entry from waiting list after notifying — this lets the patient
-        // re-join if they miss this slot and want notifications for future openings.
-        await tenantQuery(schema,
-          `DELETE FROM waiting_list WHERE id=$1`, [entry.id]);
-      } catch (err) {
-        logger.warn('Waitlist notification failed for entry', { phone: entry.phone, waitlistId: entry.id, error: err.message });
-      }
-    }
-  } catch (err) {
-    logger.warn('notifyWaitlistForDoctor failed', { schema, doctorId, error: err.message });
-  }
-}
-
 module.exports = {
   STATES,
   genBookingId,
@@ -161,5 +141,4 @@ module.exports = {
   updateSession,
   getPatient,
   logMessage,
-  notifyWaitlistForDoctor,
 };

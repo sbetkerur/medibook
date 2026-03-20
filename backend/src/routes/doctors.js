@@ -130,8 +130,15 @@ router.get('/doctors/:id', validateUUID(), async (req, res) => {
 
 router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
-    const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, hospital_id } = req.body;
+    const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, hospital_id, pricing_rules } = req.body;
     const s = req.tenant.schema_name;
+    // Validate UUID fields early — PostgreSQL's ::uuid cast would otherwise return 500
+    if (hospital_id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(hospital_id)) {
+      return res.status(400).json({ error: 'Invalid hospital_id format' });
+    }
+    if (department_id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(department_id)) {
+      return res.status(400).json({ error: 'Invalid department_id format' });
+    }
     const oldR = await tenantQuery(s, `SELECT name, is_active, hospital_id FROM doctors WHERE id=$1`, [req.params.id]);
     if (!oldR.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
     if (department_id) {
@@ -139,14 +146,16 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
       const deptCheck = await tenantQuery(s, `SELECT id FROM departments WHERE id=$1 AND hospital_id=$2`, [department_id, effectiveHospitalId]);
       if (!deptCheck.rows[0]) return res.status(400).json({ error: 'Department not found or does not belong to this hospital' });
     }
+    const pricingRulesVal = pricing_rules && typeof pricing_rules === 'object' ? JSON.stringify(pricing_rules) : null;
     const r = await tenantQuery(s, `
       UPDATE doctors SET
         name=COALESCE($1,name), specialization=COALESCE($2,specialization),
         qualification=COALESCE($3,qualification), consultation_fee=COALESCE($4,consultation_fee),
         slot_duration_minutes=COALESCE($5,slot_duration_minutes), is_active=COALESCE($6,is_active),
-        department_id=COALESCE($7::uuid,department_id), hospital_id=COALESCE($8::uuid,hospital_id)
+        department_id=COALESCE($7::uuid,department_id), hospital_id=COALESCE($8::uuid,hospital_id),
+        pricing_rules=COALESCE($10::jsonb,pricing_rules)
       WHERE id=$9 RETURNING *
-    `, [name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id || null, hospital_id || null, req.params.id]);
+    `, [name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id || null, hospital_id || null, req.params.id, pricingRulesVal]);
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_DOCTOR', 'doctor', req.params.id,
       oldR.rows[0], { name, is_active }, req.ip);
     res.json({ doctor: r.rows[0] });
@@ -202,26 +211,40 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
         if (s.start_time >= s.end_time) {
           return res.status(400).json({ error: `Day ${dow}: start_time must be before end_time` });
         }
-        if (s.lunch_start_time && !TIME_RE.test(s.lunch_start_time)) {
-          return res.status(400).json({ error: `Day ${dow}: lunch_start_time must be HH:MM` });
-        }
-        if (s.lunch_end_time && !TIME_RE.test(s.lunch_end_time)) {
-          return res.status(400).json({ error: `Day ${dow}: lunch_end_time must be HH:MM` });
+        if (s.lunch_start_time || s.lunch_end_time) {
+          // Both must be provided together — a partial lunch window breaks slot generation
+          if (!s.lunch_start_time || !s.lunch_end_time) {
+            return res.status(400).json({ error: `Day ${dow}: lunch_start_time and lunch_end_time must both be provided` });
+          }
+          if (!TIME_RE.test(s.lunch_start_time)) {
+            return res.status(400).json({ error: `Day ${dow}: lunch_start_time must be HH:MM` });
+          }
+          if (!TIME_RE.test(s.lunch_end_time)) {
+            return res.status(400).json({ error: `Day ${dow}: lunch_end_time must be HH:MM` });
+          }
+          if (s.lunch_start_time >= s.lunch_end_time) {
+            return res.status(400).json({ error: `Day ${dow}: lunch_start_time must be before lunch_end_time` });
+          }
+          if (s.lunch_start_time <= s.start_time || s.lunch_end_time >= s.end_time) {
+            return res.status(400).json({ error: `Day ${dow}: lunch window must fall within working hours` });
+          }
         }
       }
     }
     const s = req.tenant.schema_name;
-    for (const sched of schedules) {
-      await tenantQuery(s, `
-        INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working, lunch_start_time, lunch_end_time)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
-        ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
-          start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time,
-          is_working=EXCLUDED.is_working,
-          lunch_start_time=EXCLUDED.lunch_start_time,
-          lunch_end_time=EXCLUDED.lunch_end_time
-      `, [req.params.id, sched.day_of_week, sched.start_time, sched.end_time, sched.is_working !== false, sched.lunch_start_time || null, sched.lunch_end_time || null]);
-    }
+    await tenantTransaction(s, async (client) => {
+      for (const sched of schedules) {
+        await client.query(`
+          INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working, lunch_start_time, lunch_end_time)
+          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
+            start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time,
+            is_working=EXCLUDED.is_working,
+            lunch_start_time=EXCLUDED.lunch_start_time,
+            lunch_end_time=EXCLUDED.lunch_end_time
+        `, [req.params.id, sched.day_of_week, sched.start_time, sched.end_time, sched.is_working !== false, sched.lunch_start_time || null, sched.lunch_end_time || null]);
+      }
+    });
 
     // Regenerate future slots to reflect the new schedule.
     // Delete all future available slots for this doctor first, then re-create.
@@ -258,9 +281,16 @@ router.post('/doctors/:id/leaves', adminOnly, validateUUID(), async (req, res) =
     const { dates, reason } = req.body;
     if (!Array.isArray(dates) || dates.length === 0) return res.status(400).json({ error: 'dates array required' });
     const s = req.tenant.schema_name;
+    // Use IST date to reject past leaves consistently with the bot's timezone.
+    // Between 18:30–23:59 UTC, UTC date is one day behind IST — hardcode the
+    // +5:30 offset so admins can't accidentally block slots that are already past.
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const todayIST = new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
     let added = 0;
+    let skipped = 0;
     for (const d of dates) {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { skipped++; continue; }
+      if (d < todayIST) { skipped++; continue; } // silently skip past dates
       await tenantQuery(s, `
         INSERT INTO doctor_leaves (doctor_id, leave_date, reason, created_by_user_id)
         VALUES ($1,$2,$3,$4) ON CONFLICT (doctor_id, leave_date) DO NOTHING
@@ -272,13 +302,16 @@ router.post('/doctors/:id/leaves', adminOnly, validateUUID(), async (req, res) =
     }
     await writeAuditLog(s, req.user.id, req.user.role, 'ADD_DOCTOR_LEAVE', 'doctor', req.params.id,
       null, { dates, reason }, req.ip);
-    res.json({ success: true, added });
+    res.json({ success: true, added, skipped });
   } catch (err) { handleError(res, err); }
 });
 
 router.delete('/doctors/:id/leaves/:date', adminOnly, validateUUID(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
     const r = await tenantQuery(s,
       `DELETE FROM doctor_leaves WHERE doctor_id=$1 AND leave_date=$2 RETURNING id`,
       [req.params.id, req.params.date]);
@@ -297,7 +330,7 @@ router.get('/slots', async (req, res) => {
   try {
     const { doctor_id, date } = req.query;
     if (!doctor_id || !date) return res.status(400).json({ error: 'doctor_id and date required' });
-    const UUID_RE = /^[0-9a-f-]{36}$/i;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!UUID_RE.test(doctor_id)) return res.status(400).json({ error: 'Invalid doctor_id' });
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Invalid date format' });
     const r = await tenantQuery(req.tenant.schema_name, `
@@ -346,6 +379,9 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
   try {
     const { doctor_id, days = 7, clear = false } = req.body;
     if (!doctor_id) return res.status(400).json({ error: 'doctor_id required' });
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(doctor_id)) {
+      return res.status(400).json({ error: 'Invalid doctor_id format' });
+    }
     const s = req.tenant.schema_name;
     const safeDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
     if (clear) {
@@ -387,11 +423,12 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
       for (let j = 0; j < daySlots.length; j += 100) {
         const chunk = daySlots.slice(j, j + 100);
         const values = chunk.map((_, k) => `($${k*5+1},$${k*5+2},$${k*5+3},$${k*5+4},$${k*5+5},'available')`).join(',');
-        await tenantQuery(s, `
+        const insertR = await tenantQuery(s, `
           INSERT INTO time_slots (doctor_id, hospital_id, slot_date, start_time, end_time, status)
           VALUES ${values} ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING
+          RETURNING id
         `, chunk.flat());
-        generated += chunk.length;
+        generated += insertR.rows.length;
       }
     }
     res.json({ success: true, generated, days: safeDays });
@@ -411,6 +448,179 @@ router.post('/slots/block-range', adminOnly, validate(schemas.blockRange), async
       null, { doctor_id, start_date, end_date, reason, count: r.rows.length }, req.ip);
     res.json({ blocked: r.rows.length });
   } catch (err) { handleError(res, err); }
+});
+
+// ── BULK IMPORT DOCTORS via CSV ───────────────────────────────
+const { parse: parseCsv } = require('csv-parse/sync');
+
+router.post('/doctors/import', adminOnly, async (req, res) => {
+  try {
+    const { csv_data } = req.body;
+    if (!csv_data) return res.status(400).json({ error: 'csv_data is required' });
+
+    let rawCsv = csv_data;
+    if (!csv_data.includes('\n') && !csv_data.includes(',')) {
+      try { rawCsv = Buffer.from(csv_data, 'base64').toString('utf8'); } catch (_) {}
+    }
+
+    const records = parseCsv(rawCsv, { columns: true, skip_empty_lines: true, trim: true });
+    if (!records.length) return res.status(400).json({ error: 'No records found in CSV' });
+    if (records.length > 100) return res.status(400).json({ error: 'Maximum 100 doctors per import' });
+
+    const s = req.tenant.schema_name;
+    let imported = 0;
+    let skipped = 0;
+    const errors = [];
+
+    // Fetch all hospitals and departments for matching
+    const [hospitalsR, deptsR] = await Promise.all([
+      tenantQuery(s, `SELECT id, name FROM hospitals WHERE is_active=true`),
+      tenantQuery(s, `SELECT id, name, hospital_id FROM departments WHERE is_active=true`),
+    ]);
+
+    for (const row of records) {
+      try {
+        const name = (row.name || row.Name || row.NAME || '').toString().trim();
+        if (!name) { skipped++; errors.push(`Row: missing name`); continue; }
+
+        const spec = (row.specialization || row.Specialization || '').toString().trim() || null;
+        const qual = (row.qualification || row.Qualification || '').toString().trim() || null;
+        const fee = parseInt(row.consultation_fee || row.fee || '0') || 0;
+        const duration = parseInt(row.slot_duration_minutes || row.duration || '30') || 30;
+        const hospitalName = (row.hospital || row.Hospital || '').toString().trim();
+        const deptName = (row.department || row.Department || row.specialty || '').toString().trim();
+
+        // Match hospital
+        let hospitalId = null;
+        if (hospitalName) {
+          const h = hospitalsR.rows.find(h => h.name.toLowerCase() === hospitalName.toLowerCase());
+          hospitalId = h?.id || null;
+        }
+        if (!hospitalId && hospitalsR.rows.length === 1) hospitalId = hospitalsR.rows[0].id;
+        if (!hospitalId) {
+          skipped++;
+          errors.push(`Row "${name}": hospital "${hospitalName}" not found`);
+          continue;
+        }
+
+        // Match department
+        let deptId = null;
+        if (deptName) {
+          const d = deptsR.rows.find(d => d.name.toLowerCase() === deptName.toLowerCase() && d.hospital_id === hospitalId);
+          deptId = d?.id || null;
+        }
+
+        await tenantQuery(s, `
+          INSERT INTO doctors (name, specialization, qualification, hospital_id, department_id, consultation_fee, slot_duration_minutes)
+          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          ON CONFLICT DO NOTHING
+        `, [name, spec, qual, hospitalId, deptId, fee, Math.max(5, Math.min(480, duration))]);
+        imported++;
+      } catch (rowErr) {
+        skipped++;
+        errors.push(`Row: ${rowErr.message}`);
+      }
+    }
+
+    res.json({ imported, skipped, errors: errors.slice(0, 20) });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── DOCTOR AVAILABILITY ───────────────────────────────────────
+router.get('/doctors/:id/availability', validateUUID(), async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+    if (!start_date || !end_date) {
+      return res.status(400).json({ error: 'start_date and end_date required (YYYY-MM-DD)' });
+    }
+    // Validate date format
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date) || !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s, `
+      SELECT slot_date::text as date,
+             COUNT(*) FILTER (WHERE status='available')::int as available_slots,
+             COUNT(*) FILTER (WHERE status='booked')::int as booked_slots,
+             array_agg(start_time::text ORDER BY start_time) FILTER (WHERE status='available') as available_times
+      FROM time_slots
+      WHERE doctor_id=$1
+        AND slot_date BETWEEN $2 AND $3
+      GROUP BY slot_date
+      ORDER BY slot_date
+    `, [req.params.id, start_date, end_date]);
+    res.json({ availability: r.rows, doctor_id: req.params.id });
+  } catch (err) { handleError(res, err, 'GET /doctors/:id/availability'); }
+});
+
+// ── DOCTOR PRICING ────────────────────────────────────────────
+router.patch('/doctors/:id/pricing', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const { new_patient_fee, returning_patient_fee, consultation_fee } = req.body;
+    const s = req.tenant.schema_name;
+    const updates = [];
+    const params = [];
+    if (typeof consultation_fee === 'number') {
+      params.push(consultation_fee); updates.push(`consultation_fee=$${params.length}`);
+    }
+    const pricingRules = {};
+    if (typeof new_patient_fee === 'number') pricingRules.new_patient_fee = new_patient_fee;
+    if (typeof returning_patient_fee === 'number') pricingRules.returning_patient_fee = returning_patient_fee;
+    if (Object.keys(pricingRules).length > 0) {
+      params.push(JSON.stringify(pricingRules));
+      updates.push(`pricing_rules=$${params.length}`);
+    }
+    if (!updates.length) return res.status(400).json({ error: 'No pricing fields provided' });
+    params.push(req.params.id);
+    const r = await tenantQuery(s,
+      `UPDATE doctors SET ${updates.join(',')} WHERE id=$${params.length} AND is_active=true RETURNING id, name, consultation_fee, pricing_rules`,
+      params);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
+    res.json({ doctor: r.rows[0] });
+  } catch (err) { handleError(res, err, 'PATCH /doctors/:id/pricing'); }
+});
+
+// ── DOCTOR MULTI-LOCATION ─────────────────────────────────────
+router.get('/doctors/:id/locations', validateUUID(), async (req, res) => {
+  try {
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s, `
+      SELECT dh.hospital_id, dh.day_of_week, dh.start_time::text, dh.end_time::text,
+             h.name as hospital_name, h.city
+      FROM doctor_hospitals dh
+      JOIN hospitals h ON h.id = dh.hospital_id
+      WHERE dh.doctor_id = $1
+      ORDER BY dh.day_of_week, h.name
+    `, [req.params.id]);
+    res.json({ locations: r.rows });
+  } catch (err) { handleError(res, err, 'GET /doctors/:id/locations'); }
+});
+
+router.post('/doctors/:id/locations', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const { hospital_id, day_of_week, start_time, end_time } = req.body;
+    if (!hospital_id || day_of_week === undefined || !start_time || !end_time) {
+      return res.status(400).json({ error: 'hospital_id, day_of_week, start_time, end_time required' });
+    }
+    const s = req.tenant.schema_name;
+    await tenantQuery(s, `
+      INSERT INTO doctor_hospitals (doctor_id, hospital_id, day_of_week, start_time, end_time)
+      VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (doctor_id, hospital_id, day_of_week) DO UPDATE
+        SET start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time
+    `, [req.params.id, hospital_id, day_of_week, start_time, end_time]);
+    res.json({ success: true });
+  } catch (err) { handleError(res, err, 'POST /doctors/:id/locations'); }
+});
+
+router.delete('/doctors/:id/locations/:hospitalId', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const s = req.tenant.schema_name;
+    await tenantQuery(s, `
+      DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND hospital_id=$2
+    `, [req.params.id, req.params.hospitalId]);
+    res.json({ success: true });
+  } catch (err) { handleError(res, err, 'DELETE /doctors/:id/locations/:hospitalId'); }
 });
 
 module.exports = router;

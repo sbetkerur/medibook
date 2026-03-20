@@ -142,8 +142,31 @@ async function migrate() {
       INSERT INTO cron_jobs (job_name) VALUES
         ('slot_generator'),
         ('reminders'),
-        ('feedback')
+        ('feedback'),
+        ('backup'),
+        ('webhook_retry')
       ON CONFLICT (job_name) DO NOTHING;
+    `);
+
+    // ── FAILED WEBHOOKS (Retry Queue) ─────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS failed_webhooks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        phone VARCHAR(20) NOT NULL,
+        tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+        text TEXT,
+        button_id TEXT,
+        message_type VARCHAR(50) DEFAULT 'text',
+        error_message TEXT,
+        attempts INTEGER DEFAULT 0,
+        max_attempts INTEGER DEFAULT 3,
+        last_attempt_at TIMESTAMPTZ,
+        next_retry_at TIMESTAMPTZ DEFAULT NOW(),
+        status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','processing','succeeded','failed')),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_failed_webhooks_status ON failed_webhooks(status, next_retry_at);
+      CREATE INDEX IF NOT EXISTS idx_failed_webhooks_tenant ON failed_webhooks(tenant_id);
     `);
 
     // ── EMAIL SENT LOG (deduplication) ────────────────────────
@@ -214,6 +237,22 @@ async function migrate() {
       `);
     });
 
+    // ── PLAN CHANGES (Enhancement 13: Billing Dashboard) ─────
+    await runMigration(client, 6, 'plan_changes', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS plan_changes (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+          old_plan VARCHAR(50),
+          new_plan VARCHAR(50) NOT NULL,
+          changed_by UUID,
+          changed_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_changes_tenant ON plan_changes(tenant_id);
+        CREATE INDEX IF NOT EXISTS idx_plan_changes_changed_at ON plan_changes(changed_at DESC);
+      `);
+    });
+
     // ── SEED PLANS ────────────────────────────────────────────
     await client.query(`
       INSERT INTO plans (id, name, max_doctors, max_appointments_per_month, price_monthly) VALUES
@@ -231,6 +270,118 @@ async function migrate() {
       VALUES ('admin@medibook.com', $1, 'Super Admin')
       ON CONFLICT (email) DO NOTHING;
     `, [hash]);
+
+    // Version 7: Feature flags tables
+    await runMigration(client, 7, 'feature_flags', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS feature_flags (
+          key VARCHAR(100) PRIMARY KEY,
+          description TEXT,
+          default_value BOOLEAN DEFAULT false
+        );
+        CREATE TABLE IF NOT EXISTS tenant_feature_flags (
+          tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+          flag_key VARCHAR(100) REFERENCES feature_flags(key) ON DELETE CASCADE,
+          enabled BOOLEAN NOT NULL,
+          PRIMARY KEY (tenant_id, flag_key)
+        );
+        INSERT INTO feature_flags (key, description, default_value) VALUES
+          ('sms_fallback_enabled', 'Send SMS when WhatsApp delivery fails', false),
+          ('voice_transcription_enabled', 'Transcribe audio messages via Whisper', false),
+          ('skip_public_holidays', 'Skip Indian public holidays in slot generation', false),
+          ('google_sheets_export', 'Push nightly analytics to Google Sheets webhook', false),
+          ('post_appointment_followup', 'Send WhatsApp follow-up 1h after appointment', true)
+        ON CONFLICT (key) DO NOTHING;
+      `);
+    });
+
+    // Version 8: IP allowlist for tenant admin logins
+    await runMigration(client, 8, 'tenant_ip_allowlist', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS tenant_ip_allowlist (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+          cidr VARCHAR(50) NOT NULL,
+          label VARCHAR(100),
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_ip_allowlist_tenant ON tenant_ip_allowlist(tenant_id);
+      `);
+    });
+
+    // Version 9: IP abuse blocking
+    await runMigration(client, 9, 'rate_limit_blocks', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS rate_limit_blocks (
+          ip VARCHAR(45) PRIMARY KEY,
+          blocked_until TIMESTAMPTZ NOT NULL,
+          reason TEXT,
+          offense_count INTEGER DEFAULT 1,
+          blocked_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rate_blocks_until ON rate_limit_blocks(blocked_until);
+      `);
+    });
+
+    // Version 10: Quota alerts (track 80% warning emails)
+    await runMigration(client, 10, 'quota_alerts', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS quota_alerts (
+          tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+          alert_type VARCHAR(50) NOT NULL,
+          sent_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (tenant_id, alert_type)
+        );
+      `);
+    });
+
+    // Version 11: Sanitized payload on failed_webhooks
+    await runMigration(client, 11, 'failed_webhooks_payload', async () => {
+      await client.query(`
+        ALTER TABLE failed_webhooks ADD COLUMN IF NOT EXISTS sanitized_payload JSONB;
+      `);
+    });
+
+    // Version 12: Email open tracking on email_sent_log
+    await runMigration(client, 12, 'email_open_tracking', async () => {
+      await client.query(`
+        ALTER TABLE email_sent_log ADD COLUMN IF NOT EXISTS open_count INTEGER DEFAULT 0;
+        ALTER TABLE email_sent_log ADD COLUMN IF NOT EXISTS to_email VARCHAR(255);
+        ALTER TABLE email_sent_log ADD COLUMN IF NOT EXISTS template_id VARCHAR(100);
+      `);
+    });
+
+    // Version 13: Correlation ID on audit_logs
+    await runMigration(client, 13, 'audit_logs_correlation_id', async () => {
+      await client.query(`
+        ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(64);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_correlation ON audit_logs(correlation_id) WHERE correlation_id IS NOT NULL;
+      `);
+    });
+
+    // Version 14: Tenant onboarding tracking flag
+    await runMigration(client, 14, 'tenant_upgrade_prompt', async () => {
+      await client.query(`
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS upgrade_prompt BOOLEAN DEFAULT false;
+      `);
+    });
+
+    // Version 15: Backup log
+    await runMigration(client, 15, 'backup_log', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS backup_log (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          started_at TIMESTAMPTZ DEFAULT NOW(),
+          completed_at TIMESTAMPTZ,
+          status VARCHAR(20) DEFAULT 'running' CHECK (status IN ('running','success','failed')),
+          file_path TEXT,
+          size_bytes BIGINT,
+          duration_ms INTEGER,
+          error_message TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_backup_log_started ON backup_log(started_at DESC);
+      `);
+    });
 
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');

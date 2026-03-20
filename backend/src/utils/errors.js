@@ -23,7 +23,7 @@ const ERRORS = {
   TOKEN_VALIDATION_UNAVAILABLE: 'Token validation unavailable',
 };
 
-const VALID_ROLES = ['admin', 'staff'];
+const VALID_ROLES = ['admin', 'staff', 'doctor'];
 
 const VALID_APPOINTMENT_STATUSES = ['confirmed', 'completed', 'cancelled', 'no_show'];
 

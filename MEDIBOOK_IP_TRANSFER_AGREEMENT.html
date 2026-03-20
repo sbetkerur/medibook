@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MediBook — Intellectual Property Transfer Agreement</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=EB+Garamond:wght@400;500;600&display=swap');
+
+  :root {
+    --primary: #1E3A5F;
+    --accent: #C8A45A;
+    --text: #1a1a1a;
+    --text-muted: #555;
+    --border: #D4C5A0;
+    --bg: #FAFAF7;
+    --white: #FFFFFF;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.8;
+    font-size: 10.5pt;
+  }
+
+  /* ── COVER PAGE ──────────────────────────────────────────── */
+  .cover {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 4rem 3rem;
+    background: var(--primary);
+    color: white;
+    position: relative;
+  }
+
+  .cover::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      repeating-linear-gradient(
+        45deg,
+        transparent,
+        transparent 40px,
+        rgba(255,255,255,0.015) 40px,
+        rgba(255,255,255,0.015) 80px
+      );
+  }
+
+  .cover-seal {
+    width: 90px;
+    height: 90px;
+    border: 3px solid var(--accent);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2.5rem;
+    margin: 0 auto 2rem;
+    position: relative;
+    z-index: 1;
+    background: rgba(255,255,255,0.05);
+  }
+
+  .cover-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 1rem;
+    position: relative;
+    z-index: 1;
+  }
+
+  .cover h1 {
+    font-family: 'EB Garamond', serif;
+    font-size: clamp(1.8rem, 4vw, 2.8rem);
+    font-weight: 600;
+    line-height: 1.3;
+    max-width: 640px;
+    margin: 0 auto 1rem;
+    position: relative;
+    z-index: 1;
+  }
+
+  .cover-divider {
+    width: 60px;
+    height: 2px;
+    background: var(--accent);
+    margin: 1.5rem auto;
+    position: relative;
+    z-index: 1;
+  }
+
+  .cover-sub {
+    font-size: 0.9rem;
+    opacity: 0.75;
+    max-width: 480px;
+    margin: 0 auto 2.5rem;
+    position: relative;
+    z-index: 1;
+  }
+
+  .cover-meta {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    max-width: 500px;
+    margin: 0 auto;
+    position: relative;
+    z-index: 1;
+  }
+
+  .cover-meta-item {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 10px;
+    padding: 1rem;
+    text-align: left;
+  }
+
+  .cover-meta-item .label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    font-weight: 700;
+    margin-bottom: 0.3rem;
+  }
+
+  .cover-meta-item .value {
+    font-size: 0.85rem;
+    color: rgba(255,255,255,0.9);
+    font-weight: 500;
+  }
+
+  .cover-confidential {
+    position: absolute;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 0.65rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.4);
+    z-index: 1;
+  }
+
+  /* ── DOCUMENT BODY ───────────────────────────────────────── */
+  .document {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 3rem 2rem;
+  }
+
+  /* ── PREAMBLE BOX ────────────────────────────────────────── */
+  .preamble {
+    background: white;
+    border: 1px solid var(--border);
+    border-top: 4px solid var(--primary);
+    border-radius: 0 0 12px 12px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .preamble p {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    text-align: justify;
+  }
+
+  /* ── PARTIES BLOCK ───────────────────────────────────────── */
+  .parties-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .party-card {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem;
+    position: relative;
+  }
+
+  .party-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 4px;
+    border-radius: 12px 12px 0 0;
+  }
+
+  .party-card.transferor::before { background: var(--primary); }
+  .party-card.transferee::before { background: var(--accent); }
+
+  .party-role {
+    font-size: 0.65rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-bottom: 0.75rem;
+  }
+
+  .party-card.transferor .party-role { color: var(--primary); }
+  .party-card.transferee .party-role { color: #9A7A35; }
+
+  .party-field {
+    margin-bottom: 0.6rem;
+  }
+
+  .party-field label {
+    display: block;
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 0.2rem;
+  }
+
+  .field-value {
+    border-bottom: 1.5px solid #D1D5DB;
+    min-height: 24px;
+    padding: 2px 0;
+    font-size: 0.875rem;
+    color: var(--text);
+  }
+
+  /* ── SECTIONS ────────────────────────────────────────────── */
+  .section {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .section-num {
+    font-size: 0.65rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--accent);
+    margin-bottom: 0.35rem;
+  }
+
+  .section h2 {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--primary);
+    margin-bottom: 1rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid #EDE8DA;
+  }
+
+  .clause {
+    margin-bottom: 1rem;
+    padding-left: 0;
+  }
+
+  .clause-num {
+    font-weight: 700;
+    color: var(--primary);
+    margin-right: 0.4rem;
+    font-size: 0.875rem;
+  }
+
+  .clause p {
+    font-size: 0.875rem;
+    color: var(--text);
+    text-align: justify;
+    display: inline;
+  }
+
+  .clause-block {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 0.85rem;
+    align-items: flex-start;
+  }
+
+  .clause-block .clause-num {
+    flex-shrink: 0;
+    margin-top: 0.05rem;
+  }
+
+  .clause-block p {
+    font-size: 0.875rem;
+    color: var(--text);
+    text-align: justify;
+  }
+
+  /* ── ASSET LIST ──────────────────────────────────────────── */
+  .asset-list {
+    list-style: none;
+    padding: 0;
+    margin: 1rem 0;
+  }
+
+  .asset-list li {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    border-radius: 8px;
+    margin-bottom: 0.4rem;
+    font-size: 0.875rem;
+    background: #F8F5EE;
+    border: 1px solid #EDE8DA;
+  }
+
+  .asset-list li::before {
+    content: '✦';
+    color: var(--accent);
+    font-size: 0.7rem;
+    flex-shrink: 0;
+    margin-top: 0.2rem;
+  }
+
+  /* ── CONSIDERATION BOX ───────────────────────────────────── */
+  .consideration-box {
+    background: #F0F7FF;
+    border: 1px solid #BFDBFE;
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin: 1rem 0;
+  }
+
+  .consideration-box .amount-line {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .amount-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #1E40AF;
+  }
+
+  .amount-value {
+    border-bottom: 2px solid #93C5FD;
+    min-width: 200px;
+    min-height: 24px;
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--primary);
+    padding: 0 0.5rem;
+  }
+
+  .consideration-note {
+    font-size: 0.8rem;
+    color: #3B82F6;
+    margin-top: 0.4rem;
+  }
+
+  /* ── WARRANTY TABLE ──────────────────────────────────────── */
+  .warranty-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .warranty-item {
+    background: #F9FFF9;
+    border: 1px solid #A7F3D0;
+    border-radius: 8px;
+    padding: 1rem;
+  }
+
+  .warranty-item h4 {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: #065F46;
+    margin-bottom: 0.4rem;
+  }
+
+  .warranty-item p {
+    font-size: 0.8rem;
+    color: #374151;
+  }
+
+  /* ── SIGNATURE BLOCK ─────────────────────────────────────── */
+  .sig-section {
+    background: white;
+    border: 2px solid var(--primary);
+    border-radius: 12px;
+    padding: 2rem 2.5rem;
+    margin-top: 2rem;
+  }
+
+  .sig-section h2 {
+    font-size: 0.9rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--primary);
+    text-align: center;
+    margin-bottom: 1.75rem;
+  }
+
+  .sig-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3rem;
+  }
+
+  .sig-block h3 {
+    font-size: 0.7rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-muted);
+    margin-bottom: 1.25rem;
+  }
+
+  .sig-line {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+  }
+
+  .sig-line label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+
+  .sig-line .line {
+    border-bottom: 1.5px solid #D1D5DB;
+    min-height: 28px;
+  }
+
+  .sig-line .sig-area {
+    border-bottom: 1.5px solid var(--primary);
+    min-height: 52px;
+    background: #FAFAF7;
+  }
+
+  .sig-note {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 0.4rem;
+    font-style: italic;
+  }
+
+  /* ── WITNESS BLOCK ───────────────────────────────────────── */
+  .witness-section {
+    margin-top: 2rem;
+    padding-top: 1.5rem;
+    border-top: 1px dashed var(--border);
+  }
+
+  .witness-section h3 {
+    font-size: 0.7rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-muted);
+    margin-bottom: 1.25rem;
+    text-align: center;
+  }
+
+  .witness-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3rem;
+  }
+
+  /* ── SCHEDULE BOX ────────────────────────────────────────── */
+  .schedule {
+    background: #FAFAF7;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem 2.5rem;
+    margin-top: 2.5rem;
+  }
+
+  .schedule-header {
+    text-align: center;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .schedule-header .label {
+    font-size: 0.65rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--accent);
+    margin-bottom: 0.3rem;
+  }
+
+  .schedule-header h2 {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--primary);
+  }
+
+  .schedule-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 0.85rem 0;
+    border-bottom: 1px solid #EDE8DA;
+  }
+
+  .schedule-item:last-child { border-bottom: none; }
+
+  .schedule-item .item-num {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--accent);
+    width: 24px;
+    flex-shrink: 0;
+    margin-top: 0.1rem;
+  }
+
+  .schedule-item .item-body h4 {
+    font-size: 0.875rem;
+    font-weight: 700;
+    color: var(--primary);
+    margin-bottom: 0.2rem;
+  }
+
+  .schedule-item .item-body p {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+
+  /* ── FOOTER ──────────────────────────────────────────────── */
+  .doc-footer {
+    text-align: center;
+    padding: 2rem;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border);
+    margin-top: 3rem;
+  }
+
+  /* ── PRINT ───────────────────────────────────────────────── */
+  @page {
+    size: A4;
+    margin: 1.5cm 1.8cm;
+  }
+
+  @media print {
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    .cover { min-height: auto; padding: 3rem; break-after: page; }
+    .document { padding: 0; }
+    .section { break-inside: avoid; }
+    .parties-grid { break-inside: avoid; }
+    .sig-section { break-inside: avoid; }
+    .schedule { break-inside: avoid; }
+    .sig-grid { break-inside: avoid; }
+    .warranty-grid { break-inside: avoid; }
+    .consideration-box { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ══ COVER PAGE ══════════════════════════════════════════════════ -->
+<div class="cover">
+  <div class="cover-seal">⚖️</div>
+  <div class="cover-label">Legal Document · Full IP Transfer</div>
+  <h1>Intellectual Property Assignment Agreement</h1>
+  <div class="cover-divider"></div>
+  <p class="cover-sub">
+    Complete and irrevocable assignment of all intellectual property rights in the
+    MediBook Marketing Strategy &amp; Plan to the Transferee named herein.
+  </p>
+  <div class="cover-meta">
+    <div class="cover-meta-item">
+      <div class="label">Document Reference</div>
+      <div class="value">MBMS-IPA-2026-___</div>
+    </div>
+    <div class="cover-meta-item">
+      <div class="label">Effective Date</div>
+      <div class="value">_____________, 2026</div>
+    </div>
+    <div class="cover-meta-item">
+      <div class="label">Governing Law</div>
+      <div class="value">Republic of India</div>
+    </div>
+    <div class="cover-meta-item">
+      <div class="label">Document Type</div>
+      <div class="value">Assignment of IP Rights</div>
+    </div>
+  </div>
+  <div class="cover-confidential">Confidential · Private &amp; Commercial Document</div>
+</div>
+
+<!-- ══ DOCUMENT BODY ════════════════════════════════════════════════ -->
+<div class="document">
+
+  <!-- PREAMBLE -->
+  <div class="preamble">
+    <p>
+      This Intellectual Property Assignment Agreement (<strong>"Agreement"</strong>) is entered into as of the date
+      last signed below (<strong>"Effective Date"</strong>) by and between the parties identified in Clause 1.
+      This Agreement governs the complete, permanent, and irrevocable assignment of all intellectual
+      property rights in the MediBook Marketing Strategy &amp; Plan (the <strong>"Assigned Work"</strong>),
+      as more fully described in Schedule A attached hereto.
+    </p>
+  </div>
+
+  <!-- PARTIES -->
+  <div class="parties-grid">
+    <div class="party-card transferor">
+      <div class="party-role">Party A — Transferor (Assignor)</div>
+      <div class="party-field">
+        <label>Full Legal Name / Entity Name</label>
+        <div class="field-value">&nbsp;</div>
+      </div>
+      <div class="party-field">
+        <label>Address</label>
+        <div class="field-value" style="min-height:44px">&nbsp;</div>
+      </div>
+      <div class="party-field">
+        <label>Email Address</label>
+        <div class="field-value">&nbsp;</div>
+      </div>
+      <div class="party-field">
+        <label>PAN / Registration No. (if entity)</label>
+        <div class="field-value">&nbsp;</div>
+      </div>
+    </div>
+    <div class="party-card transferee">
+      <div class="party-role">Party B — Transferee (Assignee)</div>
+      <div class="party-field">
+        <label>Full Legal Name / Entity Name</label>
+        <div class="field-value">&nbsp;</div>
+      </div>
+      <div class="party-field">
+        <label>Address</label>
+        <div class="field-value" style="min-height:44px">&nbsp;</div>
+      </div>
+      <div class="party-field">
+        <label>Email Address</label>
+        <div class="field-value">&nbsp;</div>
+      </div>
+      <div class="party-field">
+        <label>PAN / Registration No. (if entity)</label>
+        <div class="field-value">&nbsp;</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 1. DEFINITIONS -->
+  <div class="section">
+    <div class="section-num">Clause 1</div>
+    <h2>Definitions</h2>
+
+    <div class="clause-block">
+      <span class="clause-num">1.1</span>
+      <p><strong>"Assigned Work"</strong> means the MediBook Marketing Strategy &amp; Plan in its entirety, including all versions, drafts, and derivative works, as further described in Schedule A of this Agreement.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">1.2</span>
+      <p><strong>"Intellectual Property Rights"</strong> means all copyright, moral rights (to the fullest extent waivable), trade secrets, know-how, trademarks (to the extent embedded in the Assigned Work), database rights, and all other proprietary rights of any nature, whether registered or unregistered, subsisting anywhere in the world.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">1.3</span>
+      <p><strong>"Transferor"</strong> means Party A identified above, the original author and owner of all Intellectual Property Rights in the Assigned Work.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">1.4</span>
+      <p><strong>"Transferee"</strong> means Party B identified above, who acquires full ownership of all Intellectual Property Rights in the Assigned Work under this Agreement.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">1.5</span>
+      <p><strong>"Consideration"</strong> means the agreed lump-sum payment made by the Transferee to the Transferor in exchange for the assignment of rights as set out in Clause 4.</p>
+    </div>
+  </div>
+
+  <!-- 2. ASSIGNMENT -->
+  <div class="section">
+    <div class="section-num">Clause 2</div>
+    <h2>Assignment of Intellectual Property Rights</h2>
+
+    <div class="clause-block">
+      <span class="clause-num">2.1</span>
+      <p><strong>Full Assignment.</strong> In consideration of the payment described in Clause 4, the Transferor hereby irrevocably, unconditionally, and absolutely assigns, transfers, and conveys to the Transferee, its successors and assigns, all right, title, and interest — including all Intellectual Property Rights — in and to the Assigned Work throughout the universe in perpetuity.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">2.2</span>
+      <p><strong>Scope of Rights Assigned.</strong> The rights assigned under Clause 2.1 include, without limitation, the exclusive rights to:</p>
+    </div>
+
+    <ul class="asset-list" style="margin-left: 2rem;">
+      <li>Reproduce, copy, and distribute the Assigned Work in any form or medium</li>
+      <li>Modify, adapt, translate, and create derivative works based on the Assigned Work</li>
+      <li>Publish, broadcast, publicly display, and communicate the Assigned Work to the public</li>
+      <li>Sub-license, sell, transfer, or assign the Assigned Work or any rights therein to third parties</li>
+      <li>Commercially exploit the Assigned Work in any manner, in any market worldwide</li>
+      <li>Register copyright or any other IP right in the Assigned Work in any jurisdiction</li>
+      <li>Bring claims and recover damages for past, present, and future infringement of rights in the Assigned Work</li>
+    </ul>
+
+    <div class="clause-block" style="margin-top: 1rem;">
+      <span class="clause-num">2.3</span>
+      <p><strong>Moral Rights Waiver.</strong> To the fullest extent permitted by applicable law, the Transferor hereby irrevocably and unconditionally waives all moral rights (including rights of attribution and integrity) in the Assigned Work in favour of the Transferee and its successors.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">2.4</span>
+      <p><strong>Further Assurances.</strong> The Transferor agrees to execute any additional documents and take any further steps reasonably requested by the Transferee to perfect, record, or enforce the assignment of rights granted herein, including filings with the Copyright Office or any other relevant authority.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">2.5</span>
+      <p><strong>No Retained Rights.</strong> Upon execution and payment, the Transferor retains no right, title, or interest of any nature in the Assigned Work and shall not use, reproduce, or exploit the Assigned Work in any manner without the prior written consent of the Transferee.</p>
+    </div>
+  </div>
+
+  <!-- 3. DELIVERY -->
+  <div class="section">
+    <div class="section-num">Clause 3</div>
+    <h2>Delivery of Assigned Work</h2>
+
+    <div class="clause-block">
+      <span class="clause-num">3.1</span>
+      <p><strong>Delivery Obligation.</strong> Within five (5) business days of receipt of the Consideration, the Transferor shall deliver to the Transferee all materials constituting the Assigned Work in their entirety, including all formats listed in Schedule A.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">3.2</span>
+      <p><strong>Delivery Method.</strong> Delivery shall be made by secure file transfer or such other method as agreed in writing between the parties.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">3.3</span>
+      <p><strong>Destruction of Copies.</strong> Upon delivery, the Transferor shall permanently delete or destroy all copies of the Assigned Work in its possession or under its control, except as required by applicable law, and shall confirm the same in writing to the Transferee.</p>
+    </div>
+  </div>
+
+  <!-- 4. CONSIDERATION -->
+  <div class="section">
+    <div class="section-num">Clause 4</div>
+    <h2>Consideration &amp; Payment</h2>
+
+    <div class="clause-block">
+      <span class="clause-num">4.1</span>
+      <p><strong>Agreed Consideration.</strong> In full and final settlement for the assignment of all rights under this Agreement, the Transferee shall pay the Transferor the following sum:</p>
+    </div>
+
+    <div class="consideration-box">
+      <div class="amount-line">
+        <span class="amount-label">Amount (INR / USD):</span>
+        <span class="amount-value">&nbsp;</span>
+      </div>
+      <div class="amount-line">
+        <span class="amount-label">Amount in Words:</span>
+        <span class="amount-value">&nbsp;</span>
+      </div>
+      <p class="consideration-note">Payment shall be inclusive / exclusive of applicable taxes (GST / TDS) — circle as applicable. Specify if payment is in INR or foreign currency.</p>
+    </div>
+
+    <div class="clause-block" style="margin-top:1rem;">
+      <span class="clause-num">4.2</span>
+      <p><strong>Payment Timeline.</strong> The Consideration shall be paid in full within ______ business days of execution of this Agreement, by bank transfer to the Transferor's account details provided separately in writing.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">4.3</span>
+      <p><strong>Taxes.</strong> Each party shall be responsible for its own income tax obligations arising from this transaction. TDS, if applicable under the Income Tax Act, 1961, shall be deducted by the Transferee and a TDS certificate (Form 16A) shall be issued to the Transferor.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">4.4</span>
+      <p><strong>One-Time Payment.</strong> The Consideration is a one-time, lump-sum payment. No royalties, revenue shares, or further payments of any kind are due to the Transferor after the Effective Date.</p>
+    </div>
+  </div>
+
+  <!-- 5. WARRANTIES -->
+  <div class="section">
+    <div class="section-num">Clause 5</div>
+    <h2>Representations &amp; Warranties</h2>
+
+    <div class="clause-block">
+      <span class="clause-num">5.1</span>
+      <p><strong>Transferor's Warranties.</strong> The Transferor represents and warrants to the Transferee that:</p>
+    </div>
+
+    <div class="warranty-grid">
+      <div class="warranty-item">
+        <h4>Original Authorship</h4>
+        <p>The Assigned Work is an original creation of the Transferor and does not infringe the copyright or any other right of any third party.</p>
+      </div>
+      <div class="warranty-item">
+        <h4>Sole Ownership</h4>
+        <p>The Transferor is the sole and exclusive owner of all Intellectual Property Rights in the Assigned Work and has full authority to assign the same.</p>
+      </div>
+      <div class="warranty-item">
+        <h4>No Prior Encumbrances</h4>
+        <p>The Assigned Work has not been previously assigned, licensed, mortgaged, or encumbered in favour of any third party.</p>
+      </div>
+      <div class="warranty-item">
+        <h4>No Pending Claims</h4>
+        <p>There are no pending or threatened claims, disputes, or proceedings relating to the ownership or use of the Assigned Work.</p>
+      </div>
+      <div class="warranty-item">
+        <h4>Authority to Contract</h4>
+        <p>The Transferor has full legal capacity and authority to enter into and perform this Agreement.</p>
+      </div>
+      <div class="warranty-item">
+        <h4>No Third-Party Content</h4>
+        <p>The Assigned Work does not incorporate any third-party copyrighted material without appropriate licence or permission.</p>
+      </div>
+    </div>
+
+    <div class="clause-block" style="margin-top:1rem;">
+      <span class="clause-num">5.2</span>
+      <p><strong>Transferee's Warranty.</strong> The Transferee represents and warrants that it has the authority and capacity to enter into this Agreement and to make the payment of Consideration as specified herein.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">5.3</span>
+      <p><strong>Indemnification.</strong> The Transferor shall indemnify, defend, and hold harmless the Transferee from and against any claims, losses, damages, costs, and expenses (including reasonable legal fees) arising from any breach of the warranties in Clause 5.1.</p>
+    </div>
+  </div>
+
+  <!-- 6. CONFIDENTIALITY -->
+  <div class="section">
+    <div class="section-num">Clause 6</div>
+    <h2>Confidentiality</h2>
+
+    <div class="clause-block">
+      <span class="clause-num">6.1</span>
+      <p>Each party agrees to keep the terms and Consideration of this Agreement strictly confidential and not to disclose the same to any third party without the prior written consent of the other party, except as required by applicable law or regulatory authority.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">6.2</span>
+      <p>The Transferor agrees to treat the Assigned Work as confidential and proprietary to the Transferee following the Effective Date, and shall not disclose, reproduce, or use the Assigned Work for any purpose after the delivery and destruction obligations in Clause 3 are fulfilled.</p>
+    </div>
+  </div>
+
+  <!-- 7. GENERAL PROVISIONS -->
+  <div class="section">
+    <div class="section-num">Clause 7</div>
+    <h2>General Provisions</h2>
+
+    <div class="clause-block">
+      <span class="clause-num">7.1</span>
+      <p><strong>Governing Law.</strong> This Agreement shall be governed by and construed in accordance with the laws of the Republic of India, including the Copyright Act, 1957 and the Information Technology Act, 2000, as applicable.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">7.2</span>
+      <p><strong>Dispute Resolution.</strong> Any dispute arising out of or in connection with this Agreement shall first be attempted to be resolved by mutual negotiation between the parties. If unresolved within 30 days, the dispute shall be referred to binding arbitration under the Arbitration and Conciliation Act, 1996, conducted by a sole arbitrator mutually agreed upon by the parties, at <span style="border-bottom:1px solid #999; display:inline-block; min-width:120px;">&nbsp;</span>, India.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">7.3</span>
+      <p><strong>Entire Agreement.</strong> This Agreement, together with Schedule A, constitutes the entire agreement between the parties with respect to the subject matter hereof and supersedes all prior negotiations, representations, and agreements.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">7.4</span>
+      <p><strong>Amendments.</strong> No amendment or modification of this Agreement shall be valid unless made in writing and signed by authorised representatives of both parties.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">7.5</span>
+      <p><strong>Severability.</strong> If any provision of this Agreement is found to be invalid or unenforceable, the remaining provisions shall continue in full force and effect.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">7.6</span>
+      <p><strong>Waiver.</strong> No failure or delay by either party to exercise any right under this Agreement shall constitute a waiver of that right.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">7.7</span>
+      <p><strong>Counterparts.</strong> This Agreement may be executed in counterparts, each of which shall be deemed an original. Electronic or digital signatures shall be deemed valid and binding.</p>
+    </div>
+    <div class="clause-block">
+      <span class="clause-num">7.8</span>
+      <p><strong>Stamp Duty.</strong> Any stamp duty payable on this Agreement shall be borne by the Transferee, unless otherwise agreed in writing.</p>
+    </div>
+  </div>
+
+  <!-- SIGNATURE BLOCK -->
+  <div class="sig-section">
+    <h2>Execution — Signatures of the Parties</h2>
+    <p style="text-align:center; font-size:0.8rem; color:#6B7280; margin-bottom:1.5rem;">
+      IN WITNESS WHEREOF, the parties have executed this Agreement as of the date written below.
+    </p>
+
+    <div class="sig-grid">
+      <!-- Transferor -->
+      <div class="sig-block">
+        <h3>Party A — Transferor (Assignor)</h3>
+
+        <div class="sig-line">
+          <label>Signature</label>
+          <div class="sig-area">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Full Name</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Designation / Title (if entity)</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Date (DD / MM / YYYY)</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Place</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <p class="sig-note">Affix company seal here if applicable</p>
+      </div>
+
+      <!-- Transferee -->
+      <div class="sig-block">
+        <h3>Party B — Transferee (Assignee)</h3>
+
+        <div class="sig-line">
+          <label>Signature</label>
+          <div class="sig-area">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Full Name</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Designation / Title (if entity)</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Date (DD / MM / YYYY)</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <div class="sig-line">
+          <label>Place</label>
+          <div class="line">&nbsp;</div>
+        </div>
+        <p class="sig-note">Affix company seal here if applicable</p>
+      </div>
+    </div>
+
+    <!-- Witnesses -->
+    <div class="witness-section">
+      <h3>Witnessed By</h3>
+      <div class="witness-grid">
+        <div class="sig-block">
+          <h3>Witness 1</h3>
+          <div class="sig-line">
+            <label>Signature</label>
+            <div class="sig-area">&nbsp;</div>
+          </div>
+          <div class="sig-line">
+            <label>Full Name</label>
+            <div class="line">&nbsp;</div>
+          </div>
+          <div class="sig-line">
+            <label>Address</label>
+            <div class="line">&nbsp;</div>
+          </div>
+          <div class="sig-line">
+            <label>Date</label>
+            <div class="line">&nbsp;</div>
+          </div>
+        </div>
+        <div class="sig-block">
+          <h3>Witness 2</h3>
+          <div class="sig-line">
+            <label>Signature</label>
+            <div class="sig-area">&nbsp;</div>
+          </div>
+          <div class="sig-line">
+            <label>Full Name</label>
+            <div class="line">&nbsp;</div>
+          </div>
+          <div class="sig-line">
+            <label>Address</label>
+            <div class="line">&nbsp;</div>
+          </div>
+          <div class="sig-line">
+            <label>Date</label>
+            <div class="line">&nbsp;</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCHEDULE A -->
+  <div class="schedule">
+    <div class="schedule-header">
+      <div class="label">Schedule A</div>
+      <h2>Description of Assigned Work</h2>
+    </div>
+
+    <p style="font-size:0.875rem; color:#374151; margin-bottom:1.25rem;">
+      The following materials, in their entirety, constitute the <strong>"Assigned Work"</strong> transferred under this Agreement:
+    </p>
+
+    <div class="schedule-item">
+      <div class="item-num">A.1</div>
+      <div class="item-body">
+        <h4>MediBook Marketing Strategy &amp; Plan — HTML Document</h4>
+        <p>Full interactive HTML document titled "MediBook — Marketing Strategy &amp; Plan" including all sections: Executive Summary, Market Analysis, Audience Personas, Positioning, Competitive Analysis, SWOT, Pricing Strategy, Channel Strategy, Content Plan, Sales Playbook, 12-Month Roadmap, KPIs, Budget Allocation, and Risk Register.</p>
+      </div>
+    </div>
+
+    <div class="schedule-item">
+      <div class="item-num">A.2</div>
+      <div class="item-body">
+        <h4>MediBook Marketing Strategy &amp; Plan — PDF Document</h4>
+        <p>Print-ready PDF export of the above HTML document, formatted for A4 paper, containing identical strategic content.</p>
+      </div>
+    </div>
+
+    <div class="schedule-item">
+      <div class="item-num">A.3</div>
+      <div class="item-body">
+        <h4>MediBook Marketing Strategy — PowerPoint Presentation</h4>
+        <p>PPTX presentation deck summarising the marketing strategy, suitable for investor or stakeholder presentations.</p>
+      </div>
+    </div>
+
+    <div class="schedule-item">
+      <div class="item-num">A.4</div>
+      <div class="item-body">
+        <h4>All Underlying Research &amp; Data</h4>
+        <p>All market research, competitive analysis data, persona research, channel budget models, KPI frameworks, and any other data or research that forms the basis of the above documents, whether in digital or written form, in the Transferor's possession.</p>
+      </div>
+    </div>
+
+    <div class="schedule-item">
+      <div class="item-num">A.5</div>
+      <div class="item-body">
+        <h4>All Derivative &amp; Supporting Works</h4>
+        <p>Any drafts, outlines, notes, source files, or supporting materials created in the course of producing the above, including any working files or editable source versions.</p>
+      </div>
+    </div>
+
+    <div class="schedule-item">
+      <div class="item-num">A.6</div>
+      <div class="item-body">
+        <h4>Product &amp; Brand Assets Referenced</h4>
+        <p>The MediBook product name, associated branding concepts, taglines, and positioning statements as articulated within the Assigned Work, to the extent they are original creations of the Transferor and incorporated in the above documents.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="doc-footer">
+    <strong>MediBook — Intellectual Property Assignment Agreement</strong><br>
+    Document Ref: MBMS-IPA-2026-___ &nbsp;|&nbsp; Prepared: March 2026 &nbsp;|&nbsp; Governing Law: Republic of India<br><br>
+    <em>This document is a template and does not constitute legal advice. Both parties are advised to seek independent legal counsel before signing.</em>
+  </div>
+
+</div>
+</body>
+</html>
