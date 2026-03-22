@@ -18,7 +18,8 @@ router.get('/patients', patientLimiter, async (req, res) => {
     const s = req.tenant.schema_name;
     let where = '';
     let params = [];
-    if (search) { params.push(`%${search}%`); where = ` WHERE name ILIKE $1 OR phone LIKE $1 OR email ILIKE $1`; }
+    if (search) { params.push(`%${search}%`); where = ` WHERE deleted_at IS NULL AND (name ILIKE $1 OR phone LIKE $1 OR email ILIKE $1)`; }
+    else { where = ` WHERE deleted_at IS NULL`; }
     const countParams = [...params];
     params.push(25, (safePage - 1) * 25);
     const [r, countR] = await Promise.all([
@@ -36,7 +37,7 @@ router.get('/patients', patientLimiter, async (req, res) => {
 router.get('/patients/:id', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, medical_history, created_at, updated_at FROM patients WHERE id=$1`,
+      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, dental_history as medical_history, created_at, updated_at FROM patients WHERE id=$1`,
       [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
@@ -95,7 +96,7 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     const r = await tenantQuery(s, `
       UPDATE patients SET
         name='[Deleted]', email=NULL, date_of_birth=NULL, gender=NULL,
-        medical_history='{}', updated_at=NOW()
+        dental_history='{}', deleted_at=NOW(), opted_out=true, updated_at=NOW()
       WHERE id=$1 RETURNING id
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
@@ -108,7 +109,7 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
 router.get('/patients/:id/medical-history', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, medical_history FROM patients WHERE id=$1`, [req.params.id]);
+      `SELECT id, name, phone, dental_history as medical_history FROM patients WHERE id=$1`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
   } catch (err) { handleError(res, err); }
@@ -122,7 +123,7 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
     }
     const s = req.tenant.schema_name;
     const r = await tenantQuery(s,
-      `UPDATE patients SET medical_history=$1, updated_at=NOW() WHERE id=$2 RETURNING id, name, medical_history`,
+      `UPDATE patients SET dental_history=$1, updated_at=NOW() WHERE id=$2 RETURNING id, name, dental_history as medical_history`,
       [JSON.stringify(medical_history), req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_MEDICAL_HISTORY', 'patient', req.params.id,

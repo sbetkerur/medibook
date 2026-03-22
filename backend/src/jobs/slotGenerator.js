@@ -1,7 +1,10 @@
 const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
 const { addDays, format } = require('date-fns');
+const { toZonedTime } = require('date-fns-tz');
 const logger = require('../utils/logger');
+
+const IST = 'Asia/Kolkata';
 const { CRON_LOOKAHEAD_DAYS } = require('../utils/errors');
 const { withCronLock } = require('../utils/cronLock');
 
@@ -74,7 +77,7 @@ async function updateNoShowScores(schema) {
   try {
     await tenantQuery(schema, `
       UPDATE doctors d SET no_show_score = (
-        SELECT ROUND(100.0 * COUNT(*) FILTER (WHERE a.status='no_show') / NULLIF(COUNT(*), 0), 2)
+        SELECT COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE a.status='no_show') / NULLIF(COUNT(*), 0), 2), 0)
         FROM appointments a
         WHERE a.doctor_id = d.id
           AND a.appointment_date >= CURRENT_DATE - INTERVAL '90 days'
@@ -118,7 +121,9 @@ async function generateSlotsForTenant(schema) {
   }
 
   // Fetch all doctor leaves for the lookahead window (single query, not per-doctor)
-  const today = new Date();
+  // Use IST "today" — UTC servers can be up to 5.5 hours behind IST, meaning
+  // new Date() gives "yesterday" in IST for the 5.5h window after IST midnight.
+  const today = toZonedTime(new Date(), IST);
   const lookaheadEnd = format(addDays(today, CRON_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
   const todayStr = format(today, 'yyyy-MM-dd');
   let leaveSet = new Set(); // Set of "docId:dateStr"
@@ -131,13 +136,20 @@ async function generateSlotsForTenant(schema) {
     }
   } catch (_) { /* doctor_leaves table may not exist in all schemas yet */ }
 
-  // Build holiday set — dates on which the whole clinic is closed (skip slot gen for all doctors)
-  let holidaySet = new Set(); // Set of dateStr
+  // Build holiday sets — hospital-specific (hospitalId:date) and clinic-wide (null hospital_id)
+  let holidaySet = new Set(); // Set of "hospitalId:dateStr"
+  let clinicWideHolidays = new Set(); // Set of dateStr where hospital_id IS NULL (applies to all)
   try {
     const holidaysR = await tenantQuery(schema,
-      `SELECT DISTINCT holiday_date::text FROM clinic_holidays
+      `SELECT hospital_id::text, holiday_date::text FROM clinic_holidays
        WHERE holiday_date BETWEEN $1 AND $2`, [todayStr, lookaheadEnd]);
-    for (const h of holidaysR.rows) holidaySet.add(h.holiday_date);
+    for (const h of holidaysR.rows) {
+      if (h.hospital_id) {
+        holidaySet.add(`${h.hospital_id}:${h.holiday_date}`);
+      } else {
+        clinicWideHolidays.add(h.holiday_date);
+      }
+    }
   } catch (_) { /* clinic_holidays table may not exist in all schemas yet */ }
 
   // Optionally skip Indian public holidays (feature flag: skip_public_holidays)
@@ -169,7 +181,7 @@ async function generateSlotsForTenant(schema) {
       if (!sched) continue;
 
       const dateStr = format(date, 'yyyy-MM-dd');
-      if (holidaySet.has(dateStr)) continue;            // clinic-wide holiday
+      if (holidaySet.has(`${doc.hospital_id}:${dateStr}`) || clinicWideHolidays.has(dateStr)) continue; // hospital-specific or clinic-wide holiday
       if (publicHolidaySet.has(dateStr)) continue;      // Indian public holiday
       if (leaveSet.has(`${docId}:${dateStr}`)) continue; // doctor-specific leave
 
@@ -394,6 +406,22 @@ function startBackupReminderCron() {
         return;
       }
 
+      // Parse DATABASE_URL to extract PGPASSWORD separately — avoids shell injection
+      // when the password contains special characters like $, `, (), etc.
+      let pgEnv = { ...process.env };
+      try {
+        const parsed = new URL(dbUrl);
+        if (parsed.password) {
+          pgEnv.PGPASSWORD = decodeURIComponent(parsed.password);
+          parsed.password = '';
+        }
+        // Build a safe connection string without credentials for pg_dump
+        pgEnv.PGSAFE_URL = parsed.toString();
+      } catch (_) {
+        // If URL parsing fails, fall back to passing dbUrl (no credentials in plain host:port form)
+        pgEnv.PGSAFE_URL = dbUrl;
+      }
+
       const backupDir = process.env.BACKUP_DIR || path.join(process.cwd(), 'backups');
       // Create backup dir if needed
       if (!fs.existsSync(backupDir)) {
@@ -404,8 +432,8 @@ function startBackupReminderCron() {
       const backupFile = path.join(backupDir, `medibook_${timestamp}.sql`);
 
       await execAsync(
-        `pg_dump "${dbUrl}" --no-password -f "${backupFile}"`,
-        { timeout: 5 * 60 * 1000 } // 5 min timeout
+        `pg_dump "${pgEnv.PGSAFE_URL}" --no-password -f "${backupFile}"`,
+        { timeout: 5 * 60 * 1000, env: pgEnv } // 5 min timeout
       );
 
       const stats = fs.statSync(backupFile);
@@ -476,7 +504,8 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false) {
   };
 
   // Fetch leaves for this doctor in the lookahead window
-  const today = new Date();
+  // Use IST "today" — same reason as generateSlotsForTenant.
+  const today = toZonedTime(new Date(), IST);
   const lookaheadEnd = format(addDays(today, CRON_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
   const todayStr = format(today, 'yyyy-MM-dd');
   let leaveSet = new Set();

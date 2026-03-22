@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
-const { query, tenantQuery } = require('../db');
+const { query, tenantQuery, tenantTransaction } = require('../db');
 const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
 const { VALID_ROLES, VALID_APPOINTMENT_STATUSES, validateUUID, handleError } = require('../utils/errors');
@@ -14,13 +14,6 @@ const slotsGenerateLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 5,
   message: { error: 'Too many slot generation requests. Try again in an hour.' },
-  standardHeaders: true,
-});
-
-const analyticsLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 20,
-  message: { error: 'Too many analytics requests. Slow down.' },
   standardHeaders: true,
 });
 
@@ -88,26 +81,28 @@ router.get('/dashboard', async (req, res) => {
         tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date=CURRENT_DATE AND status='confirmed'`),
         tenantQuery(s, `SELECT COUNT(*) FROM patients`),
         tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date>=CURRENT_DATE AND status='available'`),
+        tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= date_trunc('month', CURRENT_DATE) AND status IN ('confirmed','completed')`),
       ]),
     ]);
 
     const val = (r, field = 'count', fallback = null) =>
       r.status === 'fulfilled' ? (field === 'rows' ? r.value.rows : parseInt(r.value.rows[0]?.[field] ?? '0')) : fallback;
 
-    if (!cached && liveStats.length >= 3) {
+    if (!cached && liveStats.length >= 4) {
       statsData = {
         today_appointments: val(liveStats[0]),
         total_patients: val(liveStats[1]),
         available_slots: val(liveStats[2]),
+        appointments_month: val(liveStats[3]),
       };
       // Async update cache (non-blocking)
       query(`
-        INSERT INTO tenant_stats_cache (tenant_id, stat_date, appointments_today, patients_total, active_slots, updated_at)
-        VALUES ($1, CURRENT_DATE, $2, $3, $4, NOW())
+        INSERT INTO tenant_stats_cache (tenant_id, stat_date, appointments_today, appointments_month, patients_total, active_slots, updated_at)
+        VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, NOW())
         ON CONFLICT (tenant_id, stat_date) DO UPDATE SET
-          appointments_today=EXCLUDED.appointments_today, patients_total=EXCLUDED.patients_total,
-          active_slots=EXCLUDED.active_slots, updated_at=NOW()
-      `, [tenantId, statsData.today_appointments, statsData.total_patients, statsData.available_slots])
+          appointments_today=EXCLUDED.appointments_today, appointments_month=EXCLUDED.appointments_month,
+          patients_total=EXCLUDED.patients_total, active_slots=EXCLUDED.active_slots, updated_at=NOW()
+      `, [tenantId, statsData.today_appointments, statsData.appointments_month ?? 0, statsData.total_patients, statsData.available_slots])
         .catch(() => {});
     }
 
@@ -131,13 +126,28 @@ router.get('/dashboard', async (req, res) => {
 router.get('/appointments', async (req, res) => {
   try {
     const s = req.tenant.schema_name;
-    const { date, status, page = 1, limit = 25 } = req.query;
+    const { date, status, from, to, page = 1, limit = 25 } = req.query;
     // Enforce pagination bounds — prevent DoS via large limit
     const safeLimit = Math.min(Math.max(parseInt(limit) || 25, 1), 100);
     const safePage = Math.max(parseInt(page) || 1, 1);
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    if (date && !DATE_RE.test(date)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    }
+    if (from && !DATE_RE.test(from)) {
+      return res.status(400).json({ error: 'Invalid from date format. Use YYYY-MM-DD.' });
+    }
+    if (to && !DATE_RE.test(to)) {
+      return res.status(400).json({ error: 'Invalid to date format. Use YYYY-MM-DD.' });
+    }
+    if (status && !VALID_APPOINTMENT_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_APPOINTMENT_STATUSES.join(', ')}` });
+    }
     const where = ['1=1'];
     const params = [];
     if (date) { params.push(date); where.push(`a.appointment_date=$${params.length}`); }
+    if (from) { params.push(from); where.push(`a.appointment_date >= $${params.length}`); }
+    if (to) { params.push(to); where.push(`a.appointment_date <= $${params.length}`); }
     if (status) { params.push(status); where.push(`a.status=$${params.length}`); }
     // Separate count params (no LIMIT/OFFSET)
     const countParams = params.slice();
@@ -186,8 +196,17 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       return res.status(400).json({ error: 'cancellation_reason is required when cancelling an appointment' });
     }
 
-    const oldR = await tenantQuery(s, `SELECT status FROM appointments WHERE id=$1`, [req.params.id]);
+    const oldR = await tenantQuery(s, `SELECT status, slot_id FROM appointments WHERE id=$1`, [req.params.id]);
     if (!oldR.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+
+    // Prevent invalid state transitions — completed and cancelled are terminal states
+    const currentStatus = oldR.rows[0].status;
+    if (status && status !== currentStatus) {
+      const TERMINAL_STATUSES = ['completed', 'cancelled'];
+      if (TERMINAL_STATUSES.includes(currentStatus)) {
+        return res.status(409).json({ error: `Cannot change status from '${currentStatus}' — it is a terminal state` });
+      }
+    }
 
     const updates = ['updated_at=NOW()'];
     const params = [];
@@ -197,31 +216,33 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     if (cancellation_reason) { params.push(cancellation_reason); updates.push(`cancellation_reason=$${params.length}`); }
     if (status === 'cancelled') {
       updates.push('cancelled_at=NOW()');
+      updates.push(`cancelled_by='admin'`);
       params.push(req.user.id);
       updates.push(`cancelled_by_user_id=$${params.length}`);
     }
     params.push(req.params.id);
 
-    const r = await tenantQuery(s,
-      `UPDATE appointments SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`,
-      params);
-    if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
-
-    // Release the linked slot back to available when cancelling
-    if (status === 'cancelled' && r.rows[0].slot_id) {
-      try {
-        await tenantQuery(s,
+    // Wrap appointment update + slot release in a single transaction so a crash
+    // between the two writes cannot leave a cancelled appointment with a booked slot.
+    let updatedRow;
+    await tenantTransaction(s, async (client) => {
+      const r = await client.query(
+        `UPDATE appointments SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`,
+        params);
+      if (!r.rows[0]) return; // not found — handled below
+      updatedRow = r.rows[0];
+      if (status === 'cancelled' && updatedRow.slot_id) {
+        await client.query(
           `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`,
-          [r.rows[0].slot_id]);
-      } catch (err) {
-        logger.warn('Failed to release slot on cancellation', { slot_id: r.rows[0].slot_id, error: err.message });
+          [updatedRow.slot_id]);
       }
-    }
+    });
+    if (!updatedRow) return res.status(404).json({ error: 'Appointment not found' });
 
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_APPOINTMENT', 'appointment', req.params.id,
       { status: oldR.rows[0].status }, { status, cancellation_reason }, req.ip);
 
-    res.json({ appointment: r.rows[0] });
+    res.json({ appointment: updatedRow });
   } catch (err) { handleError(res, err); }
 });
 
@@ -231,7 +252,7 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
     const r = await tenantQuery(s, `
       SELECT a.*,
              p.name as patient_name, p.phone as patient_phone, p.email as patient_email,
-             p.date_of_birth, p.gender, p.visit_count, p.medical_history,
+             p.date_of_birth, p.gender, p.visit_count, p.dental_history as medical_history,
              d.name as doctor_name, d.specialization, d.consultation_fee,
              h.name as hospital_name, h.address as hospital_address,
              dep.name as department_name
@@ -265,37 +286,67 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
     }
     const s = req.tenant.schema_name;
 
-    // Upsert walk-in patient
-    const patientR = await tenantQuery(s, `
-      INSERT INTO patients (phone, name, visit_count)
-      VALUES ($1, $2, 1)
-      ON CONFLICT (phone) DO UPDATE SET
-        name=COALESCE(EXCLUDED.name, patients.name),
-        visit_count=patients.visit_count+1, updated_at=NOW()
-      RETURNING id
-    `, [patient_phone, patient_name || null]);
-    const patientId = patientR.rows[0].id;
+    let newAppointment;
+    let bookingId;
+    const { randomUUID } = require('crypto');
 
-    // Lock slot if provided
-    if (slot_id) {
-      const slotR = await tenantQuery(s,
-        `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
-        [slot_id]);
-      if (!slotR.rows[0]) return res.status(409).json({ error: 'Slot is no longer available' });
+    // Retry up to 3 times on booking_id collision (23505 unique_violation).
+    // Same retry pattern used by the bot booking flow in bookingFlow.js.
+    let insertAttempts = 0;
+    while (true) {
+      bookingId = 'MB' + randomUUID().replace(/-/g, '').slice(0, 10).toUpperCase();
+      try {
+        await tenantTransaction(s, async (client) => {
+          // Upsert walk-in patient
+          const patientR = await client.query(`
+            INSERT INTO patients (phone, name, visit_count)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (phone) DO UPDATE SET
+              name=COALESCE(EXCLUDED.name, patients.name),
+              visit_count=patients.visit_count+1, updated_at=NOW()
+            RETURNING id
+          `, [patient_phone, patient_name || null]);
+          const patientId = patientR.rows[0].id;
+
+          // Lock slot atomically inside the transaction — if slot already booked,
+          // the transaction rolls back and no orphaned booked slot is left behind
+          if (slot_id) {
+            const slotR = await client.query(
+              `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
+              [slot_id]);
+            if (!slotR.rows[0]) {
+              const err = new Error('Slot is no longer available');
+              err.statusCode = 409;
+              throw err;
+            }
+          }
+
+          const r = await client.query(`
+            INSERT INTO appointments
+              (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed') RETURNING *
+          `, [bookingId, patientId, doctor_id, hospital_id, slot_id || null, appointment_date, appointment_time, visit_type || 'in_person', notes || null]);
+          newAppointment = r.rows[0];
+        });
+        break; // success
+      } catch (insertErr) {
+        // 23505 = unique_violation — retry only on booking_id collision, not slot conflict
+        if (insertErr.code === '23505' && insertErr.constraint?.includes('booking_id') && ++insertAttempts < 3) {
+          logger.warn('Walk-in booking_id collision, retrying', { attempt: insertAttempts });
+          continue;
+        }
+        throw insertErr;
+      }
     }
 
-    const bookingId = 'MB' + Date.now().toString(36).toUpperCase().slice(-6);
-    const r = await tenantQuery(s, `
-      INSERT INTO appointments
-        (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed') RETURNING *
-    `, [bookingId, patientId, doctor_id, hospital_id, slot_id || null, appointment_date, appointment_time, visit_type || 'in_person', notes || null]);
-
-    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_APPOINTMENT', 'appointment', r.rows[0].id,
+    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_APPOINTMENT', 'appointment', newAppointment.id,
       null, { booking_id: bookingId, doctor_id, appointment_date }, req.ip);
 
-    res.status(201).json({ appointment: r.rows[0], booking_id: bookingId });
-  } catch (err) { handleError(res, err); }
+    res.status(201).json({ appointment: newAppointment, booking_id: bookingId });
+  } catch (err) {
+    if (err.statusCode === 409) return res.status(409).json({ error: err.message });
+    handleError(res, err);
+  }
 });
 
 // ── HOSPITALS ─────────────────────────────────────────────────
@@ -486,6 +537,8 @@ router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, r
       INSERT INTO doctors (name, specialization, qualification, department_id, hospital_id, consultation_fee, slot_duration_minutes)
       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
     `, [name, specialization, qualification, department_id, hospital_id, consultation_fee || 0, slot_duration_minutes || 30]);
+    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_DOCTOR', 'doctor', r.rows[0].id,
+      null, { name, specialization, department_id, hospital_id }, req.ip);
     res.json({ doctor: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
@@ -594,6 +647,11 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
     if (!Array.isArray(schedules)) return res.status(400).json({ error: 'schedules array required' });
 
     for (const s of schedules) {
+      // Validate day_of_week range
+      const dow = parseInt(s.day_of_week, 10);
+      if (!Number.isInteger(dow) || dow < 0 || dow > 6) {
+        return res.status(400).json({ error: `Invalid day_of_week: ${s.day_of_week}. Must be 0 (Sunday) to 6 (Saturday).` });
+      }
       // Validate time format
       if (s.is_working !== false) {
         if (!TIME_RE.test(s.start_time) || !TIME_RE.test(s.end_time)) {
@@ -645,7 +703,9 @@ router.get('/patients', patientLimiter, async (req, res) => {
     let params = [];
     if (search) {
       params.push(`%${search}%`);
-      where = ` WHERE name ILIKE $1 OR phone LIKE $1 OR email ILIKE $1`;
+      where = ` WHERE deleted_at IS NULL AND (name ILIKE $1 OR phone LIKE $1 OR email ILIKE $1)`;
+    } else {
+      where = ` WHERE deleted_at IS NULL`;
     }
     const countParams = [...params];
     params.push(25, (safePage - 1) * 25);
@@ -706,7 +766,7 @@ router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
 router.get('/patients/:id', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, medical_history, created_at, updated_at FROM patients WHERE id=$1`,
+      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, dental_history as medical_history, created_at, updated_at FROM patients WHERE id=$1`,
       [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
@@ -730,7 +790,7 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     const r = await tenantQuery(s, `
       UPDATE patients SET
         name='[Deleted]', email=NULL, date_of_birth=NULL, gender=NULL,
-        medical_history='{}', updated_at=NOW()
+        dental_history='{}', updated_at=NOW()
       WHERE id=$1 RETURNING id
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
@@ -740,45 +800,8 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-// ── ANALYTICS ─────────────────────────────────────────────────
-router.get('/analytics', analyticsLimiter, async (req, res) => {
-  try {
-    const s = req.tenant.schema_name;
-    // Clamp days to safe range
-    const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
-    const [byDay, byDoctor, byStatus, byDept] = await Promise.all([
-      tenantQuery(s, `
-        SELECT appointment_date::text as date, COUNT(*) as count
-        FROM appointments
-        WHERE appointment_date >= CURRENT_DATE - ($1 || ' days')::INTERVAL
-        GROUP BY appointment_date ORDER BY appointment_date
-      `, [d]),
-      tenantQuery(s, `
-        SELECT d.name, COUNT(a.id) as count, SUM(d.consultation_fee) as revenue
-        FROM appointments a JOIN doctors d ON d.id=a.doctor_id
-        WHERE a.created_at >= NOW() - ($1 || ' days')::INTERVAL AND a.status='confirmed'
-        GROUP BY d.name ORDER BY count DESC LIMIT 10
-      `, [d]),
-      tenantQuery(s, `
-        SELECT status, COUNT(*) as count FROM appointments
-        WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL GROUP BY status
-      `, [d]),
-      tenantQuery(s, `
-        SELECT dep.name, COUNT(a.id) as count FROM appointments a
-        JOIN doctors d ON d.id=a.doctor_id
-        LEFT JOIN departments dep ON dep.id=d.department_id
-        WHERE a.created_at >= NOW() - ($1 || ' days')::INTERVAL
-        GROUP BY dep.name ORDER BY count DESC
-      `, [d]),
-    ]);
-    res.json({
-      by_day: byDay.rows,
-      by_doctor: byDoctor.rows,
-      by_status: byStatus.rows,
-      by_department: byDept.rows,
-    });
-  } catch (err) { handleError(res, err); }
-});
+// Analytics routes are handled by routes/analytics.js (mounted before this router).
+// They are not duplicated here.
 
 // ── SLOTS ─────────────────────────────────────────────────────
 router.get('/slots', async (req, res) => {
@@ -1104,6 +1127,10 @@ router.get('/feedback', async (req, res) => {
     const { page = 1, limit = 25, doctor_id, min_rating, max_rating } = req.query;
     const safeLimit = Math.min(Math.max(parseInt(limit) || 25, 1), 100);
     const offset = (Math.max(parseInt(page) || 1, 1) - 1) * safeLimit;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (doctor_id && !UUID_RE.test(doctor_id)) {
+      return res.status(400).json({ error: 'Invalid doctor_id format' });
+    }
     const where = ['1=1'];
     const params = [];
     if (doctor_id) { params.push(doctor_id); where.push(`a.doctor_id=$${params.length}`); }
@@ -1136,43 +1163,6 @@ router.get('/feedback', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-// ── ANALYTICS SUMMARY ─────────────────────────────────────────
-router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
-  try {
-    const s = req.tenant.schema_name;
-    // Clamp days to safe range
-    const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
-    const [rev, noShow, total, feedbackAvg] = await Promise.allSettled([
-      tenantQuery(s, `
-        SELECT COALESCE(SUM(doc.consultation_fee), 0) as revenue
-        FROM appointments a JOIN doctors doc ON doc.id=a.doctor_id
-        WHERE a.status IN ('confirmed','completed')
-          AND a.created_at >= NOW() - ($1 || ' days')::INTERVAL
-      `, [d]),
-      tenantQuery(s, `
-        SELECT
-          COUNT(*) FILTER (WHERE status='no_show') as no_show_count,
-          COUNT(*) as total_count
-        FROM appointments
-        WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
-      `, [d]),
-      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL`, [d]),
-      tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg FROM appointment_feedback`),
-    ]);
-    const safeVal = (r, fn) => r.status === 'fulfilled' ? fn(r.value.rows[0]) : null;
-    const ns = noShow.status === 'fulfilled' ? noShow.value.rows[0] : null;
-    const noShowRate = ns && parseInt(ns.total_count) > 0
-      ? Math.round((parseInt(ns.no_show_count) / parseInt(ns.total_count)) * 100)
-      : 0;
-    res.json({
-      revenue: safeVal(rev, r => parseInt(r?.revenue) || 0) ?? 0,
-      no_show_rate: noShowRate,
-      no_show_count: ns ? parseInt(ns.no_show_count) : 0,
-      total_appointments: safeVal(total, r => parseInt(r?.count) || 0) ?? 0,
-      avg_feedback_rating: safeVal(feedbackAvg, r => r?.avg ? parseFloat(r.avg) : null),
-    });
-  } catch (err) { handleError(res, err); }
-});
 
 // ── DOCTOR LEAVES ─────────────────────────────────────────────
 router.get('/doctors/:id/leaves', validateUUID(), async (req, res) => {
@@ -1232,7 +1222,7 @@ router.delete('/doctors/:id/leaves/:date', adminOnly, validateUUID(), async (req
 router.get('/patients/:id/medical-history', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, medical_history FROM patients WHERE id=$1`, [req.params.id]);
+      `SELECT id, name, phone, dental_history as medical_history FROM patients WHERE id=$1`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
   } catch (err) { handleError(res, err); }
@@ -1246,7 +1236,7 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
     }
     const s = req.tenant.schema_name;
     const r = await tenantQuery(s,
-      `UPDATE patients SET medical_history=$1, updated_at=NOW() WHERE id=$2 RETURNING id, name, medical_history`,
+      `UPDATE patients SET dental_history=$1, updated_at=NOW() WHERE id=$2 RETURNING id, name, dental_history as medical_history`,
       [JSON.stringify(medical_history), req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_MEDICAL_HISTORY', 'patient', req.params.id,
@@ -1255,26 +1245,6 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
   } catch (err) { handleError(res, err); }
 });
 
-// ── SLOT HEATMAP ───────────────────────────────────────────────
-router.get('/analytics/heatmap', analyticsLimiter, async (req, res) => {
-  try {
-    const s = req.tenant.schema_name;
-    const d = Math.min(Math.max(parseInt(req.query.days) || 30, 7), 90);
-    // Count bookings grouped by hour-of-day and day-of-week
-    const r = await tenantQuery(s, `
-      SELECT
-        EXTRACT(DOW FROM appointment_date)::int as day_of_week,
-        EXTRACT(HOUR FROM appointment_time)::int as hour,
-        COUNT(*) as count
-      FROM appointments
-      WHERE appointment_date >= CURRENT_DATE - ($1 || ' days')::INTERVAL
-        AND status IN ('confirmed', 'completed')
-      GROUP BY day_of_week, hour
-      ORDER BY day_of_week, hour
-    `, [d]);
-    res.json({ heatmap: r.rows });
-  } catch (err) { handleError(res, err); }
-});
 
 // ── ONBOARDING ────────────────────────────────────────────────
 router.get('/onboarding/status', async (req, res) => {
@@ -1368,10 +1338,11 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
 
     // Release slots back to available if bulk-cancelling
     if (status === 'cancelled') {
+      const slotPlaceholders = ids.map((_, i) => `$${i + 1}`).join(',');
       await tenantQuery(s,
         `UPDATE time_slots SET status='available'
-         WHERE id IN (
-           SELECT slot_id FROM appointments WHERE id IN (${placeholders})
+         WHERE status='booked' AND id IN (
+           SELECT slot_id FROM appointments WHERE id IN (${slotPlaceholders})
          )`,
         ids);
     }

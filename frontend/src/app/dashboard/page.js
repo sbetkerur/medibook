@@ -270,14 +270,14 @@ export default function Dashboard() {
     const token = localStorage.getItem('token');
     const u = localStorage.getItem('user');
     if (!token) { router.push('/login'); return; }
-    setUser(u ? JSON.parse(u) : {});
+    try { setUser(u ? JSON.parse(u) : {}); } catch { setUser({}); }
     fetchStats();
     fetchAnalyticsSummary();
     fetchOnboarding();
 
-    // Session timeout warning: fire 1 hour before JWT expires (at 23h)
+    // Session timeout warning: fires 5 minutes before JWT expires
     const onSessionWarning = (e) => {
-      toast(`Your session expires in ${e.detail?.minutesLeft || 60} minutes. Save your work.`, {
+      toast(`Your session expires in ${e.detail?.minutesLeft || 5} minutes. Save your work.`, {
         icon: '⏳',
         duration: 10000,
         style: { background: '#fef3c7', color: '#92400e', border: '1px solid #f59e0b' },
@@ -307,23 +307,6 @@ export default function Dashboard() {
     es.onerror = () => {}; // silent reconnect handled by browser
 
     // ── Keyboard shortcuts ────────────────────────────────────────
-    const onKeyDown = (e) => {
-      // Ignore when typing in an input/textarea
-      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
-      const map = {
-        'g o': 'overview', 'g a': 'appointments', 'g d': 'doctors',
-        'g p': 'patients', 'g n': 'analytics', 'g s': 'settings',
-        'g t': 'test', 'g l': 'audit',
-      };
-      // Single-key shortcuts
-      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
-        if (e.key === '?') {
-          toast('Keyboard shortcuts: g+o Overview · g+a Appointments · g+d Doctors · g+p Patients · g+s Settings · g+t Bot Tester', {
-            duration: 6000, icon: '⌨️',
-          });
-        }
-      }
-    };
     let gPressed = false;
     let gTimer = null;
     const onKeyDownG = (e) => {
@@ -345,6 +328,7 @@ export default function Dashboard() {
       window.removeEventListener('medibook:session-warning', onSessionWarning);
       window.removeEventListener('keydown', onKeyDownG);
       clearTimeout(gTimer);
+      clearSessionTimers();
       es.close();
     };
   }, []);
@@ -555,7 +539,7 @@ export default function Dashboard() {
     try {
       const startDate = `${year}-${String(month + 1).padStart(2, '0')}-01`;
       const endDate = `${year}-${String(month + 1).padStart(2, '0')}-${new Date(year, month + 1, 0).getDate()}`;
-      const { data } = await api.get(`/admin/appointments?date=&limit=200&page=1`);
+      const { data } = await api.get(`/admin/appointments?from=${startDate}&to=${endDate}&limit=200&page=1`);
       // Group by date
       const byDate = {};
       (data.appointments || []).forEach(a => {
@@ -1300,6 +1284,7 @@ export default function Dashboard() {
     try { await api.post('/auth/logout'); } catch (_) {}
     clearSessionTimers();
     localStorage.clear();
+    delete api.defaults.headers.common.Authorization;
     router.push('/login');
   }
 

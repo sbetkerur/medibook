@@ -45,9 +45,9 @@ async function sendReminders() {
         LEFT JOIN departments dep ON dep.id=d.department_id
         WHERE a.status='confirmed'
           AND a.reminder_24h_sent=false
-          AND a.appointment_date = (CURRENT_DATE + ($1 || ' hours')::INTERVAL)::DATE
+          AND a.appointment_date = ((NOW() AT TIME ZONE $2) + make_interval(hours => $1::int))::DATE
           AND p.opted_out IS NOT TRUE
-      `, [String(hours24)]);
+      `, [String(hours24), TIMEZONE]);
 
       for (const appt of r24.rows) {
         try {
@@ -105,22 +105,11 @@ async function sendReminders() {
 
     // ── 2-HOUR REMINDERS ────────────────────────────────────
     if (reminder2hEnabled) {
-      // Compute current time in the configured timezone in JS and pass as a
-      // parameterized value — avoids interpolating TIMEZONE into the SQL string.
-      // IMPORTANT: use the real UTC timestamp (new Date()) as the base for both
-      // nowInTz and the custom-hours-ahead calculation. Using nowInTz.getTime() would
-      // be wrong because toZonedTime() shifts the internal timestamp by the UTC
-      // offset so that format() reads the right local time — applying toZonedTime
-      // again to that already-shifted value double-counts the offset.
-      const nowUTC = new Date();
-      const nowInTz = toZonedTime(nowUTC, TIMEZONE);
-      const nowTimeStr = format(nowInTz, 'HH:mm:ss');
-      // Compute the threshold ahead in JS to avoid TIME - INTERVAL underflowing
-      // past midnight (e.g. 01:00 - 2h = 23:00 yesterday, which PostgreSQL time
-      // arithmetic handles incorrectly for our purposes).
-      const customHoursAheadInTz = toZonedTime(new Date(nowUTC.getTime() + hours2 * 60 * 60 * 1000), TIMEZONE);
-      const customHoursAheadStr = format(customHoursAheadInTz, 'HH:mm:ss');
-
+      // Combine appointment_date + appointment_time into a timezone-aware timestamp
+      // and compare against UTC NOW(). This correctly handles windows that cross
+      // midnight — e.g. nowTime=23:00 IST, windowEnd=01:00 IST next day — where the
+      // old TIME-only comparison (appointment_time > '23:00' AND <= '01:00') is always
+      // false and silently skips all reminders for late-evening appointments.
       const r2 = await tenantQuery(tenant.schema_name, `
         SELECT a.id, a.booking_id, a.appointment_time,
                p.phone, p.name as patient_name, d.name as doctor_name,
@@ -131,11 +120,10 @@ async function sendReminders() {
         LEFT JOIN departments dep ON dep.id=d.department_id
         WHERE a.status='confirmed'
           AND a.reminder_2h_sent=false
-          AND a.appointment_date = CURRENT_DATE
-          AND a.appointment_time <= $2::time
-          AND a.appointment_time > $1::time
+          AND timezone($1, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '00:00:00'))::timestamp)
+              BETWEEN NOW() AND NOW() + ($2 || ' hours')::interval
           AND p.opted_out IS NOT TRUE
-      `, [nowTimeStr, customHoursAheadStr]);
+      `, [TIMEZONE, String(hours2)]);
 
       for (const appt of r2.rows) {
         try {
@@ -222,36 +210,37 @@ async function handleReminderConfirmation(schemaName, phone, text) {
 async function sendPostAppointmentFollowup() {
   await forEachActiveTenantParallel('sendPostApptFollowup', async (tenant) => {
     if (!tenant.wa_access_token_enc || !tenant.wa_phone_number_id) return;
-    // Check feature flag
+    // Check feature flag — default to disabled on error so we don't spam tenants
+    // who haven't opted in
     try {
       const { isEnabled } = require('../utils/featureFlags');
       if (!await isEnabled(tenant.id, 'post_appointment_followup')) return;
-    } catch (_) {}
+    } catch (flagErr) {
+      logger.warn('Feature flag check failed for post_appointment_followup — skipping tenant', {
+        tenant_id: tenant.id, error: flagErr.message,
+      });
+      return;
+    }
 
     const waToken = decrypt(tenant.wa_access_token_enc);
     const waPhoneId = tenant.wa_phone_number_id;
     if (!waToken) return;
 
-    const nowUTC = new Date();
-    // Find appointments that ended 1-2 hours ago (send follow-up within this window)
-    const oneHourAgoInTz = toZonedTime(new Date(nowUTC.getTime() - 60 * 60 * 1000), TIMEZONE);
-    const oneHourAgoStr = format(oneHourAgoInTz, 'HH:mm:ss');
-    const twoHoursAgoInTz = toZonedTime(new Date(nowUTC.getTime() - 2 * 60 * 60 * 1000), TIMEZONE);
-    const twoHoursAgoStr = format(twoHoursAgoInTz, 'HH:mm:ss');
-
+    // Use timezone-aware comparison for the same midnight-crossing reason as the 2h
+    // reminder above: time-only comparison fails when the 1–2 hour window straddles
+    // midnight (e.g. it is 01:30 IST, so 1h-ago = 00:30 and 2h-ago = 23:30).
     const appts = await tenantQuery(tenant.schema_name, `
       SELECT a.id, a.booking_id, p.phone, p.name as patient_name, d.name as doctor_name
       FROM appointments a
       JOIN patients p ON p.id = a.patient_id
       JOIN doctors d ON d.id = a.doctor_id
       WHERE a.status = 'confirmed'
-        AND a.appointment_date = CURRENT_DATE
-        AND a.appointment_time <= $1::time
-        AND a.appointment_time > $2::time
+        AND timezone($1, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '00:00:00'))::timestamp)
+            BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'
         AND a.follow_up_sent IS NOT TRUE
         AND p.opted_out IS NOT TRUE
-      LIMIT 20
-    `, [oneHourAgoStr, twoHoursAgoStr]);
+      LIMIT $2
+    `, [TIMEZONE, FEEDBACK_BATCH_LIMIT]);
 
     for (const appt of appts.rows) {
       try {
@@ -355,7 +344,7 @@ async function sendWeeklyDigests() {
                COUNT(*) FILTER (WHERE a.status='completed')::int AS completed,
                COUNT(*) FILTER (WHERE a.status='no_show')::int AS no_show,
                COUNT(*) FILTER (WHERE a.status='cancelled')::int AS cancelled,
-               COALESCE(SUM(d.consultation_fee) FILTER (WHERE a.status IN ('confirmed','completed')), 0)::int AS revenue
+               COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)) FILTER (WHERE a.status IN ('confirmed','completed')), 0)::int AS revenue
         FROM appointments a JOIN doctors d ON d.id=a.doctor_id
         WHERE a.appointment_date BETWEEN $1 AND $2
         GROUP BY d.name ORDER BY total DESC
@@ -458,5 +447,7 @@ module.exports = {
   startReminderCron,
   sendReminders,
   sendFeedbackRequests,
+  sendPostAppointmentFollowup,
+  sendWeeklyDigests,
   handleReminderConfirmation,
 };

@@ -22,25 +22,26 @@ router.get('/analytics', analyticsLimiter, async (req, res) => {
     const [byDay, byDoctor, byStatus, byDept] = await Promise.all([
       tenantQuery(s, `
         SELECT appointment_date::text as date, COUNT(*) as count
-        FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1 || ' days')::INTERVAL
+        FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+          AND status IN ('confirmed', 'completed')
         GROUP BY appointment_date ORDER BY appointment_date
       `, [d]),
       tenantQuery(s, `
-        SELECT d.name, COUNT(a.id) as count, SUM(d.consultation_fee) as revenue, d.no_show_score
+        SELECT d.name, COUNT(a.id) as count, SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)) as revenue
         FROM appointments a JOIN doctors d ON d.id=a.doctor_id
-        WHERE a.created_at >= NOW() - ($1 || ' days')::INTERVAL AND a.status='confirmed'
-        GROUP BY d.name, d.no_show_score ORDER BY count DESC LIMIT 10
+        WHERE a.appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL AND a.status IN ('confirmed', 'completed')
+        GROUP BY d.name ORDER BY count DESC LIMIT 10
       `, [d]),
       tenantQuery(s, `
         SELECT status, COUNT(*) as count FROM appointments
-        WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL GROUP BY status
+        WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL GROUP BY status
       `, [d]),
       tenantQuery(s, `
-        SELECT dep.name, COUNT(a.id) as count FROM appointments a
+        SELECT COALESCE(dep.name, 'General') as name, COUNT(a.id) as count FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=d.department_id
-        WHERE a.created_at >= NOW() - ($1 || ' days')::INTERVAL
-        GROUP BY dep.name ORDER BY count DESC
+        WHERE a.appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+        GROUP BY COALESCE(dep.name, 'General') ORDER BY count DESC
       `, [d]),
     ]);
     res.json({ by_day: byDay.rows, by_doctor: byDoctor.rows, by_status: byStatus.rows, by_department: byDept.rows });
@@ -54,16 +55,17 @@ router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
     const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
     const [rev, noShow, total, feedbackAvg] = await Promise.allSettled([
       tenantQuery(s, `
-        SELECT COALESCE(SUM(doc.consultation_fee), 0) as revenue
+        SELECT COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), doc.consultation_fee)), 0) as revenue
         FROM appointments a JOIN doctors doc ON doc.id=a.doctor_id
-        WHERE a.status IN ('confirmed','completed') AND a.created_at >= NOW() - ($1 || ' days')::INTERVAL
+        WHERE a.status IN ('confirmed','completed')
+          AND a.appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
       `, [d]),
       tenantQuery(s, `
         SELECT COUNT(*) FILTER (WHERE status='no_show') as no_show_count, COUNT(*) as total_count
-        FROM appointments WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
+        FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
       `, [d]),
-      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL`, [d]),
-      tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg FROM appointment_feedback`),
+      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL`, [d]),
+      tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg FROM appointment_feedback WHERE created_at >= NOW() - ($1::text || ' days')::INTERVAL`, [d]),
     ]);
     const safeVal = (r, fn) => r.status === 'fulfilled' ? fn(r.value.rows[0]) : null;
     const ns = noShow.status === 'fulfilled' ? noShow.value.rows[0] : null;
@@ -91,7 +93,7 @@ router.get('/analytics/heatmap', analyticsLimiter, async (req, res) => {
         EXTRACT(HOUR FROM appointment_time)::int as hour,
         COUNT(*) as count
       FROM appointments
-      WHERE appointment_date >= CURRENT_DATE - ($1 || ' days')::INTERVAL
+      WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
         AND status IN ('confirmed', 'completed')
       GROUP BY day_of_week, hour ORDER BY day_of_week, hour
     `, [d]);
@@ -109,7 +111,7 @@ router.get('/analytics/revenue', analyticsLimiter, async (req, res) => {
         SELECT TO_CHAR(DATE_TRUNC('month', a.appointment_date), 'Mon YYYY') AS month,
                DATE_TRUNC('month', a.appointment_date) AS month_date,
                COUNT(*)::int AS appointments,
-               COALESCE(SUM(d.consultation_fee), 0)::int AS revenue
+               COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)), 0)::int AS revenue
         FROM appointments a JOIN doctors d ON d.id=a.doctor_id
         WHERE a.status IN ('confirmed','completed')
           AND a.appointment_date >= CURRENT_DATE - ($1 * INTERVAL '1 month')
@@ -117,21 +119,21 @@ router.get('/analytics/revenue', analyticsLimiter, async (req, res) => {
         ORDER BY month_date
       `, [months]),
       tenantQuery(s, `
-        SELECT dep.name AS category,
+        SELECT COALESCE(dep.name, 'General') AS category,
                COUNT(*)::int AS appointments,
-               COALESCE(SUM(d.consultation_fee), 0)::int AS revenue
+               COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)), 0)::int AS revenue
         FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=d.department_id
         WHERE a.status IN ('confirmed','completed')
           AND a.appointment_date >= CURRENT_DATE - ($1 * INTERVAL '1 month')
-        GROUP BY dep.name ORDER BY revenue DESC
+        GROUP BY COALESCE(dep.name, 'General') ORDER BY revenue DESC
       `, [months]),
       tenantQuery(s, `
         SELECT d.name AS doctor_name,
                COALESCE(dep.name, d.specialization, 'General') AS specialization,
                COUNT(*)::int AS appointments,
-               COALESCE(SUM(d.consultation_fee), 0)::int AS revenue
+               COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)), 0)::int AS revenue
         FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=d.department_id
@@ -198,7 +200,7 @@ router.get('/analytics/cohorts', analyticsLimiter, async (req, res) => {
           COUNT(a.id) FILTER (WHERE a.status = 'completed')::int as completed
         FROM appointments a
         JOIN patients p ON p.id = a.patient_id
-        WHERE a.created_at >= NOW() - ($1 || ' days')::INTERVAL
+        WHERE a.created_at >= NOW() - ($1::text || ' days')::INTERVAL
         GROUP BY COALESCE(p.patient_type, 'new')
       `, [d]),
       tenantQuery(s, `
@@ -206,7 +208,7 @@ router.get('/analytics/cohorts', analyticsLimiter, async (req, res) => {
           COUNT(DISTINCT CASE WHEN p.visit_count = 1 THEN p.id END)::int as new_patients,
           COUNT(DISTINCT CASE WHEN p.visit_count > 1 THEN p.id END)::int as returning_patients
         FROM patients p
-        WHERE p.created_at >= NOW() - ($1 || ' days')::INTERVAL
+        WHERE p.created_at >= NOW() - ($1::text || ' days')::INTERVAL
       `, [d]),
       tenantQuery(s, `
         SELECT
@@ -237,6 +239,7 @@ router.get('/analytics/export', analyticsLimiter, async (req, res) => {
 
     let rows = [];
     let headers = [];
+    let keys = []; // explicit column order — avoids relying on Object.values() insertion order
     let filename = '';
 
     if (type === 'appointments') {
@@ -250,12 +253,13 @@ router.get('/analytics/export', analyticsLimiter, async (req, res) => {
         JOIN patients p ON p.id = a.patient_id
         JOIN doctors d ON d.id = a.doctor_id
         JOIN hospitals h ON h.id = a.hospital_id
-        WHERE a.created_at >= NOW() - ($1 || ' days')::INTERVAL
+        WHERE a.created_at >= NOW() - ($1::text || ' days')::INTERVAL
         ORDER BY a.appointment_date DESC, a.appointment_time DESC
         LIMIT 10000
       `, [d]);
       rows = r.rows;
       headers = ['Booking ID','Patient','Phone','Doctor','Hospital','Date','Time','Status','Type','Fee','Payment Status','Created At'];
+      keys = ['booking_id','patient_name','patient_phone','doctor_name','hospital_name','appointment_date','appointment_time','status','visit_type','effective_fee','payment_status','created_at'];
       filename = `appointments_${d}d`;
     } else if (type === 'patients') {
       const r = await tenantQuery(s, `
@@ -269,6 +273,7 @@ router.get('/analytics/export', analyticsLimiter, async (req, res) => {
       `);
       rows = r.rows;
       headers = ['Name','Phone','Email','Gender','Date of Birth','Total Visits','Type','Joined'];
+      keys = ['name','phone','email','gender','date_of_birth','visit_count','patient_type','created_at'];
       filename = `patients`;
     } else {
       return res.status(400).json({ error: 'Invalid type. Use: appointments, patients' });
@@ -276,13 +281,17 @@ router.get('/analytics/export', analyticsLimiter, async (req, res) => {
 
     if (format === 'csv') {
       const escape = (v) => {
-        const s = String(v ?? '');
+        let s = String(v ?? '');
+        // Trim leading whitespace before formula-char check — " =foo" bypasses a
+        // leading-char test but Excel still evaluates it as a formula after trimming.
+        const trimmed = s.trimStart();
+        if (trimmed.length > 0 && '=+-@\t\r'.includes(trimmed[0])) s = "'" + s;
         return s.includes(',') || s.includes('"') || s.includes('\n')
           ? `"${s.replace(/"/g, '""')}"` : s;
       };
       const csvLines = [
         headers.join(','),
-        ...rows.map(r => Object.values(r).map(escape).join(',')),
+        ...rows.map(r => keys.map(k => escape(r[k])).join(',')),
       ];
       res.setHeader('Content-Type', 'text/csv');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
@@ -295,7 +304,9 @@ router.get('/analytics/export', analyticsLimiter, async (req, res) => {
 });
 
 // ── GOOGLE SHEETS WEBHOOK PUSH ────────────────────────────────
-router.post('/admin/settings/sheets-webhook', async (req, res) => {
+// Route is mounted at /api/admin — path must be /settings/sheets-webhook
+// (not /admin/settings/sheets-webhook which would produce /api/admin/admin/...)
+router.post('/settings/sheets-webhook', async (req, res) => {
   try {
     const { url } = req.body;
     if (!url || typeof url !== 'string' || !url.startsWith('https://')) {

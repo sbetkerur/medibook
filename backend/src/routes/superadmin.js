@@ -3,7 +3,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { query, tenantQuery } = require('../db');
-const { createTenantSchema } = require('../db/tenantMigrate');
+const { createTenantSchema, runTenantMigrations } = require('../db/tenantMigrate');
 const { authMiddleware, invalidateTenantCache } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
 const { encrypt } = require('../utils/encryption');
@@ -195,6 +195,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
     const effectivePassword = owner_password || crypto.randomBytes(8).toString('hex');
     try {
       await createTenantSchema(schema);
+      await runTenantMigrations(schema);
 
       const hash = await bcrypt.hash(effectivePassword, 12);
       await tenantQuery(schema, `
@@ -229,6 +230,10 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
       message: 'Tenant created successfully'
     });
   } catch (err) {
+    // 23505 = unique_violation — slug or schema_name already exists (TOCTOU race)
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Slug already taken' });
+    }
     handleError(res, err, 'POST /superadmin/tenants');
   }
 });
@@ -279,6 +284,7 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
       `UPDATE tenants SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`,
       params
     );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
 
     // Log plan change for billing dashboard (Enhancement 13)
     if (plan && oldPlan && plan !== oldPlan) {

@@ -2,7 +2,7 @@
 
 const wa = require('./whatsapp');
 const { decrypt } = require('../utils/encryption');
-const { tenantQuery, tenantTransaction } = require('../db');
+const { tenantQuery } = require('../db');
 const logger = require('../utils/logger');
 const { format, parseISO, addDays: _addDays } = require('date-fns');
 const { toZonedTime: _toZonedTime } = require('date-fns-tz');
@@ -249,10 +249,11 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   }
 
   // ── FEEDBACK FLOW ────────────────────────────────────────────
-  if (session.state === STATES.COLLECT_FEEDBACK_RATING) {
+  // Greetings (Hi/Hello/Menu) escape feedback state so patients don't get stuck.
+  if (!isGreeting && session.state === STATES.COLLECT_FEEDBACK_RATING) {
     return handleFeedbackRating(phone, schema, send, ctx, choice, input);
   }
-  if (session.state === STATES.COLLECT_FEEDBACK_COMMENT) {
+  if (!isGreeting && session.state === STATES.COLLECT_FEEDBACK_COMMENT) {
     return handleFeedbackComment(phone, schema, send, ctx, input);
   }
 
@@ -310,11 +311,11 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
 
   // ── MAIN MENU ────────────────────────────────────────────────
   if (session.state === STATES.MAIN_MENU) {
-    if (/book|btn_0/i.test(choice) || choice === '1') {
+    if (/\bbook\b|btn_0/i.test(choice) || choice === '1') {
       const intents = detectIntent(input);
       return startBooking(phone, schema, tenant, send, intents ? { ...ctx, ...intents } : ctx);
     }
-    if (/appointment|my|btn_1/i.test(choice) || choice === '2') {
+    if (/\bappointment\b|\bmy\b|btn_1/i.test(choice) || choice === '2') {
       return showMyAppointments(phone, schema, tenant, send);
     }
     if (/status|check|btn_2/i.test(choice) || choice === '3') {
@@ -424,7 +425,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     return;
   }
   if (session.state === STATES.COLLECT_EMAIL) {
-    if (!/skip/i.test(input) && input.length > 0) {
+    if (!/^skip$/i.test(input) && input.length > 0) {
       // Stricter email regex: requires valid local part, domain with at least one dot,
       // and a TLD of 2+ chars. Rejects `test@.com`, `a@b.c`, consecutive dots in domain.
       if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(input) && !/\.{2,}/.test(input)) {

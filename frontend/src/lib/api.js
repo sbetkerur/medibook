@@ -73,6 +73,7 @@ api.interceptors.response.use(
 
       try {
         const { data } = await axios.post(`${API_URL}/api/auth/refresh`, { refresh_token: refreshToken });
+        if (!data.token) throw new Error('Refresh response missing token');
         localStorage.setItem('token', data.token);
         if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
         resetSessionTimers();
@@ -88,6 +89,7 @@ api.interceptors.response.use(
         localStorage.removeItem('token');
         localStorage.removeItem('refresh_token');
         localStorage.removeItem('user');
+        delete api.defaults.headers.common.Authorization;
         window.location.href = '/login';
         return Promise.reject(refreshErr);
       } finally {
@@ -119,8 +121,10 @@ let _expireTimer = null;
 
 function parseTokenExp(token) {
   try {
-    // JWT payload is the second base64url segment
-    const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    // JWT payload is the second base64url segment. Restore padding stripped by base64url encoding.
+    const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    const payload = JSON.parse(atob(padded));
     return typeof payload.exp === 'number' ? payload.exp * 1000 : null; // convert to ms
   } catch (_) {
     return null;
@@ -142,13 +146,16 @@ export function resetSessionTimers() {
   const msUntilExpiry = expMs - now;
   if (msUntilExpiry <= 0) return; // already expired
 
-  // Warn 60 minutes before actual token expiry
-  const msUntilWarn = msUntilExpiry - 60 * 60 * 1000;
+  // Warn 5 minutes before actual token expiry.
+  // A 60-minute threshold was previously used, but access tokens expire in 1h,
+  // so msUntilExpiry − 3600000 ≤ 0 immediately after login and the timer never fired.
+  const WARN_BEFORE_MS = 5 * 60 * 1000; // 5 minutes
+  const msUntilWarn = msUntilExpiry - WARN_BEFORE_MS;
   if (msUntilWarn > 0) {
     _warnTimer = setTimeout(() => {
       // Dispatch a custom event; dashboard listens and shows a toast
       window.dispatchEvent(new CustomEvent('medibook:session-warning', {
-        detail: { minutesLeft: 60 }
+        detail: { minutesLeft: 5 }
       }));
     }, msUntilWarn);
   }

@@ -449,7 +449,7 @@ async function runTenantMigrations(schemaName) {
         IF NOT EXISTS (
           SELECT 1 FROM pg_constraint
           WHERE conname = 'uq_feedback_appointment'
-            AND conrelid = ('"${schemaName}".appointment_feedback')::regclass
+            AND conrelid = 'appointment_feedback'::regclass
         ) THEN
           ALTER TABLE appointment_feedback ADD CONSTRAINT uq_feedback_appointment UNIQUE (appointment_id);
         END IF;
@@ -479,7 +479,7 @@ async function runTenantMigrations(schemaName) {
         IF NOT EXISTS (
           SELECT 1 FROM pg_constraint
           WHERE conname = 'uq_waiting_list_patient_doctor'
-            AND conrelid = ('"${schemaName}".waiting_list')::regclass
+            AND conrelid = 'waiting_list'::regclass
         ) THEN
           ALTER TABLE waiting_list ADD CONSTRAINT uq_waiting_list_patient_doctor UNIQUE (patient_id, doctor_id);
         END IF;
@@ -565,7 +565,7 @@ async function runTenantMigrations(schemaName) {
     await client.query(`
       CREATE TABLE IF NOT EXISTS reminder_confirmations (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        appointment_id UUID REFERENCES appointments(id) ON DELETE CASCADE,
+        appointment_id UUID REFERENCES appointments(id) ON DELETE CASCADE UNIQUE,
         phone VARCHAR(20) NOT NULL,
         response VARCHAR(10),
         responded_at TIMESTAMPTZ,
@@ -574,6 +574,25 @@ async function runTenantMigrations(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_reminder_conf_appt ON reminder_confirmations(appointment_id);
       CREATE INDEX IF NOT EXISTS idx_reminder_conf_phone ON reminder_confirmations(phone);
     `);
+
+    // Backfill UNIQUE constraint on appointment_id for existing reminder_confirmations tables
+    // (tables created before the UNIQUE was added). ON CONFLICT (appointment_id) requires it.
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'reminder_confirmations_appointment_id_key'
+            AND conrelid = 'reminder_confirmations'::regclass
+        ) THEN
+          DELETE FROM reminder_confirmations rc1
+          USING reminder_confirmations rc2
+          WHERE rc1.created_at < rc2.created_at
+            AND rc1.appointment_id = rc2.appointment_id;
+          ALTER TABLE reminder_confirmations
+            ADD CONSTRAINT reminder_confirmations_appointment_id_key UNIQUE (appointment_id);
+        END IF;
+      END $$;
+    `).catch(() => {});
 
     // Department pre-visit checklist
     await client.query(`

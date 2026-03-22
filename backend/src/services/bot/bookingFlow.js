@@ -91,7 +91,18 @@ async function showDepartments(phone, schema, send, ctx) {
 }
 
 async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input) {
-  const depts = ctx._depts || [];
+  let depts = ctx._depts || [];
+  // Re-fetch from DB if cache is missing (e.g. session resumed after expiry).
+  // Without this, a stale empty _depts leaves the user permanently stuck.
+  if (!depts.length && ctx.hospital_id) {
+    const r = await tenantQuery(schema,
+      `SELECT DISTINCT d.id, d.name FROM departments d
+       JOIN doctors doc ON doc.department_id=d.id
+       WHERE d.hospital_id=$1 AND d.is_active=true AND doc.is_active=true
+       ORDER BY d.name`, [ctx.hospital_id]);
+    depts = r.rows;
+    ctx._depts = depts;
+  }
   const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input);
   if (!dept) { await send.text('Please select a treatment from the options.'); return; }
 
@@ -171,12 +182,12 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       )
       AND NOT EXISTS (
         SELECT 1 FROM clinic_holidays ch
-        WHERE ch.holiday_date = slot_date
+        WHERE ch.holiday_date = slot_date AND (ch.hospital_id = $4 OR ch.hospital_id IS NULL)
       )
     GROUP BY slot_date
     ORDER BY slot_date
     LIMIT 7
-  `, [doc.id, todayStr, endStr]);
+  `, [doc.id, todayStr, endStr, ctx.hospital_id]);
 
   const dates = datesResult.rows.map(r => ({
     date: r.date,
@@ -185,9 +196,12 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   }));
 
   if (!dates.length) {
+    // Both options reset to IDLE (which shows the main menu on next message),
+    // so the buttons both say "Main Menu" / "Book Again" to avoid implying
+    // the user can directly re-select a dentist without going through the menu.
     await send.buttons(
-      `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nPlease choose a different dentist or try again later.`,
-      ['🔙 Choose Another Dentist', '🏠 Main Menu']
+      `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nPlease try a different dentist or check back later.`,
+      ['📅 Book Again', '🏠 Main Menu']
     );
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
@@ -228,12 +242,12 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
           SELECT 1 FROM doctor_leaves dl WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
         )
         AND NOT EXISTS (
-          SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date
+          SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date AND (ch.hospital_id = $3 OR ch.hospital_id IS NULL)
         )
       GROUP BY slot_date
       ORDER BY slot_date
       LIMIT 3
-    `, [ctx.doctor_id, choice]);
+    `, [ctx.doctor_id, choice, ctx.hospital_id]);
 
     if (nextDateR.rows.length) {
       const suggestions = nextDateR.rows.map(r => {
@@ -342,6 +356,16 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
 
 async function completeBooking(phone, schema, tenant, send, ctx) {
   const { LIMITS } = require('../../utils/errors');
+
+  // Guard: validate schema name before using it in a raw SET LOCAL command.
+  // tenantQuery/tenantTransaction enforce this internally; since completeBooking
+  // uses pool.connect() directly for a custom transaction, we must check here too.
+  if (!schema || !/^tenant_[a-z0-9_]+$/.test(schema)) {
+    logger.error(`completeBooking: invalid schema name "${schema}", aborting booking`);
+    await send.text('Something went wrong with your booking. Please try again.\n\nReply *Hi* to start over.');
+    return;
+  }
+
   // Phone rate limit: max N confirmed bookings per hour (prevents bot flooding)
   try {
     const recentR = await tenantQuery(schema,
@@ -489,6 +513,8 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
             date: dateLabel2,
             time: ctx.appointment_time?.slice(0, 5),
             visitType: ctx.visit_type || 'in_person',
+            patientId,
+            schemaName: schema,
           },
         });
       } catch (emailErr) {

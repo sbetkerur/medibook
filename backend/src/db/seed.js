@@ -1,7 +1,7 @@
 require('dotenv').config();
 const bcrypt = require('bcryptjs');
 const { query, tenantQuery, pool } = require('./index');
-const { createTenantSchema } = require('./tenantMigrate');
+const { createTenantSchema, runTenantMigrations } = require('./tenantMigrate');
 const { addDays, format } = require('date-fns');
 
 async function seed() {
@@ -20,9 +20,11 @@ async function seed() {
     `, [slug, schema]);
     tenant = r.rows[0];
     await createTenantSchema(schema);
+    await runTenantMigrations(schema);
     console.log('✅ Tenant created: Smile Dental Clinic');
   } else {
     await query(`UPDATE tenants SET name='Smile Dental Clinic' WHERE slug=$1`, [slug]);
+    await runTenantMigrations(schema);
     console.log('✅ Tenant name updated to: Smile Dental Clinic');
   }
 
@@ -31,7 +33,7 @@ async function seed() {
   await tenantQuery(schema, `
     INSERT INTO users (email, password_hash, name, role)
     VALUES ('demo@medibook.com', $1, 'Smile Dental Admin', 'admin')
-    ON CONFLICT (email) DO UPDATE SET name='Smile Dental Admin'
+    ON CONFLICT (email) DO UPDATE SET name='Smile Dental Admin', password_hash=EXCLUDED.password_hash
   `, [hash]);
 
   // ── CLINICS (multi-branch dental chain) ──────────────────────
@@ -108,10 +110,12 @@ async function seed() {
       [hospital2.id, name]);
     deptIds2[name] = r.rows[0].id;
   }
-  // Deactivate any old non-dental departments
+  // Deactivate any old non-dental departments (scoped to both known branches only)
   await tenantQuery(schema,
-    `UPDATE departments SET is_active=false WHERE name NOT IN (${deptList.map((_,i)=>`$${i+1}`).join(',')})`,
-    deptList);
+    `UPDATE departments SET is_active=false
+     WHERE hospital_id IN ($${deptList.length+1},$${deptList.length+2})
+       AND name NOT IN (${deptList.map((_,i)=>`$${i+1}`).join(',')})`,
+    [...deptList, hospital.id, hospital2.id]);
   console.log(`✅ ${deptList.length} dental treatment categories — Branch 1`);
   console.log(`✅ ${deptList2.length} dental treatment categories — Branch 2 (KPHB)`);
 
@@ -181,11 +185,13 @@ async function seed() {
       `, [doc.id, dow]);
     }
     // Saturday: working half-day (10AM–1PM, no lunch break)
+    // Explicitly nullify lunch columns so a re-run clears any previously set lunch times for Saturday.
     await tenantQuery(schema, `
       INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working)
       VALUES ($1,6,'10:00','13:00',true)
       ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
-        start_time='10:00', end_time='13:00', is_working=true
+        start_time='10:00', end_time='13:00', is_working=true,
+        lunch_start_time=NULL, lunch_end_time=NULL
     `, [doc.id]);
   }
   console.log('✅ Schedules set (Mon–Fri 10AM–5PM lunch 1–2PM, Sat 10AM–1PM)');

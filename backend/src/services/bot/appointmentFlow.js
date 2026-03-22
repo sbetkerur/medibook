@@ -126,12 +126,12 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
         SELECT 1 FROM doctor_leaves dl WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
       )
       AND NOT EXISTS (
-        SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date
+        SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date AND (ch.hospital_id = $5 OR ch.hospital_id IS NULL)
       )
     GROUP BY slot_date
     ORDER BY slot_date
     LIMIT 7
-  `, [a.doctor_id, startStr, endStr, a.appointment_date]);
+  `, [a.doctor_id, startStr, endStr, a.appointment_date, a.hospital_id]);
 
   const dates = datesResult.rows.map(r => ({
     date: r.date,

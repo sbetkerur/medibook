@@ -285,8 +285,12 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
     // Reminder confirmation check: if user replied YES/NO to a 24h reminder,
     // handle it directly without going through the full bot state machine.
+    // NOTE: "cancel" and "reschedule" are intentionally excluded — they are
+    // standalone bot commands (cancel appointment, reschedule) and must NOT be
+    // intercepted here even when a pending confirmation exists. The reminder
+    // confirmation handler only accepts pure yes/no-style replies.
     if (text) {
-      const isConfirmReply = /^(yes|no|confirm|cancel|reschedule|haan|nahi|1|2)\b/i.test(text.trim());
+      const isConfirmReply = /^(yes|no|confirm|haan|nahi|1|2)\b/i.test(text.trim());
       if (isConfirmReply) {
         const confirmResult = await handleReminderConfirmation(tenant.schema_name, phone, text).catch(() => false);
         if (confirmResult) {
