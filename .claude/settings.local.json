@@ -64,7 +64,12 @@
       "Bash(where chromium:*)",
       "Bash(where \"Google Chrome\")",
       "Read(//c/Users/sande/WhatsAppHospitalProject/medibook/$LOCALAPPDATA/Google/Chrome/Application/**)",
-      "Read(//c/Program Files/Chromium/Application/**)"
+      "Read(//c/Program Files/Chromium/Application/**)",
+      "Bash(node -e \":*)",
+      "Bash(node -e \"require\\(''''./backend/src/routes/admin''''\\)\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Backend:'''', d[''''status''''], ''''| DB:'''', d[''''db''''][''''status''''], ''''| Redis:'''', d[''''redis'''']\\)\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

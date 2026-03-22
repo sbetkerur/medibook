@@ -34,3 +34,4 @@ pids/
 
 # Postgres portable (local only)
 pg_portable/
+.claude/worktrees/

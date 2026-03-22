@@ -258,7 +258,7 @@ app.get('/health', async (req, res) => {
     const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
     const heapTotalMb = Math.round(mem.heapTotal / 1024 / 1024);
     const heapPercent = Math.round((mem.heapUsed / mem.heapTotal) * 100);
-    const isMemoryHigh = heapPercent > 85;
+    const isMemoryHigh = heapPercent > 85 && heapUsedMb > 200;
     const isAnyDegraded = isDegraded || isMemoryHigh;
 
     res.status(isAnyDegraded ? 503 : 200).json({
