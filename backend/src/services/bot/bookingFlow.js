@@ -52,9 +52,9 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
     const r = await tenantQuery(schema, `SELECT id, name FROM hospitals WHERE is_active=true`);
     hospitalRows = r.rows;
   }
-  const h = hospitalRows.find(r =>
-    r.id === choice || r.name.toLowerCase().includes(input.toLowerCase())
-  );
+  const numChoice = parseInt(input);
+  const h = hospitalRows.find(r => r.id === choice || r.name.toLowerCase().includes(input.toLowerCase()))
+    || (numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
   if (!h) { await send.text('Please select a location from the options.'); return; }
   ctx.hospital_id = h.id;
   ctx.hospital_name = h.name;
@@ -103,7 +103,9 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
     depts = r.rows;
     ctx._depts = depts;
   }
-  const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input);
+  const deptNumChoice = parseInt(input);
+  const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input)
+    || (deptNumChoice >= 1 && deptNumChoice <= depts.length ? depts[deptNumChoice - 1] : null);
   if (!dept) { await send.text('Please select a treatment from the options.'); return; }
 
   ctx.department_id = dept.id;
@@ -153,7 +155,9 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
 async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, input) {
   const doctors = ctx._doctors || [];
   const cleanInput = input.toLowerCase().replace(/^dr\.?\s*/i, '').trim();
-  const doc = doctors.find(d => d.id === choice) || fuzzyFind(doctors, cleanInput);
+  const docNumChoice = parseInt(input);
+  const doc = doctors.find(d => d.id === choice) || fuzzyFind(doctors, cleanInput)
+    || (docNumChoice >= 1 && docNumChoice <= doctors.length ? doctors[docNumChoice - 1] : null);
   if (!doc) { await send.text('Please select a doctor from the options shown.'); return; }
 
   ctx.doctor_id = doc.id;
@@ -211,16 +215,25 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     title: 'Available Dates',
     rows: dates.map(d => ({ id: d.date, title: d.label, description: `${d.slots} slots available` }))
   }];
+  ctx._dates = dates; // cache for numeric fallback selection
   await send.list(`📅 *Select Date*\n\nAvailable dates for Dr. ${doc.name}:`, 'Choose Date', sections);
   await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
 }
 
 async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(choice)) {
-    await send.text('Please select a date from the list.');
-    return;
+  let resolvedDate = choice;
+  // Accept numeric input ("1", "2") when list fell back to text
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(resolvedDate)) {
+    const n = parseInt(resolvedDate);
+    const cachedDates = ctx._dates || [];
+    if (n >= 1 && n <= cachedDates.length) {
+      resolvedDate = cachedDates[n - 1].date;
+    } else {
+      await send.text('Please select a date from the list, or reply *Hi* to start over.');
+      return;
+    }
   }
-  ctx.appointment_date = choice;
+  ctx.appointment_date = resolvedDate;
 
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
@@ -228,7 +241,7 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
        AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
             OR start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time)
      ORDER BY start_time`,
-    [ctx.doctor_id, choice]);
+    [ctx.doctor_id, resolvedDate]);
 
   if (!slots.rows.length) {
     // Auto-suggest next available dates instead of dead-ending
@@ -247,7 +260,7 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
       GROUP BY slot_date
       ORDER BY slot_date
       LIMIT 3
-    `, [ctx.doctor_id, choice, ctx.hospital_id]);
+    `, [ctx.doctor_id, resolvedDate, ctx.hospital_id]);
 
     if (nextDateR.rows.length) {
       const suggestions = nextDateR.rows.map(r => {
@@ -264,8 +277,8 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
 
   ctx._slots = slots.rows;
 
-  let dateLabel = choice;
-  try { dateLabel = format(parseISO(choice), 'EEE, d MMM'); } catch {}
+  let dateLabel = resolvedDate;
+  try { dateLabel = format(parseISO(resolvedDate), 'EEE, d MMM'); } catch {}
 
   const slotLines = slots.rows.map((s, i) =>
     `${i + 1}. ${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`

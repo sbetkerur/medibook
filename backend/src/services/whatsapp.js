@@ -150,10 +150,11 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
       },
     }, accessToken, phoneNumberId);
   } catch (err) {
+    logger.warn('sendList failed, falling back to text', { to, error: err.response?.data || err.message });
     const lines = sections.flatMap((s, si) =>
       s.rows.map((r, ri) => `${si * 10 + ri + 1}. ${r.title}${r.description ? ' — ' + r.description : ''}`)
     );
-    await sendText(to, `${bodyText}\n\n${lines.join('\n')}\n\nReply with number to choose.`, accessToken, phoneNumberId);
+    await sendText(to, `${bodyText}\n\n${lines.join('\n')}\n\nReply with the number of your choice.`, accessToken, phoneNumberId);
   }
 }
 
