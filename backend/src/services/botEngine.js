@@ -372,6 +372,23 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     return;
   }
 
+  // ── GLOBAL ESCAPE — cancel / back / exit at any point in booking ──
+  const BOOKING_STATES = [
+    STATES.SELECT_HOSPITAL, STATES.SELECT_DEPARTMENT, STATES.SELECT_DOCTOR,
+    STATES.SELECT_DATE, STATES.SELECT_SLOT, STATES.COLLECT_NAME, STATES.COLLECT_DOB,
+    STATES.COLLECT_GENDER, STATES.COLLECT_EMAIL, STATES.COLLECT_CHIEF_COMPLAINT,
+    STATES.CONFIRM_BOOKING,
+  ];
+  if (BOOKING_STATES.includes(session.state) && /^(cancel|exit|back|quit|stop|0|main menu|mainmenu)$/i.test(input)) {
+    await updateSession(schema, phone, STATES.IDLE, {});
+    await send.buttons(
+      '❌ Booking cancelled.\n\nWhat would you like to do?',
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
+    );
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
+    return;
+  }
+
   // ── BOOKING FLOW ─────────────────────────────────────────────
   if (session.state === STATES.SELECT_HOSPITAL) {
     return handleSelectHospital(phone, schema, tenant, send, ctx, choice, input);
