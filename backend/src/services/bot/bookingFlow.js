@@ -2,7 +2,7 @@
 
 const { tenantQuery, pool } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
-const { toZonedTime } = require('date-fns-tz');
+const { toZonedTime } = require('../../utils/dateTz');
 const logger = require('../../utils/logger');
 
 const IST = 'Asia/Kolkata';

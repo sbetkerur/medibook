@@ -5,7 +5,7 @@ const { decrypt } = require('../utils/encryption');
 const { tenantQuery } = require('../db');
 const logger = require('../utils/logger');
 const { format, parseISO, addDays: _addDays } = require('date-fns');
-const { toZonedTime: _toZonedTime } = require('date-fns-tz');
+const { toZonedTime: _toZonedTime } = require('../utils/dateTz');
 
 // ── Sub-module imports ────────────────────────────────────────
 const {

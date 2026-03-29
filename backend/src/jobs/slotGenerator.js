@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
 const { addDays, format } = require('date-fns');
-const { toZonedTime } = require('date-fns-tz');
+const { toZonedTime } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 
 const IST = 'Asia/Kolkata';

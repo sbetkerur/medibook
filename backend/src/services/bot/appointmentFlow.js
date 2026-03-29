@@ -2,7 +2,7 @@
 
 const { tenantQuery, tenantTransaction } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
-const { fromZonedTime, toZonedTime } = require('date-fns-tz');
+const { fromZonedTime, toZonedTime } = require('../../utils/dateTz');
 const logger = require('../../utils/logger');
 const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 
