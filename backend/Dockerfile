@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install dependencies first (layer cache)
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --only=production --no-audit --no-fund
 
 # Copy source
 COPY src/ ./src/
