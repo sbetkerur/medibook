@@ -1,14 +1,13 @@
 import axios from 'axios';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-
-// Warn if pointing to localhost in a non-local environment
-if (typeof window !== 'undefined' && API_URL === 'http://localhost:3001' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-  console.warn('⚠️ MediBook: NEXT_PUBLIC_API_URL is pointing to localhost in a non-local environment. Check your environment variables.');
-}
+// All API calls go through the Next.js rewrite proxy (/api/proxy/* → backend).
+// This means no NEXT_PUBLIC_API_URL needs to be baked into the bundle at build time.
+// In production, set BACKEND_URL on the frontend service in Railway.
+// In local dev, /api/proxy/* proxies to http://localhost:3001 automatically.
+const API_PROXY_BASE = '/api/proxy/api';
 
 const api = axios.create({
-  baseURL: `${API_URL}/api`,
+  baseURL: API_PROXY_BASE,
   timeout: 15000,
 });
 
@@ -72,7 +71,7 @@ api.interceptors.response.use(
       isRefreshing = true;
 
       try {
-        const { data } = await axios.post(`${API_URL}/api/auth/refresh`, { refresh_token: refreshToken });
+        const { data } = await axios.post(`${API_PROXY_BASE}/auth/refresh`, { refresh_token: refreshToken });
         if (!data.token) throw new Error('Refresh response missing token');
         localStorage.setItem('token', data.token);
         if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);

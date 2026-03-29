@@ -1,10 +1,5 @@
 const path = require('path');
 
-// Warn at build time if NEXT_PUBLIC_API_URL is not set in production
-if (process.env.NODE_ENV === 'production' && !process.env.NEXT_PUBLIC_API_URL) {
-  console.warn('\n⚠️  WARNING: NEXT_PUBLIC_API_URL is not set. Frontend will call http://localhost:3001 in production!\n');
-}
-
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
@@ -13,18 +8,28 @@ const nextConfig = {
     config.resolve.alias['@'] = path.join(__dirname, 'src');
     return config;
   },
+  // Proxy all /api/proxy/* calls to the backend at runtime.
+  // BACKEND_URL is a server-side env var (no NEXT_PUBLIC_ prefix) so it is
+  // read at request time, not baked into the bundle at build time.
+  // Set BACKEND_URL=https://your-backend.up.railway.app in Railway env vars.
+  async rewrites() {
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
+    return [
+      {
+        source: '/api/proxy/:path*',
+        destination: `${backendUrl}/:path*`,
+      },
+    ];
+  },
   async headers() {
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-    // Extract origin (scheme + host) from NEXT_PUBLIC_API_URL for CSP connect-src
-    let apiOrigin = apiUrl;
-    try { apiOrigin = new URL(apiUrl).origin; } catch (_) { /* keep raw if malformed */ }
-
+    // Since all API calls go through the Next.js rewrite proxy (/api/proxy/*),
+    // the browser only ever connects to 'self'. No external backend origin needed in CSP.
     const csp = [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'", // unsafe-eval needed by Next.js dev; tighten in prod if nonce approach is used
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob:",
-      `connect-src 'self' ${apiOrigin}`,
+      "connect-src 'self'",
       "font-src 'self'",
       "object-src 'none'",
       "base-uri 'self'",

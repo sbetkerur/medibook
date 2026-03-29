@@ -286,8 +286,7 @@ export default function Dashboard() {
     window.addEventListener('medibook:session-warning', onSessionWarning);
 
     // ── SSE real-time dashboard updates ──────────────────────────
-    const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-    const es = new EventSource(`${API_URL}/api/admin/events?token=${encodeURIComponent(token)}`);
+    const es = new EventSource(`/api/proxy/api/admin/events?token=${encodeURIComponent(token)}`);
     es.onmessage = (e) => {
       try {
         const { type, payload } = JSON.parse(e.data);
@@ -1236,8 +1235,7 @@ export default function Dashboard() {
   async function printReceipt(apptId) {
     try {
       const token = localStorage.getItem('token');
-      const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-      const resp = await fetch(`${apiBase}/api/admin/appointments/${apptId}/receipt`, {
+      const resp = await fetch(`/api/proxy/api/admin/appointments/${apptId}/receipt`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!resp.ok) { toast.error('Receipt not available'); return; }

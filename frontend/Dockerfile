@@ -8,10 +8,9 @@ RUN npm ci
 
 COPY . .
 
-# NEXT_PUBLIC_API_URL is baked into the JS bundle at build time.
-# Override with: docker build --build-arg NEXT_PUBLIC_API_URL=https://api.yourdomain.com
-ARG NEXT_PUBLIC_API_URL=http://localhost:3001
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# BACKEND_URL is consumed by Next.js rewrites at request time (server-side),
+# not baked into the JS bundle. Set it as a Railway environment variable.
+# No build ARG needed — rewrites read process.env.BACKEND_URL when the server starts.
 
 RUN npm run build
 

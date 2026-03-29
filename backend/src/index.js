@@ -53,20 +53,24 @@ if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
 }
 if (!process.env.FRONTEND_URL) {
   if (process.env.NODE_ENV === 'production') {
-    logger.error('FRONTEND_URL is required in production (CORS will block all frontend requests). Set it and restart.');
-    process.exit(1);
+    logger.warn('FRONTEND_URL is not set — CORS will allow all origins. Set FRONTEND_URL=https://your-frontend.up.railway.app to restrict access.');
+  } else {
+    logger.warn('FRONTEND_URL not set — using default http://localhost:3000 for CORS and email links');
   }
-  logger.warn('FRONTEND_URL not set — using default http://localhost:3000 for CORS and email links');
 }
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Validate and resolve FRONTEND_URL early — needed by both helmet CSP and CORS
-const rawFrontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-try { new URL(rawFrontendUrl); } catch {
-  logger.error(`Invalid FRONTEND_URL "${rawFrontendUrl}" — must be a valid URL. Exiting.`);
-  process.exit(1);
+// Validate and resolve FRONTEND_URL early — needed by both helmet CSP and CORS.
+// If not set, fall back to permissive '*' so the first Railway deploy doesn't crash.
+// Set FRONTEND_URL=https://your-frontend.up.railway.app to lock it down.
+const rawFrontendUrl = process.env.FRONTEND_URL || null;
+if (rawFrontendUrl) {
+  try { new URL(rawFrontendUrl); } catch {
+    logger.error(`Invalid FRONTEND_URL "${rawFrontendUrl}" — must be a valid URL. Exiting.`);
+    process.exit(1);
+  }
 }
 
 // Trust Railway/Render/Vercel proxy
@@ -84,7 +88,7 @@ app.use(helmet({
       styleSrc: ["'self'"],
       imgSrc: ["'self'", 'data:', 'https:'],
       // Allow the frontend origin to connect to the API (applies to any HTML served by the API)
-      connectSrc: ["'self'", rawFrontendUrl],
+      connectSrc: rawFrontendUrl ? ["'self'", rawFrontendUrl] : ["'self'"],
       frameSrc: ["'none'"],
       objectSrc: ["'none'"],
       baseUri: ["'self'"],
@@ -101,8 +105,9 @@ app.use(helmet({
 }));
 
 app.use(cors({
-  origin: rawFrontendUrl,
-  credentials: true,
+  // If FRONTEND_URL is set, restrict to that origin. Otherwise allow all (open during initial deploy).
+  origin: rawFrontendUrl || '*',
+  credentials: !!rawFrontendUrl, // credentials:true requires a specific origin, not '*'
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 
