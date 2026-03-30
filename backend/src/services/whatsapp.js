@@ -108,16 +108,18 @@ async function _send(payload, accessToken, phoneNumberId) {
     recordSuccess(phoneId);
     return res;
   } catch (err) {
-    // Auth errors (expired/invalid token) are config problems — don't trip the
-    // circuit breaker, which is meant to protect against Meta API outages.
-    const isAuthError = err.response?.data?.error?.code === 190;
-    if (!isAuthError) recordFailure(phoneId);
+    // Config/auth errors are not availability issues — don't trip the circuit breaker.
+    // Code 190 = expired/invalid token. Code 10 = permission denied (also config).
+    // Circuit breaker should only trip on network errors or Meta server errors (5xx).
+    const errCode = err.response?.data?.error?.code;
+    const isConfigError = errCode === 190 || errCode === 10;
+    if (!isConfigError) recordFailure(phoneId);
     else {
-      // Reset the circuit so a fresh token takes effect immediately
+      // Reset circuit so a fresh token takes effect immediately without waiting
       const cb = getCircuit(phoneId);
       cb.failures = 0;
       cb.state = 'CLOSED';
-      logger.warn(`Auth error for ${phoneId} — token may be expired. Circuit reset.`);
+      logger.warn(`Config/auth error (code ${errCode}) for ${phoneId} — circuit reset.`);
     }
     throw err;
   }
