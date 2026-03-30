@@ -38,7 +38,7 @@ async function startBooking(phone, schema, tenant, send, ctx) {
   ctx._hospitals = hospitals.rows;
   const sections = [{
     title: 'Our Locations',
-    rows: hospitals.rows.map(h => ({ id: h.id, title: h.name, description: h.city || '' }))
+    rows: hospitals.rows.map(h => ({ id: h.id, title: h.name.slice(0, 24), description: (h.city || '').slice(0, 72) }))
   }];
   await send.list('🦷 *Select a Clinic*\n\nChoose your preferred location:', 'View Locations', sections);
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
