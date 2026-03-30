@@ -280,26 +280,27 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   let dateLabel = resolvedDate;
   try { dateLabel = format(parseISO(resolvedDate), 'EEE, d MMM'); } catch {}
 
-  const slotLines = slots.rows.map((s, i) =>
-    `${i + 1}. ${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`
-  ).join('\n');
-
-  await send.text(`⏰ *Select Time*\n\nSlots on ${dateLabel}:\n\n${slotLines}\n\nReply with the *number* of your preferred slot (e.g. 1):`);
+  const sections = [{
+    title: `Slots on ${dateLabel}`.slice(0, 24),
+    rows: slots.rows.map(s => ({
+      id: s.id,
+      title: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`,
+      description: `Tap to book this slot`,
+    })),
+  }];
+  await send.list(`⏰ *Select Time*\n\nAvailable slots on ${dateLabel}:`, 'Choose Time', sections);
   await updateSession(schema, phone, STATES.SELECT_SLOT, ctx);
 }
 
 async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input) {
   const slots = ctx._slots || [];
   const num = parseInt(input, 10);
-  const slot = (!isNaN(num) && num >= 1 && num <= slots.length)
-    ? slots[num - 1]
-    : slots.find(s =>
-        s.id === choice ||
-        s.start_time.slice(0, 5) === input ||
-        s.start_time.slice(0, 5) === choice
-      );
+  const slot = slots.find(s => s.id === choice)                             // list reply (ID)
+    || slots.find(s => s.start_time.slice(0, 5) === choice)                 // time match
+    || slots.find(s => s.start_time.slice(0, 5) === input)                  // typed time
+    || (!isNaN(num) && num >= 1 && num <= slots.length ? slots[num - 1] : null); // typed number
   if (!slot) {
-    await send.text(`Please reply with a number between 1 and ${slots.length} to select a time slot.`);
+    await send.text(`Please select a time slot from the list.`);
     return;
   }
 
