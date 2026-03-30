@@ -62,9 +62,9 @@ async function checkTenantRateLimit(tenantId) {
 }
 
 async function checkPhoneRateLimit(phone) {
-  const result = await checkRateLimitRedis(`rl:phone:${phone}`, 5);
+  const result = await checkRateLimitRedis(`rl:phone:${phone}`, 30);
   if (result !== null) return result;
-  return checkRateLimitInMemory(phoneMsgCounts, phone, 5);
+  return checkRateLimitInMemory(phoneMsgCounts, phone, 30);
 }
 
 // Cleanup in-memory fallback maps every 5 minutes to prevent memory leak
