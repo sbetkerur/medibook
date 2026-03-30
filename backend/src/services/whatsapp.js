@@ -165,6 +165,15 @@ async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId) {
 }
 
 async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneNumberId) {
+  // WhatsApp limits: section title ≤ 24, row title ≤ 24, row description ≤ 72
+  const sanitizedSections = sections.map(s => ({
+    title: String(s.title || '').slice(0, 24),
+    rows: (s.rows || []).map(r => ({
+      id: String(r.id).slice(0, 200),
+      title: String(r.title || '').slice(0, 24),
+      ...(r.description ? { description: String(r.description).slice(0, 72) } : {}),
+    })),
+  }));
   try {
     await _send({
       recipient_type: 'individual',
@@ -173,7 +182,7 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
       interactive: {
         type: 'list',
         body: { text: String(bodyText).slice(0, 1024) },
-        action: { button: String(buttonLabel).slice(0, 20), sections },
+        action: { button: String(buttonLabel).slice(0, 20), sections: sanitizedSections },
       },
     }, accessToken, phoneNumberId);
   } catch (err) {
