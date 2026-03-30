@@ -291,9 +291,22 @@ async function sendReminderTemplate(to, { doctorName, hospitalName, date, time }
   }], accessToken, phoneNumberId);
 }
 
+function resetCircuit(phoneId) {
+  const id = phoneId || process.env.META_PHONE_NUMBER_ID;
+  if (id) {
+    _circuits.delete(id);
+    // Also evict all cached axios instances for this phoneId so fresh token is picked up
+    for (const k of _axiosPool.keys()) {
+      if (k.startsWith(`${id}:`)) _axiosPool.delete(k);
+    }
+    logger.info(`Circuit breaker and token cache reset for phoneId ${id}`);
+  }
+}
+
 module.exports = {
   sendText, sendButtons, sendList, sendTemplate, markRead,
   sendDocument, sendImage, sendReaction, updateMessageStatus,
   sendBookingConfirmationTemplate, sendReminderTemplate,
   getAxiosInstance, // exported for testing
+  resetCircuit,
 };

@@ -1447,4 +1447,18 @@ router.get('/audit-logs', adminOnly, async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// ── CIRCUIT BREAKER RESET ─────────────────────────────────────────────────────
+// Call this after updating META_ACCESS_TOKEN to immediately unblock sends.
+router.post('/admin/whatsapp/reset-circuit', async (req, res) => {
+  try {
+    const wa = require('../services/whatsapp');
+    if (typeof wa.resetCircuit === 'function') {
+      wa.resetCircuit(req.tenant.wa_phone_number_id || process.env.META_PHONE_NUMBER_ID);
+      res.json({ success: true, message: 'Circuit breaker reset — bot will send again immediately.' });
+    } else {
+      res.status(501).json({ error: 'resetCircuit not exported from whatsapp service' });
+    }
+  } catch (err) { handleError(res, err); }
+});
+
 module.exports = router;
