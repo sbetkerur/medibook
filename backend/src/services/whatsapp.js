@@ -80,7 +80,24 @@ function isCircuitOpen(phoneId) {
 
 // ── Core send helper ──────────────────────────────────────────────────────────
 async function _send(payload, accessToken, phoneNumberId) {
-  const { instance, phoneId } = getAxiosInstance(accessToken, phoneNumberId);
+  const token = accessToken || process.env.META_ACCESS_TOKEN;
+  const phoneId = phoneNumberId || process.env.META_PHONE_NUMBER_ID;
+
+  // Always use a fresh axios instance keyed on current token — never serve
+  // a cached instance built with an old (expired) token.
+  const key = `${phoneId}:${(token || '').slice(-16)}`;
+  if (!_axiosPool.has(key)) {
+    _axiosPool.set(key, axios.create({
+      baseURL: `https://graph.facebook.com/v21.0/${phoneId}`,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      timeout: 10000,
+    }));
+  }
+  // Evict stale entries for same phoneId but different token suffix
+  for (const k of _axiosPool.keys()) {
+    if (k.startsWith(`${phoneId}:`) && k !== key) _axiosPool.delete(k);
+  }
+  const instance = _axiosPool.get(key);
 
   if (isCircuitOpen(phoneId)) {
     throw new Error(`Circuit breaker OPEN for ${phoneId} — skipping send`);
@@ -91,7 +108,17 @@ async function _send(payload, accessToken, phoneNumberId) {
     recordSuccess(phoneId);
     return res;
   } catch (err) {
-    recordFailure(phoneId);
+    // Auth errors (expired/invalid token) are config problems — don't trip the
+    // circuit breaker, which is meant to protect against Meta API outages.
+    const isAuthError = err.response?.data?.error?.code === 190;
+    if (!isAuthError) recordFailure(phoneId);
+    else {
+      // Reset the circuit so a fresh token takes effect immediately
+      const cb = getCircuit(phoneId);
+      cb.failures = 0;
+      cb.state = 'CLOSED';
+      logger.warn(`Auth error for ${phoneId} — token may be expired. Circuit reset.`);
+    }
     throw err;
   }
 }
