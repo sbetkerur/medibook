@@ -110,9 +110,9 @@ const schemas = {
     name: Joi.string().min(2).max(255).optional(),
     address: Joi.string().max(500).optional().allow('', null),
     phone: Joi.string().max(20).optional().allow('', null),
-    wa_phone_number_id: Joi.string().max(100).optional().allow('', null),
-    wa_access_token: Joi.string().optional().allow('', null),
     notification_prefs: Joi.object().optional(),
+    notify_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).optional().allow('', null)
+      .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +919876543210)' }),
   }),
 
   blockRange: Joi.object({
@@ -138,11 +138,13 @@ const schemas = {
     appointment_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required()
       .messages({ 'string.pattern.base': 'appointment_date must be YYYY-MM-DD' })
       .custom((value, helpers) => {
-        // Use IST (UTC+5:30) for the "today" boundary. Between 18:30–23:59 UTC
-        // the UTC date is one calendar day behind IST — without this adjustment,
-        // patients in IST could book appointments for yesterday's IST date.
-        const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-        const todayStr = new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
+        // Use the configured timezone (default IST) for the "today" boundary.
+        // Between 18:30–23:59 UTC the UTC date is one calendar day behind IST —
+        // without this adjustment, patients in IST could book for yesterday's date.
+        const tz = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
+          ? process.env.TIMEZONE
+          : 'Asia/Kolkata';
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: tz }); // returns YYYY-MM-DD
         if (value < todayStr) return helpers.error('any.invalid');
         return value;
       }).messages({ 'any.invalid': 'appointment_date must be today or in the future' }),
@@ -159,8 +161,6 @@ const schemas = {
     owner_password: Joi.string().min(8).optional(),
     owner_name: Joi.string().max(255).optional().allow('', null),
     plan: Joi.string().valid('starter', 'growth', 'professional', 'enterprise').optional().default('starter'),
-    wa_phone_number_id: Joi.string().max(100).optional().allow('', null),
-    wa_access_token: Joi.string().optional().allow('', null),
   }),
 };
 

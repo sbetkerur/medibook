@@ -8,7 +8,6 @@ const logger = require('../../utils/logger');
 const IST = 'Asia/Kolkata';
 const emailService = require('../email');
 const wa = require('../whatsapp');
-const { decrypt } = require('../../utils/encryption');
 const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 const {
   STATES,
@@ -16,6 +15,7 @@ const {
   fuzzyFind,
   getPatient,
   updateSession,
+  notifyAdminWhatsApp,
 } = require('./utils');
 
 async function startBooking(phone, schema, tenant, send, ctx) {
@@ -53,7 +53,7 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
     hospitalRows = r.rows;
   }
   const numChoice = parseInt(input);
-  const h = hospitalRows.find(r => r.id === choice || r.name.toLowerCase().includes(input.toLowerCase()))
+  const h = hospitalRows.find(r => r.id === choice || (input && (r.name || '').toLowerCase().includes(input.toLowerCase())))
     || (numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
   if (!h) { await send.text('Please select a location from the options.'); return; }
   ctx.hospital_id = h.id;
@@ -204,8 +204,8 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     // so the buttons both say "Main Menu" / "Book Again" to avoid implying
     // the user can directly re-select a dentist without going through the menu.
     await send.buttons(
-      `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nPlease try a different dentist or check back later.`,
-      ['📅 Book Again', '🏠 Main Menu']
+      `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nPlease try a different dentist or check back later.\n\nReply *Hi* to go back to the main menu.`,
+      ['🔄 Choose Another Dentist', '🏠 Main Menu']
     );
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
@@ -275,17 +275,20 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
     return;
   }
 
-  ctx._slots = slots.rows;
+  // WhatsApp list messages are capped at 10 rows per section.
+  // Slice here so we never hit the API limit; store only the shown slots in
+  // _slots so that numeric text-fallback replies ("1", "2", …) resolve correctly.
+  const visibleSlots = slots.rows.slice(0, 10);
+  ctx._slots = visibleSlots;
 
   let dateLabel = resolvedDate;
   try { dateLabel = format(parseISO(resolvedDate), 'EEE, d MMM'); } catch {}
 
   const sections = [{
     title: `Slots on ${dateLabel}`.slice(0, 24),
-    rows: slots.rows.map(s => ({
+    rows: visibleSlots.map(s => ({
       id: s.id,
       title: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`,
-      description: `Tap to book this slot`,
     })),
   }];
   await send.list(`⏰ *Select Time*\n\nAvailable slots on ${dateLabel}:`, 'Choose Time', sections);
@@ -296,8 +299,7 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
   const slots = ctx._slots || [];
   const num = parseInt(input, 10);
   const slot = slots.find(s => s.id === choice)                             // list reply (ID)
-    || slots.find(s => s.start_time.slice(0, 5) === choice)                 // time match
-    || slots.find(s => s.start_time.slice(0, 5) === input)                  // typed time
+    || slots.find(s => s.start_time.slice(0, 5) === choice || s.start_time.slice(0, 5) === input) // time match (typed or button title)
     || (!isNaN(num) && num >= 1 && num <= slots.length ? slots[num - 1] : null); // typed number
   if (!slot) {
     await send.text(`Please select a time slot from the list.`);
@@ -452,7 +454,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
         break; // success
       } catch (insertErr) {
         // 23505 = unique_violation in PostgreSQL
-        if (insertErr.code === '23505' && insertErr.constraint?.includes('booking_id') && ++insertAttempts < 3) {
+        if (insertErr.code === '23505' && insertErr.constraint?.includes('booking_id') && ++insertAttempts < 4) {
           logger.warn('booking_id collision, retrying', { attempt: insertAttempts });
           continue;
         }
@@ -498,12 +500,12 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     // Enhancement 12: try approved WhatsApp template first (works outside 24h session window);
     // fall back to regular session message if template is not approved yet.
     (async () => {
-      const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
+      // Shared phone — use global META_* env vars (null → fallback)
       try {
         await wa.sendBookingConfirmationTemplate(phone, {
           bookingId, doctorName: ctx.doctor_name, hospitalName: ctx.hospital_name,
           date: dateLabel, time: (ctx.appointment_time || '').slice(0, 5),
-        }, waToken, tenant.wa_phone_number_id);
+        }, null, null);
       } catch {
         // Template not approved or Meta error — fall back to session text message
         await send.text(confirmationText);
@@ -539,7 +541,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       // Notify clinic admins of new booking
       try {
         const adminUsers = await tenantQuery(schema,
-          `SELECT email FROM users WHERE role = 'admin' AND is_active = true LIMIT 3`);
+          `SELECT email, notify_phone FROM users WHERE role = 'admin' AND is_active = true LIMIT 3`);
         let dateLabel3 = ctx.appointment_date;
         try { dateLabel3 = format(parseISO(ctx.appointment_date), 'EEE, d MMM yyyy'); } catch {}
         for (const admin of adminUsers.rows) {
@@ -553,6 +555,34 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
             time: ctx.appointment_time?.slice(0, 5),
             visitType: ctx.visit_type || 'in_person',
           });
+          if (admin.notify_phone) {
+            try {
+              const { sendAdminBookingAlertSMS } = require('../sms');
+              await sendAdminBookingAlertSMS(admin.notify_phone, {
+                bookingId,
+                patientName: ctx.patient_name,
+                doctorName: ctx.doctor_name,
+                hospitalName: ctx.hospital_name,
+                date: dateLabel3,
+                time: ctx.appointment_time?.slice(0, 5),
+              });
+            } catch (smsErr) {
+              logger.warn('Admin SMS alert failed', { error: smsErr.message });
+            }
+            try {
+              await notifyAdminWhatsApp(schema, tenant,
+                `🆕 *New Appointment Booked*\n\n` +
+                `Booking: *${bookingId}*\n` +
+                `Patient: ${ctx.patient_name || phone} · ${phone}\n` +
+                `Dr. ${ctx.doctor_name}\n` +
+                `📅 ${dateLabel3} at ${(ctx.appointment_time || '').slice(0, 5)}\n` +
+                `🦷 ${ctx.hospital_name}\n` +
+                `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`
+              );
+            } catch (waErr) {
+              logger.warn('Admin WhatsApp booking alert failed', { error: waErr.message });
+            }
+          }
         }
       } catch (err) {
         logger.warn('Admin booking alert failed', { error: err.message });

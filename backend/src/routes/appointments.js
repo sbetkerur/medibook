@@ -13,12 +13,13 @@ router.use(authMiddleware, tenantMiddleware);
 router.get('/appointments', async (req, res) => {
   try {
     const s = req.tenant.schema_name;
-    const { date, status, doctor_id, page = 1, limit = 25 } = req.query;
+    const { date, from, to, status, doctor_id, page = 1, limit = 25 } = req.query;
     const safeLimit = Math.min(Math.max(parseInt(limit) || 25, 1), 100);
     const safePage = Math.max(parseInt(page) || 1, 1);
 
-    // Validate status against whitelist before building SQL
-    if (status && !VALID_APPOINTMENT_STATUSES.includes(status)) {
+    // Status can be a single value or comma-separated list (e.g. "confirmed,completed")
+    const statusList = status ? status.split(',').map(s => s.trim()).filter(Boolean) : [];
+    if (statusList.length > 0 && !statusList.every(s => VALID_APPOINTMENT_STATUSES.includes(s))) {
       return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_APPOINTMENT_STATUSES.join(', ')}` });
     }
 
@@ -30,7 +31,10 @@ router.get('/appointments', async (req, res) => {
     const where = ['1=1'];
     const params = [];
     if (date) { params.push(date); where.push(`a.appointment_date=$${params.length}`); }
-    if (status) { params.push(status); where.push(`a.status=$${params.length}`); }
+    if (from) { params.push(from); where.push(`a.appointment_date>=$${params.length}`); }
+    if (to) { params.push(to); where.push(`a.appointment_date<=$${params.length}`); }
+    if (statusList.length === 1) { params.push(statusList[0]); where.push(`a.status=$${params.length}`); }
+    else if (statusList.length > 1) { params.push(statusList); where.push(`a.status = ANY($${params.length})`); }
     if (doctor_id) { params.push(doctor_id); where.push(`a.doctor_id=$${params.length}`); }
     const countParams = params.slice();
     params.push(safeLimit, (safePage - 1) * safeLimit);
@@ -80,10 +84,13 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
       WHERE a2.patient_id=$1 AND a2.id != $2
       ORDER BY a2.appointment_date DESC LIMIT 5
     `, [r.rows[0].patient_id, req.params.id]);
-    // Audit dental history access for privacy compliance
+    // Audit dental history access for privacy compliance.
+    // Store a truncated patient_id (first 8 chars) rather than the full UUID to
+    // avoid unnecessarily surfacing sensitive identifiers in audit log queries.
     if (r.rows[0].dental_history && Object.keys(r.rows[0].dental_history).length > 0) {
+      const maskedPatientId = String(r.rows[0].patient_id || '').slice(0, 8) + '…';
       writeAuditLog(s, req.user.id, req.user.role, 'ACCESS_DENTAL_HISTORY', 'patient',
-        r.rows[0].patient_id, null, null, req.ip)
+        maskedPatientId, null, null, req.ip)
         .catch(e => logger.warn('Medical history audit log failed', { error: e.message }));
     }
     res.json({ appointment: r.rows[0], patient_history: history.rows });
@@ -236,6 +243,36 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_APPOINTMENT', 'appointment', req.params.id,
       { status: oldR.rows[0].status }, { status, cancellation_reason }, req.ip);
     res.json({ appointment: r.rows[0] });
+    // Fire-and-forget WhatsApp alert to admin on cancel
+    if (status === 'cancelled') {
+      (async () => {
+        try {
+          const { notifyAdminWhatsApp } = require('../services/bot/utils');
+          const { format, parseISO } = require('date-fns');
+          const apptR = await tenantQuery(s, `
+            SELECT a.booking_id, a.appointment_date, a.appointment_time, a.cancellation_reason,
+                   p.name as patient_name, p.phone as patient_phone, d.name as doctor_name
+            FROM appointments a
+            JOIN patients p ON p.id = a.patient_id
+            JOIN doctors d ON d.id = a.doctor_id
+            WHERE a.id = $1
+          `, [req.params.id]);
+          if (!apptR.rows[0]) return;
+          const appt = apptR.rows[0];
+          let dateLabel = String(appt.appointment_date || '').slice(0, 10);
+          try { dateLabel = format(parseISO(dateLabel), 'EEE, d MMM yyyy'); } catch {}
+          await notifyAdminWhatsApp(s, req.tenant,
+            `❌ *Appointment Cancelled*\n\n` +
+            `Booking: *${appt.booking_id}*\n` +
+            `Patient: ${appt.patient_name || appt.patient_phone} · ${appt.patient_phone}\n` +
+            `Dr. ${appt.doctor_name}\n` +
+            `📅 ${dateLabel} at ${String(appt.appointment_time || '').slice(0, 5)}\n` +
+            `📝 ${appt.cancellation_reason || 'No reason given'}\n` +
+            `By: ${req.user.role}`
+          );
+        } catch (_) {}
+      })();
+    }
   } catch (err) { handleError(res, err); }
 });
 
@@ -367,6 +404,28 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_APPOINTMENT', 'appointment', r.rows[0].id,
       null, { booking_id: bookingId, doctor_id, appointment_date }, req.ip);
     res.status(201).json({ appointment: r.rows[0], booking_id: bookingId });
+    // Fire-and-forget WhatsApp alert to admin for walk-in booking
+    (async () => {
+      try {
+        const { notifyAdminWhatsApp } = require('../services/bot/utils');
+        const { format, parseISO } = require('date-fns');
+        const detailR = await tenantQuery(s,
+          `SELECT d.name as doctor_name, h.name as hospital_name
+           FROM doctors d JOIN hospitals h ON h.id = d.hospital_id
+           WHERE d.id = $1`, [doctor_id]);
+        if (!detailR.rows[0]) return;
+        let dateLabel = appointment_date;
+        try { dateLabel = format(parseISO(appointment_date), 'EEE, d MMM yyyy'); } catch {}
+        await notifyAdminWhatsApp(s, req.tenant,
+          `🆕 *Walk-in Booking Created*\n\n` +
+          `Booking: *${bookingId}*\n` +
+          `Patient: ${patient_name || patient_phone} · ${patient_phone}\n` +
+          `Dr. ${detailR.rows[0].doctor_name}\n` +
+          `📅 ${dateLabel} at ${(appointment_time || '').slice(0, 5)}\n` +
+          `🦷 ${detailR.rows[0].hospital_name}`
+        );
+      } catch (_) {}
+    })();
   } catch (err) { handleError(res, err); }
 });
 

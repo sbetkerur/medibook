@@ -11,6 +11,7 @@ const {
   STATES,
   getPatient,
   updateSession,
+  notifyAdminWhatsApp,
 } = require('./utils');
 
 async function showMyAppointments(phone, schema, tenant, send) {
@@ -180,15 +181,16 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
     await send.text('No slots available for that date. Please pick another.\n\nReply *Hi* to start over.');
     return;
   }
-  ctx._reschedule_slots = slots.rows;
+  // Cap at 10 rows — WhatsApp list messages reject more than 10 rows per section.
+  const visibleRescheduleSlots = slots.rows.slice(0, 10);
+  ctx._reschedule_slots = visibleRescheduleSlots;
   let dateLabel = choice;
   try { dateLabel = format(parseISO(choice), 'EEE, d MMM'); } catch {}
   const sections = [{
     title: 'Available Slots',
-    rows: slots.rows.map(s => ({
+    rows: visibleRescheduleSlots.map(s => ({
       id: s.id,
-      title: s.start_time.slice(0, 5),
-      description: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`
+      title: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`,
     }))
   }];
   await send.list(`⏰ *Select New Time*\n\nSlots on ${dateLabel}:`, 'Choose Time', sections);
@@ -223,7 +225,7 @@ async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, in
 }
 
 async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice) {
-  if (/yes|reschedule|confirm|btn_0/i.test(choice)) {
+  if (/yes|reschedule|confirm|btn_0|^1$/.test(choice)) {
     // Atomic: lock new slot + release old slot + update appointment
     const rescheduled = await tenantTransaction(schema, async (client) => {
       const lock = await client.query(
@@ -262,6 +264,19 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       `We'll send you a fresh reminder 24 hours before. See you then! 😊`
     );
     logger.info(`Rescheduled: ${ctx.reschedule_booking_id}`, { phone, tenant: tenant.name });
+    // Notify clinic admin via WhatsApp
+    (async () => {
+      let oldDateLabel = ctx.reschedule_old_date || '';
+      try { oldDateLabel = format(parseISO(String(ctx.reschedule_old_date).slice(0, 10)), 'EEE, d MMM'); } catch {}
+      await notifyAdminWhatsApp(schema, tenant,
+        `🔄 *Appointment Rescheduled*\n\n` +
+        `Booking: *${ctx.reschedule_booking_id}*\n` +
+        `Patient: ${phone}\n` +
+        `Dr. ${ctx.reschedule_doctor_name}\n` +
+        `Old: ${oldDateLabel} at ${(ctx.reschedule_old_time || '').slice(0, 5)}\n` +
+        `New: ${newDate} at ${(ctx.reschedule_new_time || '').slice(0, 5)}`
+      );
+    })().catch(() => {});
   } else {
     await send.text('No changes made — your original appointment is kept. ✅\n\nReply *Hi* for the main menu.');
   }
@@ -335,7 +350,7 @@ async function handleCancelReason(phone, schema, tenant, send, ctx, input, butto
 }
 
 async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
-  if (/yes|cancel|btn_0/i.test(choice)) {
+  if (/yes|cancel|btn_0|^1$/.test(choice)) {
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(
         `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,
@@ -360,6 +375,19 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
       'Your appointment has been cancelled and the slot released.\n\n' +
       'We hope everything is okay. Whenever you\'re ready, reply *Hi* to book again. 🙏'
     );
+    // Notify clinic admin via WhatsApp
+    (async () => {
+      let dateLabel = ctx.cancel_date || '';
+      try { dateLabel = format(parseISO(String(ctx.cancel_date).slice(0, 10)), 'EEE, d MMM yyyy'); } catch {}
+      await notifyAdminWhatsApp(schema, tenant,
+        `❌ *Appointment Cancelled*\n\n` +
+        `Booking: *${ctx.cancel_booking_id}*\n` +
+        `Patient: ${phone}\n` +
+        `Dr. ${ctx.cancel_doctor_name}\n` +
+        `📅 ${dateLabel} at ${(ctx.cancel_time || '').slice(0, 5)}\n` +
+        `📝 Reason: ${ctx.cancel_reason || 'Not specified'}`
+      );
+    })().catch(() => {});
   } else {
     await send.text('No worries, your appointment is still on! ✅\n\nReply *Hi* for the main menu.');
   }

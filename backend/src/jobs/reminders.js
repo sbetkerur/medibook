@@ -1,7 +1,6 @@
 const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
 const wa = require('../services/whatsapp');
-const { decrypt } = require('../utils/encryption');
 const { forEachActiveTenantParallel } = require('../utils/tenantUtils');
 const { format, parseISO, subWeeks } = require('date-fns');
 const { toZonedTime } = require('../utils/dateTz');
@@ -17,10 +16,9 @@ const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
 
 async function sendReminders() {
   await forEachActiveTenantParallel('sendReminders', async (tenant) => {
-    if (!tenant.wa_access_token_enc || !tenant.wa_phone_number_id) return;
-    const waToken = decrypt(tenant.wa_access_token_enc);
-    const waPhoneId = tenant.wa_phone_number_id;
-    if (!waToken) return;
+    // Shared phone — use global META_* env vars
+    const waToken = null;
+    const waPhoneId = null;
 
     // ── CONFIGURABLE REMINDER TIMING ────────────────────────────
     const settings = tenant.settings || {};
@@ -96,7 +94,7 @@ async function sendReminders() {
             INSERT INTO reminder_confirmations (appointment_id, phone)
             VALUES ($1, $2)
             ON CONFLICT (appointment_id) DO NOTHING
-          `, [appt.id, appt.phone]).catch(() => {});
+          `, [appt.id, appt.phone]).catch(e => logger.warn('Failed to insert reminder confirmation record', { appointment_id: appt.id, error: e.message }));
         } catch (err) {
           logger.error(`24h reminder failed for ${appt.booking_id}`, { error: err.message });
         }
@@ -176,7 +174,7 @@ async function sendReminders() {
  */
 async function handleReminderConfirmation(schemaName, phone, text) {
   const isYes = /^(yes|confirm|ok|sure|haan|ha|attending)$/i.test(text.trim());
-  const isNo  = /^(no|cancel|nahi|wont|not attending)$/i.test(text.trim());
+  const isNo  = /^(no|cancel|nahi|won'?t|not attending)$/i.test(text.trim());
   if (!isYes && !isNo) return false;
 
   try {
@@ -201,7 +199,8 @@ async function handleReminderConfirmation(schemaName, phone, text) {
     `, [isYes ? 'yes' : 'no', r.rows[0].id]);
 
     return isYes ? 'yes' : 'no'; // consumed — caller uses this to send the appropriate response
-  } catch (_) {
+  } catch (err) {
+    logger.warn('handleReminderConfirmation DB error', { phone, schemaName, error: err.message });
     return false;
   }
 }
@@ -209,7 +208,6 @@ async function handleReminderConfirmation(schemaName, phone, text) {
 // Post-appointment follow-up: send feedback request 1-2 hours after appointment ends
 async function sendPostAppointmentFollowup() {
   await forEachActiveTenantParallel('sendPostApptFollowup', async (tenant) => {
-    if (!tenant.wa_access_token_enc || !tenant.wa_phone_number_id) return;
     // Check feature flag — default to disabled on error so we don't spam tenants
     // who haven't opted in
     try {
@@ -222,9 +220,9 @@ async function sendPostAppointmentFollowup() {
       return;
     }
 
-    const waToken = decrypt(tenant.wa_access_token_enc);
-    const waPhoneId = tenant.wa_phone_number_id;
-    if (!waToken) return;
+    // Shared phone — use global META_* env vars
+    const waToken = null;
+    const waPhoneId = null;
 
     // Use timezone-aware comparison for the same midnight-crossing reason as the 2h
     // reminder above: time-only comparison fails when the 1–2 hour window straddles
@@ -273,10 +271,9 @@ async function sendFeedbackRequests() {
   const { triggerFeedback } = require('../services/botEngine');
 
   await forEachActiveTenantParallel('sendFeedbackRequests', async (tenant) => {
-    if (!tenant.wa_access_token_enc || !tenant.wa_phone_number_id) return;
-    const waToken = decrypt(tenant.wa_access_token_enc);
-    const waPhoneId = tenant.wa_phone_number_id;
-    if (!waToken) return;
+    // Shared phone — use global META_* env vars
+    const waToken = null;
+    const waPhoneId = null;
 
     const appts = await tenantQuery(tenant.schema_name, `
       SELECT a.id, a.status, p.phone, p.id as patient_id, p.name as patient_name, d.name as doctor_name

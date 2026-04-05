@@ -54,10 +54,11 @@ function levenshtein(a, b) {
 }
 
 function fuzzyFind(items, input, nameField = 'name') {
+  if (!input || input.length === 0) return null;
   const lower = input.toLowerCase();
   const exact = items.find(item =>
-    item[nameField].toLowerCase() === lower ||
-    item[nameField].toLowerCase().includes(lower)
+    (item[nameField] || '').toLowerCase() === lower ||
+    (item[nameField] || '').toLowerCase().includes(lower)
   );
   if (exact) return exact;
   // Guard: skip levenshtein for very long inputs to prevent O(m*n) DoS
@@ -65,7 +66,7 @@ function fuzzyFind(items, input, nameField = 'name') {
   let best = null, bestDist = Infinity;
   for (const item of items) {
     // Truncate long item names so levenshtein stays bounded
-    const name = item[nameField].toLowerCase().slice(0, 50);
+    const name = (item[nameField] || '').toLowerCase().slice(0, 50);
     const dist = levenshtein(lower, name);
     const threshold = Math.max(2, Math.floor(name.length * 0.4));
     if (dist < bestDist && dist <= threshold) {
@@ -132,6 +133,29 @@ async function logMessage(schemaName, phone, direction, type, content, waMessage
   }
 }
 
+/**
+ * Send a WhatsApp alert to all admin users who have notify_phone set.
+ * Uses the tenant's own WhatsApp credentials. Never throws — logs warnings on failure.
+ */
+async function notifyAdminWhatsApp(schema, tenant, message) {
+  try {
+    const adminUsers = await tenantQuery(schema,
+      `SELECT notify_phone FROM users WHERE role = 'admin' AND is_active = true AND notify_phone IS NOT NULL LIMIT 3`);
+    if (!adminUsers.rows.length) return;
+    // Shared phone — use global META_* env vars
+    const wa = require('../whatsapp');
+    for (const admin of adminUsers.rows) {
+      try {
+        await wa.sendText(admin.notify_phone, message, null, null);
+      } catch (err) {
+        logger.warn('Admin WhatsApp alert failed', { error: err.message });
+      }
+    }
+  } catch (err) {
+    logger.warn('notifyAdminWhatsApp failed', { error: err.message });
+  }
+}
+
 module.exports = {
   STATES,
   genBookingId,
@@ -141,4 +165,5 @@ module.exports = {
   updateSession,
   getPatient,
   logMessage,
+  notifyAdminWhatsApp,
 };

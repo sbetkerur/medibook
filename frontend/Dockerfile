@@ -1,3 +1,4 @@
+# Build v2
 # Stage 1: Build
 FROM node:20-alpine AS builder
 
@@ -8,9 +9,10 @@ RUN npm ci
 
 COPY . .
 
-# BACKEND_URL is consumed by Next.js rewrites at request time (server-side),
-# not baked into the JS bundle. Set it as a Railway environment variable.
-# No build ARG needed — rewrites read process.env.BACKEND_URL when the server starts.
+# BACKEND_URL must be available at build time so Next.js can compile it
+# into the routes manifest (rewrites are resolved at build, not runtime).
+ARG BACKEND_URL=https://backend-production-7df80.up.railway.app
+ENV BACKEND_URL=${BACKEND_URL}
 
 RUN npm run build
 
@@ -22,6 +24,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
+ENV BACKEND_URL=https://backend-production-7df80.up.railway.app
 
 # Standalone bundle includes only what's needed to run
 COPY --from=builder /app/.next/standalone ./

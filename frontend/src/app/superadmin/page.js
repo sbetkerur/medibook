@@ -15,7 +15,7 @@ export default function SuperAdminPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({
     name: '', slug: '', owner_email: '', owner_password: '',
-    owner_name: '', plan: 'starter', wa_phone_number_id: '', wa_access_token: '',
+    owner_name: '', plan: 'starter',
   });
   const [creating, setCreating] = useState(false);
 
@@ -72,7 +72,7 @@ export default function SuperAdminPage() {
       const { data } = await api.post('/superadmin/tenants', form);
       toast.success(`Tenant "${data.tenant.name}" created!`);
       setShowCreate(false);
-      setForm({ name: '', slug: '', owner_email: '', owner_password: '', owner_name: '', plan: 'starter', wa_phone_number_id: '', wa_access_token: '' });
+      setForm({ name: '', slug: '', owner_email: '', owner_password: '', owner_name: '', plan: 'starter' });
       fetchAll();
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to create tenant');
@@ -292,9 +292,7 @@ export default function SuperAdminPage() {
                           <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full capitalize">{t.plan_name || t.plan}</span>
                         </td>
                         <td className="px-4 py-3 text-xs">
-                          {t.wa_phone_number_id
-                            ? <span className="text-green-600">✅ Configured</span>
-                            : <span className="text-gray-400">Not set</span>}
+                          <span className="text-green-600">✅ Shared</span>
                         </td>
                         <td className="px-4 py-3">
                           <div>
@@ -701,12 +699,8 @@ export default function SuperAdminPage() {
                 </select>
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">WhatsApp Phone Number ID (optional)</label>
-                <input value={form.wa_phone_number_id}
-                  onChange={e => setForm(f => ({ ...f, wa_phone_number_id: e.target.value }))}
-                  placeholder="From Meta Developer Console"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 text-xs text-blue-700">
+                📱 WhatsApp uses a shared global number — no per-tenant credentials needed.
               </div>
             </div>
 

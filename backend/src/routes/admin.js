@@ -15,6 +15,7 @@ const slotsGenerateLimiter = rateLimit({
   max: 5,
   message: { error: 'Too many slot generation requests. Try again in an hour.' },
   standardHeaders: true,
+  keyGenerator: (req) => req.user?.id || req.ip, // per-user limit, not global
 });
 
 // ── ROLE GUARD ────────────────────────────────────────────────
@@ -175,7 +176,7 @@ router.get('/appointments', async (req, res) => {
       total,
       page: safePage,
       limit: safeLimit,
-      has_more: r.rows.length === safeLimit,
+      has_more: (safePage - 1) * safeLimit + r.rows.length < total,
     });
   } catch (err) { handleError(res, err); }
 });
@@ -490,12 +491,14 @@ router.get('/doctors', async (req, res) => {
       LEFT JOIN hospitals h ON h.id=d.hospital_id
       LEFT JOIN (
         SELECT doctor_id, COUNT(*) as total
-        FROM appointments WHERE status='confirmed'
+        FROM appointments
+        WHERE status='confirmed' AND appointment_date >= CURRENT_DATE - INTERVAL '90 days'
         GROUP BY doctor_id
       ) appt_agg ON appt_agg.doctor_id=d.id
       LEFT JOIN (
         SELECT doctor_id, COUNT(*) as available
-        FROM time_slots WHERE slot_date>=CURRENT_DATE AND status='available'
+        FROM time_slots
+        WHERE slot_date >= CURRENT_DATE AND slot_date <= CURRENT_DATE + INTERVAL '60 days' AND status='available'
         GROUP BY doctor_id
       ) slot_agg ON slot_agg.doctor_id=d.id
       ${includeInactive ? '' : 'WHERE d.is_active=true'}
@@ -671,6 +674,12 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
         if (s.lunch_start_time && s.lunch_end_time && s.lunch_start_time >= s.lunch_end_time) {
           return res.status(400).json({ error: `Day ${s.day_of_week}: lunch_start_time must be before lunch_end_time` });
         }
+        if (s.lunch_start_time && s.lunch_start_time < s.start_time) {
+          return res.status(400).json({ error: `Day ${s.day_of_week}: lunch_start_time cannot be before work start_time` });
+        }
+        if (s.lunch_end_time && s.lunch_end_time > s.end_time) {
+          return res.status(400).json({ error: `Day ${s.day_of_week}: lunch_end_time cannot be after work end_time` });
+        }
       }
     }
 
@@ -721,7 +730,7 @@ router.get('/patients', patientLimiter, async (req, res) => {
       total,
       page: safePage,
       limit: 25,
-      has_more: r.rows.length === 25,
+      has_more: (safePage - 1) * 25 + r.rows.length < total,
     });
   } catch (err) { handleError(res, err); }
 });
@@ -749,6 +758,9 @@ router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     if (gender && !VALID_GENDERS.includes(gender.toLowerCase())) {
       return res.status(400).json({ error: `gender must be one of: ${VALID_GENDERS.join(', ')}` });
     }
+    const oldPatient = await tenantQuery(s,
+      `SELECT name, email, gender, date_of_birth FROM patients WHERE id=$1`, [req.params.id]);
+    if (!oldPatient.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     const r = await tenantQuery(s, `
       UPDATE patients SET
         name=COALESCE($1,name), email=COALESCE($2,email),
@@ -758,7 +770,8 @@ router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     `, [name || null, email || null, gender || null, date_of_birth || null, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_PATIENT', 'patient', req.params.id,
-      null, { name, email, gender }, req.ip);
+      { name: oldPatient.rows[0].name, email: oldPatient.rows[0].email, gender: oldPatient.rows[0].gender, date_of_birth: oldPatient.rows[0].date_of_birth },
+      { name, email, gender, date_of_birth }, req.ip);
     res.json({ patient: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
@@ -786,11 +799,12 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
         upcoming_appointments: parseInt(upcoming.rows[0].count),
       });
     }
-    // Anonymise rather than hard-delete (GDPR-safe soft delete)
+    // Anonymise rather than hard-delete (GDPR-safe soft delete) and set deleted_at
+    // so the phone number is freed for re-registration (partial unique index on phone WHERE deleted_at IS NULL)
     const r = await tenantQuery(s, `
       UPDATE patients SET
         name='[Deleted]', email=NULL, date_of_birth=NULL, gender=NULL,
-        dental_history='{}', updated_at=NOW()
+        dental_history='{}', deleted_at=NOW(), updated_at=NOW()
       WHERE id=$1 RETURNING id
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
@@ -884,31 +898,36 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
       `SELECT * FROM doctor_schedules WHERE doctor_id=$1 AND is_working=true`, [doctor_id]);
     if (!schedR.rows.length) return res.status(400).json({ error: 'No schedule configured for this doctor' });
 
+    // Load multi-location schedule entries (doctor_hospitals). Each row has its own
+    // hospital_id, day_of_week, start_time, end_time — independent of doctor_schedules.
+    const multiHospR = await tenantQuery(s,
+      `SELECT * FROM doctor_hospitals WHERE doctor_id=$1 AND start_time IS NOT NULL AND end_time IS NOT NULL`,
+      [doctor_id]);
+    // Build a map: dayOfWeek -> [{ hospital_id, start_time, end_time }]
+    const multiScheduleMap = {};
+    for (const row of multiHospR.rows) {
+      if (!multiScheduleMap[row.day_of_week]) multiScheduleMap[row.day_of_week] = [];
+      multiScheduleMap[row.day_of_week].push(row);
+    }
+
     const { addDays, format } = require('date-fns');
     const duration = doc.slot_duration_minutes || 30;
     const today = new Date();
     let generated = 0;
 
-    for (let i = 1; i <= safeDays; i++) {
-      const date = addDays(today, i);
-      const dow = date.getDay();
-      const sched = schedR.rows.find(s => s.day_of_week === dow);
-      if (!sched) continue;
-      const dateStr = format(date, 'yyyy-MM-dd');
-      const [sh, sm] = sched.start_time.split(':').map(Number);
-      const [eh, em] = sched.end_time.split(':').map(Number);
-
+    // Helper: generate slots for a given hospital/schedule on a specific date
+    async function generateDaySlots(hospitalId, dateStr, startTime, endTime, lunchStartTime, lunchEndTime) {
+      const [sh, sm] = startTime.split(':').map(Number);
+      const [eh, em] = endTime.split(':').map(Number);
       let lunchStart = null, lunchEnd = null;
-      if (sched.lunch_start_time && sched.lunch_end_time) {
-        const [lsh, lsm] = sched.lunch_start_time.split(':').map(Number);
-        const [leh, lem] = sched.lunch_end_time.split(':').map(Number);
+      if (lunchStartTime && lunchEndTime) {
+        const [lsh, lsm] = lunchStartTime.split(':').map(Number);
+        const [leh, lem] = lunchEndTime.split(':').map(Number);
         lunchStart = lsh * 60 + lsm;
         lunchEnd   = leh * 60 + lem;
       }
-
       let cur = sh * 60 + sm;
       const end = eh * 60 + em;
-
       const daySlots = [];
       while (cur + duration <= end) {
         if (lunchStart !== null && cur < lunchEnd && cur + duration > lunchStart) {
@@ -917,10 +936,9 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
         }
         const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
         const et = `${String(Math.floor((cur + duration) / 60)).padStart(2, '0')}:${String((cur + duration) % 60).padStart(2, '0')}`;
-        daySlots.push([doctor_id, doc.hospital_id, dateStr, st, et]);
+        daySlots.push([doctor_id, hospitalId, dateStr, st, et]);
         cur += duration;
       }
-
       for (let j = 0; j < daySlots.length; j += 100) {
         const chunk = daySlots.slice(j, j + 100);
         const values = chunk.map((_, k) =>
@@ -932,6 +950,30 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
           ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING
         `, chunk.flat());
         generated += chunk.length;
+      }
+    }
+
+    for (let i = 1; i <= safeDays; i++) {
+      const date = addDays(today, i);
+      const dow = date.getDay();
+      const dateStr = format(date, 'yyyy-MM-dd');
+
+      // Primary hospital schedule
+      const sched = schedR.rows.find(s => s.day_of_week === dow);
+      if (sched) {
+        await generateDaySlots(
+          doc.hospital_id, dateStr,
+          sched.start_time, sched.end_time,
+          sched.lunch_start_time, sched.lunch_end_time
+        );
+      }
+
+      // Additional hospitals (doctor_hospitals table)
+      const multiScheds = multiScheduleMap[dow] || [];
+      for (const ms of multiScheds) {
+        // Skip if it's the same hospital as primary (already generated above)
+        if (ms.hospital_id === doc.hospital_id) continue;
+        await generateDaySlots(ms.hospital_id, dateStr, ms.start_time, ms.end_time, null, null);
       }
     }
     res.json({ success: true, generated, days: safeDays });
@@ -1016,23 +1058,25 @@ router.delete('/staff/:id', adminOnly, validateUUID(), async (req, res) => {
 router.get('/settings', async (req, res) => {
   try {
     const t = req.tenant;
-    const [hospR, planR, usageR] = await Promise.allSettled([
+    const [hospR, planR, usageR, userR] = await Promise.allSettled([
       tenantQuery(t.schema_name, `SELECT * FROM hospitals LIMIT 1`),
       query(`SELECT * FROM plans WHERE id=$1`, [t.plan]),
       Promise.all([
         tenantQuery(t.schema_name, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
         tenantQuery(t.schema_name, `SELECT COUNT(*) FROM appointments WHERE created_at >= date_trunc('month', NOW())`),
       ]),
+      tenantQuery(t.schema_name, `SELECT notify_phone FROM users WHERE id=$1`, [req.user.id]),
     ]);
     const hosp = hospR.status === 'fulfilled' ? (hospR.value.rows[0] || {}) : {};
     const planData = planR.status === 'fulfilled' ? planR.value.rows[0] : null;
     const [docCount, apptCount] = usageR.status === 'fulfilled' ? usageR.value : [null, null];
+    const notifyPhone = userR.status === 'fulfilled' ? (userR.value.rows[0]?.notify_phone || '') : '';
     res.json({
       clinic_name: t.name,
       owner_email: t.owner_email,
       plan: t.plan,
-      wa_phone_number_id: t.wa_phone_number_id || '',
-      wa_configured: !!t.wa_phone_number_id,
+      wa_configured: !!(process.env.META_PHONE_NUMBER_ID && process.env.META_ACCESS_TOKEN),
+      notify_phone: notifyPhone,
       settings: t.settings || {},
       hospital: {
         address: hosp.address || '',
@@ -1055,15 +1099,10 @@ router.get('/settings', async (req, res) => {
 
 router.patch('/settings', adminOnly, validate(schemas.updateSettings), async (req, res) => {
   try {
-    const { name, wa_phone_number_id, wa_access_token, notification_prefs } = req.body;
+    const { name, notification_prefs, notify_phone } = req.body;
     const updates = [];
     const params = [];
     if (name) { params.push(name); updates.push(`name=$${params.length}`); }
-    if (wa_phone_number_id !== undefined) { params.push(wa_phone_number_id); updates.push(`wa_phone_number_id=$${params.length}`); }
-    if (wa_access_token) {
-      const { encrypt } = require('../utils/encryption');
-      params.push(encrypt(wa_access_token)); updates.push(`wa_access_token_enc=$${params.length}`);
-    }
     if (notification_prefs) {
       params.push(JSON.stringify(notification_prefs));
       updates.push(`settings=settings || $${params.length}::jsonb`);
@@ -1072,13 +1111,16 @@ router.patch('/settings', adminOnly, validate(schemas.updateSettings), async (re
       params.push(req.tenant.id);
       await query(`UPDATE tenants SET ${updates.join(',')} WHERE id=$${params.length}`, params);
     }
+    if (notify_phone !== undefined) {
+      const cleaned = notify_phone ? notify_phone.replace(/[+\s\-()]/g, '') : null;
+      await tenantQuery(req.tenant.schema_name,
+        `UPDATE users SET notify_phone=$1 WHERE id=$2`,
+        [cleaned || null, req.user.id]);
+    }
 
-    // Audit log for settings changes (especially WA credential updates)
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
       'UPDATE_SETTINGS', 'tenant', req.tenant.id,
-      null,
-      { name: !!name, wa_phone_updated: !!wa_phone_number_id, wa_token_updated: !!wa_access_token },
-      req.ip);
+      null, { name: !!name }, req.ip);
 
     res.json({ success: true });
   } catch (err) { handleError(res, err); }
@@ -1155,7 +1197,7 @@ router.get('/feedback', async (req, res) => {
     res.json({
       feedback: r.rows,
       page: parseInt(page),
-      has_more: r.rows.length === safeLimit,
+      has_more: offset + r.rows.length < parseInt(avgR.rows[0]?.total || 0),
       avg_rating: avgR.rows[0]?.avg_rating ? parseFloat(avgR.rows[0].avg_rating) : null,
       total: parseInt(avgR.rows[0]?.total || 0),
       distribution: distR.rows,
@@ -1263,7 +1305,7 @@ router.get('/onboarding/status', async (req, res) => {
       { id: 'hospital', label: 'Add your clinic/hospital', done: hospitals > 0 },
       { id: 'doctor', label: 'Add a doctor', done: doctors > 0 },
       { id: 'slots', label: 'Generate appointment slots', done: slots > 0 },
-      { id: 'whatsapp', label: 'Configure WhatsApp', done: !!req.tenant.wa_phone_number_id },
+      { id: 'whatsapp', label: 'WhatsApp (shared — configured globally)', done: !!(process.env.META_PHONE_NUMBER_ID && process.env.META_ACCESS_TOKEN) },
     ];
     res.json({ steps, all_done: steps.every(s => s.done), onboarding_completed: completed });
   } catch (err) { handleError(res, err); }
@@ -1363,15 +1405,12 @@ router.post('/messages/send', adminOnly, async (req, res) => {
     if (!/^[0-9]{7,20}$/.test(phone.replace(/[+\s]/g, ''))) {
       return res.status(400).json({ error: 'Invalid phone number' });
     }
-    const { decrypt } = require('../utils/encryption');
-    const wa = require('../services/whatsapp');
-    const waToken = req.tenant.wa_access_token_enc ? decrypt(req.tenant.wa_access_token_enc) : null;
-    const waPhoneId = req.tenant.wa_phone_number_id;
-    if (!waToken || !waPhoneId) {
-      return res.status(400).json({ error: 'WhatsApp credentials not configured for this clinic' });
+    if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
+      return res.status(400).json({ error: 'WhatsApp not configured (META_PHONE_NUMBER_ID / META_ACCESS_TOKEN missing in env)' });
     }
+    const wa = require('../services/whatsapp');
     const normalised = phone.replace(/[+\s]/g, '');
-    await wa.sendText(normalised, message, waToken, waPhoneId);
+    await wa.sendText(normalised, message, null, null);
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
       'SEND_WA_MESSAGE', 'patient', normalised, null, { message: message.slice(0, 100) }, req.ip);
     res.json({ success: true, phone: normalised });
@@ -1453,7 +1492,7 @@ router.post('/admin/whatsapp/reset-circuit', async (req, res) => {
   try {
     const wa = require('../services/whatsapp');
     if (typeof wa.resetCircuit === 'function') {
-      wa.resetCircuit(req.tenant.wa_phone_number_id || process.env.META_PHONE_NUMBER_ID);
+      wa.resetCircuit(process.env.META_PHONE_NUMBER_ID);
       res.json({ success: true, message: 'Circuit breaker reset — bot will send again immediately.' });
     } else {
       res.status(501).json({ error: 'resetCircuit not exported from whatsapp service' });

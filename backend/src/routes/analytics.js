@@ -34,13 +34,15 @@ router.get('/analytics', analyticsLimiter, async (req, res) => {
       `, [d]),
       tenantQuery(s, `
         SELECT status, COUNT(*) as count FROM appointments
-        WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL GROUP BY status
+        WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+          AND status != 'cancelled' GROUP BY status
       `, [d]),
       tenantQuery(s, `
         SELECT COALESCE(dep.name, 'General') as name, COUNT(a.id) as count FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=d.department_id
         WHERE a.appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+          AND a.status IN ('confirmed', 'completed')
         GROUP BY COALESCE(dep.name, 'General') ORDER BY count DESC
       `, [d]),
     ]);
@@ -63,8 +65,9 @@ router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
       tenantQuery(s, `
         SELECT COUNT(*) FILTER (WHERE status='no_show') as no_show_count, COUNT(*) as total_count
         FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+          AND status != 'cancelled'
       `, [d]),
-      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL`, [d]),
+      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL AND status != 'cancelled'`, [d]),
       tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg FROM appointment_feedback WHERE created_at >= NOW() - ($1::text || ' days')::INTERVAL`, [d]),
     ]);
     const safeVal = (r, fn) => r.status === 'fulfilled' ? fn(r.value.rows[0]) : null;

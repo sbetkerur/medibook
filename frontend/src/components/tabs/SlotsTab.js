@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { format } from 'date-fns';
@@ -10,18 +10,19 @@ export default function SlotsTab({ doctors }) {
   const [slots, setSlots] = useState([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
 
-  useEffect(() => {
-    if (selDoctor && selDate) fetchSlots();
-  }, [selDoctor, selDate]);
-
-  async function fetchSlots() {
+  const fetchSlots = useCallback(async () => {
+    if (!selDoctor || !selDate) return;
     setSlotsLoading(true);
     try {
       const { data } = await api.get(`/admin/slots?doctor_id=${selDoctor}&date=${selDate}`);
       setSlots(data.slots || []);
     } catch { toast.error('Failed to load slots'); }
     finally { setSlotsLoading(false); }
-  }
+  }, [selDoctor, selDate]);
+
+  useEffect(() => {
+    fetchSlots();
+  }, [fetchSlots]);
 
   async function toggleSlot(slot) {
     if (slot.status === 'booked') return toast.error('Cannot block a booked slot');
@@ -66,14 +67,14 @@ export default function SlotsTab({ doctors }) {
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-400 inline-block"></span>Blocked</span>
             </div>
           </div>
-          <div className="p-4 grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2">
+          <div className="p-3 md:p-4 grid grid-cols-3 sm:grid-cols-5 md:grid-cols-8 gap-2">
             {slots.map(slot => (
               <div key={slot.id}
                 onClick={() => (slot.status === 'available' || slot.status === 'blocked') && toggleSlot(slot)}
-                className={`p-2 rounded-lg border text-center text-xs font-medium cursor-pointer transition-all ${slotStatusColor(slot.status)} ${slot.status === 'booked' || slot.status === 'expired' ? 'opacity-60 cursor-not-allowed' : 'hover:opacity-80'}`}
+                className={`p-2 min-h-[44px] rounded-lg border text-center text-xs font-medium cursor-pointer transition-all flex flex-col items-center justify-center ${slotStatusColor(slot.status)} ${slot.status === 'booked' || slot.status === 'expired' ? 'opacity-60 cursor-not-allowed' : 'hover:opacity-80 active:scale-95'}`}
                 title={slot.patient_name ? `Booked: ${slot.patient_name} (${slot.booking_id})` : slot.status}>
                 <div>{slot.start_time?.slice(0, 5)}</div>
-                {slot.patient_name && <div className="truncate text-[10px] mt-0.5 opacity-75">{slot.patient_name.split(' ')[0]}</div>}
+                {slot.patient_name && <div className="truncate text-xs mt-0.5 opacity-75 w-full">{slot.patient_name.split(' ')[0]}</div>}
               </div>
             ))}
             {!slots.length && <div className="col-span-8 py-6 text-center text-gray-400">No slots generated for this date</div>}

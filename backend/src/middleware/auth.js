@@ -101,7 +101,8 @@ function invalidateTenantCache(tenantId) {
 }
 
 async function checkIPAllowlist(tenantId, clientIp) {
-  if (!tenantId || !clientIp) return true; // no tenant or no IP — allow
+  if (!tenantId) return true; // no allowlist to check for this request
+  if (!clientIp) return false; // cannot determine client IP — fail closed
   try {
     // Normalise IPv4-mapped IPv6 addresses (e.g. "::ffff:192.168.1.1" → "192.168.1.1")
     const normalizedIp = clientIp.replace(/^::ffff:/i, '');

@@ -67,9 +67,19 @@ const PORT = process.env.PORT || 3001;
 // Set FRONTEND_URL=https://your-frontend.up.railway.app to lock it down.
 const rawFrontendUrl = process.env.FRONTEND_URL || null;
 if (rawFrontendUrl) {
-  try { new URL(rawFrontendUrl); } catch {
+  let parsedFrontendUrl;
+  try { parsedFrontendUrl = new URL(rawFrontendUrl); } catch {
     logger.error(`Invalid FRONTEND_URL "${rawFrontendUrl}" — must be a valid URL. Exiting.`);
     process.exit(1);
+  }
+  // In production, reject localhost/loopback origins — a misconfigured FRONTEND_URL would
+  // silently open CORS to any local process on the server.
+  if (process.env.NODE_ENV === 'production') {
+    const host = parsedFrontendUrl.hostname;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+      logger.error(`FRONTEND_URL "${rawFrontendUrl}" points to localhost — this is not allowed in production. Set it to your actual frontend domain. Exiting.`);
+      process.exit(1);
+    }
   }
 }
 
@@ -192,7 +202,7 @@ app.post('/api/webhook/resend', express.json(), async (req, res) => {
     const sig = req.headers['resend-signature'];
     if (!sig) { logger.warn('Unsigned Resend webhook rejected'); return res.sendStatus(403); }
     const expected = crypto.createHmac('sha256', process.env.RESEND_WEBHOOK_SECRET)
-      .update(JSON.stringify(req.body)).digest('hex');
+      .update(req.rawBody || Buffer.from(JSON.stringify(req.body))).digest('hex');
     if (sig !== expected) { logger.warn('Invalid Resend webhook signature'); return res.sendStatus(403); }
   }
 
@@ -292,7 +302,7 @@ app.get('/health', async (req, res) => {
         rss_mb: Math.round(mem.rss / 1024 / 1024),
         status: isMemoryHigh ? 'high' : 'ok',
       },
-      cron_alerts: isDegraded ? cronAlerts : undefined,
+      cron_alerts: isDegraded ? cronAlerts.map(({ last_error: _, ...a }) => a) : undefined,
       backup_hint: process.env.NODE_ENV !== 'production'
         ? `pg_dump $DATABASE_URL > medibook_$(date +%Y%m%d).sql`
         : undefined,
@@ -304,6 +314,12 @@ app.get('/health', async (req, res) => {
 
 // ── METRICS ENDPOINT ──────────────────────────────────────────
 app.get('/metrics', async (req, res) => {
+  if (process.env.METRICS_SECRET) {
+    const auth = (req.headers.authorization || '').replace('Bearer ', '');
+    if (auth !== process.env.METRICS_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
   try {
     const { pool: dbPool } = require('./db');
     await dbPool.query('SELECT 1');
@@ -396,8 +412,27 @@ process.on('SIGTERM', () => {
 });
 
 process.on('uncaughtException', (err) => {
-  logger.error('Uncaught exception', { error: err.message, stack: err.stack });
-  process.exit(1);
+  try { require('./utils/metrics').increment('uncaught_exceptions_total'); } catch (_) {}
+  // Port already in use or out of memory — can't recover, must exit so PM2 can restart cleanly
+  const FATAL_CODES = ['ENOMEM', 'EADDRINUSE', 'EACCES'];
+  const isFatal = FATAL_CODES.includes(err.code) || FATAL_CODES.some(c => err.message.includes(c));
+  if (isFatal) {
+    logger.error('Fatal system error — exiting for PM2 restart', { code: err.code, error: err.message });
+    process.exit(1);
+  }
+  // Non-fatal: log and keep running — a bad cron callback shouldn't take the whole bot offline
+  logger.error('Uncaught exception — server continuing', { error: err.message, stack: err.stack });
+});
+
+// Unhandled promise rejections (async throws that escaped all try-catch blocks)
+// are the most common cause of silent process crashes in Node >= 15.
+// Log them but keep the server up — the error boundary in botEngine handles
+// per-request failures; these are background tasks that can be re-tried.
+process.on('unhandledRejection', (reason, promise) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  logger.error('Unhandled promise rejection — server continuing', { error: msg, stack });
+  try { require('./utils/metrics').increment('unhandled_rejections_total'); } catch (_) {}
 });
 
 module.exports = app;

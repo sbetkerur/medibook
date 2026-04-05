@@ -6,7 +6,6 @@ const { query, tenantQuery } = require('../db');
 const { createTenantSchema, runTenantMigrations } = require('../db/tenantMigrate');
 const { authMiddleware, invalidateTenantCache } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const { encrypt } = require('../utils/encryption');
 const { validateUUID } = require('../utils/errors');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
@@ -138,7 +137,8 @@ router.get('/tenants', async (req, res) => {
     const params = [];
     if (search) {
       if (search.length > 100) return res.status(400).json({ error: 'search too long' });
-      params.push(`%${search}%`);
+      const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
+      params.push(`%${escapedSearch}%`);
       where = ` WHERE t.name ILIKE $1 OR t.slug ILIKE $1`;
     }
 
@@ -174,7 +174,7 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
 // ── CREATE TENANT ─────────────────────────────────────────────
 router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), async (req, res) => {
   try {
-    const { name, slug, owner_email, owner_password, owner_name, plan, wa_phone_number_id, wa_access_token } = req.body;
+    const { name, slug, owner_email, owner_password, owner_name, plan } = req.body;
 
     const schema = 'tenant_' + slug.replace(/-/g, '_').toLowerCase();
 
@@ -182,13 +182,11 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
     const existing = await query(`SELECT id FROM tenants WHERE slug=$1`, [slug]);
     if (existing.rows[0]) return res.status(409).json({ error: 'Slug already taken' });
 
-    const waTokenEnc = wa_access_token ? encrypt(wa_access_token) : null;
-
-    // Phase 1: insert tenant record
+    // Phase 1: insert tenant record (WA credentials are now global — no per-tenant fields)
     const r = await query(`
-      INSERT INTO tenants (name, slug, schema_name, owner_email, plan, wa_phone_number_id, wa_access_token_enc)
-      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-    `, [name, slug, schema, owner_email, plan || 'starter', wa_phone_number_id || null, waTokenEnc]);
+      INSERT INTO tenants (name, slug, schema_name, owner_email, plan)
+      VALUES ($1,$2,$3,$4,$5) RETURNING *
+    `, [name, slug, schema, owner_email, plan || 'starter']);
     const tenant = r.rows[0];
 
     // Phase 2 & 3: create schema + admin user — rollback both if either fails
@@ -241,7 +239,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
 // ── UPDATE TENANT ─────────────────────────────────────────────
 router.patch('/tenants/:id', validateUUID(), async (req, res) => {
   try {
-    const { status, plan, wa_phone_number_id, wa_access_token, name, suspension_reason } = req.body;
+    const { status, plan, name, suspension_reason } = req.body;
 
     const VALID_STATUSES = ['active', 'suspended', 'inactive'];
     if (status && !VALID_STATUSES.includes(status)) {
@@ -267,8 +265,6 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
       return res.status(400).json({ error: `Invalid plan. Must be one of: ${VALID_PLANS.join(', ')}` });
     }
     if (plan) { params.push(plan); updates.push(`plan=$${params.length}`); }
-    if (wa_phone_number_id) { params.push(wa_phone_number_id); updates.push(`wa_phone_number_id=$${params.length}`); }
-    if (wa_access_token) { params.push(encrypt(wa_access_token)); updates.push(`wa_access_token_enc=$${params.length}`); }
 
     if (!updates.length) return res.json({ message: 'Nothing to update' });
 
@@ -361,7 +357,7 @@ router.get('/tenants/:id/health', validateUUID(), async (req, res) => {
       name: t.name,
       status: t.status,
       plan: t.plan,
-      wa_configured: !!t.wa_phone_number_id,
+      wa_configured: !!(process.env.META_PHONE_NUMBER_ID && process.env.META_ACCESS_TOKEN),
       onboarding_completed: t.onboarding_completed,
       appointments_30d: v(appts30d),
       appointments_7d: v(appts7d),
@@ -372,7 +368,6 @@ router.get('/tenants/:id/health', validateUUID(), async (req, res) => {
       flags: {
         no_recent_activity: hasZeroAppts && !isNewTenant,
         low_slots: hasFewSlots,
-        no_whatsapp: !t.wa_phone_number_id,
       },
     });
   } catch (err) { handleError(res, err); }
@@ -487,7 +482,7 @@ router.get('/tenants/:id/onboarding', validateUUID(), async (req, res) => {
     const v = (r) => r.status === 'fulfilled' ? parseInt(r.value.rows[0]?.count || 0) : 0;
 
     const steps = [
-      { id: 'wa_configured', label: 'WhatsApp Connected', done: !!t.wa_phone_number_id },
+      { id: 'wa_configured', label: 'WhatsApp Connected (shared globally)', done: !!(process.env.META_PHONE_NUMBER_ID && process.env.META_ACCESS_TOKEN) },
       { id: 'hospital_added', label: 'Hospital/Clinic Added', done: v(hospitals) > 0 },
       { id: 'doctor_added', label: 'Doctor Added', done: v(doctors) > 0 },
       { id: 'slots_generated', label: 'Appointment Slots Generated', done: v(slots) > 0 },

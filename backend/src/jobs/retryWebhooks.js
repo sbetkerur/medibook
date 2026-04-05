@@ -6,7 +6,7 @@ const logger = require('../utils/logger');
 async function retryFailedWebhooks() {
   // Fetch up to 20 pending webhooks ready for retry
   const r = await query(`
-    SELECT fw.*, t.schema_name, t.wa_phone_number_id, t.wa_access_token_enc, t.name,
+    SELECT fw.*, t.schema_name, t.name,
            t.settings, t.plan, t.status as tenant_status
     FROM failed_webhooks fw
     JOIN tenants t ON t.id = fw.tenant_id
@@ -32,8 +32,6 @@ async function retryFailedWebhooks() {
       const tenant = {
         id: row.tenant_id,
         schema_name: row.schema_name,
-        wa_phone_number_id: row.wa_phone_number_id,
-        wa_access_token_enc: row.wa_access_token_enc,
         name: row.name,
         settings: row.settings,
         plan: row.plan,
@@ -56,7 +54,10 @@ async function retryFailedWebhooks() {
     } catch (err) {
       logger.warn(`Webhook retry attempt failed`, { id: row.id, error: err.message });
 
-      const nextAttemptNum = row.attempts; // already incremented above
+      // row.attempts is the pre-increment value from the SELECT; the DB was incremented
+      // above but the JS object still holds the original count. Add 1 to get the actual
+      // attempt number that just ran, so the max_attempts comparison is accurate.
+      const nextAttemptNum = row.attempts + 1;
       if (nextAttemptNum >= row.max_attempts) {
         // All retries exhausted
         await query(

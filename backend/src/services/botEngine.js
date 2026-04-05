@@ -97,8 +97,34 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
   }
 
   const schema = tenant.schema_name;
-  const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
-  const waPhoneId = tenant.wa_phone_number_id;
+  // Shared WhatsApp number — always use global META_* env vars (token/phoneId = null → fallback to env)
+  const waToken = null;
+  const waPhoneId = null;
+
+  try {
+    return await _handleInner({ phone, text, buttonId, tenant, waMessageId, schema, waToken, waPhoneId });
+  } catch (err) {
+    // Top-level safety net — if anything throws (DB error, circuit breaker open, etc.),
+    // reset the session to idle and tell the user to try again. This prevents the bot
+    // from silently dying and leaving the user stuck with no response.
+    logger.error('Bot handle() uncaught error — resetting session to idle', {
+      phone, tenant: tenant.slug, error: err.message,
+      stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
+    });
+    try {
+      await updateSession(schema, phone, STATES.IDLE, {});
+    } catch (_) { /* ignore — DB might be down */ }
+    try {
+      await wa.sendText(phone,
+        'Sorry, something went wrong. Please reply *Hi* to continue.',
+        waToken, waPhoneId);
+    } catch (_) { /* ignore — circuit might be open */ }
+    // Re-throw so BullMQ knows the job failed and can retry correctly
+    throw err;
+  }
+}
+
+async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema, waToken, waPhoneId }) {
 
   // Inbound message is already logged by the webhook handler for idempotency dedup.
   // Only log outgoing messages here to avoid a double-insert in wa_messages.
@@ -380,7 +406,6 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     STATES.CONFIRM_BOOKING,
   ];
   if (BOOKING_STATES.includes(session.state) && /^(cancel|exit|back|quit|stop|0|main menu|mainmenu)$/i.test(input)) {
-    await updateSession(schema, phone, STATES.IDLE, {});
     await send.buttons(
       '❌ Booking cancelled.\n\nWhat would you like to do?',
       ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
@@ -442,7 +467,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     return;
   }
   if (session.state === STATES.COLLECT_EMAIL) {
-    if (!/^skip$/i.test(input) && input.length > 0) {
+    if (!/^skip$/i.test(input) && !/^btn_0/.test(buttonId || '') && input.length > 0) {
       // Stricter email regex: requires valid local part, domain with at least one dot,
       // and a TLD of 2+ chars. Rejects `test@.com`, `a@b.c`, consecutive dots in domain.
       if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(input) && !/\.{2,}/.test(input)) {
@@ -458,10 +483,10 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     return handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSession);
   }
   if (session.state === STATES.CONFIRM_BOOKING) {
-    if (/yes|confirm|ok|sure|haan|btn_0/i.test(choice)) {
+    if (/^(yes|confirm|ok|sure|haan)$|^btn_0|^1$/.test(choice)) {
       return completeBooking(phone, schema, tenant, send, ctx);
     }
-    if (/no|cancel|nahi|btn_1/i.test(choice)) {
+    if (/\bno\b|\bcancel\b|\bnahi\b|btn_1|^2$/.test(choice)) {
       await send.text('Booking cancelled. Reply *Hi* to start over anytime. 👋');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
@@ -618,8 +643,9 @@ async function triggerFeedback(schemaName, phone, appointmentId, patientId, doct
  */
 async function handleVoiceMessage({ phone, audioId, tenant }) {
   const schema = tenant.schema_name;
-  const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
-  const waPhoneId = tenant.wa_phone_number_id;
+  // Shared phone — use global env vars
+  const waToken = null;
+  const waPhoneId = null;
 
   if (!process.env.OPENAI_API_KEY) {
     await wa.sendText(phone,

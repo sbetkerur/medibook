@@ -19,7 +19,16 @@ function createConnection() {
     lazyConnect: true,
     keepAlive: 30000,         // Send TCP keepalive every 30s to prevent Railway proxy from dropping idle connections
     connectTimeout: 10000,
-    commandTimeout: 30000,
+    // NOTE: do NOT set commandTimeout here. BullMQ uses blocking Redis commands
+    // (XREAD BLOCK, BRPOP) that intentionally run for many seconds while waiting
+    // for new jobs. A commandTimeout would kill those and break the queue entirely.
+    // Retry Redis connection with exponential backoff, capped at 10s, max 20 attempts.
+    // Without this, a brief Redis restart would make the queue permanently unavailable
+    // until the backend process was restarted.
+    retryStrategy: (times) => {
+      if (times > 20) return null; // give up after ~100s total — fall back to sync
+      return Math.min(times * 500, 10000);
+    },
   });
   conn.on('error', () => { /* suppress connection noise */ });
   return conn;
@@ -115,8 +124,11 @@ function startBotWorker() {
 
   botWorkerInstance.on('failed', async (job, err) => {
     logger.error('Bot job failed', { jobId: job?.id, attempts: job?.attemptsMade, error: err.message });
-    // Move to dead-letter queue after all retries exhausted
-    if (job && job.attemptsMade >= (job.opts?.attempts || 3) && dlQueue) {
+    // Move to dead-letter queue after all retries exhausted.
+    // job.opts.attempts is set to 2 when jobs are enqueued (see webhook.js).
+    // Fall back to 1 (BullMQ default) so we don't use 2 as a magic constant
+    // that could diverge from the actual queue config.
+    if (job && job.attemptsMade >= (job.opts?.attempts ?? 1) && dlQueue) {
       try {
         await dlQueue.add('failed', {
           original: job.data,
@@ -130,6 +142,22 @@ function startBotWorker() {
       }
     }
   });
+
+  botWorkerInstance.on('error', (err) => {
+    logger.error('BullMQ worker error', { error: err.message });
+  });
+
+  // Watchdog: check every 2 minutes that the worker is still running.
+  // BullMQ workers can silently stall after a Redis reconnect — if we detect
+  // the worker is closed, restart it so the queue keeps processing.
+  const watchdogInterval = setInterval(async () => {
+    if (!botWorkerInstance || botWorkerInstance.closing) {
+      logger.warn('Bot worker watchdog: worker stopped — restarting...');
+      workerStarted = false;
+      startBotWorker();
+    }
+  }, 2 * 60 * 1000);
+  watchdogInterval.unref();
 
   // Email worker — processes email-jobs queue
   if (emailQueue) {

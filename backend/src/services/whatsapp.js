@@ -22,6 +22,10 @@ function getAxiosInstance(accessToken, phoneNumberId) {
       timeout: 10000,
     }));
   }
+  // Evict stale entries for same phoneId with a different token suffix (token rotation)
+  for (const k of _axiosPool.keys()) {
+    if (k.startsWith(`${phoneId}:`) && k !== key) _axiosPool.delete(k);
+  }
   return { instance: _axiosPool.get(key), phoneId };
 }
 
@@ -38,8 +42,8 @@ function getClient(accessToken, phoneNumberId) {
 // ── Circuit Breaker ───────────────────────────────────────────────────────────
 // States: CLOSED (normal), OPEN (stop calls), HALF_OPEN (test one call)
 const _circuits = new Map(); // phoneNumberId -> { state, failures, openedAt }
-const CB_FAILURE_THRESHOLD = 5;
-const CB_RESET_MS = 60 * 1000; // 60 seconds
+const CB_FAILURE_THRESHOLD = 8;  // raised from 5 — transient blips shouldn't open the circuit
+const CB_RESET_MS = 30 * 1000;   // reduced from 60s — recover faster after a hiccup
 
 function getCircuit(phoneId) {
   if (!_circuits.has(phoneId)) {
@@ -80,24 +84,7 @@ function isCircuitOpen(phoneId) {
 
 // ── Core send helper ──────────────────────────────────────────────────────────
 async function _send(payload, accessToken, phoneNumberId) {
-  const token = accessToken || process.env.META_ACCESS_TOKEN;
-  const phoneId = phoneNumberId || process.env.META_PHONE_NUMBER_ID;
-
-  // Always use a fresh axios instance keyed on current token — never serve
-  // a cached instance built with an old (expired) token.
-  const key = `${phoneId}:${(token || '').slice(-16)}`;
-  if (!_axiosPool.has(key)) {
-    _axiosPool.set(key, axios.create({
-      baseURL: `https://graph.facebook.com/v21.0/${phoneId}`,
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      timeout: 10000,
-    }));
-  }
-  // Evict stale entries for same phoneId but different token suffix
-  for (const k of _axiosPool.keys()) {
-    if (k.startsWith(`${phoneId}:`) && k !== key) _axiosPool.delete(k);
-  }
-  const instance = _axiosPool.get(key);
+  const { instance, phoneId } = getAxiosInstance(accessToken, phoneNumberId);
 
   if (isCircuitOpen(phoneId)) {
     throw new Error(`Circuit breaker OPEN for ${phoneId} — skipping send`);

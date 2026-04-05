@@ -18,7 +18,12 @@ router.get('/patients', patientLimiter, async (req, res) => {
     const s = req.tenant.schema_name;
     let where = '';
     let params = [];
-    if (search) { params.push(`%${search}%`); where = ` WHERE deleted_at IS NULL AND (name ILIKE $1 OR phone LIKE $1 OR email ILIKE $1)`; }
+    if (search) {
+      if (search.length > 100) return res.status(400).json({ error: 'search too long' });
+      const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
+      params.push(`%${escapedSearch}%`);
+      where = ` WHERE deleted_at IS NULL AND (name ILIKE $1 OR phone LIKE $1 OR email ILIKE $1)`;
+    }
     else { where = ` WHERE deleted_at IS NULL`; }
     const countParams = [...params];
     params.push(25, (safePage - 1) * 25);
@@ -29,7 +34,7 @@ router.get('/patients', patientLimiter, async (req, res) => {
       tenantQuery(s, `SELECT COUNT(*) FROM patients${where}`, countParams),
     ]);
     const total = parseInt(countR.rows[0]?.count || 0);
-    res.json({ patients: r.rows, total, page: safePage, limit: 25, has_more: r.rows.length === 25 });
+    res.json({ patients: r.rows, total, page: safePage, limit: 25, has_more: (safePage - 1) * 25 + r.rows.length < total });
   } catch (err) { handleError(res, err); }
 });
 

@@ -58,4 +58,12 @@ async function sendBookingConfirmationSMS(phone, { bookingId, doctorName, date, 
   return sendSMS(phone, body);
 }
 
-module.exports = { sendSMS, sendBookingConfirmationSMS };
+/**
+ * Alert clinic admin via SMS when a new appointment is booked.
+ */
+async function sendAdminBookingAlertSMS(phone, { bookingId, patientName, doctorName, date, time, hospitalName }) {
+  const body = `New booking at ${hospitalName}\nPatient: ${patientName}\nDr. ${doctorName} · ${time}\n${date}\nRef: ${bookingId}`;
+  return sendSMS(phone, body);
+}
+
+module.exports = { sendSMS, sendBookingConfirmationSMS, sendAdminBookingAlertSMS };

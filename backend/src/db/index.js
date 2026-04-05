@@ -12,9 +12,19 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: parseInt(process.env.DB_POOL_MAX || '20'),
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 3000,
-  // Prevent runaway queries from blocking the pool indefinitely
-  statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT_MS || '30000'),
+  // Increased from 3s — brief Railway proxy hiccups (DB connection renegotiation,
+  // cold-start latency) were causing 3s timeouts to fail spuriously and cascade into
+  // bot job failures even when the DB itself was healthy.
+  connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT_MS || '10000'),
+  // Prevent runaway queries from blocking the pool indefinitely.
+  // Reduced from 30s — bot queries should never take > 10s; a slow query holding a
+  // connection for 30s can starve the pool under concurrent load.
+  statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT_MS || '10000'),
+  // Keep TCP connections alive so Railway's proxy doesn't silently drop idle ones.
+  // Without this, an idle pool connection can be killed at the network layer and
+  // the next query on it fails with ECONNRESET, which looks like a bot crash.
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
 pool.on('error', (err) => {

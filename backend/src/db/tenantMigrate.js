@@ -14,6 +14,7 @@ async function createTenantSchema(schemaName) {
         name VARCHAR(255) NOT NULL,
         role VARCHAR(50) DEFAULT 'staff',
         is_active BOOLEAN DEFAULT true,
+        notify_phone VARCHAR(20),
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
@@ -75,7 +76,7 @@ async function createTenantSchema(schemaName) {
 
       CREATE TABLE IF NOT EXISTS patients (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        phone VARCHAR(20) UNIQUE NOT NULL CHECK (phone ~ '^[0-9]{7,20}$'),
+        phone VARCHAR(20) NOT NULL CHECK (phone ~ '^[0-9]{7,20}$'),
         name VARCHAR(255),
         date_of_birth DATE,
         gender VARCHAR(20),
@@ -155,17 +156,6 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_holidays_date ON clinic_holidays(holiday_date);
       CREATE INDEX IF NOT EXISTS idx_services_hospital ON clinic_services(hospital_id, is_active);
 
-      CREATE TABLE IF NOT EXISTS waiting_list (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        patient_id UUID REFERENCES patients(id),
-        doctor_id UUID REFERENCES doctors(id),
-        hospital_id UUID REFERENCES hospitals(id),
-        requested_date DATE,
-        notified BOOLEAN DEFAULT false,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE (patient_id, doctor_id)
-      );
-
       CREATE TABLE IF NOT EXISTS appointment_feedback (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         appointment_id UUID REFERENCES appointments(id),
@@ -220,11 +210,12 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_appt_status ON appointments(status);
       CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id);
       CREATE INDEX IF NOT EXISTS idx_patients_phone ON patients(phone);
+      -- Partial unique index: phone numbers only unique among non-deleted patients,
+      -- so a soft-deleted patient's number can be re-registered.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_phone_active ON patients(phone) WHERE deleted_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_bot_sessions_phone ON bot_sessions(phone);
       CREATE INDEX IF NOT EXISTS idx_wa_messages_phone ON wa_messages(phone);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS idx_waiting_list_doctor ON waiting_list(doctor_id, notified);
-      CREATE INDEX IF NOT EXISTS idx_waiting_list_created_at ON waiting_list(created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_feedback_appointment ON appointment_feedback(appointment_id);
       -- Existing performance indexes
       CREATE INDEX IF NOT EXISTS idx_appt_status_date ON appointments(status, appointment_date DESC);
@@ -262,7 +253,7 @@ async function createTenantSchema(schemaName) {
         IF NOT EXISTS (
           SELECT 1 FROM pg_trigger
           WHERE tgname = 'audit_logs_immutable'
-            AND tgrelid = 'audit_logs'::regclass
+            AND tgrelid = (current_schema() || '.audit_logs')::regclass
         ) THEN
           CREATE TRIGGER audit_logs_immutable
           BEFORE UPDATE OR DELETE ON audit_logs
@@ -325,6 +316,11 @@ async function runTenantMigrations(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_doctor_leaves_doctor ON doctor_leaves(doctor_id, leave_date);
     `);
 
+    // Add notify_phone to users table for existing tenants
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_phone VARCHAR(20);
+    `);
+
     // Fix phone format constraint: digits-only (no + prefix) to match VARCHAR(20) column width.
     // The webhook layer strips any leading + before storage, so + is never present in DB.
     await client.query(`
@@ -342,7 +338,6 @@ async function runTenantMigrations(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_appt_status_date ON appointments(status, appointment_date DESC);
       CREATE INDEX IF NOT EXISTS idx_appt_created_at ON appointments(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_bot_sessions_activity ON bot_sessions(last_activity);
-      CREATE INDEX IF NOT EXISTS idx_waiting_list_created_at ON waiting_list(created_at ASC);
       CREATE INDEX IF NOT EXISTS idx_wa_messages_phone ON wa_messages(phone);
       DROP INDEX IF EXISTS idx_wa_messages_msg_id;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
@@ -406,6 +401,22 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE patients  ADD COLUMN IF NOT EXISTS opted_out   BOOLEAN DEFAULT false;
     `);
 
+    // Convert patients.phone from global UNIQUE to partial unique index so that soft-deleted
+    // patients' phone numbers can be re-registered. Drop inline constraint (patients_phone_key)
+    // if it exists and create a partial index scoped to non-deleted rows.
+    await client.query(`
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'patients_phone_key'
+            AND conrelid = (current_schema() || '.patients')::regclass
+        ) THEN
+          ALTER TABLE patients DROP CONSTRAINT patients_phone_key;
+        END IF;
+      END $$;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_phone_active ON patients(phone) WHERE deleted_at IS NULL;
+    `);
+
     // New composite indexes for reminder cron and common query patterns
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_appt_doctor_date        ON appointments(doctor_id, appointment_date);
@@ -434,7 +445,7 @@ async function runTenantMigrations(schemaName) {
         IF NOT EXISTS (
           SELECT 1 FROM pg_trigger
           WHERE tgname = 'audit_logs_immutable'
-            AND tgrelid = 'audit_logs'::regclass
+            AND tgrelid = (current_schema() || '.audit_logs')::regclass
         ) THEN
           CREATE TRIGGER audit_logs_immutable
           BEFORE UPDATE OR DELETE ON audit_logs
@@ -472,19 +483,6 @@ async function runTenantMigrations(schemaName) {
       );
       CREATE INDEX IF NOT EXISTS idx_documents_patient ON documents(patient_id, created_at DESC);
     `);
-
-    // Add unique constraint on waiting_list to prevent duplicate entries per patient+doctor
-    await client.query(`
-      DO $$ BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'uq_waiting_list_patient_doctor'
-            AND conrelid = 'waiting_list'::regclass
-        ) THEN
-          ALTER TABLE waiting_list ADD CONSTRAINT uq_waiting_list_patient_doctor UNIQUE (patient_id, doctor_id);
-        END IF;
-      END $$;
-    `).catch(() => {});
 
     // Email templates (admin-editable)
     await client.query(`

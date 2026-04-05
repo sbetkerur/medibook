@@ -5,7 +5,6 @@ const { query, tenantQuery } = require('../db');
 const botEngine = require('../services/botEngine');
 const botWorker = require('../jobs/botWorker');
 const wa = require('../services/whatsapp');
-const { decrypt } = require('../utils/encryption');
 const logger = require('../utils/logger');
 const { handleReminderConfirmation } = require('../jobs/reminders');
 const { isEnabled } = require('../utils/featureFlags');
@@ -45,9 +44,16 @@ function checkRateLimitInMemory(map, key, maxPerMinute) {
   const now = Date.now();
   let entry = map.get(key);
   if (!entry || now > entry.resetAt) {
-    // If map is at capacity and this is a new key, fail open (allow) to avoid blocking
-    // legitimate users. The cleanup interval will shrink it shortly.
-    if (!entry && map.size >= IN_MEMORY_MAP_MAX_SIZE) return true;
+    // If map is at capacity and this is a new key, try to evict the oldest expired entry first.
+    // If no expired entry is found, fail closed to prevent unbounded memory growth from DoS.
+    if (!entry && map.size >= IN_MEMORY_MAP_MAX_SIZE) {
+      // Evict the oldest expired entry; if none found, fail closed to prevent DoS via memory exhaustion
+      let evicted = false;
+      for (const [k, v] of map.entries()) {
+        if (now > v.resetAt) { map.delete(k); evicted = true; break; }
+      }
+      if (!evicted) return false;
+    }
     entry = { count: 0, resetAt: now + 60000 };
     map.set(key, entry);
   }
@@ -142,30 +148,20 @@ router.post('/webhook/whatsapp', async (req, res) => {
     const change = entry?.changes?.[0];
     const value = change?.value;
 
-    // Handle both statuses and messages — need tenant for status tracking
-    const phoneNumberId = value?.metadata?.phone_number_id;
-    let tenant = null;
-
-    if (phoneNumberId) {
-      const r = await query(
-        `SELECT * FROM tenants WHERE wa_phone_number_id=$1 AND status='active'`,
-        [phoneNumberId]
-      );
-      tenant = r.rows[0] || null;
-    }
-
-    // Dev fallback
-    if (!tenant && process.env.NODE_ENV !== 'production') {
-      const r = await query(`SELECT * FROM tenants WHERE status='active' LIMIT 1`);
-      tenant = r.rows[0] || null;
-    }
-
-    // Process delivery/read status updates (track in wa_messages)
+    // ── STATUS UPDATES (delivery receipts) ───────────────────────
+    // For status updates we need to find the tenant — use global_bot_sessions for routing.
     if (value?.statuses?.length) {
-      if (tenant) {
-        for (const status of value.statuses) {
-          if (status.id) {
-            wa.updateMessageStatus(tenant.schema_name, status.id, status.status).catch(() => {});
+      const statusPhone = value.statuses[0]?.recipient_id;
+      if (statusPhone) {
+        const gs = await query(`SELECT tenant_id FROM global_bot_sessions WHERE phone=$1`, [statusPhone]).catch(() => null);
+        if (gs?.rows[0]?.tenant_id) {
+          const tr = await query(`SELECT schema_name FROM tenants WHERE id=$1`, [gs.rows[0].tenant_id]).catch(() => null);
+          if (tr?.rows[0]) {
+            for (const status of value.statuses) {
+              if (status.id) {
+                wa.updateMessageStatus(tr.rows[0].schema_name, status.id, status.status).catch(() => {});
+              }
+            }
           }
         }
       }
@@ -173,11 +169,6 @@ router.post('/webhook/whatsapp', async (req, res) => {
     }
 
     if (!value?.messages?.length) return;
-
-    if (!tenant) {
-      logger.warn('No tenant found for webhook', { phoneNumberId });
-      return;
-    }
 
     const msg = value.messages[0];
     // Normalize phone: strip leading '+' so '919876543210' and '+919876543210' map to same user
@@ -217,13 +208,119 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
     if (!text && !buttonId && !unsupportedType) return;
 
+    // ── GLOBAL SESSION ROUTING (shared WhatsApp number) ──────────
+    // All tenants share one phone number. Route each patient to their chosen clinic
+    // via the global_bot_sessions table. New patients see a clinic selector first.
+    let tenant = null;
+
+    const isSwitchClinic = /^(switch|change)\s*(clinic|hospital|branch)?$/i.test((text || '').trim());
+    if (isSwitchClinic) {
+      await query(
+        `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant', last_activity=NOW() WHERE phone=$1`,
+        [phone]
+      ).catch(() => {});
+    }
+
+    const gs = await query(`SELECT * FROM global_bot_sessions WHERE phone=$1`, [phone]).catch(() => null);
+    const globalSession = gs?.rows[0] || null;
+
+    if (!globalSession || !globalSession.tenant_id || globalSession.state === 'select_tenant') {
+      // Load all active tenants
+      const tenantsR = await query(
+        `SELECT id, name, settings->>'city' as city FROM tenants WHERE status='active' ORDER BY name`
+      );
+      const activeTenants = tenantsR.rows;
+
+      if (activeTenants.length === 0) {
+        logger.warn('No active tenants — dropping incoming message', { phone: maskPhone(phone) });
+        return;
+      }
+
+      if (activeTenants.length === 1) {
+        // Auto-assign single tenant — no selection needed
+        await query(
+          `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity)
+           VALUES ($1,$2,'active',NOW())
+           ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active', last_activity=NOW()`,
+          [phone, activeTenants[0].id]
+        );
+        const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [activeTenants[0].id]);
+        tenant = r.rows[0] || null;
+      } else {
+        // Multi-tenant: check if patient is selecting a clinic right now
+        let selected = null;
+
+        // buttonId from list/button reply may be a tenant UUID
+        if (buttonId) {
+          selected = activeTenants.find(t => t.id === buttonId);
+        }
+
+        if (!selected && text) {
+          // Exact match only (case-insensitive) — patient must type the clinic name as listed
+          const trimmed = text.trim();
+          selected = activeTenants.find(t => t.name.toLowerCase() === trimmed.toLowerCase());
+        }
+
+        if (selected) {
+          // Patient matched a clinic — confirm and route
+          await query(
+            `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity)
+             VALUES ($1,$2,'active',NOW())
+             ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active', last_activity=NOW()`,
+            [phone, selected.id]
+          );
+          await wa.sendText(phone, `✅ Clinic selected: *${selected.name}*`, null, null)
+            .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
+          const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
+          tenant = r.rows[0] || null;
+        } else {
+          // No match — show clinic list as plain text and wait for typed reply
+          await query(
+            `INSERT INTO global_bot_sessions (phone, state, last_activity)
+             VALUES ($1,'select_tenant',NOW())
+             ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant', last_activity=NOW()`,
+            [phone]
+          ).catch(() => {});
+
+          const isRetry = globalSession?.state === 'select_tenant' && text &&
+            !/^(hi|hello|hey|start|menu)$/i.test(text.trim());
+          const prompt = isRetry
+            ? `❌ No clinic found matching *"${text.trim()}"*.\n\nPlease type your clinic name and try again.`
+            : `👋 Welcome to MediBook!\n\nPlease type the name of your clinic to get started.`;
+
+          await wa.sendText(phone, prompt, null, null)
+            .catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
+          return;
+        }
+      }
+    } else {
+      // Patient already assigned to a tenant
+      const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [globalSession.tenant_id]);
+      tenant = r.rows[0] || null;
+
+      if (!tenant) {
+        // Tenant was deactivated — reset and re-run selection on next message
+        await query(
+          `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant', last_activity=NOW() WHERE phone=$1`,
+          [phone]
+        ).catch(() => {});
+        logger.warn('Tenant deactivated — global session reset', { phone: maskPhone(phone) });
+        return;
+      }
+    }
+
+    if (!tenant) {
+      logger.warn('Could not resolve tenant for phone', { phone: maskPhone(phone) });
+      return;
+    }
+
     // Per-tenant rate limiting: max 60 messages/minute (Redis-backed, multi-instance safe)
     if (!await checkTenantRateLimit(tenant.id)) {
       logger.warn(`Rate limit exceeded for tenant ${tenant.name}`, { tenantId: tenant.id });
       return; // Already sent 200, just drop the message
     }
 
-    // Per-phone rate limiting: max 5 messages/minute per phone number (Redis-backed)
+    // Per-phone rate limiting: max 30 messages/minute per phone number (Redis-backed)
     if (!await checkPhoneRateLimit(phone)) {
       logger.warn('Per-phone rate limit exceeded — dropping message', { phone: maskPhone(phone), tenant: tenant.slug });
       return;
@@ -245,10 +342,9 @@ router.post('/webhook/whatsapp', async (req, res) => {
     // If message type is unsupported (image, document, sticker, etc.), send a helpful reply
     if (unsupportedType) {
       logger.info('Unsupported message type received', { phone, type: unsupportedType, tenant: tenant.slug });
-      const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
       wa.sendText(phone,
         `Sorry, I can only process text messages. Please type *Hi* to start booking an appointment. 😊`,
-        waToken, tenant.wa_phone_number_id
+        null, null
       ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone, type: unsupportedType, error: err.message }));
       return;
     }
@@ -276,8 +372,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
     // Mark message as read — shows blue double tick to user
     if (msgId) {
-      const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
-      wa.markRead(msgId, waToken, tenant.wa_phone_number_id).catch(() => {});
+      wa.markRead(msgId, null, null).catch(() => {});
     }
 
     logger.info('Incoming WhatsApp message', { phone: maskPhone(phone), tenant: tenant.slug, type: msg.type });
@@ -290,20 +385,19 @@ router.post('/webhook/whatsapp', async (req, res) => {
     // intercepted here even when a pending confirmation exists. The reminder
     // confirmation handler only accepts pure yes/no-style replies.
     if (text) {
-      const isConfirmReply = /^(yes|no|confirm|haan|nahi|1|2)\b/i.test(text.trim());
+      const isConfirmReply = /^(yes|no|confirm|haan|nahi|ha|ok|sure|nope)\b/i.test(text.trim());
       if (isConfirmReply) {
         const confirmResult = await handleReminderConfirmation(tenant.schema_name, phone, text).catch(() => false);
         if (confirmResult) {
-          const waToken = tenant.wa_access_token_enc ? decrypt(tenant.wa_access_token_enc) : null;
           if (confirmResult === 'yes') {
             wa.sendText(phone,
               `✅ Thank you for confirming! We'll see you at your appointment. 😊\n\nIf plans change, reply *Reschedule* or *Cancel Appointment*.`,
-              waToken, tenant.wa_phone_number_id
+              null, null
             ).catch(() => {});
           } else {
             wa.sendText(phone,
               `Got it! Reply *Cancel Appointment* to cancel your booking, or *Reschedule* to pick a new time. 🙏\n\nReply *Hi* for the main menu.`,
-              waToken, tenant.wa_phone_number_id
+              null, null
             ).catch(() => {});
           }
           return;
@@ -324,12 +418,22 @@ router.post('/webhook/whatsapp', async (req, res) => {
           logger.error('Sync bot processing error (backpressure fallback)', { error: err.message });
         });
       } else {
-        await botWorker.getQueue().add('process', { phone, text, buttonId, tenantId: tenant.id }, {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 2000 },
-          removeOnComplete: 100,
-          removeOnFail: 50,
-        });
+        try {
+          await botWorker.getQueue().add('process', { phone, text, buttonId, tenantId: tenant.id }, {
+            attempts: 2,
+            backoff: { type: 'fixed', delay: 1000 },
+            removeOnComplete: 100,
+            removeOnFail: 50,
+          });
+        } catch (queueErr) {
+          // Queue add failed (Redis timeout/disconnect) — fall back to sync so the
+          // message is never silently dropped. This is the most common cause of
+          // "bot not responding" when Redis has a blip.
+          logger.warn('Queue add failed, falling back to sync processing', { error: queueErr.message });
+          botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
+            logger.error('Sync bot processing error (queue fallback)', { error: err.message });
+          });
+        }
       }
     } else {
       // Sync fallback: process inline
@@ -353,6 +457,10 @@ router.post('/webhook/whatsapp', async (req, res) => {
 });
 
 // ── DEV TEST ENDPOINT ─────────────────────────────────────────
+// Mutex to serialize /webhook/test calls — prevents concurrent requests from
+// corrupting each other's module-level monkey-patch of the whatsapp module.
+let _testEndpointMutex = Promise.resolve();
+
 if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT === 'true') {
   router.post('/webhook/test', testEndpointLimiter, async (req, res) => {
     const { phone = '919999999999', message = 'Hi', button_id, tenant_slug } = req.body;
@@ -367,6 +475,13 @@ if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT ==
 
       const responses = [];
       const waModule = require('../services/whatsapp');
+
+      // Acquire mutex — wait for any in-flight test to finish before patching module globals
+      let releaseMutex;
+      const prevMutex = _testEndpointMutex;
+      _testEndpointMutex = new Promise(resolve => { releaseMutex = resolve; });
+      await prevMutex;
+
       const origSendText = waModule.sendText;
       const origSendButtons = waModule.sendButtons;
       const origSendList = waModule.sendList;
@@ -381,6 +496,7 @@ if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT ==
         waModule.sendText = origSendText;
         waModule.sendButtons = origSendButtons;
         waModule.sendList = origSendList;
+        releaseMutex();
       }
 
       res.json({ ok: true, phone, message, tenant: tenant.name, responses });

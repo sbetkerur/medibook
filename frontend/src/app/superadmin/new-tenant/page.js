@@ -23,9 +23,10 @@ export default function NewTenantPage() {
   const [plans, setPlans] = useState([]);
   const [creating, setCreating] = useState(false);
   const [createdTenant, setCreatedTenant] = useState(null);
+  const [showPassword, setShowPassword] = useState(false);
   const [form, setForm] = useState({
     name: '', slug: '', owner_email: '', owner_name: '', owner_password: '',
-    plan: 'starter', wa_phone_number_id: '', wa_access_token: '',
+    plan: 'starter',
   });
 
   useEffect(() => {
@@ -74,8 +75,6 @@ export default function NewTenantPage() {
         owner_name: form.owner_name.trim() || form.name.trim() + ' Admin',
         owner_password: form.owner_password.trim() || undefined,
         plan: form.plan,
-        wa_phone_number_id: form.wa_phone_number_id.trim() || undefined,
-        wa_access_token: form.wa_access_token.trim() || undefined,
       });
       setCreatedTenant(data);
       setStep(5);
@@ -104,7 +103,16 @@ export default function NewTenantPage() {
           <div className="bg-gray-50 rounded-xl p-4 mb-5 font-mono text-sm space-y-2">
             <p className="text-xs font-semibold text-gray-500 uppercase mb-3">Login Credentials</p>
             <div className="flex justify-between"><span className="text-gray-500">Email:</span><span className="font-medium">{creds.email}</span></div>
-            <div className="flex justify-between"><span className="text-gray-500">Password:</span><span className="font-medium">{creds.password}</span></div>
+            <div className="flex justify-between items-center gap-2">
+              <span className="text-gray-500">Password:</span>
+              <div className="flex items-center gap-2">
+                <span className="font-medium">{showPassword ? creds.password : '••••••••••••'}</span>
+                <button type="button" onClick={() => setShowPassword(v => !v)}
+                  className="text-xs text-blue-500 hover:text-blue-700 underline shrink-0">
+                  {showPassword ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </div>
             <div className="flex justify-between"><span className="text-gray-500">Clinic Slug:</span><span className="font-medium text-blue-600">{creds.tenant_slug}</span></div>
           </div>
 
@@ -250,35 +258,17 @@ export default function NewTenantPage() {
             </div>
           )}
 
-          {/* STEP 3: WhatsApp Config */}
+          {/* STEP 3: WhatsApp (shared — info only) */}
           {step === 3 && (
             <div className="space-y-4">
               <div>
-                <h2 className="text-lg font-semibold text-gray-900 mb-1">WhatsApp Configuration</h2>
-                <p className="text-sm text-gray-500">Optional — can be added later from tenant settings.</p>
+                <h2 className="text-lg font-semibold text-gray-900 mb-1">WhatsApp</h2>
+                <p className="text-sm text-gray-500">All clinics share a single global WhatsApp number.</p>
               </div>
-              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800 space-y-1">
-                <p className="font-semibold mb-2">How to get these values:</p>
-                <ol className="list-decimal list-inside space-y-1 text-xs">
-                  <li>Go to <strong>developers.facebook.com</strong> → My Apps</li>
-                  <li>Create or open your app → Add <strong>WhatsApp</strong> product</li>
-                  <li>Under WhatsApp → API Setup, copy <strong>Phone Number ID</strong></li>
-                  <li>Generate a <strong>Temporary Access Token</strong> (or use a permanent System User token)</li>
-                  <li>Set webhook URL to: <code className="bg-blue-100 px-1 rounded">https://your-api.railway.app/api/webhook/whatsapp</code></li>
-                </ol>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number ID</label>
-                <input value={form.wa_phone_number_id} onChange={e => set('wa_phone_number_id', e.target.value)}
-                  placeholder="e.g. 123456789012345"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">WhatsApp Access Token</label>
-                <input type="password" value={form.wa_access_token} onChange={e => set('wa_access_token', e.target.value)}
-                  placeholder="EAAGm0P... (stored encrypted)"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                <p className="text-xs text-gray-400 mt-1">Stored encrypted in the database. Never shown again after save.</p>
+              <div className="bg-green-50 border border-green-200 rounded-xl p-4 text-sm text-green-800 space-y-2">
+                <p className="font-semibold">✅ Shared WhatsApp Number Active</p>
+                <p className="text-xs">This platform uses one shared WhatsApp phone number for all clinics. Patients are routed to their chosen clinic automatically via a clinic-selection menu.</p>
+                <p className="text-xs">To update the global WhatsApp credentials, set <code className="bg-green-100 px-1 rounded">META_PHONE_NUMBER_ID</code> and <code className="bg-green-100 px-1 rounded">META_ACCESS_TOKEN</code> in the server environment variables.</p>
               </div>
             </div>
           )}
@@ -297,7 +287,7 @@ export default function NewTenantPage() {
                   { label: 'Admin Email', value: form.owner_email },
                   { label: 'Admin Name', value: form.owner_name || `${form.name} Admin` },
                   { label: 'Plan', value: selectedPlan ? `${selectedPlan.name} (₹${selectedPlan.price_monthly === 0 ? 'Free' : selectedPlan.price_monthly + '/mo'})` : form.plan },
-                  { label: 'WhatsApp', value: form.wa_phone_number_id || 'Not configured (add later)' },
+                  { label: 'WhatsApp', value: 'Shared global number' },
                 ].map(({ label, value, mono }) => (
                   <div key={label} className="flex justify-between items-center px-4 py-3 text-sm">
                     <span className="text-gray-500">{label}</span>

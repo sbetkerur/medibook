@@ -35,9 +35,6 @@ async function migrate() {
         name VARCHAR(255) NOT NULL,
         slug VARCHAR(100) UNIQUE NOT NULL,
         schema_name VARCHAR(100) UNIQUE NOT NULL,
-        wa_phone_number_id VARCHAR(100),
-        wa_access_token_enc TEXT,
-        wa_webhook_verify_token VARCHAR(255),
         plan VARCHAR(50) DEFAULT 'starter',
         status VARCHAR(50) DEFAULT 'active',
         owner_email VARCHAR(255) NOT NULL,
@@ -63,7 +60,6 @@ async function migrate() {
       );
 
       CREATE INDEX IF NOT EXISTS idx_tenants_slug ON tenants(slug);
-      CREATE INDEX IF NOT EXISTS idx_tenants_wa_phone ON tenants(wa_phone_number_id);
       CREATE INDEX IF NOT EXISTS idx_tenants_status ON tenants(status);
     `);
 
@@ -380,6 +376,33 @@ async function migrate() {
           error_message TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_backup_log_started ON backup_log(started_at DESC);
+      `);
+    });
+
+    // Version 17: Drop obsolete per-tenant WA credential columns (now global via env vars)
+    await runMigration(client, 17, 'drop_per_tenant_wa_columns', async () => {
+      await client.query(`
+        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_phone_number_id;
+        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_access_token_enc;
+        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_webhook_verify_token;
+        DROP INDEX IF EXISTS idx_tenants_wa_phone;
+      `);
+    });
+
+    // Version 16: Global bot sessions — shared WhatsApp number routing
+    // Maps patient phone → tenant so all tenants can share a single WA number.
+    await runMigration(client, 16, 'global_bot_sessions', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS global_bot_sessions (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          phone VARCHAR(20) UNIQUE NOT NULL,
+          tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+          state VARCHAR(50) DEFAULT 'select_tenant',
+          last_activity TIMESTAMPTZ DEFAULT NOW(),
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_global_sessions_phone ON global_bot_sessions(phone);
+        CREATE INDEX IF NOT EXISTS idx_global_sessions_tenant ON global_bot_sessions(tenant_id);
       `);
     });
 

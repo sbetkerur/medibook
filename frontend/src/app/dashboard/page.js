@@ -31,7 +31,6 @@ const NAV = [
   { id: 'doctors', label: 'Dentists', icon: '🦷' },
   { id: 'hospitals', label: 'Clinics', icon: '🏥' },
   { id: 'patients', label: 'Patients', icon: '👥' },
-  { id: 'waitinglist', label: 'Waiting List', icon: '⏳' },
   { id: 'feedback', label: 'Feedback', icon: '⭐' },
   { id: 'analytics', label: 'Analytics', icon: '📈' },
   { id: 'calendar', label: 'Calendar', icon: '📆' },
@@ -133,7 +132,8 @@ export default function Dashboard() {
   // Settings state
   const [settings, setSettings] = useState(null);
   const [settingsForm, setSettingsForm] = useState({
-    name: '', wa_phone_number_id: '', wa_access_token: '', notification_prefs: {}
+    notify_phone: '',
+    name: '', notification_prefs: {}
   });
   const [settingsSaving, setSettingsSaving] = useState(false);
 
@@ -150,11 +150,6 @@ export default function Dashboard() {
 
   // Analytics summary state
   const [analyticsSummary, setAnalyticsSummary] = useState(null);
-
-  // Waiting list state
-  const [waitingList, setWaitingList] = useState([]);
-  const [waitingListPage, setWaitingListPage] = useState(1);
-  const [waitingListHasMore, setWaitingListHasMore] = useState(false);
 
   // Dark mode
   const [darkMode, setDarkMode] = useState(() => {
@@ -446,9 +441,8 @@ export default function Dashboard() {
       setSettings(data);
       setSettingsForm({
         name: data.clinic_name || '',
-        wa_phone_number_id: data.wa_phone_number_id || '',
-        wa_access_token: '',
         notification_prefs: data.settings?.notification_prefs || {},
+        notify_phone: data.notify_phone || '',
       });
     } catch { toast.error('Failed to load settings'); }
   }, []);
@@ -459,14 +453,6 @@ export default function Dashboard() {
       setAnalyticsSummary(data);
     } catch { /* silent */ }
   }, []);
-
-  const fetchWaitingList = useCallback(async (page = waitingListPage) => {
-    try {
-      const { data } = await api.get(`/admin/waiting-list?page=${page}&limit=25`);
-      setWaitingList(data.waiting_list || []);
-      setWaitingListHasMore(data.has_more || false);
-    } catch { toast.error('Failed to load waiting list'); }
-  }, [waitingListPage]);
 
   const fetchFeedback = useCallback(async (page = 1) => {
     try {
@@ -538,7 +524,7 @@ export default function Dashboard() {
     try {
       const startDate = `${year}-${String(month + 1).padStart(2, '0')}-01`;
       const endDate = `${year}-${String(month + 1).padStart(2, '0')}-${new Date(year, month + 1, 0).getDate()}`;
-      const { data } = await api.get(`/admin/appointments?from=${startDate}&to=${endDate}&limit=200&page=1`);
+      const { data } = await api.get(`/admin/appointments?from=${startDate}&to=${endDate}&limit=200&page=1&status=confirmed,completed`);
       // Group by date
       const byDate = {};
       (data.appointments || []).forEach(a => {
@@ -973,7 +959,6 @@ export default function Dashboard() {
         if (tab === 'appointments') await fetchAppointments();
         else if (tab === 'doctors') await fetchDoctors();
         else if (tab === 'patients') await fetchPatients();
-        else if (tab === 'waitinglist') await fetchWaitingList(1);
         else if (tab === 'feedback') await fetchFeedback(1);
         else if (tab === 'analytics') { await fetchAnalytics(); await fetchAnalyticsSummary(); await fetchRevenue(); }
         else if (tab === 'services') { await fetchServices(); if (!hospitals.length) await fetchHospitals(); }
@@ -1340,8 +1325,7 @@ export default function Dashboard() {
     try {
       const payload = {};
       if (settingsForm.name) payload.name = settingsForm.name;
-      if (settingsForm.wa_phone_number_id !== undefined) payload.wa_phone_number_id = settingsForm.wa_phone_number_id;
-      if (settingsForm.wa_access_token) payload.wa_access_token = settingsForm.wa_access_token;
+      payload.notify_phone = settingsForm.notify_phone || '';
       await api.patch('/admin/settings', payload);
       toast.success('Settings saved!');
       fetchSettings();
@@ -1422,14 +1406,14 @@ export default function Dashboard() {
           <div className="flex items-center gap-2">
             {tab === 'analytics' && (
               <button onClick={printAnalytics}
-                className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">
-                🖨️ Print Report
+                className="p-2 sm:px-3 sm:py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition" title="Print Report">
+                🖨️<span className="hidden sm:inline"> Print Report</span>
               </button>
             )}
             {tab === 'appointments' && (
               <button onClick={exportCSV}
-                className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">
-                📥 Export CSV
+                className="p-2 sm:px-3 sm:py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition" title="Export CSV">
+                📥<span className="hidden sm:inline"> Export CSV</span>
               </button>
             )}
             {/* Notification Bell */}
@@ -1444,7 +1428,7 @@ export default function Dashboard() {
                 )}
               </button>
               {showNotifDropdown && (
-                <div className="absolute right-0 top-full mt-2 w-80 bg-white border border-gray-200 rounded-xl shadow-xl z-50 overflow-hidden">
+                <div className="absolute right-0 top-full mt-2 w-72 max-w-[calc(100vw-1rem)] sm:w-80 bg-white border border-gray-200 rounded-xl shadow-xl z-50 overflow-hidden">
                   <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
                     <span className="font-semibold text-sm text-gray-800">Recent Bookings</span>
                     <button onClick={() => { setShowNotifDropdown(false); setNotifCount(0); }}
@@ -1467,18 +1451,18 @@ export default function Dashboard() {
               )}
             </div>
             <button onClick={fetchStats}
-              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">
-              🔄 Refresh
+              className="p-2 sm:px-3 sm:py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition" title="Refresh">
+              🔄<span className="hidden sm:inline"> Refresh</span>
             </button>
             <button onClick={() => setDarkMode(v => !v)}
-              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition"
+              className="p-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition"
               title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
               {darkMode ? '☀️' : '🌙'}
             </button>
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto p-6">
+        <main className="flex-1 overflow-y-auto p-3 sm:p-6">
 
           {/* Tab loading skeleton */}
           {tabLoading && (
@@ -1539,7 +1523,7 @@ export default function Dashboard() {
           {tab === 'overview' && (
             <div className="space-y-6">
               {loading ? (
-                <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 md:gap-4">
                   {[1,2,3,4,5].map(i => (
                     <div key={i} className="bg-white rounded-xl p-5 border-l-4 border-gray-200 shadow-sm animate-pulse">
                       <div className="flex items-center justify-between">
@@ -1564,7 +1548,7 @@ export default function Dashboard() {
                     ↻ Refresh
                   </button>
                 </div>
-                <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 md:gap-4">
                   <StatCard label="Today" value={stats?.today_appointments} icon="📅" color="border-blue-500" />
                   <StatCard label="Upcoming" value={stats?.upcoming_appointments} icon="🗓" color="border-green-500" />
                   <StatCard label="Patients" value={stats?.total_patients} icon="👥" color="border-purple-500" />
@@ -1690,7 +1674,61 @@ export default function Dashboard() {
               )}
 
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="overflow-x-auto">
+                {/* Mobile appointment cards */}
+                <div className="md:hidden divide-y divide-gray-100">
+                  {appointments.map(a => (
+                    <div key={`mob-${a.id}`} className="p-4 space-y-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="font-medium text-gray-900 truncate">{a.patient_name}</div>
+                          <div className="flex items-center gap-1.5 mt-0.5">
+                            <a href={`https://wa.me/${a.patient_phone}`} target="_blank" rel="noreferrer"
+                              className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
+                            <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(a.patient_phone || ''); setWaMessageText(''); }}
+                              className="text-xs text-green-500 hover:text-green-700">📤</button>
+                          </div>
+                        </div>
+                        <Badge status={a.status} />
+                      </div>
+                      <div className="text-xs text-gray-500 space-y-0.5">
+                        <div>🦷 Dr. {a.doctor_name}</div>
+                        <div>📅 {(() => { try { return format(parseISO(a.appointment_date), 'd MMM yy'); } catch { return a.appointment_date; } })()} at {a.appointment_time?.slice(0, 5)}</div>
+                        <div className="font-mono text-blue-600">{a.booking_id} · <span className="capitalize">{a.visit_type?.replace('_', ' ')}</span></div>
+                      </div>
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        {a.status === 'confirmed' && (<>
+                          <button onClick={() => updateApptStatus(a.id, 'completed')}
+                            className="px-3 py-1.5 text-xs bg-blue-50 text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-100 transition">
+                            ✅ Done
+                          </button>
+                          <button onClick={() => updateApptStatus(a.id, 'no_show')}
+                            className="px-3 py-1.5 text-xs bg-gray-50 text-gray-500 border border-gray-200 rounded-lg hover:bg-gray-100 transition">
+                            🚫 No Show
+                          </button>
+                          <button onClick={() => { setCancellingAppt(a); setCancelReason(''); }}
+                            className="px-3 py-1.5 text-xs bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition">
+                            ✕ Cancel
+                          </button>
+                        </>)}
+                        <button onClick={() => printReceipt(a.id)}
+                          className="px-3 py-1.5 text-xs bg-purple-50 text-purple-600 border border-purple-200 rounded-lg hover:bg-purple-100 transition">
+                          🖨️ Receipt
+                        </button>
+                        <button onClick={() => { setEditingNotesId(a.id); setNotesText(a.notes || ''); }}
+                          className={`px-3 py-1.5 text-xs border rounded-lg transition ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                          📝 {a.notes ? 'Notes' : 'Add Note'}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  {!appointments.length && (
+                    <div className="px-4 py-12 text-center text-gray-400">
+                      No appointments found{filterDate || filterStatus ? ' for selected filters' : ''}
+                    </div>
+                  )}
+                </div>
+                {/* Desktop table */}
+                <div className="hidden md:block overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead className="bg-gray-50 border-b border-gray-200">
                       <tr>
@@ -1857,19 +1895,19 @@ export default function Dashboard() {
                     )}
                     <div className="mt-4 pt-3 border-t border-gray-100 grid grid-cols-2 gap-2">
                       <button onClick={() => openEditDoctor(d)}
-                        className="px-3 py-1.5 text-xs font-medium border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
+                        className="px-3 py-2 text-xs font-medium border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
                         ✏️ Edit
                       </button>
                       <button onClick={() => openSchedule(d)}
-                        className="px-3 py-1.5 text-xs font-medium border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 transition">
+                        className="px-3 py-2 text-xs font-medium border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 transition">
                         📅 Schedule
                       </button>
                       <button onClick={() => openSlotsViewer(d)}
-                        className="px-3 py-1.5 text-xs font-medium border border-green-200 text-green-600 rounded-lg hover:bg-green-50 transition">
+                        className="px-3 py-2 text-xs font-medium border border-green-200 text-green-600 rounded-lg hover:bg-green-50 transition">
                         ⏰ View Slots
                       </button>
                       <button onClick={() => toggleDoctorStatus(d)}
-                        className={`px-3 py-1.5 text-xs font-medium border rounded-lg transition ${d.is_active ? 'border-red-200 text-red-500 hover:bg-red-50' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
+                        className={`px-3 py-2 text-xs font-medium border rounded-lg transition ${d.is_active ? 'border-red-200 text-red-500 hover:bg-red-50' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
                         {d.is_active ? '🚫 Deactivate' : '✅ Activate'}
                       </button>
                     </div>
@@ -1906,6 +1944,41 @@ export default function Dashboard() {
                 <p className="text-sm text-gray-400">{patientTotal} patient{patientTotal !== 1 ? 's' : ''} total</p>
               )}
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                {/* Mobile patient cards */}
+                <div className="md:hidden divide-y divide-gray-100">
+                  {patients.map(p => (
+                    <div key={`mob-${p.id}`} className="p-4">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="font-medium text-gray-900 cursor-pointer truncate" onClick={() => openPatientHistory(p)}>
+                            {p.name || '—'}
+                          </div>
+                          <a href={`https://wa.me/${p.phone}`} target="_blank" rel="noreferrer"
+                            className="text-xs text-green-600 hover:underline">+{p.phone}</a>
+                        </div>
+                        <div className="text-xs text-gray-400 text-right shrink-0">
+                          <div className="capitalize">{p.gender || '—'}</div>
+                          <div>{p.visit_count} visits</div>
+                        </div>
+                      </div>
+                      <div className="flex gap-2 mt-3">
+                        <button onClick={e => { e.stopPropagation(); openEditPatient(p); }}
+                          className="px-3 py-2 text-xs text-blue-600 border border-blue-200 bg-blue-50 rounded-lg hover:bg-blue-100 transition">
+                          ✏️ Edit
+                        </button>
+                        <button onClick={e => { e.stopPropagation(); deletePatient(p); }}
+                          className="px-3 py-2 text-xs text-red-500 border border-red-200 bg-red-50 rounded-lg hover:bg-red-100 transition">
+                          🗑 Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  {!patients.length && (
+                    <div className="px-4 py-12 text-center text-gray-400">No patients found</div>
+                  )}
+                </div>
+                {/* Desktop table */}
+                <div className="hidden md:block overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead className="bg-gray-50 border-b border-gray-200">
                     <tr>
@@ -1945,6 +2018,7 @@ export default function Dashboard() {
                     )}
                   </tbody>
                 </table>
+                </div>
               </div>
               {(patientPage > 1 || patientHasMore) && (
                 <div className="flex items-center justify-between mt-2">
@@ -2041,74 +2115,6 @@ export default function Dashboard() {
                       </div>
                     );
                   })}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ── WAITING LIST ── */}
-          {tab === 'waitinglist' && !tabLoading && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <p className="text-sm text-gray-500">{waitingList.length} patient{waitingList.length !== 1 ? 's' : ''} waiting</p>
-                <button onClick={() => fetchWaitingList(1)}
-                  className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">
-                  🔄 Refresh
-                </button>
-              </div>
-              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800">
-                These patients joined the waitlist via WhatsApp. They will be notified automatically when a slot opens.
-              </div>
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <table className="w-full text-sm">
-                  <thead className="bg-gray-50 border-b border-gray-200">
-                    <tr>
-                      {['Patient', 'Phone', 'Doctor', 'Requested Date', 'Joined'].map(h => (
-                        <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-50">
-                    {waitingList.map(w => (
-                      <tr key={w.id} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-4 py-3 font-medium text-gray-900">{w.patient_name || '—'}</td>
-                        <td className="px-4 py-3">
-                          <a href={`https://wa.me/${w.patient_phone}`} target="_blank" rel="noreferrer"
-                            className="text-green-600 hover:underline">{w.patient_phone}</a>
-                        </td>
-                        <td className="px-4 py-3 text-gray-700">Dr. {w.doctor_name}</td>
-                        <td className="px-4 py-3 text-gray-600 text-sm">
-                          {w.requested_date ? (() => { try { return format(parseISO(w.requested_date), 'd MMM yyyy'); } catch { return w.requested_date; } })() : 'Any date'}
-                        </td>
-                        <td className="px-4 py-3 text-gray-400 text-xs">
-                          {w.created_at ? format(parseISO(w.created_at), 'd MMM yyyy') : '—'}
-                        </td>
-                      </tr>
-                    ))}
-                    {!waitingList.length && (
-                      <tr>
-                        <td colSpan={5} className="px-4 py-12 text-center">
-                          <div className="text-3xl mb-2">⏳</div>
-                          <p className="text-gray-400">No patients on waiting list</p>
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-              {(waitingListPage > 1 || waitingListHasMore) && (
-                <div className="flex items-center justify-between mt-2">
-                  <button onClick={() => { const p = waitingListPage - 1; setWaitingListPage(p); fetchWaitingList(p); }}
-                    disabled={waitingListPage === 1}
-                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                    ← Previous
-                  </button>
-                  <span className="text-sm text-gray-500">Page {waitingListPage}</span>
-                  <button onClick={() => { const p = waitingListPage + 1; setWaitingListPage(p); fetchWaitingList(p); }}
-                    disabled={!waitingListHasMore}
-                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                    Next →
-                  </button>
                 </div>
               )}
             </div>
@@ -2584,37 +2590,38 @@ export default function Dashboard() {
                     </div>
                     <div className="pt-3 border-t border-gray-100">
                       <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">WhatsApp Integration</h3>
-                      <div className="space-y-3">
-                        <div>
-                          <label className="block text-xs font-medium text-gray-700 mb-1">Phone Number ID</label>
-                          <input value={settingsForm.wa_phone_number_id}
-                            onChange={e => setSettingsForm(f => ({ ...f, wa_phone_number_id: e.target.value }))}
-                            placeholder="From Meta Developer Console"
-                            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs" />
-                        </div>
-                        <div>
-                          <label className="block text-xs font-medium text-gray-700 mb-1">
-                            Access Token <span className="text-gray-400 font-normal">(leave blank to keep existing)</span>
-                          </label>
-                          <input type="password" value={settingsForm.wa_access_token}
-                            onChange={e => setSettingsForm(f => ({ ...f, wa_access_token: e.target.value }))}
-                            placeholder="Paste new token here"
-                            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                        </div>
-                      </div>
+                      <p className="text-xs text-gray-500 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+                        📱 WhatsApp is configured globally via a shared phone number. Contact your platform administrator to update credentials.
+                      </p>
                     </div>
                     <div className="pt-3 border-t border-gray-100">
                       <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Notifications</h3>
-                      <label className="flex items-center gap-3 cursor-pointer select-none">
-                        <div className="relative">
-                          <input type="checkbox" className="sr-only"
-                            checked={settingsForm.notification_prefs?.email_on_booking !== false}
-                            onChange={e => setSettingsForm(f => ({ ...f, notification_prefs: { ...f.notification_prefs, email_on_booking: e.target.checked } }))} />
-                          <div className={`w-10 h-5 rounded-full transition-colors ${settingsForm.notification_prefs?.email_on_booking !== false ? 'bg-blue-500' : 'bg-gray-300'}`} />
-                          <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${settingsForm.notification_prefs?.email_on_booking !== false ? 'translate-x-5' : ''}`} />
+                      <div className="space-y-3">
+                        <label className="flex items-center gap-3 cursor-pointer select-none">
+                          <div className="relative">
+                            <input type="checkbox" className="sr-only"
+                              checked={settingsForm.notification_prefs?.email_on_booking !== false}
+                              onChange={e => setSettingsForm(f => ({ ...f, notification_prefs: { ...f.notification_prefs, email_on_booking: e.target.checked } }))} />
+                            <div className={`w-10 h-5 rounded-full transition-colors ${settingsForm.notification_prefs?.email_on_booking !== false ? 'bg-blue-500' : 'bg-gray-300'}`} />
+                            <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${settingsForm.notification_prefs?.email_on_booking !== false ? 'translate-x-5' : ''}`} />
+                          </div>
+                          <span className="text-sm text-gray-700">Email notification on new booking</span>
+                        </label>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">
+                            SMS notification number
+                            <span className="text-gray-400 font-normal ml-1">(optional — requires Twilio)</span>
+                          </label>
+                          <input
+                            type="tel"
+                            value={settingsForm.notify_phone}
+                            onChange={e => setSettingsForm(f => ({ ...f, notify_phone: e.target.value }))}
+                            placeholder="e.g. 919876543210"
+                            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          />
+                          <p className="text-xs text-gray-400 mt-1">An SMS will be sent to this number each time an appointment is booked via the WhatsApp bot.</p>
                         </div>
-                        <span className="text-sm text-gray-700">Email notification on new booking</span>
-                      </label>
+                      </div>
                     </div>
                     <div className="pt-4">
                       <button type="submit" disabled={settingsSaving}
@@ -3550,54 +3557,93 @@ export default function Dashboard() {
             <span>Day</span><span>On</span><span>Start</span><span>End</span><span>Lunch</span><span>Break Start</span><span>Break End</span>
           </div>
           {schedule.map((day, i) => (
-            <div key={day.day_of_week}
-              className={`grid grid-cols-[90px_60px_1fr_1fr_70px_1fr_1fr] gap-2 items-center px-2 py-2 rounded-lg transition-colors ${day.is_working ? 'bg-blue-50' : 'bg-gray-50'}`}>
-              {/* Day name */}
-              <span className="text-sm font-medium text-gray-700">{DAYS[day.day_of_week]}</span>
-
-              {/* Working toggle */}
-              <label className="flex items-center cursor-pointer">
-                <div className="relative">
-                  <input type="checkbox" className="sr-only"
-                    checked={day.is_working}
-                    onChange={e => updateScheduleDay(i, 'is_working', e.target.checked)} />
-                  <div className={`w-9 h-5 rounded-full transition-colors ${day.is_working ? 'bg-blue-500' : 'bg-gray-300'}`} />
-                  <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.is_working ? 'translate-x-4' : ''}`} />
+            <div key={day.day_of_week}>
+              {/* Mobile card layout */}
+              <div className={`sm:hidden rounded-lg p-3 mb-1 ${day.is_working ? 'bg-blue-50' : 'bg-gray-50'}`}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-semibold text-gray-700">{DAYS[day.day_of_week]}</span>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <span className="text-xs text-gray-400">{day.is_working ? 'Working' : 'Off'}</span>
+                    <div className="relative">
+                      <input type="checkbox" className="sr-only" checked={day.is_working} onChange={e => updateScheduleDay(i, 'is_working', e.target.checked)} />
+                      <div className={`w-9 h-5 rounded-full transition-colors ${day.is_working ? 'bg-blue-500' : 'bg-gray-300'}`} />
+                      <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.is_working ? 'translate-x-4' : ''}`} />
+                    </div>
+                  </label>
                 </div>
-              </label>
-
-              {/* Start / End times */}
-              <input type="time" value={day.start_time}
-                disabled={!day.is_working}
-                onChange={e => updateScheduleDay(i, 'start_time', e.target.value)}
-                className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-30 disabled:bg-gray-100 w-full" />
-              <input type="time" value={day.end_time}
-                disabled={!day.is_working}
-                onChange={e => updateScheduleDay(i, 'end_time', e.target.value)}
-                className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-30 disabled:bg-gray-100 w-full" />
-
-              {/* Lunch toggle */}
-              <label className={`flex items-center gap-1 cursor-pointer ${!day.is_working ? 'opacity-30 pointer-events-none' : ''}`}>
-                <div className="relative">
-                  <input type="checkbox" className="sr-only"
-                    checked={day.has_lunch}
-                    disabled={!day.is_working}
-                    onChange={e => updateScheduleDay(i, 'has_lunch', e.target.checked)} />
-                  <div className={`w-9 h-5 rounded-full transition-colors ${day.has_lunch && day.is_working ? 'bg-orange-400' : 'bg-gray-300'}`} />
-                  <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.has_lunch && day.is_working ? 'translate-x-4' : ''}`} />
-                </div>
-                <span className="text-xs text-gray-500">🍽</span>
-              </label>
-
-              {/* Lunch start / end */}
-              <input type="time" value={day.lunch_start_time}
-                disabled={!day.is_working || !day.has_lunch}
-                onChange={e => updateScheduleDay(i, 'lunch_start_time', e.target.value)}
-                className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:opacity-30 disabled:bg-gray-100 w-full" />
-              <input type="time" value={day.lunch_end_time}
-                disabled={!day.is_working || !day.has_lunch}
-                onChange={e => updateScheduleDay(i, 'lunch_end_time', e.target.value)}
-                className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:opacity-30 disabled:bg-gray-100 w-full" />
+                {day.is_working && (<>
+                  <div className="grid grid-cols-2 gap-2 mb-2">
+                    <div>
+                      <p className="text-xs text-gray-400 mb-1">Start</p>
+                      <input type="time" value={day.start_time} onChange={e => updateScheduleDay(i, 'start_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full" />
+                    </div>
+                    <div>
+                      <p className="text-xs text-gray-400 mb-1">End</p>
+                      <input type="time" value={day.end_time} onChange={e => updateScheduleDay(i, 'end_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full" />
+                    </div>
+                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer mb-2">
+                    <div className="relative">
+                      <input type="checkbox" className="sr-only" checked={day.has_lunch} onChange={e => updateScheduleDay(i, 'has_lunch', e.target.checked)} />
+                      <div className={`w-9 h-5 rounded-full transition-colors ${day.has_lunch ? 'bg-orange-400' : 'bg-gray-300'}`} />
+                      <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.has_lunch ? 'translate-x-4' : ''}`} />
+                    </div>
+                    <span className="text-xs text-gray-500">🍽 Lunch break</span>
+                  </label>
+                  {day.has_lunch && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">Break Start</p>
+                        <input type="time" value={day.lunch_start_time} onChange={e => updateScheduleDay(i, 'lunch_start_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 w-full" />
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">Break End</p>
+                        <input type="time" value={day.lunch_end_time} onChange={e => updateScheduleDay(i, 'lunch_end_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 w-full" />
+                      </div>
+                    </div>
+                  )}
+                </>)}
+              </div>
+              {/* Desktop row layout */}
+              <div className={`hidden sm:grid grid-cols-[90px_60px_1fr_1fr_70px_1fr_1fr] gap-2 items-center px-2 py-2 rounded-lg transition-colors ${day.is_working ? 'bg-blue-50' : 'bg-gray-50'}`}>
+                <span className="text-sm font-medium text-gray-700">{DAYS[day.day_of_week]}</span>
+                <label className="flex items-center cursor-pointer">
+                  <div className="relative">
+                    <input type="checkbox" className="sr-only"
+                      checked={day.is_working}
+                      onChange={e => updateScheduleDay(i, 'is_working', e.target.checked)} />
+                    <div className={`w-9 h-5 rounded-full transition-colors ${day.is_working ? 'bg-blue-500' : 'bg-gray-300'}`} />
+                    <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.is_working ? 'translate-x-4' : ''}`} />
+                  </div>
+                </label>
+                <input type="time" value={day.start_time}
+                  disabled={!day.is_working}
+                  onChange={e => updateScheduleDay(i, 'start_time', e.target.value)}
+                  className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-30 disabled:bg-gray-100 w-full" />
+                <input type="time" value={day.end_time}
+                  disabled={!day.is_working}
+                  onChange={e => updateScheduleDay(i, 'end_time', e.target.value)}
+                  className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-30 disabled:bg-gray-100 w-full" />
+                <label className={`flex items-center gap-1 cursor-pointer ${!day.is_working ? 'opacity-30 pointer-events-none' : ''}`}>
+                  <div className="relative">
+                    <input type="checkbox" className="sr-only"
+                      checked={day.has_lunch}
+                      disabled={!day.is_working}
+                      onChange={e => updateScheduleDay(i, 'has_lunch', e.target.checked)} />
+                    <div className={`w-9 h-5 rounded-full transition-colors ${day.has_lunch && day.is_working ? 'bg-orange-400' : 'bg-gray-300'}`} />
+                    <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.has_lunch && day.is_working ? 'translate-x-4' : ''}`} />
+                  </div>
+                  <span className="text-xs text-gray-500">🍽</span>
+                </label>
+                <input type="time" value={day.lunch_start_time}
+                  disabled={!day.is_working || !day.has_lunch}
+                  onChange={e => updateScheduleDay(i, 'lunch_start_time', e.target.value)}
+                  className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:opacity-30 disabled:bg-gray-100 w-full" />
+                <input type="time" value={day.lunch_end_time}
+                  disabled={!day.is_working || !day.has_lunch}
+                  onChange={e => updateScheduleDay(i, 'lunch_end_time', e.target.value)}
+                  className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:opacity-30 disabled:bg-gray-100 w-full" />
+              </div>
             </div>
           ))}
         </div>
@@ -3657,7 +3703,7 @@ export default function Dashboard() {
     {showWalkinModal && (
       <Modal title="New Walk-in Appointment" onClose={() => setShowWalkinModal(false)}>
         <form onSubmit={saveWalkin} className="space-y-4">
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Patient Phone *</label>
               <input value={walkinForm.patient_phone} onChange={e => setWalkinForm(f => ({ ...f, patient_phone: e.target.value }))}
@@ -3671,7 +3717,7 @@ export default function Dashboard() {
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Hospital *</label>
               <select value={walkinForm.hospital_id} onChange={e => setWalkinForm(f => ({ ...f, hospital_id: e.target.value }))}
@@ -3691,7 +3737,7 @@ export default function Dashboard() {
               </select>
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Date *</label>
               <input type="date" value={walkinForm.appointment_date} onChange={e => setWalkinForm(f => ({ ...f, appointment_date: e.target.value }))}
@@ -3745,7 +3791,7 @@ export default function Dashboard() {
               placeholder="patient@email.com"
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Gender</label>
               <select value={patientEditForm.gender} onChange={e => setPatientEditForm(f => ({ ...f, gender: e.target.value }))}
