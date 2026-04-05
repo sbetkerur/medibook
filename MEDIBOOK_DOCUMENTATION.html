@@ -445,7 +445,7 @@
     </div>
     <div class="cover-meta-item">
       <div class="label">Date</div>
-      <div class="value">March 2026</div>
+      <div class="value">April 2026</div>
     </div>
     <div class="cover-meta-item">
       <div class="label">Developed by</div>
@@ -706,8 +706,8 @@
           <div class="vflow-line"></div>
         </div>
         <div class="vflow-content">
-          <h4>Select Hospital (if multiple branches)</h4>
-          <p>If the clinic has multiple locations, the patient selects which hospital they want to visit. Single-branch clinics skip this step automatically.</p>
+          <h4>Type Clinic Name (if multiple branches)</h4>
+          <p>If the clinic has multiple locations, the patient types the name of their preferred branch. The bot uses fuzzy matching (Levenshtein distance) to find the right clinic even with typos or partial names. Single-branch clinics skip this step automatically. On a shared WhatsApp number, new patients also go through this step to be routed to their clinic.</p>
         </div>
       </div>
 
@@ -718,7 +718,7 @@
         </div>
         <div class="vflow-content">
           <h4>Select Treatment / Specialty</h4>
-          <p>A list of dental treatment categories is shown (e.g., General Dentistry, Root Canal Treatment, Orthodontics & Braces). Patient picks the relevant specialty. All appointments are always in-clinic.</p>
+          <p>A list of dental treatment categories is shown (e.g., General Dentistry, Root Canal Treatment, Orthodontics & Braces). Patient picks the relevant specialty. All appointments are always in-clinic. The bot also uses <strong>smart intent detection</strong> — if the patient's message contains keywords like "root canal", "toothache", or "braces", the treatment is pre-selected automatically.</p>
         </div>
       </div>
 
@@ -740,7 +740,7 @@
         </div>
         <div class="vflow-content">
           <h4>Select Date</h4>
-          <p>The next 7 available days (with open slots) are presented as options. Days without availability are automatically excluded.</p>
+          <p>The next 7 available days (with open slots) are presented as options. Days without availability are automatically excluded. The patient can also type shortcuts like <strong>"tomorrow"</strong>, <strong>"Monday"</strong>, or any day name and the bot resolves it to the correct date automatically.</p>
         </div>
       </div>
 
@@ -844,11 +844,29 @@
         <p>After the appointment date, the bot asks for a rating (1–5 stars) and optional comment.</p>
       </div>
     </div>
+  </div>
+
+  <h3>3.4 Admin Notifications (WhatsApp + SMS)</h3>
+  <div class="tab-grid">
     <div class="tab-item">
-      <div class="tab-num" style="background:#8B5CF6">📋</div>
+      <div class="tab-num" style="background:#2563EB">📲</div>
       <div class="tab-info">
-        <h4>Waitlist Notification</h4>
-        <p>If fully booked, patients can join a waitlist and receive a WhatsApp notification when a slot opens up.</p>
+        <h4>Instant WhatsApp Alerts to Admin</h4>
+        <p>Every time an appointment is booked, cancelled, or rescheduled — whether via the WhatsApp bot or from the admin dashboard — the clinic admin receives an instant WhatsApp message on their registered notify phone. The message includes the booking ID, patient name, doctor, date, time, and clinic name. For reschedules, both old and new date/time are shown.</p>
+      </div>
+    </div>
+    <div class="tab-item">
+      <div class="tab-num" style="background:#7C3AED">📱</div>
+      <div class="tab-info">
+        <h4>SMS Alerts via Twilio</h4>
+        <p>In addition to WhatsApp, the same booking, cancellation, and reschedule events also trigger an SMS to the admin's notify phone via Twilio. This ensures the admin is reached even if WhatsApp is unavailable or unread.</p>
+      </div>
+    </div>
+    <div class="tab-item">
+      <div class="tab-num" style="background:#059669">⚙️</div>
+      <div class="tab-info">
+        <h4>Settings → Notifications</h4>
+        <p>Admins configure their notification phone number in the dashboard under Settings &gt; Notifications. A single number receives both WhatsApp and SMS alerts. No extra WhatsApp number or third-party account is needed — notifications are sent using the clinic's own WhatsApp Business number already connected to MediBook.</p>
       </div>
     </div>
   </div>
@@ -970,7 +988,7 @@
       <div class="tab-num">13</div>
       <div class="tab-info">
         <h4>Settings</h4>
-        <p>Clinic name, address, notifications, WhatsApp credentials, language preferences.</p>
+        <p>Clinic name, address, WhatsApp credentials, language preferences, and notification settings. The Notifications sub-section lets admins set a phone number to receive instant WhatsApp + SMS alerts on every booking, cancellation, and reschedule.</p>
       </div>
     </div>
     <div class="tab-item">
@@ -1131,7 +1149,7 @@
     <div class="feature-card">
       <div class="icon">📊</div>
       <h4>Plan Distribution</h4>
-      <p>Breakdown of how many clinics are on each pricing plan (Starter / Growth / Professional / Enterprise).</p>
+      <p>Breakdown of how many clinics are on each pricing plan (Growth / Professional / Enterprise).</p>
     </div>
   </div>
 
@@ -1220,8 +1238,18 @@
     </div>
     <div class="cron-card purple">
       <div class="time">⚡ Real-Time</div>
-      <h4>WhatsApp Message Queue</h4>
-      <p>Incoming patient messages are queued asynchronously and processed in order. The queue handles traffic spikes gracefully and retries failed messages automatically.</p>
+      <h4>WhatsApp Message Queue (BullMQ)</h4>
+      <p>Incoming patient messages are pushed into a BullMQ Redis queue and processed by a dedicated worker in order. The queue handles traffic spikes gracefully, retries failed messages automatically (with backoff), and ensures each phone number's messages are processed sequentially. Rate limiting (30 msgs/min per phone, 60/min per tenant) is enforced at the webhook level before enqueuing.</p>
+    </div>
+    <div class="cron-card amber">
+      <div class="time">⚡ Real-Time</div>
+      <h4>WhatsApp Circuit Breaker</h4>
+      <p>The WhatsApp sending layer uses a circuit breaker pattern. If Meta's API starts returning repeated errors, the circuit opens — stopping outbound messages temporarily and preventing cascading failures. The circuit auto-resets after a cooldown period or can be manually reset via the admin API. Authentication errors (401/403) and permission errors are excluded from the trip counter.</p>
+    </div>
+    <div class="cron-card blue">
+      <div class="time">⚡ Real-Time · Every Booking Event</div>
+      <h4>Admin Notifications (WhatsApp + SMS)</h4>
+      <p>On every booking confirmation, cancellation, or reschedule, the system immediately sends a WhatsApp message and an SMS (via Twilio) to the clinic admin's configured notify phone. Uses the clinic's own WhatsApp Business number — no extra setup required. Configurable under Settings → Notifications.</p>
     </div>
   </div>
 
@@ -1256,6 +1284,7 @@
         <li>Zero chance of cross-clinic data leakage</li>
         <li>Tenant ID validated on every API request</li>
         <li>WhatsApp credentials encrypted (AES-256)</li>
+        <li>Bot session context encrypted at rest (AES-256) — patient booking data is never stored in plaintext in the database session store</li>
       </ul>
     </div>
     <div class="security-item amber">
@@ -1266,6 +1295,9 @@
         <li>Slot generation: 5 per hour</li>
         <li>Analytics: 20 requests per minute</li>
         <li>Webhook: 2,000 messages per minute</li>
+        <li>Bot: 30 messages per minute per phone number (Redis-backed, in-memory fallback)</li>
+        <li>Bot: 60 messages per minute per tenant</li>
+        <li>Bot: input length capped at 500 characters to prevent oversized payloads</li>
       </ul>
     </div>
     <div class="security-item purple">
@@ -1309,37 +1341,25 @@
      ════════════════════════════════════════ -->
 <div class="container" id="plans">
   <h2>8. Subscription Plans</h2>
-  <p class="section-intro">MediBook offers four tiered plans to suit dental clinics of every size — from solo dentists to multi-branch dental chains.</p>
+  <p class="section-intro">MediBook offers three tiered plans to suit dental clinics of every size — from solo dentists to multi-branch dental chains. All new clients start with a 2-week free trial before choosing a plan.</p>
 
   <div class="plan-grid">
-    <div class="plan-card">
-      <div class="plan-name">Starter</div>
-      <div class="plan-price">₹999<span>/mo</span></div>
-      <span class="badge badge-green" style="font-size:11px">Best for Solo</span>
-      <ul>
-        <li>Up to 3 doctors</li>
-        <li>100 appointments/month</li>
-        <li>WhatsApp booking bot</li>
-        <li>Basic analytics</li>
-        <li>Email support</li>
-      </ul>
-    </div>
     <div class="plan-card popular">
       <div class="plan-name">Growth</div>
-      <div class="plan-price">₹2,499<span>/mo</span></div>
+      <div class="plan-price">₹999<span>/mo</span></div>
       <span class="badge badge-blue" style="font-size:11px">Most Popular</span>
       <ul>
         <li>Up to 10 doctors</li>
-        <li>500 appointments/month</li>
-        <li>All Starter features</li>
-        <li>Advanced analytics</li>
-        <li>Waiting list management</li>
+        <li>1,000 appointments/month</li>
+        <li>WhatsApp booking bot</li>
+        <li>Full dashboard + analytics</li>
+        <li>24h + 2h reminders</li>
         <li>Priority support</li>
       </ul>
     </div>
     <div class="plan-card">
       <div class="plan-name">Professional</div>
-      <div class="plan-price">₹4,999<span>/mo</span></div>
+      <div class="plan-price">₹1,999<span>/mo</span></div>
       <span class="badge badge-purple" style="font-size:11px">For Clinics</span>
       <ul>
         <li>Up to 25 doctors</li>
@@ -1383,31 +1403,46 @@
     <div class="arch-row">
       <div class="arch-box amber">📱 Patient<small>WhatsApp App</small></div>
       <div class="arch-box primary">🖥️ Clinic Admin<small>Web Browser</small></div>
+      <div class="arch-box green">🏥 Reception Staff<small>Reception Portal</small></div>
       <div class="arch-box purple">👑 Super Admin<small>Web Browser</small></div>
     </div>
 
-    <div class="arch-connector">↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓</div>
+    <div class="arch-connector">↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓</div>
 
     <div class="arch-row">
-      <div class="arch-box amber">🔗 Meta WhatsApp<small>Cloud API</small></div>
-      <div class="arch-box primary" style="flex:2">🌐 Next.js Frontend<small>Admin & Super Admin Dashboard</small></div>
+      <div class="arch-box amber">🔗 Meta WhatsApp<small>Cloud API (Shared Number)</small></div>
+      <div class="arch-box primary" style="flex:2">🌐 Next.js Frontend<small>Admin · Reception · Doctor · Super Admin Portals</small></div>
     </div>
 
     <div class="arch-connector">↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓</div>
 
     <div class="arch-row">
-      <div class="arch-box primary" style="flex:3">⚙️ Node.js / Express API Server<small>REST API · Bot Engine · Authentication · Cron Jobs</small></div>
+      <div class="arch-box primary" style="flex:3">⚙️ Node.js / Express API Server<small>REST API · Bot Engine · Authentication · Cron Jobs · Circuit Breaker</small></div>
+    </div>
+
+    <div class="arch-connector">↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓</div>
+
+    <div class="arch-row">
+      <div class="arch-box amber" style="flex:2">⚡ BullMQ Worker<small>Async message queue — processes WhatsApp messages from all tenants in order; retries on failure</small></div>
     </div>
 
     <div class="arch-connector">↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ↓</div>
 
     <div class="arch-row">
-      <div class="arch-box green">🗄️ PostgreSQL<small>Per-tenant schemas</small></div>
-      <div class="arch-box green">⚡ Redis<small>Sessions · Cache · Queue</small></div>
-      <div class="arch-box green">📧 Email Service<small>Password resets</small></div>
+      <div class="arch-box green">🗄️ PostgreSQL<small>Public schema + per-tenant schemas + global_bot_sessions</small></div>
+      <div class="arch-box green">⚡ Redis<small>Rate limits · Queue · Cron locks</small></div>
+      <div class="arch-box green">📧 Email / SMS<small>Booking confirmations · Alerts</small></div>
     </div>
 
   </div>
+
+  <h3>Shared WhatsApp Number — Multi-Tenant Routing</h3>
+  <p>All tenants share a single Meta WhatsApp phone number. Routing to the correct clinic is handled by the <strong>global_bot_sessions</strong> table in the public schema:</p>
+  <ul style="margin:12px 0 16px 24px;line-height:2">
+    <li><strong>New patient</strong> messages the number → bot asks them to type their clinic name → fuzzy match → tenant resolved → session stored in <code>global_bot_sessions</code> with the matched <code>tenant_id</code>.</li>
+    <li><strong>Returning patient</strong> → their <code>global_bot_sessions</code> row already has a <code>tenant_id</code> → routed directly to that clinic without asking again.</li>
+    <li>Patient types <strong>"Switch Clinic"</strong> → <code>tenant_id</code> set to NULL, clinic selector shown again.</li>
+  </ul>
 
   <h3>Data Flow: Patient Booking</h3>
   <div class="flow-container">
@@ -1426,18 +1461,24 @@
       <div class="flow-arrow">→</div>
       <div class="flow-step highlight">
         <div class="step-num">3</div>
+        <div class="step-icon">⚡</div>
+        <div class="step-name">Enqueued in BullMQ</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step highlight">
+        <div class="step-num">4</div>
         <div class="step-icon">🤖</div>
-        <div class="step-name">Bot Engine processes</div>
+        <div class="step-name">Bot Worker processes</div>
       </div>
       <div class="flow-arrow">→</div>
       <div class="flow-step">
-        <div class="step-num">4</div>
+        <div class="step-num">5</div>
         <div class="step-icon">🗄️</div>
         <div class="step-name">Slot locked in DB</div>
       </div>
       <div class="flow-arrow">→</div>
       <div class="flow-step success">
-        <div class="step-num">5</div>
+        <div class="step-num">6</div>
         <div class="step-icon">✅</div>
         <div class="step-name">Confirmation sent</div>
       </div>
@@ -1466,7 +1507,7 @@
     <div class="feature-card">
       <div class="icon" style="font-size:28px">🔘</div>
       <h4>Interactive Buttons</h4>
-      <p>Up to <strong>3 tappable reply buttons</strong>. Used for yes/no decisions, main menu, gender selection, and visit type. Button titles are max 20 characters.</p>
+      <p>Up to <strong>3 tappable reply buttons</strong>. Used for yes/no decisions, main menu, gender selection, chief complaint, and booking confirmation. Button titles are max 20 characters.</p>
       <p style="margin-top:8px;font-size:12px;color:#6B7280">API type: <code>interactive / button</code></p>
     </div>
     <div class="feature-card">
@@ -1501,16 +1542,36 @@
     </table>
   </div>
 
+  <!-- ── 10.2b Smart Intent Detection ── -->
+  <h3>10.2b Smart Intent Detection</h3>
+  <p>The bot analyses every incoming message for dental keywords and date shortcuts. When detected, it pre-fills the corresponding step — reducing taps and letting patients get straight to the point.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Patient types…</th><th>Bot auto-detects</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>root canal, rct, throbbing, nerve pain</code></td><td>Treatment: Root Canal Treatment</td><td>Skips treatment selection step</td></tr>
+        <tr><td><code>brace, aligner, crooked teeth, ortho</code></td><td>Treatment: Orthodontics &amp; Braces</td><td>Skips treatment selection step</td></tr>
+        <tr><td><code>implant, missing tooth, replace tooth</code></td><td>Treatment: Dental Implants</td><td>Skips treatment selection step</td></tr>
+        <tr><td><code>whitening, veneer, smile makeover, cosmetic</code></td><td>Treatment: Cosmetic Dentistry</td><td>Skips treatment selection step</td></tr>
+        <tr><td><code>toothache, cavity, filling, scaling, checkup</code></td><td>Treatment: General Dentistry</td><td>Skips treatment selection step</td></tr>
+        <tr><td><code>wisdom tooth, extraction, oral surgery</code></td><td>Treatment: Oral Surgery</td><td>Skips treatment selection step</td></tr>
+        <tr><td><code>today</code></td><td>Date: current IST date</td><td>Skips date selection step</td></tr>
+        <tr><td><code>tomorrow</code></td><td>Date: next IST day</td><td>Skips date selection step</td></tr>
+        <tr><td><code>Monday / Tuesday / …</code></td><td>Date: next upcoming weekday</td><td>Skips date selection step</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <!-- ── 10.3 Complete State Machine ── -->
   <h3>10.3 Complete Bot State Machine</h3>
-  <p>The bot tracks exactly where each patient is in their conversation using a state stored per phone number. There are <strong>20 distinct states</strong> (visit type selection removed; chief complaint step added for dental):</p>
+  <p>The bot tracks exactly where each patient is in their conversation using a state stored per phone number. There are <strong>25 distinct states</strong> (visit type selection removed; chief complaint, email, session-resume, and status-check steps added):</p>
   <div class="table-wrap">
     <table>
       <thead><tr><th>State</th><th>Description</th><th>Flow</th></tr></thead>
       <tbody>
         <tr><td><code>idle</code></td><td>No active conversation. Waiting for "Hi".</td><td>All flows</td></tr>
         <tr><td><code>main_menu</code></td><td>Main menu shown — waiting for choice.</td><td>Entry</td></tr>
-        <tr><td><code>select_hospital</code></td><td>Waiting for patient to pick a clinic branch.</td><td>Booking</td></tr>
+        <tr><td><code>select_hospital</code></td><td>Waiting for patient to type their clinic name (fuzzy matched; auto-skipped if only one branch).</td><td>Booking</td></tr>
         <tr><td><code>select_department</code></td><td>Waiting for dental treatment/specialty selection.</td><td>Booking</td></tr>
         <tr><td><code>select_doctor</code></td><td>Waiting for dentist selection.</td><td>Booking</td></tr>
         <tr><td><code>select_date</code></td><td>Waiting for appointment date.</td><td>Booking</td></tr>
@@ -1532,6 +1593,7 @@
         <tr><td><code>cancel_confirm</code></td><td>Waiting for final cancel confirmation.</td><td>Cancel</td></tr>
         <tr><td><code>collect_feedback_rating</code></td><td>Post-visit — waiting for 1–5 star rating.</td><td>Feedback</td></tr>
         <tr><td><code>collect_feedback_comment</code></td><td>Rating received — waiting for comment or Skip.</td><td>Feedback</td></tr>
+        <tr><td><code>resume_confirm</code></td><td>Patient sent "Hi" mid-booking — asking if they want to resume the incomplete booking or start fresh.</td><td>Session Resume</td></tr>
       </tbody>
     </table>
   </div>
@@ -1609,24 +1671,22 @@
 
   <!-- MSG 2: Hospital Selection -->
   <div class="msg-section">
-    <h4>② Hospital Selection <span style="font-size:12px;color:#6B7280">(only shown if clinic has multiple branches)</span></h4>
+    <h4>② Clinic Name Entry <span style="font-size:12px;color:#6B7280">(only shown if clinic has multiple branches)</span></h4>
     <div class="state-tag">main_menu → select_hospital</div>
-    <p class="trigger"><strong>Trigger:</strong> Patient taps "📅 Book Appointment" and clinic has more than 1 active hospital.</p>
+    <p class="trigger"><strong>Trigger:</strong> Patient taps "📅 Book Appointment" and clinic has more than 1 active hospital. Also triggered on a shared WhatsApp number for new patients.</p>
     <div class="chat-wrap">
-      <div class="chat-label">💬 Bot → Patient (Interactive List)</div>
+      <div class="chat-label">💬 Bot → Patient (Text)</div>
       <div class="bubble-row out">
         <div class="bubble out">
-          <div class="bubble-type">Interactive List</div>
-          🦷 <b>Select a Clinic</b><br><br>Choose your preferred location:
-          <div class="btn-group"><span class="list-chip">📋 View Locations</span></div>
+          <div class="bubble-type">Text Message</div>
+          🦷 <b>Enter Clinic Name</b><br><br>Please type the name of your clinic:
         </div>
       </div>
       <div class="bubble-row out" style="margin-top:4px">
         <div class="bubble out" style="font-size:12px;color:#666;background:#f5f5f5;border:1px solid #ddd">
-          <em>List opens with section "Our Locations":</em><br>
-          • Smile Dental Clinic — Banjara Hills<br>
-          • Smile Dental Clinic — Secunderabad<br>
-          • (all active clinic branches)
+          <em>Patient types clinic name (e.g. "smile banjara hills"). Bot uses fuzzy matching — typos and partial names are accepted.</em><br><br>
+          On a match:<br>
+          ✅ <b>Smile Dental Clinic — Banjara Hills</b><br><br>Welcome! You're booking at <b>Smile Dental Clinic — Banjara Hills</b>. Let's get started.
         </div>
       </div>
     </div>
@@ -1830,7 +1890,7 @@
     </div>
     <div class="info-box green">
       <span class="icon">✅</span>
-      <p><strong>Simultaneous actions on confirmation:</strong> (1) Patient gets this WhatsApp message. (2) Patient email gets a booking confirmation email (if email was provided). (3) Clinic admin gets a new booking alert email. (4) The slot is locked atomically — no double-booking possible.</p>
+      <p><strong>Simultaneous actions on confirmation:</strong> (1) Patient gets this WhatsApp message. (2) Patient email gets a booking confirmation email (if email was provided). (3) Clinic admin gets a new booking alert email. (4) Clinic admin receives an instant WhatsApp notification and SMS (via Twilio) on their configured notify phone — includes booking ID, patient name, doctor, date, and time. (5) The slot is locked atomically — no double-booking possible.</p>
     </div>
     <div class="info-box amber" style="margin-top:8px">
       <span class="icon">⚠️</span>
@@ -1954,7 +2014,7 @@
     </div>
     <div class="info-box green">
       <span class="icon">✅</span>
-      <p>After cancellation, the slot is immediately released and made available for other patients. If any patients are on the waitlist for that doctor, they automatically receive a "Slot Available!" notification.</p>
+      <p>After cancellation, the slot is immediately released and made available for other patients.</p>
     </div>
   </div>
 </div>
@@ -2001,27 +2061,9 @@
     <p style="font-size:12px;color:#6B7280;margin-top:4px">Template variables: {{1}} = doctor name, {{2}} = appointment time</p>
   </div>
 
-  <!-- Waitlist Notification -->
-  <div class="msg-section">
-    <h4>③ Waitlist Slot Available Notification</h4>
-    <p class="trigger"><strong>Sent:</strong> Automatically when a booking is cancelled or a slot becomes available, to the first 5 patients on the waitlist for that doctor.</p>
-    <div class="chat-wrap">
-      <div class="chat-label">💬 Bot → Waitlisted Patient (Text)</div>
-      <div class="bubble-row out">
-        <div class="bubble out">
-          🎉 <b>Slot Available!</b><br><br>A slot has opened up with Dr. Priya Sharma.<br><br>Reply <b>Hi</b> to book your appointment now before it's taken!
-        </div>
-      </div>
-    </div>
-    <div class="info-box green" style="margin-top:4px">
-      <span class="icon">✅</span>
-      <p>When the notification is sent, the patient's bot session is automatically moved to <code>main_menu</code> state — so as soon as they reply, they immediately see the booking options.</p>
-    </div>
-  </div>
-
   <!-- Feedback Request -->
   <div class="msg-section">
-    <h4>④ Post-Visit Feedback Request</h4>
+    <h4>③ Post-Visit Feedback Request</h4>
     <p class="trigger"><strong>Sent:</strong> Daily at 10:00 AM IST, to patients whose appointment was completed or marked no-show the previous day, and who have not yet submitted feedback.</p>
     <div class="chat-wrap">
       <div class="chat-label">💬 Bot → Patient (Text — triggers feedback flow)</div>
@@ -2206,10 +2248,12 @@
         <tr><td>Backend API</td><td>Node.js + Express</td><td>Business logic, bot engine, cron jobs</td></tr>
         <tr><td>Frontend</td><td>Next.js (React)</td><td>Admin dashboard and super admin panel</td></tr>
         <tr><td>Database</td><td>PostgreSQL</td><td>All clinic and patient data (schema-per-tenant)</td></tr>
-        <tr><td>Cache / Queue</td><td>Redis + BullMQ</td><td>Session cache, message queue, cron locking</td></tr>
-        <tr><td>WhatsApp</td><td>Meta Cloud API</td><td>Send and receive WhatsApp messages</td></tr>
-        <tr><td>Email</td><td>Resend</td><td>Password reset emails</td></tr>
-        <tr><td>Deployment</td><td>Docker Compose</td><td>One-command local and production deployment</td></tr>
+        <tr><td>Cache / Queue</td><td>Redis + BullMQ</td><td>Rate limiting, async bot message queue, cron locking</td></tr>
+        <tr><td>WhatsApp</td><td>Meta Cloud API (shared number)</td><td>Send and receive WhatsApp messages across all tenants</td></tr>
+        <tr><td>Email</td><td>Resend</td><td>Booking confirmation emails, password resets</td></tr>
+        <tr><td>SMS</td><td>Twilio (optional)</td><td>Admin alerts for bookings, cancellations, reschedules</td></tr>
+        <tr><td>Error Tracking</td><td>Sentry (optional)</td><td>Runtime error monitoring and alerting in production</td></tr>
+        <tr><td>Deployment</td><td>Docker Compose / Railway / Vercel</td><td>One-command local, cloud backend (Railway), cloud frontend (Vercel)</td></tr>
       </tbody>
     </table>
   </div>
@@ -2227,7 +2271,7 @@
   <p style="font-size:13px;color:rgba(255,255,255,0.6);margin-top:4px;">
     © 2026 Swalambha AI Technologies. All rights reserved.
   </p>
-  <p style="margin-top:16px;font-size:11px;opacity:0.4">MediBook Product Documentation · Version 1.0 · March 2026</p>
+  <p style="margin-top:16px;font-size:11px;opacity:0.4">MediBook Product Documentation · Version 1.1 · April 2026</p>
   <p style="font-size:11px;opacity:0.4">This document is intended for non-technical stakeholders. All features described are implemented in the current codebase.</p>
   <p style="font-size:11px;opacity:0.4;margin-top:8px;">MediBook is a product of Swalambha AI Technologies. Unauthorized reproduction or distribution of this document is prohibited.</p>
 </div>
