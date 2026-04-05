@@ -43,6 +43,14 @@ async function startBooking(phone, schema, tenant, send, ctx) {
 async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, input) {
   // Use the hospital list cached in ctx._hospitals (set during startBooking).
   // Fall back to a DB fetch only if cache is missing (e.g. old session before this change).
+  // If the user tapped a stale main-menu button (e.g. "📅 Book Appointment") while already
+  // in SELECT_HOSPITAL, just re-send the clinic prompt instead of trying to match the button
+  // title as a clinic name. WhatsApp buttons remain tappable on old messages.
+  if (/btn_0|btn_1|btn_2/i.test(choice) || /book appointment|my appointments|check status/i.test(input)) {
+    await send.text('🦷 *Enter Clinic Name*\n\nPlease type the name of your clinic:');
+    return;
+  }
+
   let hospitalRows = ctx._hospitals;
   if (!hospitalRows) {
     const r = await tenantQuery(schema, `SELECT id, name FROM hospitals WHERE is_active=true`);
