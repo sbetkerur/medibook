@@ -399,7 +399,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return;
   }
 
-  // ── GLOBAL ESCAPE — cancel / back / exit at any point in booking ──
+  // ── GLOBAL ESCAPE — cancel / back / exit / stale-button at any point in booking ──
   const BOOKING_STATES = [
     STATES.SELECT_HOSPITAL, STATES.SELECT_DEPARTMENT, STATES.SELECT_DOCTOR,
     STATES.SELECT_DATE, STATES.SELECT_SLOT, STATES.SELECT_PATIENT,
@@ -407,13 +407,33 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     STATES.COLLECT_GENDER, STATES.COLLECT_EMAIL, STATES.COLLECT_CHIEF_COMPLAINT,
     STATES.CONFIRM_BOOKING,
   ];
-  if (BOOKING_STATES.includes(session.state) && /^(cancel|exit|back|quit|stop|0|main menu|mainmenu)$/i.test(input)) {
-    await send.buttons(
-      '❌ Booking cancelled.\n\nWhat would you like to do?',
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
-    );
-    await updateSession(schema, phone, STATES.MAIN_MENU, {});
-    return;
+  if (BOOKING_STATES.includes(session.state)) {
+    // Explicit typed escape keywords
+    if (/^(cancel|exit|back|quit|0|main menu|mainmenu)$/i.test(input)) {
+      await send.buttons(
+        '❌ Booking cancelled.\n\nWhat would you like to do?',
+        ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
+      );
+      await updateSession(schema, phone, STATES.MAIN_MENU, {});
+      return;
+    }
+
+    // Patient tapped a stale main-menu button (still tappable on old WhatsApp messages)
+    // Route them to the matching action instead of letting the booking step mishandle it.
+    if (/book appointment/i.test(input)) {
+      await updateSession(schema, phone, STATES.IDLE, {});
+      const intents = detectIntent(input);
+      return startBooking(phone, schema, tenant, send, intents ? { ...ctx, ...intents } : {});
+    }
+    if (/my appointments/i.test(input)) {
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return showMyAppointments(phone, schema, tenant, send);
+    }
+    if (/check status/i.test(input)) {
+      await send.text('📋 *Check Appointment Status*\n\nPlease enter your Booking ID (e.g. MB12AB3):');
+      await updateSession(schema, phone, STATES.CHECK_BOOKING_STATUS, {});
+      return;
+    }
   }
 
   // ── BOOKING FLOW ─────────────────────────────────────────────
