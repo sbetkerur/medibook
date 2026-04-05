@@ -36,8 +36,7 @@ async function startBooking(phone, schema, tenant, send, ctx) {
 
   // Cache clinic list in context to avoid a DB re-fetch on every user input
   ctx._hospitals = hospitals.rows;
-  const clinicLines = hospitals.rows.map((h, i) => `${i + 1}. ${h.name}${h.city ? ` (${h.city})` : ''}`).join('\n');
-  await send.text(`🦷 *Select a Clinic*\n\nPlease type the name of your preferred clinic:\n\n${clinicLines}`);
+  await send.text(`🦷 *Enter Clinic Name*\n\nPlease type the name of your clinic:`);
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
 
@@ -53,8 +52,7 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
   const h = hospitalRows.find(r => r.id === choice || (input && (r.name || '').toLowerCase().includes(input.toLowerCase())))
     || (numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
   if (!h) {
-    const clinicLines = hospitalRows.map((r, i) => `${i + 1}. ${r.name}`).join('\n');
-    await send.text(`Sorry, I couldn't find that clinic. Please type the clinic name or number:\n\n${clinicLines}`);
+    await send.text(`Sorry, I couldn't find a clinic matching "*${input}*". Please check the name and try again:`);
     return;
   }
   ctx.hospital_id = h.id;
