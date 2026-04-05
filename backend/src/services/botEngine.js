@@ -418,20 +418,27 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       return;
     }
 
-    // Patient tapped a stale main-menu button (still tappable on old WhatsApp messages)
-    // Route them to the matching action instead of letting the booking step mishandle it.
-    if (/book appointment/i.test(input)) {
-      await updateSession(schema, phone, STATES.IDLE, {});
-      const intents = detectIntent(input);
-      return startBooking(phone, schema, tenant, send, intents ? { ...ctx, ...intents } : {});
-    }
-    if (/my appointments/i.test(input)) {
-      await updateSession(schema, phone, STATES.IDLE, {});
-      return showMyAppointments(phone, schema, tenant, send);
-    }
-    if (/check status/i.test(input)) {
-      await send.text('📋 *Check Appointment Status*\n\nPlease enter your Booking ID (e.g. MB12AB3):');
-      await updateSession(schema, phone, STATES.CHECK_BOOKING_STATUS, {});
+    // Patient tapped a stale button from a previous message (WhatsApp keeps all buttons tappable).
+    // Any button title that isn't valid for the current step means they stepped outside the flow.
+    // Exit cleanly: cancel the booking and show the main menu so the intent is clear.
+    const staleMainMenuButton =
+      /book appointment|my appointments|check status/i.test(input);
+    const staleOtherButton =
+      // A WhatsApp interactive button was tapped (buttonId present) but its title doesn't
+      // look like free-text input — e.g. tapping a stale "✅ Confirm" or "❌ Cancel" or
+      // a treatment/doctor/date button from an earlier step while on a different step.
+      buttonId &&
+      !/^(hi|hello|hey|menu|start|cancel|exit|back|quit)$/i.test(input) &&
+      !staleMainMenuButton;
+
+    if (staleMainMenuButton || staleOtherButton) {
+      const patient = await getPatient(schema, phone);
+      const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
+      await send.buttons(
+        `👋 Welcome${firstName} to *Swalambha AI Technologies*!\n\nHow can I help you today?`,
+        ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
+      );
+      await updateSession(schema, phone, STATES.MAIN_MENU, {});
       return;
     }
   }
