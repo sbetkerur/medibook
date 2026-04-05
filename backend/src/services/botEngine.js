@@ -220,59 +220,18 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return;
   }
 
-  // ── SESSION EXPIRY & 24H RESUME ──────────────────────────────
-  const SESSION_FLOW_EXPIRY_MS = 30 * 60 * 1000;       // 30 min — reset idle mid-flows
-  const SESSION_RESUME_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h — offer to resume
+  // ── SESSION EXPIRY — 4-hour hard cutoff ─────────────────────
+  // Any active (non-idle) session untouched for 4+ hours is silently reset.
+  // The background sessionCleaner cron handles sessions where the patient
+  // never sends another message; this catches the case where they do.
+  const SESSION_EXPIRY_MS = 4 * 60 * 60 * 1000; // 4 hours
   if (!isGreeting && session.state !== STATES.IDLE && session.state !== STATES.MAIN_MENU) {
     const elapsed = Date.now() - new Date(session.last_activity).getTime();
-    if (elapsed > SESSION_FLOW_EXPIRY_MS) {
-      if (elapsed < SESSION_RESUME_WINDOW_MS && ctx.doctor_name && ctx.appointment_date) {
-        // Offer to resume incomplete booking
-        await send.buttons(
-          `👋 Welcome back! You were booking an appointment with *Dr. ${ctx.doctor_name}* on *${ctx.appointment_date}*.\n\nWould you like to continue?`,
-          ['✅ Yes, continue', '🔄 Start fresh']
-        );
-        await updateSession(schema, phone, STATES.RESUME_CONFIRM, ctx);
-        return;
-      }
-      // Beyond 24h or no resumable context — reset to idle
+    if (elapsed > SESSION_EXPIRY_MS) {
       await updateSession(schema, phone, STATES.IDLE, {});
       session.state = STATES.IDLE;
+      // Fall through — treat this message as a fresh start
     }
-  }
-
-  // ── RESUME CONFIRM ───────────────────────────────────────────
-  if (session.state === STATES.RESUME_CONFIRM) {
-    const resumeChoice = buttonId || lowerInput;
-    if (/yes|continue|btn_0/i.test(resumeChoice)) {
-      // Resume from where they left off — go to the appropriate state
-      const resumeState = ctx.slot_id ? STATES.CONFIRM_BOOKING
-        : ctx.appointment_date ? STATES.SELECT_SLOT
-        : ctx.doctor_id ? STATES.SELECT_DATE
-        : STATES.IDLE;
-      session.state = resumeState;
-      await updateSession(schema, phone, resumeState, ctx);
-      if (resumeState === STATES.CONFIRM_BOOKING) {
-        return showConfirmation(phone, schema, send, ctx, updateSession);
-      }
-      if (resumeState === STATES.SELECT_SLOT) {
-        // Re-fetch and re-render the slot list for the cached date so the user
-        // actually sees something to tap — a text hint alone leaves them stuck.
-        return handleSelectDate(phone, schema, tenant, send, ctx, ctx.appointment_date);
-      }
-      if (resumeState === STATES.SELECT_DATE) {
-        // Re-render the date list for the cached doctor. Populate _doctors so
-        // handleSelectDoctor can locate the doc by ID without a DB re-fetch.
-        ctx._doctors = [{ id: ctx.doctor_id, name: ctx.doctor_name }];
-        return handleSelectDoctor(phone, schema, tenant, send, ctx, ctx.doctor_id, ctx.doctor_name);
-      }
-      await send.text('Reply *Hi* to start over.');
-      return;
-    }
-    // Start fresh
-    await updateSession(schema, phone, STATES.IDLE, {});
-    session.state = STATES.IDLE;
-    // Fall through to greeting handler below
   }
 
   // ── FEEDBACK FLOW ────────────────────────────────────────────

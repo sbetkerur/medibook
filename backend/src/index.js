@@ -380,6 +380,7 @@ const server = app.listen(PORT, () => {
     const { startBotWorker } = require('./jobs/botWorker');
     const { startWebhookRetryCron } = require('./jobs/retryWebhooks');
     const { startBackupCron } = require('./jobs/backupManager');
+    const { startSessionCleanerCron } = require('./jobs/sessionCleaner');
     // Track cron tasks so we can stop them gracefully before DB closes
     cronTasks = [
       ...startSlotGeneratorCron(),
@@ -387,6 +388,7 @@ const server = app.listen(PORT, () => {
       startBackupReminderCron(),
       startWebhookRetryCron(),
       startBackupCron(),
+      startSessionCleanerCron(),
     ];
     startBotWorker();
   }
