@@ -49,7 +49,14 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
     hospitalRows = r.rows;
   }
   const numChoice = parseInt(input);
+  // 1. ID match (list reply fallback) or substring match
+  // 2. fuzzyFind (levenshtein)
+  // 3. All typed words found in clinic name (e.g. "smile banjara" → "Smile Dental - Banjara Hills")
+  // 4. Numeric selection
+  const words = input ? input.toLowerCase().split(/\s+/).filter(Boolean) : [];
   const h = hospitalRows.find(r => r.id === choice || (input && (r.name || '').toLowerCase().includes(input.toLowerCase())))
+    || fuzzyFind(hospitalRows, input)
+    || (words.length > 1 && hospitalRows.find(r => words.every(w => (r.name || '').toLowerCase().includes(w))))
     || (numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
   if (!h) {
     await send.text(`Sorry, I couldn't find a clinic matching "*${input}*". Please check the name and try again:`);
