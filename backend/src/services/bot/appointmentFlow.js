@@ -10,37 +10,47 @@ const IST = 'Asia/Kolkata';
 const {
   STATES,
   getPatient,
+  getPatients,
   updateSession,
   notifyAdminWhatsApp,
 } = require('./utils');
 
 async function showMyAppointments(phone, schema, tenant, send) {
-  const patient = await getPatient(schema, phone);
-  if (!patient) {
+  // Use getPatients (plural) to support family booking — a single phone number
+  // can have multiple patient profiles (e.g. parent booking for child/spouse).
+  // The old getPatient (singular) only returned the FIRST profile, so appointments
+  // booked for other family members were invisible in this view.
+  const patients = await getPatients(schema, phone);
+  if (!patients.length) {
     await send.text('We don\'t have any appointments linked to this number.\n\nReply *Hi* and tap *Book Appointment* to schedule your first one! 😊');
     return;
   }
 
+  const patientIds = patients.map(p => p.id);
+  const multiplePatients = patientIds.length > 1;
+
   const [upcomingR, pastR] = await Promise.all([
     tenantQuery(schema,
       `SELECT a.booking_id, a.appointment_date, a.appointment_time, a.status,
-              d.name as doctor_name, h.name as hospital_name
+              d.name as doctor_name, h.name as hospital_name, p.name as patient_name
        FROM appointments a
        JOIN doctors d ON d.id=a.doctor_id
        JOIN hospitals h ON h.id=a.hospital_id
-       WHERE a.patient_id=$1 AND a.appointment_date >= CURRENT_DATE AND a.status NOT IN ('cancelled')
+       JOIN patients p ON p.id=a.patient_id
+       WHERE a.patient_id = ANY($1::uuid[]) AND a.appointment_date >= CURRENT_DATE AND a.status NOT IN ('cancelled')
        ORDER BY a.appointment_date, a.appointment_time
        LIMIT 5`,
-      [patient.id]),
+      [patientIds]),
     tenantQuery(schema,
       `SELECT a.booking_id, a.appointment_date, a.appointment_time, a.status,
-              d.name as doctor_name
+              d.name as doctor_name, p.name as patient_name
        FROM appointments a
        JOIN doctors d ON d.id=a.doctor_id
-       WHERE a.patient_id=$1 AND a.appointment_date < CURRENT_DATE
+       JOIN patients p ON p.id=a.patient_id
+       WHERE a.patient_id = ANY($1::uuid[]) AND a.appointment_date < CURRENT_DATE
        ORDER BY a.appointment_date DESC, a.appointment_time DESC
        LIMIT 3`,
-      [patient.id]),
+      [patientIds]),
   ]);
 
   if (!upcomingR.rows.length && !pastR.rows.length) {
@@ -56,7 +66,8 @@ async function showMyAppointments(phone, schema, tenant, send) {
     const upcomingList = upcomingR.rows.map((a, i) => {
       let dt = a.appointment_date;
       try { dt = format(parseISO(a.appointment_date), 'EEE, d MMM'); } catch {}
-      return `${i + 1}. *${a.booking_id}*\n   👨‍⚕️ Dr. ${a.doctor_name}\n   📅 ${dt} at ${(a.appointment_time || '').slice(0, 5)}\n   ${statusLabel(a.status)}`;
+      const patientLine = multiplePatients && a.patient_name ? `\n   👤 ${a.patient_name}` : '';
+      return `${i + 1}. *${a.booking_id}*\n   👨‍⚕️ Dr. ${a.doctor_name}\n   📅 ${dt} at ${(a.appointment_time || '').slice(0, 5)}\n   ${statusLabel(a.status)}${patientLine}`;
     }).join('\n\n');
     bodyText += `📅 *Upcoming Appointments*\n\n${upcomingList}`;
   } else {
@@ -67,7 +78,8 @@ async function showMyAppointments(phone, schema, tenant, send) {
     const pastList = pastR.rows.map(a => {
       let dt = a.appointment_date;
       try { dt = format(parseISO(a.appointment_date), 'd MMM yyyy'); } catch {}
-      return `• *${a.booking_id}* — Dr. ${a.doctor_name}, ${dt} — ${statusLabel(a.status)}`;
+      const patientSuffix = multiplePatients && a.patient_name ? ` · ${a.patient_name}` : '';
+      return `• *${a.booking_id}* — Dr. ${a.doctor_name}, ${dt} — ${statusLabel(a.status)}${patientSuffix}`;
     }).join('\n');
     bodyText += `\n\n📜 *Past Appointments*\n${pastList}`;
   }

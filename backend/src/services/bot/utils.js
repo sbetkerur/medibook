@@ -23,6 +23,7 @@ const STATES = {
   CANCEL_SELECT: 'cancel_select',
   CANCEL_REASON: 'cancel_reason',
   CANCEL_CONFIRM: 'cancel_confirm',
+  SELECT_PATIENT: 'select_patient',
   COLLECT_EMAIL: 'collect_email',
   COLLECT_CHIEF_COMPLAINT: 'collect_chief_complaint',
   CHECK_BOOKING_STATUS: 'check_booking_status',
@@ -118,8 +119,14 @@ async function updateSession(schemaName, phone, state, context) {
 
 async function getPatient(schemaName, phone) {
   const r = await tenantQuery(schemaName,
-    `SELECT id, phone, name, email, date_of_birth, gender, visit_count FROM patients WHERE phone=$1`, [phone]);
+    `SELECT id, phone, name, email, date_of_birth, gender, visit_count FROM patients WHERE phone=$1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, [phone]);
   return r.rows[0] || null;
+}
+
+async function getPatients(schemaName, phone) {
+  const r = await tenantQuery(schemaName,
+    `SELECT id, phone, name, date_of_birth, gender, visit_count FROM patients WHERE phone=$1 AND deleted_at IS NULL ORDER BY created_at ASC`, [phone]);
+  return r.rows;
 }
 
 async function logMessage(schemaName, phone, direction, type, content, waMessageId) {
@@ -164,6 +171,7 @@ module.exports = {
   getSession,
   updateSession,
   getPatient,
+  getPatients,
   logMessage,
   notifyAdminWhatsApp,
 };

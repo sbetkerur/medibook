@@ -4,7 +4,7 @@ async function createTenantSchema(schemaName) {
   const client = await pool.connect();
   try {
     await client.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
-    await client.query(`SET search_path TO "${schemaName}"`);
+    await client.query(`SET search_path TO "${schemaName}", public`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -210,9 +210,6 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_appt_status ON appointments(status);
       CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id);
       CREATE INDEX IF NOT EXISTS idx_patients_phone ON patients(phone);
-      -- Partial unique index: phone numbers only unique among non-deleted patients,
-      -- so a soft-deleted patient's number can be re-registered.
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_phone_active ON patients(phone) WHERE deleted_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_bot_sessions_phone ON bot_sessions(phone);
       CREATE INDEX IF NOT EXISTS idx_wa_messages_phone ON wa_messages(phone);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
@@ -401,9 +398,9 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE patients  ADD COLUMN IF NOT EXISTS opted_out   BOOLEAN DEFAULT false;
     `);
 
-    // Convert patients.phone from global UNIQUE to partial unique index so that soft-deleted
-    // patients' phone numbers can be re-registered. Drop inline constraint (patients_phone_key)
-    // if it exists and create a partial index scoped to non-deleted rows.
+    // Allow multiple patients per phone (family booking support).
+    // Drop any unique constraint / index on patients.phone so a parent can book
+    // for a child, spouse, or other family member from the same number.
     await client.query(`
       DO $$ BEGIN
         IF EXISTS (
@@ -414,7 +411,7 @@ async function runTenantMigrations(schemaName) {
           ALTER TABLE patients DROP CONSTRAINT patients_phone_key;
         END IF;
       END $$;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_phone_active ON patients(phone) WHERE deleted_at IS NULL;
+      DROP INDEX IF EXISTS idx_patients_phone_active;
     `);
 
     // New composite indexes for reminder cron and common query patterns

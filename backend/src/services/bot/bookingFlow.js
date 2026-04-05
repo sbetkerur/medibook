@@ -14,6 +14,7 @@ const {
   genBookingId,
   fuzzyFind,
   getPatient,
+  getPatients,
   updateSession,
   notifyAdminWhatsApp,
 } = require('./utils');
@@ -67,7 +68,9 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
     || (words.length > 1 && hospitalRows.find(r => words.every(w => (r.name || '').toLowerCase().includes(w))))
     || (numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
   if (!h) {
-    await send.text(`Sorry, I couldn't find a clinic matching "*${input}*". Please check the name and try again:`);
+    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
   ctx.hospital_id = h.id;
@@ -121,7 +124,12 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
   const deptNumChoice = parseInt(input);
   const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input)
     || (deptNumChoice >= 1 && deptNumChoice <= depts.length ? depts[deptNumChoice - 1] : null);
-  if (!dept) { await send.text('Please select a treatment from the options.'); return; }
+  if (!dept) {
+    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
+    return;
+  }
 
   ctx.department_id = dept.id;
   ctx.department_name = dept.name;
@@ -173,7 +181,12 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   const docNumChoice = parseInt(input);
   const doc = doctors.find(d => d.id === choice) || fuzzyFind(doctors, cleanInput)
     || (docNumChoice >= 1 && docNumChoice <= doctors.length ? doctors[docNumChoice - 1] : null);
-  if (!doc) { await send.text('Please select a doctor from the options shown.'); return; }
+  if (!doc) {
+    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
+    return;
+  }
 
   ctx.doctor_id = doc.id;
   ctx.doctor_name = doc.name;
@@ -215,14 +228,33 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   }));
 
   if (!dates.length) {
-    // Both options reset to IDLE (which shows the main menu on next message),
-    // so the buttons both say "Main Menu" / "Book Again" to avoid implying
-    // the user can directly re-select a dentist without going through the menu.
-    await send.buttons(
-      `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nPlease try a different dentist or check back later.\n\nReply *Hi* to go back to the main menu.`,
-      ['🔄 Choose Another Dentist', '🏠 Main Menu']
-    );
-    await updateSession(schema, phone, STATES.IDLE, {});
+    // Offer other dentists in the same department so the user doesn't have to
+    // restart the entire booking flow just to try a different doctor.
+    const otherDoctors = doctors.filter(d => d.id !== doc.id);
+    if (otherDoctors.length > 0) {
+      await send.text(`Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days. Here are other dentists available for ${ctx.department_name}:`);
+      if (otherDoctors.length <= 3) {
+        await send.buttons('🦷 *Select Dentist*', otherDoctors.map(d => `Dr. ${d.name}`));
+      } else {
+        const sections = [{
+          title: `${ctx.department_name} Dentists`,
+          rows: otherDoctors.map(d => ({
+            id: d.id,
+            title: `Dr. ${d.name}`,
+            description: [d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : ''].filter(Boolean).join(' • ')
+          })),
+        }];
+        await send.list('🦷 *Select Dentist*', 'View Dentists', sections);
+      }
+      await updateSession(schema, phone, STATES.SELECT_DOCTOR, { ...ctx, _doctors: otherDoctors });
+    } else {
+      // No other doctors in this department — guide user back to menu
+      const deptLabel = ctx.department_name || 'this specialty';
+      await send.text(
+        `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days, and there are no other dentists available for ${deptLabel} right now.\n\nPlease try again later or contact the clinic directly.\n\nReply *Hi* to go back to the main menu.`
+      );
+      await updateSession(schema, phone, STATES.IDLE, {});
+    }
     return;
   }
 
@@ -244,7 +276,9 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
     if (n >= 1 && n <= cachedDates.length) {
       resolvedDate = cachedDates[n - 1].date;
     } else {
-      await send.text('Please select a date from the list, or reply *Hi* to start over.');
+      await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
+        ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
+      await updateSession(schema, phone, STATES.MAIN_MENU, {});
       return;
     }
   }
@@ -317,22 +351,73 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
     || slots.find(s => s.start_time.slice(0, 5) === choice || s.start_time.slice(0, 5) === input) // time match (typed or button title)
     || (!isNaN(num) && num >= 1 && num <= slots.length ? slots[num - 1] : null); // typed number
   if (!slot) {
-    await send.text(`Please select a time slot from the list.`);
+    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
 
   ctx.slot_id = slot.id;
   ctx.appointment_time = slot.start_time;
 
-  const patient = await getPatient(schema, phone);
-  if (patient?.name) {
-    ctx.patient_id = patient.id;
-    ctx.patient_name = patient.name;
-    return askChiefComplaint(phone, schema, send, ctx);
+  const patients = await getPatients(schema, phone);
+  if (patients.length === 0) {
+    // No profiles yet — collect new patient details
+    await send.text('👤 *Patient Name*\n\nPlease enter the full name of the patient:');
+    await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
+    return;
   }
 
-  await send.text('👤 *Your Name*\n\nPlease enter your full name:');
-  await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
+  // One or more profiles — let the user pick or add a new person
+  ctx._patients = patients;
+  if (patients.length === 1) {
+    await send.buttons(
+      `👤 *Who is this appointment for?*`,
+      [`👤 ${patients[0].name}`, '➕ Add new person']
+    );
+  } else {
+    const sections = [{
+      title: 'Family Members',
+      rows: [
+        ...patients.map(p => ({ id: p.id, title: p.name, description: p.gender || '' })),
+        { id: 'new_patient', title: '➕ Add new person', description: 'Book for someone else' },
+      ],
+    }];
+    await send.list('👨‍👩‍👧 *Who is this appointment for?*\n\nSelect a family member or add a new person:', 'Select Patient', sections);
+  }
+  await updateSession(schema, phone, STATES.SELECT_PATIENT, ctx);
+}
+
+async function handleSelectPatient(phone, schema, send, ctx, choice, input) {
+  const patients = ctx._patients || [];
+
+  // "Add new person" — via list reply ID, button title, or typed text
+  if (
+    choice === 'new_patient' ||
+    /^➕|^add new|^new person|^new$/i.test(input) ||
+    /^btn_1/i.test(choice)
+  ) {
+    await send.text('👤 *New Patient Name*\n\nPlease enter the full name of the person being booked:');
+    await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
+    return;
+  }
+
+  // Match by patient ID (list reply) or by name
+  const numChoice = parseInt(input, 10);
+  const selected =
+    patients.find(p => p.id === choice) ||
+    patients.find(p => (p.name || '').toLowerCase() === input.toLowerCase()) ||
+    patients.find(p => (p.name || '').toLowerCase().includes(input.toLowerCase().replace(/^👤\s*/, ''))) ||
+    (!isNaN(numChoice) && numChoice >= 1 && numChoice <= patients.length ? patients[numChoice - 1] : null);
+
+  if (!selected) {
+    await send.text('Please select a person from the options, or tap *Add new person*.');
+    return;
+  }
+
+  ctx.patient_id = selected.id;
+  ctx.patient_name = selected.name;
+  return askChiefComplaint(phone, schema, send, ctx);
 }
 
 async function askChiefComplaint(phone, schema, send, ctx) {
@@ -436,16 +521,12 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       return;
     }
 
-    // Upsert patient (include email if collected)
+    // Insert new patient or increment visit count for existing one.
+    // Phone is no longer unique (family booking) so we use a plain INSERT for new profiles.
     if (!patientId) {
       const pr = await client.query(
         `INSERT INTO patients (phone, name, date_of_birth, gender, email, visit_count)
          VALUES ($1,$2,$3,$4,$5,1)
-         ON CONFLICT (phone) DO UPDATE SET
-           name=EXCLUDED.name, date_of_birth=EXCLUDED.date_of_birth,
-           gender=EXCLUDED.gender,
-           email=COALESCE(EXCLUDED.email, patients.email),
-           visit_count=patients.visit_count+1, updated_at=NOW()
          RETURNING id`,
         [phone, ctx.patient_name, ctx.patient_dob || null, ctx.patient_gender || null, ctx.patient_email || null]);
       patientId = pr.rows[0].id;
@@ -633,6 +714,7 @@ module.exports = {
   handleSelectDoctor,
   handleSelectDate,
   handleSelectSlot,
+  handleSelectPatient,
   askChiefComplaint,
   handleChiefComplaint,
   showConfirmation,

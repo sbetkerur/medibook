@@ -23,6 +23,7 @@ const {
   handleSelectDoctor,
   handleSelectDate,
   handleSelectSlot,
+  handleSelectPatient,
   askChiefComplaint,
   handleChiefComplaint,
   showConfirmation,
@@ -401,7 +402,8 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   // ── GLOBAL ESCAPE — cancel / back / exit at any point in booking ──
   const BOOKING_STATES = [
     STATES.SELECT_HOSPITAL, STATES.SELECT_DEPARTMENT, STATES.SELECT_DOCTOR,
-    STATES.SELECT_DATE, STATES.SELECT_SLOT, STATES.COLLECT_NAME, STATES.COLLECT_DOB,
+    STATES.SELECT_DATE, STATES.SELECT_SLOT, STATES.SELECT_PATIENT,
+    STATES.COLLECT_NAME, STATES.COLLECT_DOB,
     STATES.COLLECT_GENDER, STATES.COLLECT_EMAIL, STATES.COLLECT_CHIEF_COMPLAINT,
     STATES.CONFIRM_BOOKING,
   ];
@@ -429,6 +431,9 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   }
   if (session.state === STATES.SELECT_SLOT) {
     return handleSelectSlot(phone, schema, tenant, send, ctx, choice, input);
+  }
+  if (session.state === STATES.SELECT_PATIENT) {
+    return handleSelectPatient(phone, schema, send, ctx, choice, input);
   }
   if (session.state === STATES.COLLECT_NAME) {
     if (input.length < 2 || input.length > 100) {
