@@ -328,7 +328,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       ? 'How can I help you today?'
       : 'Book a dental appointment, check your status, or manage existing bookings.';
     await send.buttons(
-      `🦷 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
+      `🦷 Welcome${firstName} to *Swalambha AI Technologies*!\n\n${subtitle}`,
       ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
     );
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
