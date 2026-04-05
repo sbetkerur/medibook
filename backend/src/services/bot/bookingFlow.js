@@ -72,6 +72,7 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
   }
   ctx.hospital_id = h.id;
   ctx.hospital_name = h.name;
+  await send.text(`✅ *${h.name}*\n\nWelcome! You're booking an appointment at *${h.name}*. Let's get started.`);
   return showDepartments(phone, schema, send, ctx);
 }
 
