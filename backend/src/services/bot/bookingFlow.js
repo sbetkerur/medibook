@@ -36,11 +36,8 @@ async function startBooking(phone, schema, tenant, send, ctx) {
 
   // Cache clinic list in context to avoid a DB re-fetch on every user input
   ctx._hospitals = hospitals.rows;
-  const sections = [{
-    title: 'Our Locations',
-    rows: hospitals.rows.map(h => ({ id: h.id, title: h.name.slice(0, 24), description: (h.city || '').slice(0, 72) }))
-  }];
-  await send.list('🦷 *Select a Clinic*\n\nChoose your preferred location:', 'View Locations', sections);
+  const clinicLines = hospitals.rows.map((h, i) => `${i + 1}. ${h.name}${h.city ? ` (${h.city})` : ''}`).join('\n');
+  await send.text(`🦷 *Select a Clinic*\n\nPlease type the name of your preferred clinic:\n\n${clinicLines}`);
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
 
@@ -55,7 +52,11 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
   const numChoice = parseInt(input);
   const h = hospitalRows.find(r => r.id === choice || (input && (r.name || '').toLowerCase().includes(input.toLowerCase())))
     || (numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
-  if (!h) { await send.text('Please select a location from the options.'); return; }
+  if (!h) {
+    const clinicLines = hospitalRows.map((r, i) => `${i + 1}. ${r.name}`).join('\n');
+    await send.text(`Sorry, I couldn't find that clinic. Please type the clinic name or number:\n\n${clinicLines}`);
+    return;
+  }
   ctx.hospital_id = h.id;
   ctx.hospital_name = h.name;
   return showDepartments(phone, schema, send, ctx);
