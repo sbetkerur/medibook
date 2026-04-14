@@ -187,6 +187,24 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
 
   const isGreeting = /^(hi|hello|hey|menu|start|helo|hy|hai)$/i.test(input);
 
+  // ── GREETING — fast path ─────────────────────────────────────
+  // Handled BEFORE session context loading so that "Hi" reliably
+  // resets from ANY state — including corrupted/encrypted sessions
+  // where context decryption would otherwise fail and return early.
+  if (isGreeting) {
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
+    const patient = await getPatient(schema, phone).catch(() => null);
+    const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
+    const subtitle = patient?.name
+      ? 'How can I help you today?'
+      : 'Book a dental appointment, check your status, or manage existing bookings.';
+    await send.buttons(
+      `🦷 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
+      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
+    );
+    return;
+  }
+
   let session = await getSession(schema, phone);
   let ctx = {};
   try {
@@ -279,16 +297,15 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return;
   }
 
-  // ── GREETING → MAIN MENU ─────────────────────────────────────
-  if (isGreeting || session.state === STATES.IDLE) {
+  // ── IDLE fallback — any non-greeting message when session is idle ──
+  if (session.state === STATES.IDLE) {
     const patient = await getPatient(schema, phone);
     const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
-    const isReturning = !!patient?.name;
-    const subtitle = isReturning
+    const subtitle = patient?.name
       ? 'How can I help you today?'
       : 'Book a dental appointment, check your status, or manage existing bookings.';
     await send.buttons(
-      `🦷 Welcome${firstName} to *Swalambha AI Technologies*!\n\n${subtitle}`,
+      `🦷 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
       ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
     );
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
@@ -394,7 +411,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       const patient = await getPatient(schema, phone);
       const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
       await send.buttons(
-        `👋 Welcome${firstName} to *Swalambha AI Technologies*!\n\nHow can I help you today?`,
+        `👋 Welcome${firstName} to *${tenant.name}*!\n\nHow can I help you today?`,
         ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
       );
       await updateSession(schema, phone, STATES.MAIN_MENU, {});
