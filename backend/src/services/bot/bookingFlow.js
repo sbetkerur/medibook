@@ -35,48 +35,88 @@ async function startBooking(phone, schema, tenant, send, ctx) {
     return showDepartments(phone, schema, send, ctx);
   }
 
-  // Cache clinic list in context to avoid a DB re-fetch on every user input
+  // Multiple branches — show interactive list/buttons so the user taps, not types
   ctx._hospitals = hospitals.rows;
-  await send.text(`🦷 *Enter Clinic Name*\n\nPlease type the name of your clinic:`);
+
+  const prompt = `🏥 *Select a Branch*\n\nWhich ${tenant.name} branch would you like to visit?`;
+
+  if (hospitals.rows.length <= 3) {
+    await send.buttons(prompt, hospitals.rows.map(h => h.name.slice(0, 20)));
+  } else {
+    const sections = [{
+      title: 'Our Branches',
+      rows: hospitals.rows.map(h => ({
+        id: h.id,
+        title: h.name.slice(0, 24),
+        description: (h.city || '').slice(0, 72),
+      })),
+    }];
+    await send.list(prompt, 'View Branches', sections);
+  }
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
 
 async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, input) {
-  // Use the hospital list cached in ctx._hospitals (set during startBooking).
-  // Fall back to a DB fetch only if cache is missing (e.g. old session before this change).
-  // If the user tapped a stale main-menu button (e.g. "📅 Book Appointment") while already
-  // in SELECT_HOSPITAL, just re-send the clinic prompt instead of trying to match the button
-  // title as a clinic name. WhatsApp buttons remain tappable on old messages.
-  if (/btn_0|btn_1|btn_2/i.test(choice) || /book appointment|my appointments|check status/i.test(input)) {
-    await send.text('🦷 *Enter Clinic Name*\n\nPlease type the name of your clinic:');
-    return;
+  let hospitalRows = ctx._hospitals;
+  if (!hospitalRows || !hospitalRows.length) {
+    const r = await tenantQuery(schema, `SELECT id, name, city FROM hospitals WHERE is_active=true ORDER BY name`);
+    hospitalRows = r.rows;
+    ctx._hospitals = hospitalRows;
   }
 
-  let hospitalRows = ctx._hospitals;
-  if (!hospitalRows) {
-    const r = await tenantQuery(schema, `SELECT id, name FROM hospitals WHERE is_active=true`);
-    hospitalRows = r.rows;
+  // If the user tapped a stale main-menu button while already in SELECT_HOSPITAL,
+  // re-send the branch picker rather than trying to match button titles as clinic names.
+  if (/book appointment|my appointments|check status/i.test(input)) {
+    return _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows);
   }
-  const numChoice = parseInt(input);
-  // 1. ID match (list reply fallback) or substring match
-  // 2. fuzzyFind (levenshtein)
-  // 3. All typed words found in clinic name (e.g. "smile banjara" → "Smile Dental - Banjara Hills")
-  // 4. Numeric selection
-  const words = input ? input.toLowerCase().split(/\s+/).filter(Boolean) : [];
-  const h = hospitalRows.find(r => r.id === choice || (input && (r.name || '').toLowerCase().includes(input.toLowerCase())))
-    || fuzzyFind(hospitalRows, input)
-    || (words.length > 1 && hospitalRows.find(r => words.every(w => (r.name || '').toLowerCase().includes(w))))
-    || (numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
+
+  const numChoice = parseInt(input, 10);
+  const words = (input || '').toLowerCase().split(/\s+/).filter(Boolean);
+
+  const h =
+    // 1. Exact UUID match from a list-reply
+    hospitalRows.find(r => r.id === choice) ||
+    // 2. Button-index match (btn_0, btn_1, btn_2 from buttons widget)
+    (/^btn_(\d+)/i.test(choice)
+      ? hospitalRows[parseInt(choice.match(/^btn_(\d+)/i)[1], 10)]
+      : null) ||
+    // 3. Case-insensitive substring of the name
+    (input && hospitalRows.find(r => (r.name || '').toLowerCase().includes(input.toLowerCase()))) ||
+    // 4. All typed words present in name ("smile banjara" → "Smile Dental - Banjara Hills")
+    (words.length > 1 && hospitalRows.find(r => words.every(w => (r.name || '').toLowerCase().includes(w)))) ||
+    // 5. Levenshtein fuzzy match
+    fuzzyFind(hospitalRows, input) ||
+    // 6. Numeric selection ("1", "2", …)
+    (!isNaN(numChoice) && numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
+
   if (!h) {
-    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
-    await updateSession(schema, phone, STATES.MAIN_MENU, {});
-    return;
+    // Re-prompt rather than cancelling — user may have mistyped
+    await send.text('❓ Branch not found. Please select from the list below:');
+    return _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows);
   }
+
   ctx.hospital_id = h.id;
   ctx.hospital_name = h.name;
-  await send.text(`✅ *${h.name}*\n\nWelcome! You're booking an appointment at *${h.name}*. Let's get started.`);
   return showDepartments(phone, schema, send, ctx);
+}
+
+// Helper: render the branch picker (buttons or list depending on count)
+async function _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows) {
+  const prompt = `🏥 *Select a Branch*\n\nWhich ${tenant.name} branch would you like to visit?`;
+  if (hospitalRows.length <= 3) {
+    await send.buttons(prompt, hospitalRows.map(h => h.name.slice(0, 20)));
+  } else {
+    const sections = [{
+      title: 'Our Branches',
+      rows: hospitalRows.map(h => ({
+        id: h.id,
+        title: h.name.slice(0, 24),
+        description: (h.city || '').slice(0, 72),
+      })),
+    }];
+    await send.list(prompt, 'View Branches', sections);
+  }
+  await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
 
 // Dental is always in-person — skip the visit type question and go straight to treatments.
