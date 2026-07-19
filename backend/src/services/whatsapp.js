@@ -154,15 +154,20 @@ async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId) {
 }
 
 async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneNumberId) {
-  // WhatsApp limits: section title ≤ 24, row title ≤ 24, row description ≤ 72
-  const sanitizedSections = sections.map(s => ({
-    title: String(s.title || '').slice(0, 24),
-    rows: (s.rows || []).map(r => ({
+  // WhatsApp limits: section title ≤ 24, row title ≤ 24, row description ≤ 72,
+  // and ≤ 10 rows TOTAL per list message — an 11-row list is rejected outright
+  // (Meta #131009), so without the cap every send from a tenant with 11+
+  // dentists/branches failed and degraded to the numbered-text fallback.
+  let rowBudget = 10;
+  const sanitizedSections = sections.map(s => {
+    const rows = (s.rows || []).slice(0, Math.max(rowBudget, 0)).map(r => ({
       id: String(r.id).slice(0, 200),
       title: String(r.title || '').slice(0, 24),
       ...(r.description ? { description: String(r.description).slice(0, 72) } : {}),
-    })),
-  }));
+    }));
+    rowBudget -= rows.length;
+    return { title: String(s.title || '').slice(0, 24), rows };
+  }).filter(s => s.rows.length > 0);
   try {
     await _send({
       recipient_type: 'individual',
