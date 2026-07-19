@@ -1,4 +1,9 @@
 {
+  "scripts": {
+    "deploy:backend": "railway up ./backend --path-as-root --service backend --detach",
+    "deploy:frontend": "railway up ./frontend --path-as-root --service frontend --detach",
+    "deploy": "npm run deploy:backend && npm run deploy:frontend"
+  },
   "dependencies": {
     "pptxgenjs": "^4.0.1",
     "puppeteer": "^24.40.0",

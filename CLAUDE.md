@@ -30,6 +30,18 @@ Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on eve
 boot, so schema changes in `migrate.js` / `tenantMigrate.js` must be idempotent
 (`IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` / versioned `runMigration`).
 
+Deploying via CLI — `railway up` archives the **git root** by default (even
+when run from inside `backend/`), which has no start script, so the build
+fails with Railpack "No start command detected" and an empty `configFile` in
+the deployment meta. ALWAYS pass the service dir with `--path-as-root`
+(from the repo root, or use `npm run deploy:backend` / `deploy:frontend`):
+
+```bash
+railway up ./backend  --path-as-root --service backend  --detach
+railway up ./frontend --path-as-root --service frontend --detach
+railway deployment list --service backend --json   # poll status (detached mode doesn't wait)
+```
+
 Seed credentials: super admin `admin@medibook.com` / `SuperAdmin@123`;
 tenant admin `demo@medibook.com` / `Demo@123456` (slug `demo-clinic`).
 
