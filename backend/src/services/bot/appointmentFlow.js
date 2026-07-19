@@ -37,7 +37,9 @@ async function showMyAppointments(phone, schema, tenant, send) {
        JOIN doctors d ON d.id=a.doctor_id
        JOIN hospitals h ON h.id=a.hospital_id
        JOIN patients p ON p.id=a.patient_id
-       WHERE a.patient_id = ANY($1::uuid[]) AND a.appointment_date >= CURRENT_DATE AND a.status NOT IN ('cancelled')
+       WHERE a.patient_id = ANY($1::uuid[])
+         AND (a.appointment_date + COALESCE(a.appointment_time, '23:59'::time)) >= timezone('Asia/Kolkata', NOW())
+         AND a.status NOT IN ('cancelled')
        ORDER BY a.appointment_date, a.appointment_time
        LIMIT 5`,
       [patientIds]),
@@ -47,7 +49,8 @@ async function showMyAppointments(phone, schema, tenant, send) {
        FROM appointments a
        JOIN doctors d ON d.id=a.doctor_id
        JOIN patients p ON p.id=a.patient_id
-       WHERE a.patient_id = ANY($1::uuid[]) AND a.appointment_date < CURRENT_DATE
+       WHERE a.patient_id = ANY($1::uuid[])
+         AND (a.appointment_date + COALESCE(a.appointment_time, '23:59'::time)) < timezone('Asia/Kolkata', NOW())
        ORDER BY a.appointment_date DESC, a.appointment_time DESC
        LIMIT 3`,
       [patientIds]),
@@ -193,6 +196,15 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
       return;
     }
   }
+  // Only accept dates from the offered list — the list query excludes leaves,
+  // holidays, the current date and the old appointment's date; a typed
+  // arbitrary date skipped all of those checks (including past dates, whose
+  // still-'available' slot rows would let the appointment move into the past).
+  const offeredDates = ctx._reschedule_dates || [];
+  if (offeredDates.length && !offeredDates.some(d => d.date === resolvedDate)) {
+    await send.text('That date is not available. Please pick a date from the list, or reply *Hi* to start over.');
+    return;
+  }
   ctx.reschedule_new_date = resolvedDate;
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
@@ -221,11 +233,15 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
 
 async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, input) {
   const slots = ctx._reschedule_slots || [];
+  // Numeric fallback mirrors the booking flow: when sendList degrades to
+  // numbered text ("Reply with the number of your choice"), "1"/"2" must work
+  // here too — without it this step dead-ended on the text-fallback path.
+  const num = parseInt(input, 10);
   const slot = slots.find(s =>
     s.id === choice ||
     s.start_time.slice(0, 5) === input ||
     s.start_time.slice(0, 5) === choice
-  );
+  ) || (num >= 1 && num <= slots.length ? slots[num - 1] : null);
   if (!slot) { await send.text('Please select a time slot from the list.'); return; }
   ctx.reschedule_new_slot_id = slot.id;
   ctx.reschedule_new_time = slot.start_time;

@@ -329,11 +329,11 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
 }
 
 async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
+  const cachedDates = ctx._dates || [];
   let resolvedDate = choice;
   // Accept numeric input ("1", "2") when list fell back to text
   if (!/^\d{4}-\d{2}-\d{2}$/.test(resolvedDate)) {
     const n = parseInt(resolvedDate);
-    const cachedDates = ctx._dates || [];
     if (n >= 1 && n <= cachedDates.length) {
       resolvedDate = cachedDates[n - 1].date;
     } else {
@@ -342,6 +342,14 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
       await updateSession(schema, phone, STATES.MAIN_MENU, {});
       return;
     }
+  }
+  // Only accept dates from the offered list. The list query excludes doctor
+  // leaves and clinic holidays; a typed arbitrary date (or a stale list row
+  // tapped after a holiday was declared) skipped those checks entirely and
+  // could book a slot on a day the clinic is closed.
+  if (cachedDates.length && !cachedDates.some(d => d.date === resolvedDate)) {
+    await send.text('That date is not available. Please pick a date from the list, or reply *Hi* to start over.');
+    return;
   }
   ctx.appointment_date = resolvedDate;
 
@@ -583,9 +591,16 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     await client.query('BEGIN');
     await client.query(`SET LOCAL search_path TO "${schema}", public`);
 
-    // Atomic slot lock
+    // Atomic slot lock. The time predicate re-checks that the slot hasn't
+    // passed — a patient can sit on the confirm screen for hours (4h session
+    // window) and previously could confirm a slot whose start time had gone by.
     const slotUpdate = await client.query(
-      `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
+      `UPDATE time_slots SET status='booked'
+       WHERE id=$1 AND status='available'
+         AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+              OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                  AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
+       RETURNING id`,
       [ctx.slot_id]);
 
     if (!slotUpdate.rows.length) {

@@ -11,6 +11,8 @@ let botWorkerInstance = null; // stored so shutdown() can close it
 let emailWorker = null;
 let queueAvailable = false;
 let workerStarted = false;
+let watchdogStarted = false;
+let shuttingDown = false;
 
 function createConnection() {
   const conn = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
@@ -150,25 +152,35 @@ function startBotWorker() {
   // Watchdog: check every 2 minutes that the worker is still running.
   // BullMQ workers can silently stall after a Redis reconnect — if we detect
   // the worker is closed, restart it so the queue keeps processing.
-  const watchdogInterval = setInterval(async () => {
-    if (!botWorkerInstance || botWorkerInstance.closing) {
-      logger.warn('Bot worker watchdog: worker stopped — restarting...');
-      workerStarted = false;
-      startBotWorker();
-    }
-  }, 2 * 60 * 1000);
-  watchdogInterval.unref();
+  // Registered once: each watchdog-triggered restart re-enters this function,
+  // and without the guard every restart stacked another interval and spawned a
+  // duplicate email worker below.
+  if (!watchdogStarted) {
+    watchdogStarted = true;
+    const watchdogInterval = setInterval(async () => {
+      if (shuttingDown) return; // close() sets `closing` — don't fight shutdown
+      if (!botWorkerInstance || botWorkerInstance.closing) {
+        logger.warn('Bot worker watchdog: worker stopped — restarting...');
+        workerStarted = false;
+        startBotWorker();
+      }
+    }, 2 * 60 * 1000);
+    watchdogInterval.unref();
+  }
 
-  // Email worker — processes email-jobs queue
-  if (emailQueue) {
+  // Email worker — processes email-jobs queue (create once; watchdog restarts
+  // must not orphan a healthy instance)
+  if (emailQueue && !emailWorker) {
     const emailConn = createConnection();
     const emailSvc = require('../services/email');
     emailWorker = new Worker('email-jobs', async (job) => {
       const type = job.name;
+      // rethrow:true — a failed send must throw so BullMQ's 3-attempt backoff
+      // actually retries it (see queueEmail's job options in services/email.js)
       if (type === 'booking_confirmation') {
-        await emailSvc.sendBookingConfirmation(job.data.toEmail, job.data.data);
+        await emailSvc.sendBookingConfirmation(job.data.toEmail, job.data.data, { rethrow: true });
       } else if (type === 'reminder') {
-        await emailSvc.sendReminderEmail(job.data.toEmail, job.data.data);
+        await emailSvc.sendReminderEmail(job.data.toEmail, job.data.data, { rethrow: true });
       } else if (type === 'admin_booking_alert') {
         await emailSvc.sendAdminBookingAlert(job.data);
       } else {
@@ -215,6 +227,7 @@ async function getQueueStats() {
 }
 
 async function shutdown() {
+  shuttingDown = true; // stop the watchdog from restarting workers mid-shutdown
   try {
     // Close workers first so in-flight jobs finish before queues are torn down
     if (botWorkerInstance) await botWorkerInstance.close();

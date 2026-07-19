@@ -33,10 +33,25 @@ async function checkAndMarkEmailSent(hash) {
       `SELECT 1 FROM email_sent_log WHERE content_hash=$1 AND sent_at > NOW() - (INTERVAL '1 hour' * $2)`,
       [hash, windowHours]
     );
-    return !!existing.rows[0]; // true = within window (skip), false = stale (allow re-send)
+    if (existing.rows[0]) return true; // within window — skip
+    // Stale row: refresh sent_at so THIS send is deduped going forward —
+    // otherwise dedup for this hash stays permanently disabled once stale.
+    await dbQuery(`UPDATE email_sent_log SET sent_at=NOW() WHERE content_hash=$1`, [hash]).catch(() => {});
+    return false;
   } catch (_) {
     return false; // DB unavailable — allow sending rather than silently drop
   }
+}
+
+// Release a dedup claim after a FAILED send. The claim is taken before the
+// send (to close the concurrent-send race), so without this a transient
+// Resend error left the hash claimed and every retry within the window was
+// skipped as a "duplicate" — the email was permanently lost.
+async function releaseEmailClaim(hash) {
+  try {
+    const { query: dbQuery } = require('../db');
+    await dbQuery(`DELETE FROM email_sent_log WHERE content_hash=$1`, [hash]);
+  } catch (_) { /* best-effort */ }
 }
 
 // ── DB-STORED TEMPLATE SUPPORT ────────────────────────────────
@@ -151,7 +166,7 @@ async function queueEmail(type, payload) {
   else if (type === 'admin_booking_alert') await sendAdminBookingAlert(payload);
 }
 
-async function sendBookingConfirmation(toEmail, data) {
+async function sendBookingConfirmation(toEmail, data, opts = {}) {
   const resend = getResend();
   if (!resend) return;
   const { bookingId, patientName, doctorName, date, time, hospitalName, visitType, patientId, schemaName } = data;
@@ -200,11 +215,14 @@ async function sendBookingConfirmation(toEmail, data) {
   } catch (err) {
     logger.warn(`Email send failed for ${bookingId}`, { error: err.message });
     try { require('../utils/metrics').increment('emails_failed_total'); } catch (_) {}
-    // Non-fatal — don't throw
+    await releaseEmailClaim(dedupHash); // failed send must not consume the dedup slot
+    // Queue worker passes rethrow:true so BullMQ retries; sync callers
+    // (booking flow) must not crash on a failed email.
+    if (opts.rethrow) throw err;
   }
 }
 
-async function sendReminderEmail(toEmail, data) {
+async function sendReminderEmail(toEmail, data, opts = {}) {
   const resend = getResend();
   if (!resend || !toEmail) return;
   const { bookingId, patientName, doctorName, date, time, hoursUntil, patientId, schemaName } = data;
@@ -241,6 +259,8 @@ async function sendReminderEmail(toEmail, data) {
     });
   } catch (err) {
     logger.warn(`Reminder email failed for ${bookingId}`, { error: err.message });
+    await releaseEmailClaim(dedupHash); // failed send must not consume the dedup slot
+    if (opts.rethrow) throw err;
   }
 }
 

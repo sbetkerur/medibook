@@ -165,33 +165,50 @@ router.post('/webhook/whatsapp', async (req, res) => {
       logger.warn('Unsigned webhook request in production (META_APP_SECRET not configured)');
     }
 
-    const entry = req.body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
+    // Meta batches deliveries: one POST can carry several entries/changes and
+    // several messages per value (rapid consecutive texts, coalesced redelivery
+    // after downtime). Only entry[0]/changes[0]/messages[0] used to be
+    // processed — everything else was ACKed and silently dropped.
+    for (const entry of req.body?.entry || []) {
+      for (const change of entry?.changes || []) {
+        const value = change?.value;
+        if (!value) continue;
 
-    // ── STATUS UPDATES (delivery receipts) ───────────────────────
-    // For status updates we need to find the tenant — use global_bot_sessions for routing.
-    if (value?.statuses?.length) {
-      const statusPhone = value.statuses[0]?.recipient_id;
-      if (statusPhone) {
-        const gs = await query(`SELECT tenant_id FROM global_bot_sessions WHERE phone=$1`, [statusPhone]).catch(() => null);
-        if (gs?.rows[0]?.tenant_id) {
+        // ── STATUS UPDATES (delivery receipts) ───────────────────
+        // Route each status by ITS recipient — a batch can span patients whose
+        // sessions point at different tenants.
+        for (const status of value.statuses || []) {
+          if (!status?.id || !status.recipient_id) continue;
+          const gs = await query(`SELECT tenant_id FROM global_bot_sessions WHERE phone=$1`, [status.recipient_id]).catch(() => null);
+          if (!gs?.rows[0]?.tenant_id) continue;
           const tr = await query(`SELECT schema_name FROM tenants WHERE id=$1`, [gs.rows[0].tenant_id]).catch(() => null);
           if (tr?.rows[0]) {
-            for (const status of value.statuses) {
-              if (status.id) {
-                wa.updateMessageStatus(tr.rows[0].schema_name, status.id, status.status).catch(() => {});
-              }
-            }
+            wa.updateMessageStatus(tr.rows[0].schema_name, status.id, status.status).catch(() => {});
+          }
+        }
+
+        // A value can carry both statuses and messages — process both.
+        for (const msg of value.messages || []) {
+          try {
+            await processIncomingMessage(msg);
+          } catch (msgErr) {
+            logger.error('Webhook message processing failed', { msgId: msg?.id, error: msgErr.message });
           }
         }
       }
-      return;
     }
+  } catch (err) {
+    logger.error('Webhook handler error', {
+      error: err.message,
+      stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
+    });
+  }
+});
 
-    if (!value?.messages?.length) return;
-
-    const msg = value.messages[0];
+// One incoming patient message end-to-end: parse → tenant routing → dedup →
+// rate limits → enqueue/sync. Extracted so the POST handler can iterate over
+// Meta's batched payloads; early `return`s skip just this message.
+async function processIncomingMessage(msg) {
     // Normalize phone: strip leading '+' so '917795676142' and '+917795676142' map to same user
     const phone = (msg.from || '').replace(/^\+/, '');
     if (!/^\d{7,20}$/.test(phone)) {
@@ -234,7 +251,9 @@ router.post('/webhook/whatsapp', async (req, res) => {
     // via the global_bot_sessions table. New patients see a clinic selector first.
     let tenant = null;
 
-    const isSwitchClinic = /^(switch|change)\s*(clinic|hospital|branch)?$/i.test((text || '').trim());
+    // Noun is REQUIRED — a bare "change" mid-booking ("change the date") must
+    // not silently reset the patient's clinic selection.
+    const isSwitchClinic = /^(switch|change)\s+(clinic|hospital|branch)$/i.test((text || '').trim());
     if (isSwitchClinic) {
       await query(
         `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant', last_activity=NOW() WHERE phone=$1`,
@@ -335,6 +354,30 @@ router.post('/webhook/whatsapp', async (req, res) => {
       return;
     }
 
+    // Idempotency — atomic INSERT dedup using the unique partial index on
+    // wa_message_id. This must run BEFORE rate limits and the voice/unsupported
+    // branches: Meta redelivers on missed ACKs, and a redelivered voice message
+    // used to be transcribed and fed through the state machine twice.
+    if (msgId) {
+      try {
+        const inserted = await tenantQuery(
+          tenant.schema_name,
+          `INSERT INTO wa_messages (phone, direction, message_type, content, wa_message_id)
+           VALUES ($1,'in',$2,$3,$4)
+           ON CONFLICT (wa_message_id) WHERE wa_message_id IS NOT NULL DO NOTHING
+           RETURNING id`,
+          [phone, msg.type, (text || buttonId || '').slice(0, 500), msgId]
+        );
+        if (!inserted.rows[0]) {
+          logger.info('Duplicate message skipped', { msgId, phone });
+          return;
+        }
+      } catch (dupErr) {
+        // Non-conflict errors (e.g. DB down) — log and still process rather than silently drop
+        logger.warn('Message dedup check failed, processing anyway', { msgId, error: dupErr.message });
+      }
+    }
+
     // Per-tenant rate limiting: max 60 messages/minute (Redis-backed, multi-instance safe)
     if (!await checkTenantRateLimit(tenant.id)) {
       logger.warn(`Rate limit exceeded for tenant ${tenant.name}`, { tenantId: tenant.id });
@@ -368,27 +411,6 @@ router.post('/webhook/whatsapp', async (req, res) => {
         null, null
       ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone, type: unsupportedType, error: err.message }));
       return;
-    }
-
-    // Idempotency — atomic INSERT dedup using the unique partial index on wa_message_id
-    if (msgId) {
-      try {
-        const inserted = await tenantQuery(
-          tenant.schema_name,
-          `INSERT INTO wa_messages (phone, direction, message_type, content, wa_message_id)
-           VALUES ($1,'in',$2,$3,$4)
-           ON CONFLICT (wa_message_id) WHERE wa_message_id IS NOT NULL DO NOTHING
-           RETURNING id`,
-          [phone, msg.type, (text || buttonId || '').slice(0, 500), msgId]
-        );
-        if (!inserted.rows[0]) {
-          logger.info('Duplicate message skipped', { msgId, phone });
-          return;
-        }
-      } catch (dupErr) {
-        // Non-conflict errors (e.g. DB down) — log and still process rather than silently drop
-        logger.warn('Message dedup check failed, processing anyway', { msgId, error: dupErr.message });
-      }
     }
 
     // Mark message as read — shows blue double tick to user
@@ -468,14 +490,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
       // Sync fallback: process inline
       processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'queue unavailable' });
     }
-
-  } catch (err) {
-    logger.error('Webhook handler error', {
-      error: err.message,
-      stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
-    });
-  }
-});
+}
 
 // ── DEV TEST ENDPOINT ─────────────────────────────────────────
 // Mutex to serialize /webhook/test calls — prevents concurrent requests from
@@ -484,6 +499,18 @@ let _testEndpointMutex = Promise.resolve();
 
 if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT === 'true') {
   router.post('/webhook/test', testEndpointLimiter, async (req, res) => {
+    // In production the endpoint additionally requires a shared secret — it is
+    // otherwise unauthenticated and returns any patient's appointment details
+    // (and can book/cancel as any patient) keyed only by phone number.
+    if (process.env.NODE_ENV === 'production') {
+      const secret = process.env.TEST_ENDPOINT_SECRET || '';
+      const provided = String(req.headers['x-test-secret'] || '');
+      const a = Buffer.from(provided);
+      const b = Buffer.from(secret);
+      if (!secret || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        return res.status(401).json({ error: 'Unauthorized — set TEST_ENDPOINT_SECRET and send it as X-Test-Secret' });
+      }
+    }
     const { phone = '917795676142', message = 'Hi', button_id, tenant_slug } = req.body;
     try {
       const r = tenant_slug

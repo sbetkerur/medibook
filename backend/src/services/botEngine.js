@@ -108,19 +108,24 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     // Top-level safety net — if anything throws (DB error, circuit breaker open, etc.),
     // reset the session to idle and tell the user to try again. This prevents the bot
     // from silently dying and leaving the user stuck with no response.
-    logger.error('Bot handle() uncaught error — resetting session to idle', {
+    logger.error('Bot handle() uncaught error', {
       phone, tenant: tenant.slug, error: err.message,
       stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
     });
-    try {
-      await updateSession(schema, phone, STATES.IDLE, {});
-    } catch (_) { /* ignore — DB might be down */ }
+    // Deliberately do NOT reset the session here. The rethrow below feeds the
+    // BullMQ/failed_webhooks retry machinery, which replays this same message —
+    // with the session wiped, every replay landed in IDLE as "didn't
+    // understand" spam and could never succeed at the original intent. With
+    // state intact, a retry after a transient failure (DB blip) completes the
+    // step the patient was on. If failures persist, "Hi" always resets, and
+    // the 4-hour session expiry catches abandoned flows.
     try {
       await wa.sendText(phone,
-        'Sorry, something went wrong. Please reply *Hi* to continue.',
+        'Sorry, something went wrong — retrying. If nothing happens, reply *Hi* to start over.',
         waToken, waPhoneId);
     } catch (_) { /* ignore — circuit might be open */ }
-    // Re-throw so BullMQ knows the job failed and can retry correctly
+    try { require('../utils/metrics').increment('bot_errors_total'); } catch (_) {}
+    // Re-throw so BullMQ marks the job failed and the retry path engages
     throw err;
   }
 }
@@ -262,7 +267,12 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   }
 
   // ── REMINDER SHORTCUTS ───────────────────────────────────────
-  if (/^reschedule$/i.test(input) && !isGreeting) {
+  // Shortcuts only fire when the patient is NOT mid-flow: typed answers inside
+  // a booking legitimately contain these words — "toothache" at the
+  // reason-for-visit prompt used to wipe the nearly-complete booking one step
+  // before confirmation.
+  const atRestingState = session.state === STATES.IDLE || session.state === STATES.MAIN_MENU;
+  if (atRestingState && /^reschedule$/i.test(input) && !isGreeting) {
     const patient = await getPatient(schema, phone);
     if (!patient) {
       await send.text('No appointments found. Reply *Hi* to book your first appointment.');
@@ -273,7 +283,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     await updateSession(schema, phone, STATES.RESCHEDULE_SELECT, {});
     return;
   }
-  if (/^cancel appointment$/i.test(input) && !isGreeting) {
+  if (atRestingState && /^cancel appointment$/i.test(input) && !isGreeting) {
     const patient = await getPatient(schema, phone);
     if (!patient) {
       await send.text('No appointments found. Reply *Hi* to book your first appointment.');
@@ -286,7 +296,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   }
 
   // ── DENTAL EMERGENCY SHORTCUT ────────────────────────────────
-  if (/^(emergency|toothache|tooth ache|dental emergency|urgent)$/i.test(input) && !isGreeting) {
+  if (atRestingState && /^(emergency|toothache|tooth ache|dental emergency|urgent)$/i.test(input) && !isGreeting) {
     await send.text(
       `🚨 *Dental Emergency*\n\n` +
       `We'll get you seen as soon as possible!\n\n` +
@@ -589,7 +599,7 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
       }
     } catch (_) {}
   }
-  if (/skip/i.test(input)) {
+  if (/^skip$/i.test((input || '').trim())) {
     await send.text('No problem! Reply *Hi* for the main menu.');
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
@@ -618,7 +628,9 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
 }
 
 async function handleFeedbackComment(phone, schema, send, ctx, input) {
-  const comment = /skip/i.test(input) ? null : input;
+  // Exact match only — an unanchored /skip/ silently discarded any genuine
+  // comment containing the word ("the receptionist skipped my X-ray review").
+  const comment = /^skip$/i.test((input || '').trim()) ? null : input;
   try {
     if (ctx.feedback_appointment_id && ctx.feedback_patient_id) {
       await tenantQuery(schema,
