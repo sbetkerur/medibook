@@ -76,6 +76,9 @@ api.interceptors.response.use(
         localStorage.setItem('token', data.token);
         if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
         resetSessionTimers();
+        // Notify long-lived consumers of the old token (e.g. the dashboard's SSE
+        // EventSource, which embeds the token in its URL) so they can reconnect.
+        window.dispatchEvent(new CustomEvent('medibook:token-refreshed', { detail: { token: data.token } }));
 
         api.defaults.headers.common.Authorization = `Bearer ${data.token}`;
         processQueue(null, data.token);

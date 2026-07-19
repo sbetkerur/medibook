@@ -20,6 +20,18 @@ function getClient() {
   return sharedClient;
 }
 
+// Atomic INCR + EXPIRE in one Lua script, shared by every rate limiter.
+// The two-step INCR-then-EXPIRE has a race: if the process dies between the
+// calls, the key persists with no TTL and the counter never resets.
+const INCR_WITH_TTL_SCRIPT = `local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return c`;
+
+/** Increment `key`, setting `ttlSeconds` on first increment. Returns the count. */
+async function incrWithTTL(key, ttlSeconds) {
+  return getClient().eval(INCR_WITH_TTL_SCRIPT, 1, key, ttlSeconds);
+}
+
 async function redisHealthCheck() {
   try {
     const client = getClient();
@@ -40,4 +52,4 @@ function closeClient() {
   }
 }
 
-module.exports = { getClient, redisHealthCheck, closeClient };
+module.exports = { getClient, incrWithTTL, redisHealthCheck, closeClient };

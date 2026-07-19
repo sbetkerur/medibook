@@ -151,11 +151,16 @@ app.use('/api/webhook', webhookIpLimiter);
 app.use('/api/webhook', webhookLimiter);
 app.use('/api', globalLimiter);
 
-// ── PER-TENANT RATE LIMITING (Enhancement 15) ────────────────
-// Applied globally to all admin routes — runs after auth+tenant middleware set req.user and req.tenant
+// ── AUTH + PER-TENANT RATE LIMITING (Enhancement 15) ─────────
+// Auth, tenant resolution and per-tenant rate limiting are applied ONCE here
+// for all admin routes (legacy and /v1 alias). The individual route files do
+// NOT re-apply them — previously they did, which ran JWT verification, the
+// token-blacklist query, the tenant lookup and the IP-allowlist check twice
+// on every single admin request.
 const tenantRateLimit = require('./middleware/tenantRateLimit');
 const { authMiddleware: _auth, tenantMiddleware: _tenant } = require('./middleware/auth');
 app.use('/api/admin', _auth, _tenant, tenantRateLimit);
+app.use('/api/v1/admin', _auth, _tenant, tenantRateLimit);
 
 // ── ROUTES ────────────────────────────────────────────────────
 app.use('/api', require('./routes/auth'));
@@ -195,15 +200,49 @@ app.get('/api/track/open', async (req, res) => {
   }
 });
 
-// POST /api/webhook/resend — Resend bounce/complaint webhook
+// Verify a Svix webhook signature (used by Resend).
+// Svix signs `${svix-id}.${svix-timestamp}.${rawBody}` with HMAC-SHA256 using the
+// base64-decoded portion of the `whsec_…` secret, and sends one or more
+// space-separated `v1,<base64sig>` values in the `svix-signature` header.
+function verifySvixSignature(req, secret) {
+  const svixId = req.headers['svix-id'];
+  const svixTimestamp = req.headers['svix-timestamp'];
+  const svixSignature = req.headers['svix-signature'];
+  if (!svixId || !svixTimestamp || !svixSignature) return false;
+
+  // Reject stale/future timestamps (±5 min) to prevent replay attacks
+  const ts = parseInt(svixTimestamp, 10);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 300) return false;
+
+  let key;
+  try {
+    key = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
+  } catch { return false; }
+
+  const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+  const signedContent = `${svixId}.${svixTimestamp}.${rawBody.toString('utf8')}`;
+  const expected = crypto.createHmac('sha256', key).update(signedContent).digest();
+
+  // Header may contain multiple signatures: "v1,<sig> v1,<sig>"
+  for (const part of String(svixSignature).split(' ')) {
+    const [version, sig] = part.split(',');
+    if (version !== 'v1' || !sig) continue;
+    let candidate;
+    try { candidate = Buffer.from(sig, 'base64'); } catch { continue; }
+    if (candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// POST /api/webhook/resend — Resend bounce/complaint webhook (signed via Svix)
 app.post('/api/webhook/resend', express.json(), async (req, res) => {
-  // Verify Resend webhook signature if secret is configured
   if (process.env.RESEND_WEBHOOK_SECRET) {
-    const sig = req.headers['resend-signature'];
-    if (!sig) { logger.warn('Unsigned Resend webhook rejected'); return res.sendStatus(403); }
-    const expected = crypto.createHmac('sha256', process.env.RESEND_WEBHOOK_SECRET)
-      .update(req.rawBody || Buffer.from(JSON.stringify(req.body))).digest('hex');
-    if (sig !== expected) { logger.warn('Invalid Resend webhook signature'); return res.sendStatus(403); }
+    if (!verifySvixSignature(req, process.env.RESEND_WEBHOOK_SECRET)) {
+      logger.warn('Invalid or missing Svix signature on Resend webhook — rejected');
+      return res.sendStatus(403);
+    }
   }
 
   res.sendStatus(200);

@@ -46,10 +46,21 @@ const nextConfig = {
         ],
       },
       {
-        // Short-lived cache for public assets (images, fonts, icons in /public)
-        source: '/:path*',
+        // Short-lived cache for static public assets only (images, fonts, icons).
+        // Scoped by file type so HTML pages and API responses are excluded.
+        source: '/:all*(svg|jpg|jpeg|gif|png|ico|webp|avif|woff|woff2|ttf)',
         headers: [
           { key: 'Cache-Control', value: 'public, max-age=3600, stale-while-revalidate=86400' },
+        ],
+      },
+      {
+        // Never cache proxied API responses — they are authenticated JSON
+        // (patient data). A blanket public max-age here previously let browsers
+        // and shared caches store PHI for an hour. Declared AFTER the asset rule
+        // so it wins if both ever match the same path (last matching rule wins).
+        source: '/api/proxy/:path*',
+        headers: [
+          { key: 'Cache-Control', value: 'no-store' },
         ],
       },
       {

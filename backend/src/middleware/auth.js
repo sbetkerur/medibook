@@ -98,11 +98,25 @@ async function tenantMiddleware(req, res, next) {
 
 function invalidateTenantCache(tenantId) {
   tenantCache.delete(tenantId);
+  allowlistExistsCache.delete(tenantId);
 }
+
+// Cache whether a tenant has ANY IP allowlist rows (60s TTL). The vast
+// majority of tenants have none, so this skips a DB round-trip on every
+// authenticated request. When rows exist we still query per-request to
+// match the client IP against CIDR ranges.
+const ALLOWLIST_CACHE_TTL_MS = 60 * 1000;
+const allowlistExistsCache = new Map(); // tenantId → { exists, expiresAt }
 
 async function checkIPAllowlist(tenantId, clientIp) {
   if (!tenantId) return true; // no allowlist to check for this request
   if (!clientIp) return false; // cannot determine client IP — fail closed
+
+  const cached = allowlistExistsCache.get(tenantId);
+  if (cached && cached.expiresAt > Date.now() && cached.exists === false) {
+    return true; // no allowlist configured — allow all (cached)
+  }
+
   try {
     // Normalise IPv4-mapped IPv6 addresses (e.g. "::ffff:192.168.1.1" → "192.168.1.1")
     const normalizedIp = clientIp.replace(/^::ffff:/i, '');
@@ -121,6 +135,7 @@ async function checkIPAllowlist(tenantId, clientIp) {
     );
 
     const total = parseInt(r.rows[0]?.total || 0);
+    allowlistExistsCache.set(tenantId, { exists: total > 0, expiresAt: Date.now() + ALLOWLIST_CACHE_TTL_MS });
     if (total === 0) return true; // no allowlist configured — allow all
 
     const matched = parseInt(r.rows[0]?.matched || 0);

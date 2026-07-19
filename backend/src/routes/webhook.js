@@ -15,21 +15,23 @@ const testEndpointLimiter = rateLimit({
   message: { error: 'Too many test requests. Slow down.' },
   standardHeaders: true,
   legacyHeaders: false,
+  // Limit only matters when the endpoint is exposed in production via
+  // ENABLE_TEST_ENDPOINT; in dev/test it just breaks longer smoke-test runs
+  // (the full booking+cancel conversation is 30+ calls in under a minute).
+  skip: () => process.env.NODE_ENV !== 'production',
 });
 
-// Rate limiting — uses Redis (INCR+EXPIRE) when available so limits are
-// shared across all backend instances. Falls back to in-process Maps when
-// Redis is unavailable (e.g. local dev with old Redis).
-const { getClient: getRedisClient } = require('../utils/redisClient');
+// Rate limiting — uses Redis (atomic INCR+EXPIRE via incrWithTTL) when
+// available so limits are shared across all backend instances. Falls back to
+// in-process Maps when Redis is unavailable (e.g. local dev with old Redis).
+const { incrWithTTL } = require('../utils/redisClient');
 
 const tenantMsgCounts = new Map(); // fallback: tenant_id -> { count, resetAt }
 const phoneMsgCounts  = new Map(); // fallback: phone     -> { count, resetAt }
 
 async function checkRateLimitRedis(key, maxPerMinute) {
   try {
-    const redis = getRedisClient();
-    const count = await redis.incr(key);
-    if (count === 1) await redis.expire(key, 60); // set TTL on first increment
+    const count = await incrWithTTL(key, 60);
     return count <= maxPerMinute;
   } catch (_) {
     return null; // Redis unavailable — caller uses in-memory fallback
@@ -91,6 +93,21 @@ function maskPhone(phone) {
   return '*'.repeat(Math.min(phone.length - 4, 8)) + phone.slice(-4);
 }
 
+// Process a bot message synchronously (fire-and-forget). On failure, persist to
+// failed_webhooks so the retry cron replays it — used by ALL sync fallback paths
+// (queue unavailable, queue saturated, queue add failed). Previously only the
+// queue-unavailable path saved failures; the other two silently lost messages.
+function processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType, context }) {
+  botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
+    logger.error(`Sync bot processing error (${context})`, { error: err.message });
+    query(`
+      INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, error_message, next_retry_at)
+      VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '2 minutes')
+    `, [phone, tenant.id, text || null, buttonId || null, messageType || 'text', err.message?.slice(0, 500)])
+      .catch(dbErr => logger.warn('Failed to save webhook to retry queue', { error: dbErr.message }));
+  });
+}
+
 // Startup warning if META_APP_SECRET looks like a placeholder
 const { META_APP_SECRET } = process.env;
 if (!META_APP_SECRET || META_APP_SECRET === 'PLACEHOLDER_REPLACE_WITH_APP_SECRET' || META_APP_SECRET === 'your_app_secret_here') {
@@ -135,7 +152,11 @@ router.post('/webhook/whatsapp', async (req, res) => {
         .createHmac('sha256', META_APP_SECRET)
         .update(rawBody)
         .digest('hex');
-      if (sig !== expected) {
+      // Constant-time comparison — a plain !== leaks timing information that
+      // could help an attacker forge signatures byte by byte.
+      const sigBuf = Buffer.from(String(sig));
+      const expectedBuf = Buffer.from(expected);
+      if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
         logger.warn('Invalid Meta webhook signature — ignoring');
         return;
       }
@@ -386,7 +407,19 @@ router.post('/webhook/whatsapp', async (req, res) => {
     // confirmation handler only accepts pure yes/no-style replies.
     if (text) {
       const isConfirmReply = /^(yes|no|confirm|haan|nahi|ha|ok|sure|nope)\b/i.test(text.trim());
+      // Only treat a yes/no as a reminder confirmation when the patient is NOT in
+      // the middle of a bot conversation. Otherwise an "ok"/"yes" that's really a
+      // booking step (e.g. confirming a slot) would be hijacked and consumed here.
+      // null = state unknown (lookup failed) — do NOT intercept in that case, so
+      // a mid-conversation reply is never consumed here on a DB blip.
+      let botSessionState = null;
       if (isConfirmReply) {
+        try {
+          const sr = await tenantQuery(tenant.schema_name, `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
+          botSessionState = sr.rows[0]?.state || 'idle';
+        } catch (_) { /* leave null — fall through to bot engine below */ }
+      }
+      if (isConfirmReply && botSessionState === 'idle') {
         const confirmResult = await handleReminderConfirmation(tenant.schema_name, phone, text).catch(() => false);
         if (confirmResult) {
           if (confirmResult === 'yes') {
@@ -414,9 +447,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
       const { LIMITS } = require('../utils/errors');
       if (waiting > LIMITS.QUEUE_BACKPRESSURE_THRESHOLD) {
         logger.warn(`Bot queue backpressure: ${waiting} jobs waiting — processing synchronously`);
-        botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
-          logger.error('Sync bot processing error (backpressure fallback)', { error: err.message });
-        });
+        processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'backpressure fallback' });
       } else {
         try {
           await botWorker.getQueue().add('process', { phone, text, buttonId, tenantId: tenant.id }, {
@@ -430,22 +461,12 @@ router.post('/webhook/whatsapp', async (req, res) => {
           // message is never silently dropped. This is the most common cause of
           // "bot not responding" when Redis has a blip.
           logger.warn('Queue add failed, falling back to sync processing', { error: queueErr.message });
-          botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
-            logger.error('Sync bot processing error (queue fallback)', { error: err.message });
-          });
+          processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'queue fallback' });
         }
       }
     } else {
       // Sync fallback: process inline
-      botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
-        logger.error('Sync bot processing error', { error: err.message });
-        // Save to failed_webhooks for retry
-        query(`
-          INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, error_message, next_retry_at)
-          VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '2 minutes')
-        `, [phone, tenant.id, text || null, buttonId || null, msg?.type || 'text', err.message?.slice(0, 500)])
-          .catch(dbErr => logger.warn('Failed to save webhook to retry queue', { error: dbErr.message }));
-      });
+      processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'queue unavailable' });
     }
 
   } catch (err) {

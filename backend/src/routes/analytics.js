@@ -2,9 +2,9 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const { tenantQuery, query } = require('../db');
-const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
+const { adminOnly } = require('./adminHelpers');
 
-router.use(authMiddleware, tenantMiddleware);
+// Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
 const { LIMITS, handleError } = require('../utils/errors');
 const analyticsLimiter = rateLimit({
@@ -309,7 +309,10 @@ router.get('/analytics/export', analyticsLimiter, async (req, res) => {
 // ── GOOGLE SHEETS WEBHOOK PUSH ────────────────────────────────
 // Route is mounted at /api/admin — path must be /settings/sheets-webhook
 // (not /admin/settings/sheets-webhook which would produce /api/admin/admin/...)
-router.post('/settings/sheets-webhook', async (req, res) => {
+// adminOnly: this mutates tenant settings, same as PATCH /settings.
+// NOTE: nothing consumes google_sheets_webhook_url yet — the push feature is
+// not implemented. Kept so saved URLs survive until it is (or remove both).
+router.post('/settings/sheets-webhook', adminOnly, async (req, res) => {
   try {
     const { url } = req.body;
     if (!url || typeof url !== 'string' || !url.startsWith('https://')) {

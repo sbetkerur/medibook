@@ -122,7 +122,16 @@
       "Bash(powershell.exe -Command \"Test-Path 'C:\\\\Program Files \\(x86\\)\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe'\" 2>&1)",
       "Bash(powershell.exe -Command \"Test-Path 'C:\\\\Program Files\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe'\" 2>&1)",
       "Bash(where railway:*)",
-      "Bash(npx @railway/cli --version)"
+      "Bash(npx @railway/cli --version)",
+      "Skill(code-review)",
+      "Bash(where.exe msedge *)",
+      "Bash('/c/Program Files/Google/Chrome/Application/chrome.exe' --headless=new --disable-gpu --no-first-run --user-data-dir=C:/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/0dcc843c-fc11-4ad8-b960-b8e524d5e920/scratchpad/chrome-profile --no-pdf-header-footer '--print-to-pdf=C:\\\\claude_projects\\\\medibook\\\\MEDIBOOK_SALES_PLAN.pdf' file:///C:/claude_projects/medibook/MEDIBOOK_SALES_PLAN.html)",
+      "Bash(echo \"exit=$?\")",
+      "WebSearch",
+      "Bash('/c/Program Files/Google/Chrome/Application/chrome.exe' --headless=new --disable-gpu --no-first-run --user-data-dir=C:/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/0dcc843c-fc11-4ad8-b960-b8e524d5e920/scratchpad/chrome-profile --no-pdf-header-footer '--print-to-pdf=C:\\\\claude_projects\\\\medibook\\\\MEDIBOOK_QR_KIT.pdf' file:///C:/claude_projects/medibook/MEDIBOOK_QR_KIT.html)",
+      "Bash('/c/Program Files/Google/Chrome/Application/chrome.exe' --headless=new --disable-gpu --no-first-run --user-data-dir=C:/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/0dcc843c-fc11-4ad8-b960-b8e524d5e920/scratchpad/chrome-profile-2 --no-pdf-header-footer '--print-to-pdf=C:\\\\claude_projects\\\\medibook\\\\MEDIBOOK_QR_KIT.pdf' file:///C:/claude_projects/medibook/MEDIBOOK_QR_KIT.html)",
+      "WebFetch(domain:skydentalclinics.com)",
+      "WebFetch(domain:www.chiseldental.co.in)"
     ]
   }
 }

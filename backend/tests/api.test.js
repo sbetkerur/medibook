@@ -169,12 +169,9 @@ async function run() {
     console.log('     departments:' + r.body.departments.length);
   });
 
-  await test('GET /admin/waiting-list returns array', async () => {
-    const r = await req('GET', '/api/admin/waiting-list', null, clinicToken);
-    if (r.status !== 200) throw new Error('status ' + r.status);
-    if (!Array.isArray(r.body.waiting_list)) throw new Error('no array');
-    console.log('     entries:' + r.body.waiting_list.length);
-  });
+  // NOTE: the waiting-list feature was removed from the product — no
+  // /admin/waiting-list route or waiting_list table exists anymore, so the
+  // test that used to exercise it here was deleted.
 
   await test('GET /admin/audit-logs returns array', async () => {
     const r = await req('GET', '/api/admin/audit-logs?limit=5', null, clinicToken);

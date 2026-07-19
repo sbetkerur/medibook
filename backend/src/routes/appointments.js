@@ -1,13 +1,12 @@
 'use strict';
 const router = require('express').Router();
 const { tenantQuery, tenantTransaction } = require('../db');
-const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const { VALID_APPOINTMENT_STATUSES, validateUUID, handleError } = require('../utils/errors');
+const { VALID_APPOINTMENT_STATUSES, APPOINTMENT_TRANSITIONS, UUID_RE, validateUUID, handleError } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
 
-router.use(authMiddleware, tenantMiddleware);
+// Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
 // ── LIST APPOINTMENTS ─────────────────────────────────────────
 router.get('/appointments', async (req, res) => {
@@ -23,7 +22,6 @@ router.get('/appointments', async (req, res) => {
       return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_APPOINTMENT_STATUSES.join(', ')}` });
     }
 
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (doctor_id && !UUID_RE.test(doctor_id)) {
       return res.status(400).json({ error: 'Invalid doctor_id format' });
     }
@@ -111,7 +109,6 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
       return res.status(400).json({ error: 'cancellation_reason required when bulk cancelling' });
     }
     if (ids.length > 50) return res.status(400).json({ error: 'Cannot bulk update more than 50 appointments at once' });
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!ids.every(id => UUID_RE.test(id))) return res.status(400).json({ error: 'All ids must be valid UUIDs' });
     const s = req.tenant.schema_name;
 
@@ -140,17 +137,29 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
         return r;
       });
     } else {
+      // Enforce the same state machine as the single-appointment PATCH: only
+      // update rows whose CURRENT status allows a transition to the target.
+      // Previously this branch updated unconditionally, so a bulk "confirmed"
+      // could resurrect cancelled/completed appointments without re-locking
+      // their slots.
+      const allowedSources = Object.keys(APPOINTMENT_TRANSITIONS)
+        .filter(from => APPOINTMENT_TRANSITIONS[from].includes(status));
+      if (!allowedSources.length) {
+        return res.status(409).json({ error: `No status can transition to '${status}'` });
+      }
       const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
       const statusParam = ids.length + 1;
       updated = await tenantQuery(s, `
         UPDATE appointments SET status=$${statusParam}, updated_at=NOW()
-        WHERE id IN (${placeholders}) RETURNING id, slot_id, doctor_id
-      `, [...ids, status]);
+        WHERE id IN (${placeholders}) AND status = ANY($${ids.length + 2})
+        RETURNING id, slot_id, doctor_id
+      `, [...ids, status, allowedSources]);
     }
 
     await writeAuditLog(s, req.user.id, req.user.role, 'BULK_UPDATE_APPOINTMENTS', 'appointment', null,
       null, { ids, status }, req.ip);
-    res.json({ updated: updated.rows.length, ids: updated.rows.map(a => a.id) });
+    // skipped = requested ids that were not in a state allowing this transition
+    res.json({ updated: updated.rows.length, skipped: ids.length - updated.rows.length, ids: updated.rows.map(a => a.id) });
   } catch (err) { handleError(res, err); }
 });
 
@@ -173,16 +182,11 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     if (!oldR.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
 
     // Enforce valid state transitions to prevent data inconsistency
-    // (e.g. reverting a completed appointment back to confirmed)
+    // (e.g. reverting a completed appointment back to confirmed).
+    // APPOINTMENT_TRANSITIONS is shared with the bulk route so the two can't drift.
     if (status) {
-      const VALID_TRANSITIONS = {
-        confirmed: ['completed', 'cancelled', 'no_show'],
-        no_show:   ['confirmed'],   // allow re-confirmation if patient arrived late
-        completed: [],              // terminal — no further transitions
-        cancelled: [],              // terminal
-      };
       const currentStatus = oldR.rows[0].status;
-      const allowed = VALID_TRANSITIONS[currentStatus] || [];
+      const allowed = APPOINTMENT_TRANSITIONS[currentStatus] || [];
       if (!allowed.includes(status)) {
         return res.status(409).json({
           error: `Invalid status transition: '${currentStatus}' → '${status}'. ` +
@@ -352,6 +356,11 @@ router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
 <script>window.onload=function(){window.print();}</script>
 </body></html>`;
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    // Relax the API-wide helmet CSP for this HTML page only: the receipt uses an
+    // inline <style> block and an inline window.print() script, which the global
+    // script-src/style-src 'self' policy would block (unstyled page, no auto-print).
+    res.setHeader('Content-Security-Policy',
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:");
     res.send(html);
   } catch (err) { handleError(res, err); }
 });
@@ -378,32 +387,84 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
       return res.status(400).json({ error: 'Doctor not found or does not belong to the specified hospital' });
     }
 
-    const patientR = await tenantQuery(s, `
-      INSERT INTO patients (phone, name, visit_count) VALUES ($1,$2,1)
-      ON CONFLICT (phone) DO UPDATE SET
-        name=COALESCE(EXCLUDED.name, patients.name),
-        visit_count=patients.visit_count+1, updated_at=NOW()
-      RETURNING id
-    `, [patient_phone, patient_name || null]);
-    const patientId = patientR.rows[0].id;
-    if (slot_id) {
-      // Verify slot belongs to the specified doctor AND hospital before locking it
-      const slotR = await tenantQuery(s,
-        `UPDATE time_slots SET status='booked'
-         WHERE id=$1 AND status='available' AND doctor_id=$2 AND hospital_id=$3
-         RETURNING id`,
-        [slot_id, doctor_id, hospital_id]);
-      if (!slotR.rows[0]) return res.status(409).json({ error: 'Slot is no longer available or does not belong to the specified doctor' });
+    // Plan quota: block walk-in creation once the monthly allowance is used up
+    const { insertAppointmentWithRetry, checkMonthlyQuota } = require('../services/bookingCore');
+    const quota = await checkMonthlyQuota(req.tenant);
+    if (!quota.allowed) {
+      return res.status(403).json({
+        error: `Monthly appointment limit reached for your plan (${quota.used}/${quota.limit}). Upgrade to book more appointments.`,
+        quota_exceeded: true,
+      });
     }
-    const bookingId = 'MB' + Date.now().toString(36).toUpperCase().slice(-6);
-    const r = await tenantQuery(s, `
-      INSERT INTO appointments
-        (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed') RETURNING *
-    `, [bookingId, patientId, doctor_id, hospital_id, slot_id || null, appointment_date, appointment_time, visit_type || 'in_person', notes || null]);
-    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_APPOINTMENT', 'appointment', r.rows[0].id,
+
+    // Single transaction: patient upsert + slot lock + appointment insert.
+    // Without this, a failed INSERT (e.g. booking-ID collision) would leave the
+    // slot orphaned in 'booked' status with no appointment attached.
+    let bookingResult;
+    try {
+      bookingResult = await tenantTransaction(s, async (client) => {
+        // patients.phone is intentionally NON-unique (family booking: one phone can
+        // have several patient profiles), so ON CONFLICT (phone) is not usable — it
+        // would raise 42P10. Reuse an existing profile for this phone (matching the
+        // supplied name when present) and bump visit_count; otherwise create a new one.
+        let patientId;
+        const existingPatient = await client.query(
+          `SELECT id FROM patients
+           WHERE phone=$1 AND deleted_at IS NULL
+             AND ($2::text IS NULL OR lower(name)=lower($2))
+           ORDER BY created_at ASC LIMIT 1`,
+          [patient_phone, patient_name || null]);
+        if (existingPatient.rows[0]) {
+          patientId = existingPatient.rows[0].id;
+          await client.query(
+            `UPDATE patients SET name=COALESCE($2, name), visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`,
+            [patientId, patient_name || null]);
+        } else {
+          const patientR = await client.query(
+            `INSERT INTO patients (phone, name, visit_count) VALUES ($1,$2,1) RETURNING id`,
+            [patient_phone, patient_name || null]);
+          patientId = patientR.rows[0].id;
+        }
+
+        if (slot_id) {
+          // Verify the slot belongs to the specified doctor AND hospital, and that
+          // its date/time actually match the requested appointment_date/time —
+          // otherwise the appointment record (used by reminders and the dashboard)
+          // could disagree with the slot that was locked.
+          const slotR = await client.query(
+            `UPDATE time_slots SET status='booked'
+             WHERE id=$1 AND status='available' AND doctor_id=$2 AND hospital_id=$3
+               AND slot_date=$4::date AND start_time=$5::time
+             RETURNING id`,
+            [slot_id, doctor_id, hospital_id, appointment_date, appointment_time]);
+          if (!slotR.rows[0]) {
+            const err = new Error('SLOT_TAKEN');
+            err.code = 'SLOT_TAKEN';
+            throw err;
+          }
+        }
+
+        return insertAppointmentWithRetry(client, {
+          patientId,
+          doctorId: doctor_id,
+          hospitalId: hospital_id,
+          slotId: slot_id || null,
+          appointmentDate: appointment_date,
+          appointmentTime: appointment_time,
+          visitType: visit_type || 'in_person',
+          notes: notes || null,
+        });
+      });
+    } catch (txErr) {
+      if (txErr.code === 'SLOT_TAKEN') {
+        return res.status(409).json({ error: 'Slot is no longer available, does not belong to the specified doctor/hospital, or does not match the requested date and time' });
+      }
+      throw txErr;
+    }
+    const { bookingId, row: appointment } = bookingResult;
+    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_APPOINTMENT', 'appointment', appointment.id,
       null, { booking_id: bookingId, doctor_id, appointment_date }, req.ip);
-    res.status(201).json({ appointment: r.rows[0], booking_id: bookingId });
+    res.status(201).json({ appointment, booking_id: bookingId });
     // Fire-and-forget WhatsApp alert to admin for walk-in booking
     (async () => {
       try {
@@ -455,56 +516,65 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     const { addDays, format } = require('date-fns');
     const followUpDate = format(addDays(new Date(orig.appointment_date), follow_up_days), 'yyyy-MM-dd');
 
-    // Find first available slot on or after follow-up date
-    const slotR = await tenantQuery(s, `
-      SELECT id, slot_date::text, start_time::text
-      FROM time_slots
-      WHERE doctor_id=$1
-        AND slot_date >= $2
-        AND status='available'
-      ORDER BY slot_date, start_time
-      LIMIT 1
-    `, [targetDoctorId, followUpDate]);
+    // Single transaction: find + lock slot, insert follow-up, link to original.
+    // Prevents an orphaned 'booked' slot if any later statement fails.
+    const { insertAppointmentWithRetry } = require('../services/bookingCore');
+    let followUp;
+    try {
+      followUp = await tenantTransaction(s, async (client) => {
+        // Lock the first available slot on or after the follow-up date.
+        // FOR UPDATE SKIP LOCKED serialises against concurrent bookers without blocking.
+        const slotR = await client.query(`
+          SELECT id, slot_date::text, start_time::text
+          FROM time_slots
+          WHERE doctor_id=$1
+            AND slot_date >= $2
+            AND status='available'
+          ORDER BY slot_date, start_time
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        `, [targetDoctorId, followUpDate]);
+        if (!slotR.rows[0]) {
+          const err = new Error('NO_SLOT');
+          err.code = 'NO_SLOT';
+          throw err;
+        }
+        const slot = slotR.rows[0];
+        await client.query(`UPDATE time_slots SET status='booked' WHERE id=$1`, [slot.id]);
 
-    if (!slotR.rows[0]) {
-      return res.status(404).json({ error: `No available slots found after ${followUpDate} for the selected doctor` });
+        const { bookingId, row } = await insertAppointmentWithRetry(client, {
+          patientId: orig.patient_id,
+          doctorId: targetDoctorId,
+          hospitalId: orig.hospital_id,
+          slotId: slot.id,
+          appointmentDate: slot.slot_date,
+          appointmentTime: slot.start_time,
+          visitType: orig.visit_type,
+          notes: notes || 'Follow-up appointment',
+        });
+
+        // Link back to original
+        await client.query(
+          `UPDATE appointments SET follow_up_appointment_id=$1, follow_up_days=$2 WHERE id=$3`,
+          [row.id, follow_up_days, req.params.id]);
+
+        return { bookingId, row, slot };
+      });
+    } catch (txErr) {
+      if (txErr.code === 'NO_SLOT') {
+        return res.status(404).json({ error: `No available slots found after ${followUpDate} for the selected doctor` });
+      }
+      throw txErr;
     }
-    const slot = slotR.rows[0];
 
-    // Atomic slot lock
-    const lockR = await tenantQuery(s, `
-      UPDATE time_slots
-      SET status='booked'
-      WHERE id=$1 AND status='available'
-      RETURNING id
-    `, [slotR.rows[0].id]);
-    if (!lockR.rows[0]) {
-      return res.status(409).json({ error: 'Slot no longer available — please try again' });
-    }
-
-    // Create follow-up appointment
-    const bookingId = 'MB' + Date.now().toString(36).toUpperCase().slice(-6);
-    const newApptR = await tenantQuery(s, `
-      INSERT INTO appointments
-        (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, status, visit_type, notes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'confirmed',$8,$9)
-      RETURNING *
-    `, [bookingId, orig.patient_id, targetDoctorId, orig.hospital_id, slot.id,
-        slot.slot_date, slot.start_time, orig.visit_type, notes || 'Follow-up appointment']);
-
-    // Link back to original
-    await tenantQuery(s, `
-      UPDATE appointments SET follow_up_appointment_id=$1, follow_up_days=$2 WHERE id=$3
-    `, [newApptR.rows[0].id, follow_up_days, req.params.id]);
-
-    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_FOLLOWUP', 'appointment', newApptR.rows[0].id,
-      null, { original_id: req.params.id, follow_up_days, booking_id: bookingId }, req.ip);
+    await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_FOLLOWUP', 'appointment', followUp.row.id,
+      null, { original_id: req.params.id, follow_up_days, booking_id: followUp.bookingId }, req.ip);
 
     res.json({
-      follow_up_appointment: newApptR.rows[0],
-      booking_id: bookingId,
-      date: slot.slot_date,
-      time: slot.start_time,
+      follow_up_appointment: followUp.row,
+      booking_id: followUp.bookingId,
+      date: followUp.slot.slot_date,
+      time: followUp.slot.start_time,
     });
   } catch (err) { handleError(res, err, 'POST /appointments/:id/followup'); }
 });

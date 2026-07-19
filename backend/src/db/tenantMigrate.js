@@ -391,6 +391,13 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE doctor_schedules ADD COLUMN IF NOT EXISTS lunch_end_time TIME DEFAULT NULL;
     `);
 
+    // Track WHY a slot is blocked: slots blocked automatically by a doctor leave
+    // are marked so that deleting the leave only un-blocks those slots and never
+    // releases slots an admin blocked manually for another reason.
+    await client.query(`
+      ALTER TABLE time_slots ADD COLUMN IF NOT EXISTS blocked_by_leave BOOLEAN DEFAULT false;
+    `);
+
     // Soft-delete columns for hospitals and patients
     await client.query(`
       ALTER TABLE hospitals ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ DEFAULT NULL;

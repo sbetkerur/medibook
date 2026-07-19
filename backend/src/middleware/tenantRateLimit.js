@@ -1,5 +1,5 @@
 'use strict';
-const { getClient } = require('../utils/redisClient');
+const { incrWithTTL } = require('../utils/redisClient');
 const { query } = require('../db');
 const logger = require('../utils/logger');
 const axios = require('axios');
@@ -12,13 +12,17 @@ const PLAN_LIMITS = {
 };
 
 // Per-endpoint overrides (req.path pattern -> max per minute)
-// Tenant can store { "/admin/appointments": 200 } in settings.rate_limits
+// Tenant can store { "/admin/appointments": 200 } in settings.rate_limits.
+// NOTE: this middleware is mounted at /api/admin, so req.path is the path AFTER
+// the mount point (e.g. "/appointments"). Accept patterns with or without the
+// "/admin" prefix so the documented settings format actually matches.
 function getEndpointLimit(tenant, reqPath, planLimit) {
   const customLimits = tenant?.settings?.rate_limits;
   if (!customLimits || typeof customLimits !== 'object') return planLimit;
   // Check exact path match or prefix match
   for (const [pattern, limit] of Object.entries(customLimits)) {
-    if (reqPath === pattern || reqPath.startsWith(pattern)) {
+    const normalized = pattern.replace(/^\/admin(?=\/)/, '');
+    if (reqPath === normalized || reqPath.startsWith(normalized)) {
       return typeof limit === 'number' ? limit : planLimit;
     }
   }
@@ -90,12 +94,12 @@ module.exports = async function tenantRateLimit(req, res, next) {
   const limit = getEndpointLimit(req.tenant, req.path, planLimit);
 
   try {
-    const redis = getClient();
     const window = Math.floor(Date.now() / 60000);
     const key = `ratelimit:tenant:${tenantId}:${window}`;
 
-    const count = await redis.incr(key);
-    if (count === 1) await redis.expire(key, 65);
+    // Atomic INCR + EXPIRE — avoids leaving a TTL-less counter if the process
+    // dies between the two calls (which would rate-limit the tenant forever).
+    const count = await incrWithTTL(key, 65);
 
     res.setHeader('X-RateLimit-Limit', limit);
     res.setHeader('X-RateLimit-Remaining', Math.max(0, limit - count));
@@ -106,8 +110,7 @@ module.exports = async function tenantRateLimit(req, res, next) {
       const abuseKey = `ratelimit:abuse:${clientIp}`;
       let abuseCount = 0;
       try {
-        abuseCount = await redis.incr(abuseKey);
-        if (abuseCount === 1) await redis.expire(abuseKey, 5 * 60);
+        abuseCount = await incrWithTTL(abuseKey, 5 * 60);
         if (abuseCount >= 10) {
           await recordIPAbuse(clientIp, `Rate limit exceeded ${abuseCount} times for tenant ${tenantId}`);
         }

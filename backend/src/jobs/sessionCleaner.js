@@ -38,9 +38,11 @@ async function cleanStaleSessions() {
 }
 
 function startSessionCleanerCron() {
-  // Run every 30 minutes
+  // Run every 30 minutes. NOTE: withCronLock takes (lockName, ttlSeconds, fn) —
+  // the TTL was previously omitted, which shifted the callback into the TTL slot
+  // and meant this cron never actually ran.
   const task = cron.schedule('*/30 * * * *', async () => {
-    await withCronLock('session_cleaner', async () => {
+    await withCronLock('cron:session_cleaner', 1740, async () => {
       await cleanStaleSessions();
     });
   });

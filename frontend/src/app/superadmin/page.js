@@ -172,7 +172,7 @@ export default function SuperAdminPage() {
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Top nav */}
-      <nav className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
+      <nav className="bg-white border-b border-gray-200 px-4 sm:px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <span className="text-xl font-bold text-blue-600">🏥 MediBook</span>
           <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full font-medium">Super Admin</span>
@@ -181,7 +181,7 @@ export default function SuperAdminPage() {
           className="text-sm text-gray-500 hover:text-red-500 transition">Sign Out</button>
       </nav>
 
-      <div className="max-w-6xl mx-auto p-6 space-y-6">
+      <div className="max-w-6xl mx-auto p-4 sm:p-6 space-y-6">
         {/* Stats */}
         {stats && (
           <>
@@ -242,7 +242,7 @@ export default function SuperAdminPage() {
         )}
 
         {/* Tab bar */}
-        <div className="flex gap-1 bg-white rounded-xl shadow-sm p-1 border border-gray-100">
+        <div className="flex gap-1 bg-white rounded-xl shadow-sm p-1 border border-gray-100 overflow-x-auto">
           {[
             { id: 'tenants', label: '🏥 Tenants' },
             { id: 'billing', label: '💰 Billing', onClick: () => { setTab('billing'); if (!billing) fetchBilling(); } },
@@ -251,7 +251,7 @@ export default function SuperAdminPage() {
           ].map(t => (
             <button key={t.id}
               onClick={() => { if (t.onClick) t.onClick(); else setTab(t.id); }}
-              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${tab === t.id ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-50'}`}>
+              className={`flex-1 shrink-0 whitespace-nowrap px-3 py-2 rounded-lg text-sm font-medium transition-colors ${tab === t.id ? 'bg-blue-600 text-white' : 'text-gray-600 hover:bg-gray-50'}`}>
               {t.label}
             </button>
           ))}
@@ -259,7 +259,7 @@ export default function SuperAdminPage() {
 
         {/* Tenants table */}
         {tab === 'tenants' && <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-          <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+          <div className="px-5 py-4 border-b border-gray-100 flex flex-wrap items-center justify-between gap-2">
             <h2 className="font-semibold text-gray-800">All Tenants ({tenants.length})</h2>
             <div className="flex gap-2">
               <button onClick={fetchAll} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>
@@ -437,7 +437,7 @@ export default function SuperAdminPage() {
         {/* Rate Limits Tab (Feature 32) */}
         {tab === 'rate_limits' && (
           <div className="space-y-5">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-lg font-semibold text-gray-800">Rate Limit Dashboard</h2>
               <button onClick={fetchRateLimits} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>
             </div>
@@ -541,7 +541,7 @@ export default function SuperAdminPage() {
         {/* Backups Tab (Feature 33) */}
         {tab === 'backups' && (
           <div className="space-y-5">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-lg font-semibold text-gray-800">Database Backups</h2>
               <div className="flex gap-2">
                 <button onClick={fetchBackups} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>

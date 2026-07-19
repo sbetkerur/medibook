@@ -394,20 +394,19 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       return;
     }
 
-    // Patient tapped a stale button from a previous message (WhatsApp keeps all buttons tappable).
-    // Any button title that isn't valid for the current step means they stepped outside the flow.
-    // Exit cleanly: cancel the booking and show the main menu so the intent is clear.
+    // Patient tapped a stale MAIN MENU button from a previous message (WhatsApp keeps
+    // all buttons tappable). Those titles never appear as valid options inside the
+    // booking flow, so they unambiguously mean "take me back to the menu".
+    //
+    // NOTE: do NOT treat other buttonId replies here as stale — every legitimate
+    // list/button reply in the booking flow (branch, treatment, dentist, date, slot,
+    // gender, Skip, ✅ Confirm, …) carries a buttonId. Genuinely stale taps (e.g. an
+    // old date row while in SELECT_SLOT) fall through to the current state handler,
+    // whose "option not found" fallback re-prompts or exits cleanly.
     const staleMainMenuButton =
       /book appointment|my appointments|check status/i.test(input);
-    const staleOtherButton =
-      // A WhatsApp interactive button was tapped (buttonId present) but its title doesn't
-      // look like free-text input — e.g. tapping a stale "✅ Confirm" or "❌ Cancel" or
-      // a treatment/doctor/date button from an earlier step while on a different step.
-      buttonId &&
-      !/^(hi|hello|hey|menu|start|cancel|exit|back|quit)$/i.test(input) &&
-      !staleMainMenuButton;
 
-    if (staleMainMenuButton || staleOtherButton) {
+    if (staleMainMenuButton) {
       const patient = await getPatient(schema, phone);
       const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
       await send.buttons(
@@ -439,6 +438,12 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return handleSelectPatient(phone, schema, send, ctx, choice, input);
   }
   if (session.state === STATES.COLLECT_NAME) {
+    // A button/list tap here is a stale reply from an earlier message — the name
+    // must be typed. Re-prompt instead of storing the button title as the name.
+    if (buttonId) {
+      await send.text('👤 Please *type* the full name of the patient:');
+      return;
+    }
     if (input.length < 2 || input.length > 100) {
       await send.text('Please enter your full name (between 2 and 100 characters).');
       return;
@@ -449,6 +454,10 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return;
   }
   if (session.state === STATES.COLLECT_DOB) {
+    if (buttonId) {
+      await send.text('🎂 Please *type* the date of birth in DD/MM/YYYY format:\nExample: 15/08/1990');
+      return;
+    }
     const m = input.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
     if (!m) { await send.text('Invalid format. Please use DD/MM/YYYY\nExample: 15/08/1990'); return; }
     const [, dd, mm, yyyy] = m;

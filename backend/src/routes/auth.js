@@ -10,6 +10,11 @@ const emailService = require('../services/email');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
 
+// Skip rate limits outside production — same policy as the global authLimiter
+// in index.js. Without this, repeated local test runs exhaust the hourly
+// forgot-password allowance and the test suite starts failing with 429s.
+const skipInDev = () => process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development';
+
 // ── Login rate limiter — 10 attempts per 15 minutes per IP ────
 // Prevents brute-force and credential-stuffing attacks against both
 // tenant admin and super admin login endpoints.
@@ -20,6 +25,7 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true, // only count failed/all requests toward the limit
+  skip: skipInDev,
 });
 
 // Strict limiters for unauthenticated sensitive endpoints
@@ -29,6 +35,7 @@ const forgotPasswordLimiter = rateLimit({
   message: { error: 'Too many password reset requests. Try again in an hour.' },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: skipInDev,
 });
 
 const resetPasswordLimiter = rateLimit({
@@ -37,6 +44,7 @@ const resetPasswordLimiter = rateLimit({
   message: { error: 'Too many reset attempts. Try again in an hour.' },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: skipInDev,
 });
 
 const changePasswordLimiter = rateLimit({
@@ -45,6 +53,7 @@ const changePasswordLimiter = rateLimit({
   message: { error: 'Too many password change attempts. Try again in an hour.' },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: skipInDev,
 });
 
 // ── SUPER ADMIN LOGIN ─────────────────────────────────────────
@@ -113,33 +122,57 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
   }
 });
 
-// Helper: issue a refresh token (30-day, one-time-use)
+// Hash a token for storage (refresh tokens AND password-reset tokens) — a DB
+// leak must not yield usable credentials. The raw token is sent to the client
+// once and never stored.
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+// Helper: issue a refresh token (30-day, one-time-use). Only the SHA-256 hash
+// is persisted; the raw token goes to the client.
 async function issueRefreshToken(userId, userRole, tenantId = null) {
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   await query(
     `INSERT INTO refresh_tokens (user_id, user_role, tenant_id, token, expires_at) VALUES ($1,$2,$3,$4,$5)`,
-    [userId, userRole, tenantId, token, expiresAt]
+    [userId, userRole, tenantId, hashToken(token), expiresAt]
   );
   return token;
 }
 
 // ── REFRESH TOKEN ─────────────────────────────────────────────
-router.post('/auth/refresh', async (req, res) => {
+const refreshLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30,
+  message: { error: 'Too many refresh attempts. Please wait and try again.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.post('/auth/refresh', refreshLimiter, async (req, res) => {
   try {
     const { refresh_token } = req.body;
-    if (!refresh_token) return res.status(400).json({ error: 'refresh_token required' });
+    if (!refresh_token || typeof refresh_token !== 'string') {
+      return res.status(400).json({ error: 'refresh_token required' });
+    }
 
     // SELECT FOR UPDATE inside a transaction prevents the race condition where two
     // simultaneous refresh calls both see used=false before either writes used=true.
+    // Lookup is HASH-ONLY. Never add a raw-value fallback (`token IN (hash, raw)`):
+    // it lets anyone who reads the stored hash replay it as the token itself,
+    // defeating the point of hashing. Tokens issued before hashing are converted
+    // in place by public-schema migration 18 (hash_plaintext_tokens).
     const { pool } = require('../db');
     const client = await pool.connect();
     let rt;
     try {
       await client.query('BEGIN');
       const r = await client.query(
-        `SELECT * FROM refresh_tokens WHERE token=$1 AND used=false AND expires_at > NOW() FOR UPDATE`,
-        [refresh_token]
+        `SELECT * FROM refresh_tokens
+         WHERE token=$1 AND used=false AND expires_at > NOW()
+         FOR UPDATE`,
+        [hashToken(refresh_token)]
       );
       if (!r.rows[0]) {
         await client.query('ROLLBACK');
@@ -259,10 +292,11 @@ router.post('/auth/forgot-password', forgotPasswordLimiter, validate(schemas.for
         `UPDATE password_resets SET used=true WHERE email=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND used=false`,
         [foundEmail, tenantId]
       );
+      // Store only the SHA-256 hash — the raw token goes into the email link once.
       await query(
         `INSERT INTO password_resets (email, tenant_id, token, expires_at)
          VALUES ($1, $2, $3, $4)`,
-        [foundEmail, tenantId, token, expiresAt]
+        [foundEmail, tenantId, hashToken(token), expiresAt]
       );
 
       const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${token}`;
@@ -328,21 +362,42 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
     const { token, password } = req.body;
 
     // Use SELECT FOR UPDATE inside a transaction to prevent two simultaneous
-    // reset requests from both consuming the same token.
+    // reset requests from both consuming the same token. Tenant validity is
+    // checked BEFORE marking the token used — otherwise a suspended-clinic
+    // user's only reset token would be burned by a failed attempt.
     const { pool } = require('../db');
     const client = await pool.connect();
     let reset;
+    let tenantSchema = null;
     try {
       await client.query('BEGIN');
+      // Lookup is HASH-ONLY — same rationale as /auth/refresh: a raw-value
+      // fallback would let a leaked stored hash be replayed as the token itself.
+      // Pre-hashing rows are converted by migration 18 (hash_plaintext_tokens).
       const r = await client.query(
         `SELECT * FROM password_resets WHERE token=$1 AND used=false AND expires_at > NOW() FOR UPDATE`,
-        [token]
+        [hashToken(token)]
       );
       if (!r.rows[0]) {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Invalid or expired reset token' });
       }
       reset = r.rows[0];
+
+      if (reset.tenant_id) {
+        // Tenant user — verify tenant still exists and is active before consuming the token
+        const tenantR = await client.query(`SELECT schema_name, status FROM tenants WHERE id=$1`, [reset.tenant_id]);
+        if (!tenantR.rows[0]) {
+          await client.query('ROLLBACK');
+          return res.status(410).json({ error: 'This clinic no longer exists. Contact support.' });
+        }
+        if (tenantR.rows[0].status !== 'active') {
+          await client.query('ROLLBACK');
+          return res.status(403).json({ error: 'This clinic account is suspended. Contact support.' });
+        }
+        tenantSchema = tenantR.rows[0].schema_name;
+      }
+
       await client.query(`UPDATE password_resets SET used=true WHERE id=$1`, [reset.id]);
       await client.query('COMMIT');
     } catch (txErr) {
@@ -354,16 +409,8 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
 
     const hash = await bcrypt.hash(password, 12);
 
-    if (reset.tenant_id) {
-      // Tenant user — verify tenant still exists and is active
-      const tenantR = await query(`SELECT schema_name, status FROM tenants WHERE id=$1`, [reset.tenant_id]);
-      if (!tenantR.rows[0]) {
-        return res.status(410).json({ error: 'This clinic no longer exists. Contact support.' });
-      }
-      if (tenantR.rows[0].status !== 'active') {
-        return res.status(403).json({ error: 'This clinic account is suspended. Contact support.' });
-      }
-      await tenantQuery(tenantR.rows[0].schema_name,
+    if (tenantSchema) {
+      await tenantQuery(tenantSchema,
         `UPDATE users SET password_hash=$1 WHERE email=$2`, [hash, reset.email]);
     } else {
       // Super admin

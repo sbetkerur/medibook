@@ -406,6 +406,25 @@ async function migrate() {
       `);
     });
 
+    // Version 18: Hash pre-existing plaintext refresh/reset tokens in place.
+    // routes/auth.js now stores AND looks up tokens hash-only; rows written
+    // before hashing would otherwise stop working (forced re-login for every
+    // user). Runs exactly once (versioned), so it never double-hashes — the
+    // only exception is a dev DB that already ran the hashing code before this
+    // migration existed; those few sessions just require one re-login.
+    await runMigration(client, 18, 'hash_plaintext_tokens', async () => {
+      const { createHash } = require('crypto');
+      const sha256 = (v) => createHash('sha256').update(v).digest('hex');
+      for (const table of ['refresh_tokens', 'password_resets']) {
+        const r = await client.query(
+          `SELECT id, token FROM ${table} WHERE used=false AND expires_at > NOW()`
+        );
+        for (const row of r.rows) {
+          await client.query(`UPDATE ${table} SET token=$1 WHERE id=$2`, [sha256(row.token), row.id]);
+        }
+      }
+    });
+
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
     console.log('✅ Super admin created: admin@medibook.com / SuperAdmin@123');

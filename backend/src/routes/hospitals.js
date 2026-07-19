@@ -1,12 +1,11 @@
 'use strict';
 const router = require('express').Router();
 const { tenantQuery } = require('../db');
-const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const { validateUUID, handleError } = require('../utils/errors');
+const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 
-router.use(authMiddleware, tenantMiddleware);
+// Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
 // ── HOSPITALS ─────────────────────────────────────────────────
 router.get('/hospitals', async (req, res) => {
@@ -30,7 +29,7 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
   } catch (err) { handleError(res, err); }
 });
 
-router.patch('/hospitals/:id', adminOnly, validateUUID(), validate(schemas.createHospital), async (req, res) => {
+router.patch('/hospitals/:id', adminOnly, validateUUID(), validate(schemas.updateHospital), async (req, res) => {
   try {
     const { name, address, city, phone } = req.body;
     const s = req.tenant.schema_name;
@@ -80,7 +79,6 @@ router.delete('/hospitals/:id', adminOnly, validateUUID(), async (req, res) => {
 router.get('/departments', async (req, res) => {
   try {
     const { hospital_id } = req.query;
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (hospital_id && !UUID_RE.test(hospital_id)) {
       return res.status(400).json({ error: 'hospital_id must be a valid UUID' });
     }

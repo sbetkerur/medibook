@@ -12,6 +12,48 @@ const BATCH_SIZE = 100;
 const PARALLEL_DOCTORS = 50;        // process up to 50 doctors concurrently
 const TENANT_TIMEOUT_MS = 30_000;   // 30 s max per tenant
 
+/**
+ * Compute the slot start/end times for one working day.
+ * Single source of truth for the slot arithmetic — previously duplicated in
+ * four places (nightly cron, per-doctor regen, dry-run preview, admin route),
+ * which had already started to drift.
+ *
+ * @param {string} startTime  - schedule start, "HH:MM[:SS]"
+ * @param {string} endTime    - schedule end, "HH:MM[:SS]"
+ * @param {number} duration   - slot length in minutes
+ * @param {string|null} lunchStartTime - optional lunch window start
+ * @param {string|null} lunchEndTime   - optional lunch window end
+ * @returns {Array<{st: string, et: string}>} slot boundaries as "HH:MM"
+ */
+function computeDaySlotTimes(startTime, endTime, duration, lunchStartTime = null, lunchEndTime = null) {
+  const toMinutes = (t) => {
+    const [h, m] = String(t).split(':').map(Number);
+    return h * 60 + m;
+  };
+  const toHHMM = (mins) =>
+    `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
+
+  let cur = toMinutes(startTime);
+  const end = toMinutes(endTime);
+  let lunchStart = null, lunchEnd = null;
+  if (lunchStartTime && lunchEndTime) {
+    lunchStart = toMinutes(lunchStartTime);
+    lunchEnd = toMinutes(lunchEndTime);
+  }
+
+  const slots = [];
+  while (cur + duration <= end) {
+    // Skip any slot that would overlap the lunch window
+    if (lunchStart !== null && cur < lunchEnd && cur + duration > lunchStart) {
+      cur = lunchEnd;
+      continue;
+    }
+    slots.push({ st: toHHMM(cur), et: toHHMM(cur + duration) });
+    cur += duration;
+  }
+  return slots;
+}
+
 /** Wrap a promise with a hard timeout */
 function withTimeout(promise, ms, label) {
   return Promise.race([
@@ -185,30 +227,9 @@ async function generateSlotsForTenant(schema) {
       if (publicHolidaySet.has(dateStr)) continue;      // Indian public holiday
       if (leaveSet.has(`${docId}:${dateStr}`)) continue; // doctor-specific leave
 
-      const [sh, sm] = sched.start.split(':').map(Number);
-      const [eh, em] = sched.end.split(':').map(Number);
-      let cur = sh * 60 + sm;
-      const end = eh * 60 + em;
-
-      let lunchStart = null, lunchEnd = null;
-      if (sched.lunchStart && sched.lunchEnd) {
-        const [lsh, lsm] = sched.lunchStart.split(':').map(Number);
-        const [leh, lem] = sched.lunchEnd.split(':').map(Number);
-        lunchStart = lsh * 60 + lsm;
-        lunchEnd   = leh * 60 + lem;
-      }
-
-      while (cur + doc.duration <= end) {
-        if (lunchStart !== null && cur < lunchEnd && cur + doc.duration > lunchStart) {
-          cur = lunchEnd;
-          continue;
-        }
-        const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
-        const et = `${String(Math.floor((cur + doc.duration) / 60)).padStart(2, '0')}:${String((cur + doc.duration) % 60).padStart(2, '0')}`;
+      for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
         localBatch.push({ docId, hospitalId: doc.hospital_id, dateStr, st, et, maxCapacity: 1 });
         localCount++;
-        cur += doc.duration;
-
         if (localBatch.length >= BATCH_SIZE) {
           await flushSlots(schema, localBatch);
           localBatch = [];
@@ -285,8 +306,11 @@ async function cleanupTokenBlacklist() {
     await query(`DELETE FROM refresh_tokens WHERE used=true OR expires_at < NOW() - INTERVAL '7 days'`);
   } catch (_) { /* non-fatal */ }
   try {
-    // Prune email dedup log older than 48 hours (keep a grace window beyond EMAIL_DEDUP_WINDOW_HOURS)
-    await query(`DELETE FROM email_sent_log WHERE sent_at < NOW() - INTERVAL '48 hours'`);
+    // Prune email log after 30 days. Dedup only needs EMAIL_DEDUP_WINDOW_HOURS,
+    // but this table also backs open-rate tracking (open_count via the tracking
+    // pixel) — the old 48-hour purge silently erased those stats. One row per
+    // email sent keeps the table small even at 30-day retention.
+    await query(`DELETE FROM email_sent_log WHERE sent_at < NOW() - INTERVAL '30 days'`);
   } catch (_) { /* non-fatal */ }
 }
 
@@ -323,7 +347,8 @@ function startSlotGeneratorCron() {
             const s = tenant.schema_name;
             const [todayAppts, monthAppts, totalPatients, activeSlots] = await Promise.allSettled([
               tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date = CURRENT_DATE AND status = 'confirmed'`),
-              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= date_trunc('month', CURRENT_DATE) AND status IN ('confirmed','completed')`),
+              // IST month start — keep in lockstep with the live query in routes/admin.js
+              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')::date AND status IN ('confirmed','completed')`),
               tenantQuery(s, `SELECT COUNT(*) FROM patients`),
               tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= CURRENT_DATE AND status = 'available'`),
             ]);
@@ -476,9 +501,10 @@ function startBackupReminderCron() {
  * @param {string} schema   - Tenant schema name
  * @param {string} doctorId - Doctor UUID
  * @param {boolean} dryRun  - If true, return preview without inserting
+ * @param {number} days     - Lookahead window in days (defaults to the cron window)
  * @returns {number|object} - Slot count, or dry-run preview object
  */
-async function generateSlotsForDoctor(schema, doctorId, dryRun = false) {
+async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = CRON_LOOKAHEAD_DAYS) {
   const docR = await tenantQuery(schema,
     `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
             s.day_of_week, s.start_time, s.end_time,
@@ -506,7 +532,7 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false) {
   // Fetch leaves for this doctor in the lookahead window
   // Use IST "today" — same reason as generateSlotsForTenant.
   const today = toZonedTime(new Date(), IST);
-  const lookaheadEnd = format(addDays(today, CRON_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
+  const lookaheadEnd = format(addDays(today, days), 'yyyy-MM-dd');
   const todayStr = format(today, 'yyyy-MM-dd');
   let leaveSet = new Set();
   try {
@@ -517,43 +543,55 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false) {
     for (const l of leavesR.rows) leaveSet.add(l.leave_date);
   } catch (_) {}
 
+  // Fetch clinic holidays (hospital-specific + clinic-wide) — the nightly cron
+  // skips these, but this per-doctor path previously did not, so regenerating
+  // after a schedule change quietly recreated bookable slots on declared holidays.
+  const holidaySet = new Set(); // dateStr values that block this doctor's hospital
+  try {
+    const holidaysR = await tenantQuery(schema,
+      `SELECT holiday_date::text as holiday_date FROM clinic_holidays
+       WHERE holiday_date BETWEEN $1 AND $2 AND (hospital_id = $3 OR hospital_id IS NULL)`,
+      [todayStr, lookaheadEnd, doc.hospital_id]);
+    for (const h of holidaysR.rows) holidaySet.add(h.holiday_date);
+  } catch (_) { /* clinic_holidays table may not exist in all schemas yet */ }
+
+  // Indian public holidays (same feature flag the nightly cron honours)
+  let publicHolidaySet = new Set();
+  try {
+    const { isEnabled } = require('../utils/featureFlags');
+    const tenantRecord = await query(`SELECT id FROM tenants WHERE schema_name=$1`, [schema]);
+    const tenantId = tenantRecord.rows[0]?.id;
+    if (tenantId && await isEnabled(tenantId, 'skip_public_holidays')) {
+      const thisYear = new Date().getFullYear();
+      const [h1, h2] = await Promise.all([
+        fetchPublicHolidays(thisYear),
+        fetchPublicHolidays(thisYear + 1),
+      ]);
+      publicHolidaySet = new Set([...h1, ...h2]);
+    }
+  } catch (_) {}
+
+  const isBlockedDay = (dateStr) =>
+    leaveSet.has(dateStr) || holidaySet.has(dateStr) || publicHolidaySet.has(dateStr);
+
   // Dry-run: collect slots into an array without inserting
   if (dryRun) {
     const previewSlots = [];
     let count = 0;
 
-    for (let i = 1; i <= CRON_LOOKAHEAD_DAYS; i++) {
+    for (let i = 1; i <= days; i++) {
       const date = addDays(today, i);
       const dow = date.getDay();
       const sched = doc.schedules.find(s => s.dow === dow);
       if (!sched) continue;
       const dateStr = format(date, 'yyyy-MM-dd');
-      if (leaveSet.has(dateStr)) continue;
+      if (isBlockedDay(dateStr)) continue;
 
-      const [sh, sm] = sched.start.split(':').map(Number);
-      const [eh, em] = sched.end.split(':').map(Number);
-      let cur = sh * 60 + sm;
-      const end = eh * 60 + em;
-      let lunchStart = null, lunchEnd = null;
-      if (sched.lunchStart && sched.lunchEnd) {
-        const [lsh, lsm] = sched.lunchStart.split(':').map(Number);
-        const [leh, lem] = sched.lunchEnd.split(':').map(Number);
-        lunchStart = lsh * 60 + lsm;
-        lunchEnd   = leh * 60 + lem;
-      }
-
-      while (cur + doc.duration <= end) {
-        if (lunchStart !== null && cur < lunchEnd && cur + doc.duration > lunchStart) {
-          cur = lunchEnd;
-          continue;
-        }
-        const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
-        const et = `${String(Math.floor((cur + doc.duration) / 60)).padStart(2, '0')}:${String((cur + doc.duration) % 60).padStart(2, '0')}`;
+      for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
         if (previewSlots.length < 10) {
           previewSlots.push({ date: dateStr, start_time: st, end_time: et });
         }
         count++;
-        cur += doc.duration;
       }
     }
 
@@ -564,36 +602,17 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false) {
   let localBatch = [];
   let count = 0;
 
-  for (let i = 1; i <= CRON_LOOKAHEAD_DAYS; i++) {
+  for (let i = 1; i <= days; i++) {
     const date = addDays(today, i);
     const dow = date.getDay();
     const sched = doc.schedules.find(s => s.dow === dow);
     if (!sched) continue;
     const dateStr = format(date, 'yyyy-MM-dd');
-    if (leaveSet.has(dateStr)) continue;
+    if (isBlockedDay(dateStr)) continue;
 
-    const [sh, sm] = sched.start.split(':').map(Number);
-    const [eh, em] = sched.end.split(':').map(Number);
-    let cur = sh * 60 + sm;
-    const end = eh * 60 + em;
-    let lunchStart = null, lunchEnd = null;
-    if (sched.lunchStart && sched.lunchEnd) {
-      const [lsh, lsm] = sched.lunchStart.split(':').map(Number);
-      const [leh, lem] = sched.lunchEnd.split(':').map(Number);
-      lunchStart = lsh * 60 + lsm;
-      lunchEnd   = leh * 60 + lem;
-    }
-
-    while (cur + doc.duration <= end) {
-      if (lunchStart !== null && cur < lunchEnd && cur + doc.duration > lunchStart) {
-        cur = lunchEnd;
-        continue;
-      }
-      const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
-      const et = `${String(Math.floor((cur + doc.duration) / 60)).padStart(2, '0')}:${String((cur + doc.duration) % 60).padStart(2, '0')}`;
+    for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
       localBatch.push({ docId: doctorId, hospitalId: doc.hospital_id, dateStr, st, et, maxCapacity: 1 });
       count++;
-      cur += doc.duration;
       if (localBatch.length >= BATCH_SIZE) {
         await flushSlots(schema, localBatch);
         localBatch = [];
@@ -608,6 +627,7 @@ module.exports = {
   startSlotGeneratorCron,
   generateSlotsForTenant,
   generateSlotsForDoctor,
+  computeDaySlotTimes,
   updateNoShowScores,
   cleanupExpiredSlots,
   startBackupReminderCron,

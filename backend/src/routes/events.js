@@ -8,8 +8,18 @@
 const router = require('express').Router();
 const logger = require('../utils/logger');
 
+// Unique ID for this process — used to ignore our own Redis pub/sub messages.
+// Without it, the publishing instance would deliver every event twice: once via
+// the direct in-process broadcast and again when its own subscriber receives
+// the message back from Redis.
+const INSTANCE_ID = require('crypto').randomUUID();
+
 // In-process SSE client registry: tenantId -> Set<res>
 const _clients = new Map();
+
+// Cap concurrent SSE streams per tenant so a single account (or a runaway client
+// opening many EventSource connections) can't exhaust sockets/memory.
+const MAX_SSE_CLIENTS_PER_TENANT = 50;
 
 // Redis subscriber connection (separate from the shared client to allow blocking subscribe)
 let _subscriber = null;
@@ -25,7 +35,8 @@ function getSubscriber() {
     });
     _subscriber.on('message', (_channel, raw) => {
       try {
-        const { tenantId, event } = JSON.parse(raw);
+        const { tenantId, event, source } = JSON.parse(raw);
+        if (source === INSTANCE_ID) return; // already broadcast in-process by publish()
         broadcastToTenant(tenantId, event);
       } catch (_) {}
     });
@@ -62,10 +73,11 @@ async function publish(tenantId, event) {
   if (!tenantId) return;
   // Always do in-process broadcast (covers single-instance setups)
   broadcastToTenant(tenantId, event);
-  // Cross-instance fan-out via Redis
+  // Cross-instance fan-out via Redis — tagged with our instance ID so our own
+  // subscriber skips the message (it was already broadcast above).
   try {
     const { getClient } = require('../utils/redisClient');
-    await getClient().publish('medibook:sse', JSON.stringify({ tenantId, event }));
+    await getClient().publish('medibook:sse', JSON.stringify({ tenantId, event, source: INSTANCE_ID }));
   } catch (_) {}
 }
 
@@ -74,6 +86,14 @@ async function publish(tenantId, event) {
 router.get('/events', (req, res) => {
   const tenantId = req.tenant?.id;
   if (!tenantId) return res.status(403).json({ error: 'Tenant not found' });
+
+  // Enforce the per-tenant connection cap BEFORE switching to the SSE stream so
+  // we can still respond with a normal JSON error status.
+  const existing = _clients.get(tenantId);
+  if (existing && existing.size >= MAX_SSE_CLIENTS_PER_TENANT) {
+    logger.warn('SSE connection limit reached for tenant', { tenantId, active: existing.size });
+    return res.status(429).json({ error: 'Too many active dashboard connections. Close other tabs and retry.' });
+  }
 
   // SSE headers
   res.setHeader('Content-Type', 'text/event-stream');

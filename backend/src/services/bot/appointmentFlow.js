@@ -237,7 +237,10 @@ async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, in
 }
 
 async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice) {
-  if (/yes|reschedule|confirm|btn_0|^1$/.test(choice)) {
+  // Check negative intent FIRST — replies like "no, don't reschedule" contain the
+  // word "reschedule" and would otherwise match the positive pattern below.
+  const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|btn_1|^2$/i.test(choice);
+  if (!isNegative && /yes|reschedule|confirm|btn_0|^1$/.test(choice)) {
     // Atomic: lock new slot + release old slot + update appointment
     const rescheduled = await tenantTransaction(schema, async (client) => {
       const lock = await client.query(
@@ -362,7 +365,11 @@ async function handleCancelReason(phone, schema, tenant, send, ctx, input, butto
 }
 
 async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
-  if (/yes|cancel|btn_0|^1$/.test(choice)) {
+  // Check negative intent FIRST — replies like "no, don't cancel" contain the
+  // word "cancel" and would otherwise match the positive pattern and cancel
+  // the appointment the patient explicitly asked to keep.
+  const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|btn_1|^2$/i.test(choice);
+  if (!isNegative && /yes|cancel|btn_0|^1$/.test(choice)) {
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(
         `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,

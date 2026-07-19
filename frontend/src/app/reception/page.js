@@ -92,17 +92,17 @@ export default function ReceptionPage() {
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col">
       {/* Header */}
-      <header className="bg-gray-800 border-b border-gray-700 px-8 py-5 flex items-center justify-between">
+      <header className="bg-gray-800 border-b border-gray-700 px-4 sm:px-8 py-4 sm:py-5 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold text-white">
+          <h1 className="text-2xl sm:text-3xl font-bold text-white">
             Today&apos;s Queue
             {clinicName && <span className="text-blue-400"> — {clinicName}</span>}
           </h1>
-          <p className="text-gray-400 text-lg mt-1">{today}</p>
+          <p className="text-gray-400 text-base sm:text-lg mt-1">{today}</p>
         </div>
-        <div className="flex items-center gap-8">
+        <div className="flex flex-wrap items-center gap-4 sm:gap-8">
           <div className="text-right">
-            <div className="text-4xl font-mono font-bold text-blue-400">
+            <div className="text-3xl sm:text-4xl font-mono font-bold text-blue-400">
               {format(currentTime, 'HH:mm:ss')}
             </div>
             <div className="text-sm text-gray-400 mt-1">
@@ -125,7 +125,7 @@ export default function ReceptionPage() {
       </header>
 
       {/* Stats bar */}
-      <div className="bg-gray-800 px-8 py-3 flex gap-8 border-b border-gray-700">
+      <div className="bg-gray-800 px-4 sm:px-8 py-3 flex flex-wrap gap-x-6 gap-y-2 sm:gap-x-8 border-b border-gray-700">
         <div className="flex items-center gap-2">
           <span className="w-3 h-3 rounded-full bg-green-500 inline-block"></span>
           <span className="text-gray-300 text-lg">
@@ -156,13 +156,13 @@ export default function ReceptionPage() {
       </div>
 
       {/* Table */}
-      <div className="flex-1 overflow-auto px-8 py-6">
+      <div className="flex-1 overflow-auto px-4 sm:px-8 py-4 sm:py-6">
         {loading ? (
           <div className="text-center text-gray-400 text-2xl py-24">Loading queue...</div>
         ) : appointments.length === 0 ? (
           <div className="text-center text-gray-400 text-2xl py-24">No appointments scheduled for today.</div>
         ) : (
-          <table className="w-full">
+          <table className="w-full min-w-[640px]">
             <thead>
               <tr className="border-b-2 border-gray-600">
                 <th className="text-left px-4 py-4 text-gray-400 text-xl font-semibold uppercase tracking-wide w-16">Token</th>

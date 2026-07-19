@@ -31,6 +31,16 @@ async function sendReminders() {
 
     // ── 24-HOUR REMINDERS ──────────────────────────────────
     if (reminder24hEnabled) {
+      // Match on the appointment TIMESTAMP entering the N-hour window, not on a
+      // whole-date comparison. The old check
+      //   appointment_date = (NOW() + 24h)::DATE
+      // matched ALL of tomorrow's appointments at the first hourly run after
+      // midnight, so patients received "reminders" at 00:30 IST — up to 33 hours
+      // early and in the middle of the night. With the timestamp window, a 9 AM
+      // appointment enters the window at ~9 AM the day before. The date > today
+      // guard keeps the old "only remind for future days" semantics (same-day
+      // bookings are covered by the 2-hour reminder), and reminder_24h_sent
+      // prevents duplicates across cron runs.
       const r24 = await tenantQuery(tenant.schema_name, `
         SELECT a.id, a.booking_id, a.appointment_date, a.appointment_time,
                p.phone, p.name as patient_name,
@@ -43,7 +53,9 @@ async function sendReminders() {
         LEFT JOIN departments dep ON dep.id=d.department_id
         WHERE a.status='confirmed'
           AND a.reminder_24h_sent=false
-          AND a.appointment_date = ((NOW() AT TIME ZONE $2) + make_interval(hours => $1::int))::DATE
+          AND a.appointment_date > (NOW() AT TIME ZONE $2)::date
+          AND timezone($2, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '09:00:00'))::timestamp)
+              <= NOW() + make_interval(hours => $1::int)
           AND p.opted_out IS NOT TRUE
       `, [String(hours24), TIMEZONE]);
 
@@ -109,7 +121,7 @@ async function sendReminders() {
       // old TIME-only comparison (appointment_time > '23:00' AND <= '01:00') is always
       // false and silently skips all reminders for late-evening appointments.
       const r2 = await tenantQuery(tenant.schema_name, `
-        SELECT a.id, a.booking_id, a.appointment_time,
+        SELECT a.id, a.booking_id, a.appointment_date::text as appointment_date, a.appointment_time,
                p.phone, p.name as patient_name, d.name as doctor_name,
                dep.pre_visit_checklist
         FROM appointments a
@@ -123,7 +135,12 @@ async function sendReminders() {
           AND p.opted_out IS NOT TRUE
       `, [TIMEZONE, String(hours2)]);
 
+      // The window crosses midnight (see comment above), so an appointment in it
+      // is either today or tomorrow IST — never claim "Today" for a post-midnight one.
+      const todayIST = format(toZonedTime(new Date(), TIMEZONE), 'yyyy-MM-dd');
+
       for (const appt of r2.rows) {
+        const dayLabel = appt.appointment_date === todayIST ? 'Today' : 'Tomorrow';
         try {
           // Try template first, fall back to plain text with pre-visit checklist
           try {
@@ -147,9 +164,11 @@ async function sendReminders() {
 
             await wa.sendText(
               appt.phone,
-              `⏰ *Your dental appointment is in ${hours2} hour${hours2 !== 1 ? 's' : ''}!*\n\n` +
+              // The hourly cron fires this anywhere within the next ${hours2}h window,
+              // so state the exact time rather than an imprecise "in N hours".
+              `⏰ *Reminder: your dental appointment is coming up!*\n\n` +
               `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
-              `🕐 ${(appt.appointment_time || '').slice(0, 5)}\n\n` +
+              `🕐 ${dayLabel} at ${(appt.appointment_time || '').slice(0, 5)}\n\n` +
               `🦷 *Quick reminders:*\n• Please arrive 10 minutes early\n• Bring any dental X-rays or records\n• Avoid eating 1 hour before your appointment` +
               `${departmentChecklist}\n\n` +
               `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`,
@@ -275,6 +294,8 @@ async function sendFeedbackRequests() {
     const waToken = null;
     const waPhoneId = null;
 
+    // Skip appointments that already received the 2-hour post-appointment
+    // follow-up (follow_up_sent) so patients aren't asked for feedback twice.
     const appts = await tenantQuery(tenant.schema_name, `
       SELECT a.id, a.status, p.phone, p.id as patient_id, p.name as patient_name, d.name as doctor_name
       FROM appointments a
@@ -282,6 +303,7 @@ async function sendFeedbackRequests() {
       JOIN doctors d ON d.id=a.doctor_id
       WHERE a.status IN ('completed', 'no_show')
         AND a.appointment_date = CURRENT_DATE - INTERVAL '1 day'
+        AND a.follow_up_sent IS NOT TRUE
         AND NOT EXISTS (
           SELECT 1 FROM appointment_feedback af WHERE af.appointment_id=a.id
         )
@@ -292,26 +314,32 @@ async function sendFeedbackRequests() {
     for (const appt of appts.rows) {
       try {
         const firstName = appt.patient_name ? appt.patient_name.split(' ')[0] : 'there';
-        await wa.sendText(
-          appt.phone,
-          `⭐ *How was your dental visit, ${firstName}?*\n\n` +
-          `We hope Dr. ${appt.doctor_name} took great care of your smile! 🦷\n\n` +
-          `Rate your experience:\n` +
-          `1 ⭐ — Poor\n` +
-          `2 ⭐⭐ — Below average\n` +
-          `3 ⭐⭐⭐ — Average\n` +
-          `4 ⭐⭐⭐⭐ — Good\n` +
-          `5 ⭐⭐⭐⭐⭐ — Excellent\n\n` +
-          `Just reply with a number *1–5*. Takes 5 seconds! 🙏`,
-          waToken, waPhoneId
-        );
-        await triggerFeedback(
-          tenant.schema_name,
-          appt.phone,
-          appt.id,
-          appt.patient_id,
-          appt.doctor_name
-        );
+        // no_show patients didn't have a visit — a "how was your visit?" message
+        // would be tone-deaf. Nudge them to rebook instead.
+        const message = appt.status === 'no_show'
+          ? `🦷 Hi ${firstName}, we missed you at your appointment with Dr. ${appt.doctor_name} yesterday.\n\n` +
+            `No worries — these things happen! Reply *Hi* to book a new appointment whenever you're ready. 😊`
+          : `⭐ *How was your dental visit, ${firstName}?*\n\n` +
+            `We hope Dr. ${appt.doctor_name} took great care of your smile! 🦷\n\n` +
+            `Rate your experience:\n` +
+            `1 ⭐ — Poor\n` +
+            `2 ⭐⭐ — Below average\n` +
+            `3 ⭐⭐⭐ — Average\n` +
+            `4 ⭐⭐⭐⭐ — Good\n` +
+            `5 ⭐⭐⭐⭐⭐ — Excellent\n\n` +
+            `Just reply with a number *1–5*. Takes 5 seconds! 🙏`;
+        await wa.sendText(appt.phone, message, waToken, waPhoneId);
+        // Only arm the rating flow for completed visits — no_show patients got
+        // a rebook nudge, not a rating request.
+        if (appt.status !== 'no_show') {
+          await triggerFeedback(
+            tenant.schema_name,
+            appt.phone,
+            appt.id,
+            appt.patient_id,
+            appt.doctor_name
+          );
+        }
         logger.info(`Feedback request sent for appointment ${appt.id}`);
       } catch (err) {
         logger.error(`Feedback request failed for appointment ${appt.id}`, { error: err.message });

@@ -2,14 +2,12 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const { query, tenantQuery, tenantTransaction } = require('../db');
-const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const { validateUUID, handleError } = require('../utils/errors');
+const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
-const { addDays, format } = require('date-fns');
 const logger = require('../utils/logger');
 
-router.use(authMiddleware, tenantMiddleware);
+// Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
 const slotsGenerateLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 5,
@@ -133,10 +131,10 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
     const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, hospital_id, pricing_rules } = req.body;
     const s = req.tenant.schema_name;
     // Validate UUID fields early — PostgreSQL's ::uuid cast would otherwise return 500
-    if (hospital_id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(hospital_id)) {
+    if (hospital_id && !UUID_RE.test(hospital_id)) {
       return res.status(400).json({ error: 'Invalid hospital_id format' });
     }
-    if (department_id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(department_id)) {
+    if (department_id && !UUID_RE.test(department_id)) {
       return res.status(400).json({ error: 'Invalid department_id format' });
     }
     const oldR = await tenantQuery(s, `SELECT name, is_active, hospital_id FROM doctors WHERE id=$1`, [req.params.id]);
@@ -287,22 +285,60 @@ router.post('/doctors/:id/leaves', adminOnly, validateUUID(), async (req, res) =
     const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
     const todayIST = new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
     let added = 0;
-    let skipped = 0;
-    for (const d of dates) {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { skipped++; continue; }
-      if (d < todayIST) { skipped++; continue; } // silently skip past dates
-      await tenantQuery(s, `
+    // Malformed and past dates are silently skipped
+    const validDates = dates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d) && d >= todayIST);
+    let skipped = dates.length - validDates.length;
+    if (validDates.length) {
+      const ins = await tenantQuery(s, `
         INSERT INTO doctor_leaves (doctor_id, leave_date, reason, created_by_user_id)
-        VALUES ($1,$2,$3,$4) ON CONFLICT (doctor_id, leave_date) DO NOTHING
-      `, [req.params.id, d, reason || null, req.user.id]);
+        SELECT $1, d, $2, $3 FROM unnest($4::date[]) AS d
+        ON CONFLICT (doctor_id, leave_date) DO NOTHING
+        RETURNING id
+      `, [req.params.id, reason || null, req.user.id, validDates]);
+      // Only count rows actually inserted — ON CONFLICT DO NOTHING returns no row
+      // for dates that were already on leave.
+      added = ins.rows.length;
+      skipped += validDates.length - added;
+      // Mark blocked_by_leave so removing the leave later only releases these
+      // slots — never slots an admin blocked manually for another reason.
       await tenantQuery(s,
-        `UPDATE time_slots SET status='blocked' WHERE doctor_id=$1 AND slot_date=$2 AND status='available'`,
-        [req.params.id, d]);
-      added++;
+        `UPDATE time_slots SET status='blocked', blocked_by_leave=true
+         WHERE doctor_id=$1 AND slot_date = ANY($2::date[]) AND status='available'`,
+        [req.params.id, validDates]);
     }
+
+    // Surface already-booked appointments on the leave dates: blocking only
+    // affects AVAILABLE slots, so confirmed bookings still stand and patients
+    // would show up to an absent doctor unless the clinic reschedules them.
+    let affectedAppointments = [];
+    if (validDates.length) {
+      try {
+        const apptR = await tenantQuery(s, `
+          SELECT a.booking_id, a.appointment_date::text, a.appointment_time::text,
+                 p.name as patient_name, p.phone as patient_phone
+          FROM appointments a
+          JOIN patients p ON p.id = a.patient_id
+          WHERE a.doctor_id=$1 AND a.status='confirmed' AND a.appointment_date = ANY($2::date[])
+          ORDER BY a.appointment_date, a.appointment_time
+        `, [req.params.id, validDates]);
+        affectedAppointments = apptR.rows;
+      } catch (apptErr) {
+        logger.warn('Leave: affected-appointment lookup failed', { error: apptErr.message });
+      }
+    }
+
     await writeAuditLog(s, req.user.id, req.user.role, 'ADD_DOCTOR_LEAVE', 'doctor', req.params.id,
-      null, { dates, reason }, req.ip);
-    res.json({ success: true, added, skipped });
+      null, { dates, reason, affected_appointments: affectedAppointments.length }, req.ip);
+    res.json({
+      success: true,
+      added,
+      skipped,
+      affected_appointments: affectedAppointments.length,
+      affected_appointment_details: affectedAppointments,
+      ...(affectedAppointments.length > 0 && {
+        warning: `${affectedAppointments.length} confirmed appointment(s) already exist on the leave date(s). Reschedule or cancel them — patients have NOT been notified automatically.`,
+      }),
+    });
   } catch (err) { handleError(res, err); }
 });
 
@@ -316,8 +352,11 @@ router.delete('/doctors/:id/leaves/:date', adminOnly, validateUUID(), async (req
       `DELETE FROM doctor_leaves WHERE doctor_id=$1 AND leave_date=$2 RETURNING id`,
       [req.params.id, req.params.date]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Leave record not found' });
+    // Only release slots that THIS leave blocked (blocked_by_leave) — a blanket
+    // unblock previously also re-opened slots an admin had blocked manually.
     await tenantQuery(s,
-      `UPDATE time_slots SET status='available' WHERE doctor_id=$1 AND slot_date=$2 AND status='blocked'`,
+      `UPDATE time_slots SET status='available', blocked_by_leave=false
+       WHERE doctor_id=$1 AND slot_date=$2 AND status='blocked' AND blocked_by_leave=true`,
       [req.params.id, req.params.date]);
     await writeAuditLog(s, req.user.id, req.user.role, 'REMOVE_DOCTOR_LEAVE', 'doctor', req.params.id,
       null, { date: req.params.date }, req.ip);
@@ -330,7 +369,6 @@ router.get('/slots', async (req, res) => {
   try {
     const { doctor_id, date } = req.query;
     if (!doctor_id || !date) return res.status(400).json({ error: 'doctor_id and date required' });
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!UUID_RE.test(doctor_id)) return res.status(400).json({ error: 'Invalid doctor_id' });
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Invalid date format' });
     const r = await tenantQuery(req.tenant.schema_name, `
@@ -366,8 +404,12 @@ router.patch('/slots/:id', validateUUID(), async (req, res) => {
     if (existing.rows[0].status === 'booked' && newStatus === 'blocked') {
       return res.status(409).json({ error: 'Cannot block a booked slot' });
     }
+    // Clear blocked_by_leave on any manual block/unblock: the flag marks slots
+    // blocked BY A LEAVE so that removing the leave releases only those. Once an
+    // admin manually changes a slot's status, the slot is under manual control —
+    // a stale flag would let a later leave removal re-open a manually blocked slot.
     const r = await tenantQuery(s,
-      `UPDATE time_slots SET status=$1 WHERE id=$2 AND status != 'booked' RETURNING *`,
+      `UPDATE time_slots SET status=$1, blocked_by_leave=false WHERE id=$2 AND status != 'booked' RETURNING *`,
       [newStatus, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Slot not found or is already booked' });
     await writeAuditLog(s, req.user.id, req.user.role, `slot_${newStatus === 'blocked' ? 'block' : 'unblock'}`, 'time_slot', req.params.id, null, null, req.ip);
@@ -379,7 +421,7 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
   try {
     const { doctor_id, days = 7, clear = false } = req.body;
     if (!doctor_id) return res.status(400).json({ error: 'doctor_id required' });
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(doctor_id)) {
+    if (!UUID_RE.test(doctor_id)) {
       return res.status(400).json({ error: 'Invalid doctor_id format' });
     }
     const s = req.tenant.schema_name;
@@ -387,50 +429,16 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
     if (clear) {
       await tenantQuery(s, `DELETE FROM time_slots WHERE doctor_id=$1 AND status IN ('available','blocked') AND slot_date >= CURRENT_DATE`, [doctor_id]);
     }
-    const docR = await tenantQuery(s, `SELECT * FROM doctors WHERE id=$1`, [doctor_id]);
+    const docR = await tenantQuery(s, `SELECT id FROM doctors WHERE id=$1`, [doctor_id]);
     if (!docR.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
-    const doc = docR.rows[0];
-    const schedR = await tenantQuery(s, `SELECT * FROM doctor_schedules WHERE doctor_id=$1 AND is_working=true`, [doctor_id]);
+    const schedR = await tenantQuery(s, `SELECT id FROM doctor_schedules WHERE doctor_id=$1 AND is_working=true`, [doctor_id]);
     if (!schedR.rows.length) return res.status(400).json({ error: 'No schedule configured for this doctor' });
-    const duration = Math.max(5, doc.slot_duration_minutes || 30);
-    const today = new Date();
-    let generated = 0;
-    for (let i = 1; i <= safeDays; i++) {
-      const date = addDays(today, i);
-      const dow = date.getDay();
-      const sched = schedR.rows.find(sc => sc.day_of_week === dow);
-      if (!sched) continue;
-      const dateStr = format(date, 'yyyy-MM-dd');
-      const [sh, sm] = sched.start_time.split(':').map(Number);
-      const [eh, em] = sched.end_time.split(':').map(Number);
-      let lunchStart = null, lunchEnd = null;
-      if (sched.lunch_start_time && sched.lunch_end_time) {
-        const [lsh, lsm] = sched.lunch_start_time.split(':').map(Number);
-        const [leh, lem] = sched.lunch_end_time.split(':').map(Number);
-        lunchStart = lsh * 60 + lsm;
-        lunchEnd = leh * 60 + lem;
-      }
-      let cur = sh * 60 + sm;
-      const end = eh * 60 + em;
-      const daySlots = [];
-      while (cur + duration <= end) {
-        if (lunchStart !== null && cur < lunchEnd && cur + duration > lunchStart) { cur = lunchEnd; continue; }
-        const st = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
-        const et = `${String(Math.floor((cur + duration) / 60)).padStart(2, '0')}:${String((cur + duration) % 60).padStart(2, '0')}`;
-        daySlots.push([doctor_id, doc.hospital_id, dateStr, st, et]);
-        cur += duration;
-      }
-      for (let j = 0; j < daySlots.length; j += 100) {
-        const chunk = daySlots.slice(j, j + 100);
-        const values = chunk.map((_, k) => `($${k*5+1},$${k*5+2},$${k*5+3},$${k*5+4},$${k*5+5},'available')`).join(',');
-        const insertR = await tenantQuery(s, `
-          INSERT INTO time_slots (doctor_id, hospital_id, slot_date, start_time, end_time, status)
-          VALUES ${values} ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING
-          RETURNING id
-        `, chunk.flat());
-        generated += insertR.rows.length;
-      }
-    }
+    // Delegate to the shared generator so this route applies the same exclusions
+    // as the nightly cron (doctor leaves, clinic holidays, public holidays, IST
+    // base date). The previous inline loop skipped none of them, so manually
+    // generated slots reappeared on declared holidays and leave days.
+    const { generateSlotsForDoctor } = require('../jobs/slotGenerator');
+    const generated = await generateSlotsForDoctor(s, doctor_id, false, safeDays);
     res.json({ success: true, generated, days: safeDays });
   } catch (err) { handleError(res, err); }
 });
@@ -472,11 +480,23 @@ router.post('/doctors/import', adminOnly, async (req, res) => {
     let skipped = 0;
     const errors = [];
 
-    // Fetch all hospitals and departments for matching
-    const [hospitalsR, deptsR] = await Promise.all([
+    // Enforce the plan's doctor quota — same limit POST /doctors applies.
+    // Without this check, CSV import silently bypassed max_doctors.
+    const planR = await query(`SELECT max_doctors FROM plans WHERE id=$1`, [req.tenant.plan]);
+    const planLimit = planR.rows[0]?.max_doctors ?? null;
+    let activeCount = 0;
+    if (planLimit !== null) {
+      const countR = await tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`);
+      activeCount = parseInt(countR.rows[0].count);
+    }
+
+    // Fetch all hospitals, departments, and existing doctors for matching
+    const [hospitalsR, deptsR, existingR] = await Promise.all([
       tenantQuery(s, `SELECT id, name FROM hospitals WHERE is_active=true`),
       tenantQuery(s, `SELECT id, name, hospital_id FROM departments WHERE is_active=true`),
+      tenantQuery(s, `SELECT lower(name) as name, hospital_id FROM doctors`),
     ]);
+    const existingDoctorKeys = new Set(existingR.rows.map(d => `${d.name}::${d.hospital_id}`));
 
     for (const row of records) {
       try {
@@ -510,11 +530,28 @@ router.post('/doctors/import', adminOnly, async (req, res) => {
           deptId = d?.id || null;
         }
 
+        // Skip duplicates — doctors has no unique constraint on name, so the old
+        // ON CONFLICT DO NOTHING was a no-op and re-imports duplicated every row.
+        const dupKey = `${name.toLowerCase()}::${hospitalId}`;
+        if (existingDoctorKeys.has(dupKey)) {
+          skipped++;
+          errors.push(`Row "${name}": doctor already exists at this hospital — skipped`);
+          continue;
+        }
+
+        // Plan quota check (mirrors POST /doctors)
+        if (planLimit !== null && activeCount >= planLimit) {
+          skipped++;
+          errors.push(`Row "${name}": doctor limit reached for your plan (${activeCount}/${planLimit})`);
+          continue;
+        }
+
         await tenantQuery(s, `
           INSERT INTO doctors (name, specialization, qualification, hospital_id, department_id, consultation_fee, slot_duration_minutes)
           VALUES ($1,$2,$3,$4,$5,$6,$7)
-          ON CONFLICT DO NOTHING
         `, [name, spec, qual, hospitalId, deptId, fee, Math.max(5, Math.min(480, duration))]);
+        existingDoctorKeys.add(dupKey);
+        activeCount++;
         imported++;
       } catch (rowErr) {
         skipped++;
@@ -601,6 +638,19 @@ router.post('/doctors/:id/locations', adminOnly, validateUUID(), async (req, res
     const { hospital_id, day_of_week, start_time, end_time } = req.body;
     if (!hospital_id || day_of_week === undefined || !start_time || !end_time) {
       return res.status(400).json({ error: 'hospital_id, day_of_week, start_time, end_time required' });
+    }
+    if (!UUID_RE.test(hospital_id)) {
+      return res.status(400).json({ error: 'Invalid hospital_id format' });
+    }
+    const dow = parseInt(day_of_week);
+    if (!Number.isInteger(dow) || dow < 0 || dow > 6) {
+      return res.status(400).json({ error: 'day_of_week must be 0 (Sunday) through 6 (Saturday)' });
+    }
+    if (!TIME_RE.test(start_time) || !TIME_RE.test(end_time)) {
+      return res.status(400).json({ error: 'start_time and end_time must be HH:MM (24h format)' });
+    }
+    if (start_time >= end_time) {
+      return res.status(400).json({ error: 'start_time must be before end_time' });
     }
     const s = req.tenant.schema_name;
     await tenantQuery(s, `

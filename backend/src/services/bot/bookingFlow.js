@@ -11,7 +11,6 @@ const wa = require('../whatsapp');
 const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 const {
   STATES,
-  genBookingId,
   fuzzyFind,
   getPatient,
   getPatients,
@@ -32,7 +31,7 @@ async function startBooking(phone, schema, tenant, send, ctx) {
   if (hospitals.rows.length === 1) {
     ctx.hospital_id = hospitals.rows[0].id;
     ctx.hospital_name = hospitals.rows[0].name;
-    return showDepartments(phone, schema, send, ctx);
+    return showDepartments(phone, schema, tenant, send, ctx);
   }
 
   // Multiple branches — show interactive list/buttons so the user taps, not types
@@ -97,7 +96,7 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
 
   ctx.hospital_id = h.id;
   ctx.hospital_name = h.name;
-  return showDepartments(phone, schema, send, ctx);
+  return showDepartments(phone, schema, tenant, send, ctx);
 }
 
 // Helper: render the branch picker (buttons or list depending on count)
@@ -120,7 +119,7 @@ async function _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows)
 }
 
 // Dental is always in-person — skip the visit type question and go straight to treatments.
-async function showDepartments(phone, schema, send, ctx) {
+async function showDepartments(phone, schema, tenant, send, ctx) {
   ctx.visit_type = 'in_person';
   ctx.visit_label = '🦷 In-Clinic Visit';
 
@@ -137,6 +136,17 @@ async function showDepartments(phone, schema, send, ctx) {
   }
 
   ctx._depts = depts.rows;
+
+  // Smart-intent shortcut: if detectIntent() recognised a treatment in the
+  // user's free text (e.g. "book root canal"), skip the treatment picker and
+  // jump straight to dentist selection for that department.
+  if (ctx.department_hint) {
+    const hinted = fuzzyFind(depts.rows, ctx.department_hint);
+    delete ctx.department_hint; // one-shot — never reuse on later messages
+    if (hinted) {
+      return handleSelectDept(phone, schema, tenant, send, ctx, hinted.id, hinted.name);
+    }
+  }
 
   if (depts.rows.length <= 3) {
     await send.buttons('🦷 *Select Treatment*\n\nWhat dental treatment do you need?',
@@ -296,6 +306,17 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       await updateSession(schema, phone, STATES.IDLE, {});
     }
     return;
+  }
+
+  // Smart-intent shortcut: if detectIntent() recognised a date in the user's
+  // free text ("tomorrow", "friday", …) and that date has open slots, skip the
+  // date picker and show the time slots directly.
+  if (ctx.date_hint) {
+    const hintedDate = dates.find(d => d.date === ctx.date_hint);
+    delete ctx.date_hint; // one-shot — never reuse on later messages
+    if (hintedDate) {
+      return handleSelectDate(phone, schema, tenant, send, ctx, hintedDate.date);
+    }
   }
 
   const sections = [{
@@ -512,6 +533,7 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
 
 async function completeBooking(phone, schema, tenant, send, ctx) {
   const { LIMITS } = require('../../utils/errors');
+  const { insertAppointmentWithRetry, checkMonthlyQuota } = require('../bookingCore');
 
   // Guard: validate schema name before using it in a raw SET LOCAL command.
   // tenantQuery/tenantTransaction enforce this internally; since completeBooking
@@ -535,6 +557,22 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       return;
     }
   } catch (_) {} // rate limit check is non-fatal
+
+  // Plan quota: block bookings once the clinic's monthly allowance is used up
+  const quota = await checkMonthlyQuota(tenant);
+  if (!quota.allowed) {
+    logger.warn('Monthly appointment quota reached — booking blocked', {
+      tenant: tenant.slug, used: quota.used, limit: quota.limit,
+    });
+    await send.text(
+      '⚠️ *Online booking temporarily unavailable*\n\n' +
+      'This clinic cannot accept more online bookings right now. ' +
+      'Please call the clinic directly to book your appointment.\n\n' +
+      'Reply *Hi* for the main menu.'
+    );
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
 
   // Single transaction: slot lock + patient upsert + appointment insert
   const client = await pool.connect();
@@ -575,28 +613,17 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
         `UPDATE patients SET visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`, [patientId]);
     }
 
-    // Retry up to 3 times on booking_id collision (unique constraint violation)
-    let insertAttempts = 0;
-    while (true) {
-      bookingId = genBookingId();
-      try {
-        await client.query(
-          `INSERT INTO appointments
-           (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status, notes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed',$9)`,
-          [bookingId, patientId, ctx.doctor_id, ctx.hospital_id, ctx.slot_id,
-           ctx.appointment_date, ctx.appointment_time, ctx.visit_type || 'in_person',
-           ctx.chief_complaint || null]);
-        break; // success
-      } catch (insertErr) {
-        // 23505 = unique_violation in PostgreSQL
-        if (insertErr.code === '23505' && insertErr.constraint?.includes('booking_id') && ++insertAttempts < 4) {
-          logger.warn('booking_id collision, retrying', { attempt: insertAttempts });
-          continue;
-        }
-        throw insertErr; // re-throw if not a booking_id collision or max retries exceeded
-      }
-    }
+    // Insert with booking-ID collision retry (shared with walk-in/follow-up routes)
+    ({ bookingId } = await insertAppointmentWithRetry(client, {
+      patientId,
+      doctorId: ctx.doctor_id,
+      hospitalId: ctx.hospital_id,
+      slotId: ctx.slot_id,
+      appointmentDate: ctx.appointment_date,
+      appointmentTime: ctx.appointment_time,
+      visitType: ctx.visit_type || 'in_person',
+      notes: ctx.chief_complaint || null,
+    }));
 
     await client.query('COMMIT');
   } catch (err) {
@@ -705,20 +732,23 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
             } catch (smsErr) {
               logger.warn('Admin SMS alert failed', { error: smsErr.message });
             }
-            try {
-              await notifyAdminWhatsApp(schema, tenant,
-                `🆕 *New Appointment Booked*\n\n` +
-                `Booking: *${bookingId}*\n` +
-                `Patient: ${ctx.patient_name || phone} · ${phone}\n` +
-                `Dr. ${ctx.doctor_name}\n` +
-                `📅 ${dateLabel3} at ${(ctx.appointment_time || '').slice(0, 5)}\n` +
-                `🦷 ${ctx.hospital_name}\n` +
-                `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`
-              );
-            } catch (waErr) {
-              logger.warn('Admin WhatsApp booking alert failed', { error: waErr.message });
-            }
           }
+        }
+        // notifyAdminWhatsApp fans out to every admin with a notify_phone itself,
+        // so it must be called ONCE — calling it inside the per-admin loop above
+        // sent each admin N copies of the same alert (N admins → N² messages).
+        try {
+          await notifyAdminWhatsApp(schema, tenant,
+            `🆕 *New Appointment Booked*\n\n` +
+            `Booking: *${bookingId}*\n` +
+            `Patient: ${ctx.patient_name || phone} · ${phone}\n` +
+            `Dr. ${ctx.doctor_name}\n` +
+            `📅 ${dateLabel3} at ${(ctx.appointment_time || '').slice(0, 5)}\n` +
+            `🦷 ${ctx.hospital_name}\n` +
+            `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`
+          );
+        } catch (waErr) {
+          logger.warn('Admin WhatsApp booking alert failed', { error: waErr.message });
         }
       } catch (err) {
         logger.warn('Admin booking alert failed', { error: err.message });

@@ -27,6 +27,15 @@ const VALID_ROLES = ['admin', 'staff', 'doctor'];
 
 const VALID_APPOINTMENT_STATUSES = ['confirmed', 'completed', 'cancelled', 'no_show'];
 
+// Allowed appointment status transitions — single source of truth used by both
+// the single-appointment PATCH and the bulk update route.
+const APPOINTMENT_TRANSITIONS = {
+  confirmed: ['completed', 'cancelled', 'no_show'],
+  no_show:   ['confirmed'],   // allow re-confirmation if patient arrived late
+  completed: [],              // terminal — no further transitions
+  cancelled: [],              // terminal
+};
+
 const SLOT_LOOKAHEAD_DAYS = 14;
 const CRON_LOOKAHEAD_DAYS = 60; // must be >= SLOT_LOOKAHEAD_DAYS to keep a rolling buffer
 const FEEDBACK_BATCH_LIMIT = 10;
@@ -57,6 +66,8 @@ module.exports = {
   ERRORS,
   VALID_ROLES,
   VALID_APPOINTMENT_STATUSES,
+  APPOINTMENT_TRANSITIONS,
+  UUID_RE,
   SLOT_LOOKAHEAD_DAYS,
   CRON_LOOKAHEAD_DAYS,
   FEEDBACK_BATCH_LIMIT,

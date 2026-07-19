@@ -127,9 +127,9 @@ export default function DoctorPage() {
   const headerName = selectedDoctor ? `Dr. ${selectedDoctor.name}` : (user?.name || 'Doctor');
 
   return (
-    <div className="flex h-screen bg-gray-50">
+    <div className="flex flex-col md:flex-row h-screen bg-gray-50">
       {/* Left Column */}
-      <div className="w-96 bg-white border-r border-gray-200 flex flex-col">
+      <div className="w-full md:w-96 shrink-0 max-h-[45vh] md:max-h-none bg-white border-b md:border-b-0 md:border-r border-gray-200 flex flex-col">
         <div className="p-5 border-b border-gray-100">
           <div className="flex items-center justify-between mb-1">
             <h1 className="text-lg font-bold text-gray-900">{headerName}</h1>
@@ -203,8 +203,8 @@ export default function DoctorPage() {
             </div>
           </div>
         ) : (
-          <div className="p-8 max-w-2xl">
-            <div className="flex items-center justify-between mb-6">
+          <div className="p-4 sm:p-8 max-w-2xl">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-6">
               <div>
                 <h2 className="text-2xl font-bold text-gray-900">{selectedAppt.patient_name || '—'}</h2>
                 <p className="text-gray-500 mt-1">Booking: <span className="font-mono font-semibold text-gray-700">{selectedAppt.booking_id}</span></p>

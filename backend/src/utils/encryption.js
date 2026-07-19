@@ -85,9 +85,11 @@ function decrypt(ciphertext) {
     }
   }
 
-  // ── Legacy CryptoJS format (ECB) — backward compatibility only ──
-  // Used to decrypt values stored before this upgrade. New writes always
-  // use AES-256-GCM above. Remove this block once all rows are re-encrypted.
+  // ── Legacy CryptoJS format — backward compatibility only ──
+  // crypto-js AES.encrypt() defaults to AES-CBC with an OpenSSL-style, MD5-based
+  // key derivation (EVP_BytesToKey) — weaker than the GCM path above and with no
+  // authentication. Used only to decrypt values stored before this upgrade; new
+  // writes always use AES-256-GCM. Remove this block once all rows are re-encrypted.
   try {
     const CryptoJS = require('crypto-js');
     const bytes = CryptoJS.AES.decrypt(ciphertext, RAW_KEY);

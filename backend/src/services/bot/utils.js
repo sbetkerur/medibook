@@ -112,9 +112,15 @@ async function updateSession(schemaName, phone, state, context) {
       `UPDATE bot_sessions SET state='idle', context='{}', last_activity=NOW() WHERE phone=$1`, [phone]);
     return;
   }
+  // UPSERT, not UPDATE: the greeting fast-path in botEngine calls updateSession
+  // BEFORE getSession has created a row. A plain UPDATE silently no-ops for a
+  // brand-new phone, so the first "Hi" left no session and the patient's first
+  // "Book" tap landed in idle state — re-showing the menu instead of booking.
   await tenantQuery(schemaName,
-    `UPDATE bot_sessions SET state=$1, context=$2::jsonb, last_activity=NOW() WHERE phone=$3`,
-    [state, encryptedContext, phone]);
+    `INSERT INTO bot_sessions (phone, state, context, last_activity)
+     VALUES ($1, $2, $3::jsonb, NOW())
+     ON CONFLICT (phone) DO UPDATE SET state=$2, context=$3::jsonb, last_activity=NOW()`,
+    [phone, state, encryptedContext]);
 }
 
 async function getPatient(schemaName, phone) {

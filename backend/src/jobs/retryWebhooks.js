@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const { query } = require('../db');
 const botEngine = require('../services/botEngine');
 const logger = require('../utils/logger');
+const { withCronLock } = require('../utils/cronLock');
 
 async function retryFailedWebhooks() {
   // Fetch up to 20 pending webhooks ready for retry
@@ -22,11 +23,14 @@ async function retryFailedWebhooks() {
   logger.info(`Retrying ${r.rows.length} failed webhooks`);
 
   for (const row of r.rows) {
-    // Mark as processing
-    await query(
-      `UPDATE failed_webhooks SET status='processing', last_attempt_at=NOW(), attempts=attempts+1 WHERE id=$1`,
+    // Atomically claim the row — the status='pending' guard means that if
+    // another instance (or an overlapping run) already claimed it, we skip.
+    const claimed = await query(
+      `UPDATE failed_webhooks SET status='processing', last_attempt_at=NOW(), attempts=attempts+1
+       WHERE id=$1 AND status='pending' RETURNING id`,
       [row.id]
     );
+    if (!claimed.rows[0]) continue; // claimed by someone else
 
     try {
       const tenant = {
@@ -118,13 +122,16 @@ async function retryFailedWebhooks() {
 }
 
 function startWebhookRetryCron() {
-  // Run every 5 minutes
+  // Run every 5 minutes. Cron lock prevents duplicate retries (= duplicate
+  // WhatsApp messages to patients) when multiple backend instances run.
   const task = cron.schedule('*/5 * * * *', async () => {
-    try {
-      await retryFailedWebhooks();
-    } catch (err) {
-      logger.error('Webhook retry cron error', { error: err.message });
-    }
+    await withCronLock('cron:webhook_retry', 270, async () => {
+      try {
+        await retryFailedWebhooks();
+      } catch (err) {
+        logger.error('Webhook retry cron error', { error: err.message });
+      }
+    });
   });
   logger.info('Webhook retry cron registered (every 5 minutes)');
   return task;

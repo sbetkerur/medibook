@@ -62,7 +62,9 @@ async function tenantQuery(schemaName, sql, params = []) {
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    await client.query('ROLLBACK');
+    // ROLLBACK itself can throw on a broken connection — never let that mask
+    // the original query error.
+    await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
     client.release();
@@ -86,7 +88,7 @@ async function tenantTransaction(schemaName, callback) {
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
     client.release();

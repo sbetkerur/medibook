@@ -256,40 +256,32 @@ async function testBotFlow() {
   });
 
   // ── BOOKING FLOW ──────────────────────────────────────────────
-  await test('Selecting Book starts booking flow', async () => {
+  // Current dental flow: a single hospital is auto-selected and every visit is
+  // in-clinic, so booking starts directly at the treatment (department) picker.
+  // The old flow's separate visit-type step no longer exists.
+  await test('Selecting Book starts booking flow (treatment selection)', async () => {
     // Re-send Hi to ensure main_menu state, then select Book
     await bot('Hi');
     const { data } = await bot('Book Appointment');
     const r = data.responses;
     assert(r?.length > 0, 'No response after Book Appointment');
-    const hasProgress = r.some(m =>
-      m.text?.includes('Visit') || m.text?.includes('Hospital') ||
-      m.text?.includes('Location') || m.text?.includes('Specialty') ||
-      m.text?.includes('Consultation') ||
-      m.buttons?.some(b => b.includes('Visit') || b.includes('Consultation'))
+    const hasTreatments = r.some(m =>
+      m.text?.includes('Treatment') || m.sections ||
+      m.buttons?.some(b => b.includes('General'))
     );
-    assert(hasProgress, `Expected booking step. Got: ${JSON.stringify(r)}`);
+    assert(hasTreatments, `Expected treatment selection. Got: ${JSON.stringify(r)}`);
   });
 
-  await test('Selecting In-Person visit type shows departments', async () => {
-    const { data } = await bot('In-Person Visit');
-    const r = data.responses;
-    assert(r?.length > 0, 'No response');
-    const hasDept = r.some(m =>
-      m.text?.includes('Specialty') || m.text?.includes('General') ||
-      m.text?.includes('department') || m.sections
-    );
-    assert(hasDept, `Expected department list. Got: ${JSON.stringify(r)}`);
-  });
-
-  await test('Selecting department shows doctors', async () => {
+  await test('Selecting treatment shows dentists', async () => {
     const { data } = await bot('General Medicine');
     const r = data.responses;
     assert(r?.length > 0, 'No response');
     const hasDoc = r.some(m =>
-      m.text?.includes('Doctor') || m.text?.includes('Smoke') || m.sections
+      m.text?.includes('Dentist') || m.text?.includes('Doctor') ||
+      m.text?.includes('Smoke') || m.sections ||
+      m.buttons?.some(b => b.includes('Smoke'))
     );
-    assert(hasDoc, `Expected doctor list. Got: ${JSON.stringify(r)}`);
+    assert(hasDoc, `Expected dentist list. Got: ${JSON.stringify(r)}`);
   });
 
   await test('Selecting doctor shows available dates', async () => {
@@ -355,13 +347,24 @@ async function testBotFlow() {
     assert(hasNext, `Expected email prompt or booking summary. Got: ${JSON.stringify(r)}`);
   });
 
-  await test('Skipping email shows booking summary', async () => {
+  await test('Skipping email asks for reason for visit', async () => {
     const { data } = await bot('Skip');
     const r = data.responses;
     assert(r?.length > 0, 'No response');
+    const hasReason = r.some(m =>
+      m.text?.includes('Reason') ||
+      m.buttons?.some(b => b.includes('Checkup') || b.includes('Pain'))
+    );
+    assert(hasReason, `Expected reason-for-visit prompt. Got: ${JSON.stringify(r)}`);
+  });
+
+  await test('Selecting reason for visit shows booking summary', async () => {
+    const { data } = await bot('Checkup / Cleaning');
+    const r = data.responses;
+    assert(r?.length > 0, 'No response');
     const hasSummary = r.some(m =>
-      m.text?.includes('Booking Summary') || m.text?.includes('review') ||
-      m.text?.includes('Confirm') || m.text?.includes('Doctor')
+      m.text?.includes('review') || m.text?.includes('Confirm') ||
+      m.buttons?.some(b => b.includes('Confirm'))
     );
     assert(hasSummary, `Expected booking summary. Got: ${JSON.stringify(r)}`);
   });

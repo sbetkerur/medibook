@@ -629,7 +629,7 @@ router.get('/webhooks/failed', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-router.post('/webhooks/:id/retry', async (req, res) => {
+router.post('/webhooks/:id/retry', validateUUID(), async (req, res) => {
   try {
     const { id } = req.params;
     const r = await query(
@@ -682,8 +682,9 @@ router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
 
     const appts = parseInt(apptCount.rows[0].count);
     const doctors = parseInt(doctorCount.rows[0].count);
-    const apptPct = Math.round((appts / t.max_appointments_per_month) * 100);
-    const doctorPct = Math.round((doctors / t.max_doctors) * 100);
+    // NULL limit = unlimited plan (e.g. enterprise) — report 0% and never recommend an upgrade
+    const apptPct = t.max_appointments_per_month ? Math.round((appts / t.max_appointments_per_month) * 100) : 0;
+    const doctorPct = t.max_doctors ? Math.round((doctors / t.max_doctors) * 100) : 0;
 
     res.json({
       tenant_id: t.id,

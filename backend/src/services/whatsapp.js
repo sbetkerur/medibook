@@ -277,14 +277,16 @@ async function sendBookingConfirmationTemplate(to, { bookingId, doctorName, hosp
   }], accessToken, phoneNumberId);
 }
 
+// Parameter order MUST match jobs/reminders.js (the live sender for this
+// template): {{1}} doctor, {{2}} date, {{3}} time, {{4}} hospital.
 async function sendReminderTemplate(to, { doctorName, hospitalName, date, time }, accessToken, phoneNumberId) {
   await sendTemplate(to, 'appointment_reminder_24h', [{
     type: 'body',
     parameters: [
       { type: 'text', text: String(doctorName) },
-      { type: 'text', text: String(hospitalName) },
       { type: 'text', text: String(date) },
       { type: 'text', text: String(time) },
+      { type: 'text', text: String(hospitalName) },
     ],
   }], accessToken, phoneNumberId);
 }

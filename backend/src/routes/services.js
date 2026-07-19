@@ -1,12 +1,12 @@
 'use strict';
 const router = require('express').Router();
 const { tenantQuery } = require('../db');
-const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { handleError } = require('../utils/errors');
 const rateLimit = require('express-rate-limit');
 
-router.use(rateLimit({ windowMs: 60 * 1000, max: 120 }), authMiddleware, tenantMiddleware);
+// Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
+router.use(rateLimit({ windowMs: 60 * 1000, max: 120 }));
 
 // ── SERVICE CATALOG (A1) ──────────────────────────────────────
 

@@ -281,24 +281,37 @@ export default function Dashboard() {
     window.addEventListener('medibook:session-warning', onSessionWarning);
 
     // ── SSE real-time dashboard updates ──────────────────────────
-    const es = new EventSource(`/api/proxy/api/admin/events?token=${encodeURIComponent(token)}`);
-    es.onmessage = (e) => {
-      try {
-        const { type, payload } = JSON.parse(e.data);
-        if (type === 'new_booking') {
-          toast.success(`New booking: ${payload?.patientName || 'Patient'} → Dr. ${payload?.doctorName || ''}`, {
-            duration: 5000, icon: '📅',
-          });
-          // Silently refresh stats so counters update
-          fetchStats(true);
-          setNotifications(prev => [
-            { id: Date.now(), message: `New booking: ${payload?.patientName} at ${payload?.time}`, read: false, created_at: new Date().toISOString() },
-            ...prev.slice(0, 19),
-          ]);
-        }
-      } catch (_) {}
+    // The EventSource URL embeds the access token (EventSource can't set headers).
+    // Tokens expire after 1h, so we must reconnect with the fresh token whenever
+    // the api interceptor rotates it — otherwise the browser retries forever with
+    // the stale token and real-time updates silently stop.
+    let es = null;
+    const connectSSE = () => {
+      if (es) es.close();
+      const currentToken = localStorage.getItem('token');
+      if (!currentToken) return;
+      es = new EventSource(`/api/proxy/api/admin/events?token=${encodeURIComponent(currentToken)}`);
+      es.onmessage = (e) => {
+        try {
+          const { type, payload } = JSON.parse(e.data);
+          if (type === 'new_booking') {
+            toast.success(`New booking: ${payload?.patientName || 'Patient'} → Dr. ${payload?.doctorName || ''}`, {
+              duration: 5000, icon: '📅',
+            });
+            // Silently refresh stats so counters update
+            fetchStats(true);
+            setNotifications(prev => [
+              { id: Date.now(), message: `New booking: ${payload?.patientName} at ${payload?.time}`, read: false, created_at: new Date().toISOString() },
+              ...prev.slice(0, 19),
+            ]);
+          }
+        } catch (_) {}
+      };
+      es.onerror = () => {}; // silent reconnect handled by browser
     };
-    es.onerror = () => {}; // silent reconnect handled by browser
+    connectSSE();
+    const onTokenRefreshed = () => connectSSE();
+    window.addEventListener('medibook:token-refreshed', onTokenRefreshed);
 
     // ── Keyboard shortcuts ────────────────────────────────────────
     let gPressed = false;
@@ -320,10 +333,11 @@ export default function Dashboard() {
 
     return () => {
       window.removeEventListener('medibook:session-warning', onSessionWarning);
+      window.removeEventListener('medibook:token-refreshed', onTokenRefreshed);
       window.removeEventListener('keydown', onKeyDownG);
       clearTimeout(gTimer);
       clearSessionTimers();
-      es.close();
+      if (es) es.close();
     };
   }, []);
 
@@ -1393,17 +1407,17 @@ export default function Dashboard() {
       {/* Main content */}
       <div className="flex-1 flex flex-col overflow-hidden">
         <header className="bg-white border-b border-gray-200 px-4 md:px-6 py-4 flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-3">
-            <button className="md:hidden p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 transition" onClick={() => setSidebarOpen(true)}>
+          <div className="flex items-center gap-3 min-w-0 flex-1">
+            <button className="md:hidden p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 transition shrink-0" onClick={() => setSidebarOpen(true)}>
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
               </svg>
             </button>
-            <h1 className="text-lg font-semibold text-gray-900">
+            <h1 className="text-lg font-semibold text-gray-900 truncate">
               {NAV.find(n => n.id === tab)?.icon} {NAV.find(n => n.id === tab)?.label}
             </h1>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             {tab === 'analytics' && (
               <button onClick={printAnalytics}
                 className="p-2 sm:px-3 sm:py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition" title="Print Report">
@@ -2303,7 +2317,7 @@ export default function Dashboard() {
                 {revenueData ? (
                   <div className="space-y-5">
                     {/* KPI cards */}
-                    <div className="grid grid-cols-3 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
                       <div className="bg-green-50 rounded-lg p-4 text-center">
                         <div className="text-2xl font-bold text-green-700">₹{(revenueData.total_revenue || 0).toLocaleString('en-IN')}</div>
                         <div className="text-xs text-green-600 mt-1">Total Revenue ({revenueMonths}m)</div>
@@ -2524,6 +2538,7 @@ export default function Dashboard() {
                 </button>
               </div>
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead className="bg-gray-50 border-b border-gray-200">
                     <tr>
@@ -2568,6 +2583,7 @@ export default function Dashboard() {
                     )}
                   </tbody>
                 </table>
+                </div>
               </div>
             </div>
           )}
@@ -2643,7 +2659,7 @@ export default function Dashboard() {
                           <span className="text-gray-400 font-normal ml-1">(₹{settings.plan_limits.price_monthly}/mo)</span>
                         )}
                       </h3>
-                      <div className="grid grid-cols-2 gap-4">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         {/* Dentists */}
                         <div>
                           <div className="flex justify-between text-sm mb-1">
@@ -2709,7 +2725,7 @@ export default function Dashboard() {
                       placeholder="Enter current password"
                       className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
                   </div>
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-medium text-gray-700 mb-1">New Password</label>
                       <input type="password" value={changePwdForm.new_password}
@@ -2745,7 +2761,7 @@ export default function Dashboard() {
           {/* ── CALENDAR ── */}
           {tab === 'calendar' && !tabLoading && (
             <div className="space-y-4">
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <button
                   onClick={() => {
                     const d = new Date(calendarDate.getFullYear(), calendarDate.getMonth() - 1, 1);
@@ -2774,8 +2790,8 @@ export default function Dashboard() {
                   Today
                 </button>
               </div>
-              <div className="flex gap-4 items-start">
-                <div className="flex-1 bg-white rounded-xl shadow-sm overflow-hidden">
+              <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
+                <div className="flex-1 min-w-0 bg-white rounded-xl shadow-sm overflow-hidden">
                   <div className="grid grid-cols-7 border-b border-gray-200 bg-gray-50">
                     {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
                       <div key={d} className="py-2 text-center text-xs font-semibold text-gray-400 uppercase">{d}</div>
@@ -2810,7 +2826,7 @@ export default function Dashboard() {
                   </div>
                 </div>
                 {selectedCalDay && (
-                  <div className="w-72 shrink-0 bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="w-full lg:w-72 lg:shrink-0 bg-white rounded-xl shadow-sm overflow-hidden">
                     <div className="px-4 py-3 border-b border-gray-100 bg-gray-50">
                       <h3 className="font-semibold text-gray-800 text-sm">
                         {(() => { try { return format(parseISO(selectedCalDay), 'EEEE, d MMMM'); } catch { return selectedCalDay; } })()}
@@ -2840,9 +2856,9 @@ export default function Dashboard() {
           {/* ── DOCTOR LEAVES ── */}
           {tab === 'leaves' && !tabLoading && (
             <div className="space-y-4">
-              <div className="flex gap-6 items-start">
+              <div className="flex flex-col md:flex-row gap-4 md:gap-6 md:items-start">
                 {/* Doctor selector */}
-                <div className="w-56 shrink-0">
+                <div className="w-full md:w-56 md:shrink-0">
                   <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Select Doctor</label>
                   <div className="space-y-1">
                     {leavesDoctorList.length === 0 ? (
@@ -3053,7 +3069,7 @@ export default function Dashboard() {
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                     placeholder="Hi" />
                 </div>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   <button onClick={testBot} disabled={botLoading}
                     className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition">
                     {botLoading ? 'Sending...' : '📨 Send Message'}
@@ -3067,7 +3083,7 @@ export default function Dashboard() {
                     ))}
                   </div>
                 </div>
-                <div className="pt-1 border-t border-gray-100 flex items-center justify-between">
+                <div className="pt-1 border-t border-gray-100 flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs text-gray-400">If the bot gets stuck, reset the session to start fresh.</span>
                   <button onClick={resetBotSession} disabled={botResetting}
                     className="px-3 py-1.5 text-xs border border-orange-200 text-orange-600 rounded-lg hover:bg-orange-50 disabled:opacity-50 transition whitespace-nowrap">
@@ -3146,8 +3162,8 @@ export default function Dashboard() {
       <Modal title={editingDoctor ? `Edit Dr. ${editingDoctor.name}` : 'Add New Doctor'} onClose={() => setShowDoctorModal(false)}>
         <p className="text-xs text-gray-400 -mt-1 mb-1">Fields marked <span className="text-red-400">*</span> are required. All others are optional.</p>
         <form onSubmit={saveDoctor} className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div className="col-span-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="sm:col-span-2">
               <label className="block text-xs font-medium text-gray-700 mb-1">
                 Full Name <span className="text-red-400">*</span>
               </label>
@@ -3171,7 +3187,7 @@ export default function Dashboard() {
                 placeholder="e.g. MBBS, MD"
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
-            <div className="col-span-2">
+            <div className="sm:col-span-2">
               <label className="block text-xs font-medium text-gray-700 mb-1">
                 Hospital <span className="text-red-400">*</span>
               </label>
@@ -3186,7 +3202,7 @@ export default function Dashboard() {
                 {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
               </select>
             </div>
-            <div className="col-span-2">
+            <div className="sm:col-span-2">
               <label className="block text-xs font-medium text-gray-700 mb-1">
                 Department <span className="text-gray-400 font-normal">(optional)</span>
               </label>

@@ -2,11 +2,10 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const { tenantQuery } = require('../db');
-const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
-const { validateUUID, handleError } = require('../utils/errors');
+const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 
-router.use(authMiddleware, tenantMiddleware);
+// Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
 const patientLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 
@@ -42,7 +41,7 @@ router.get('/patients', patientLimiter, async (req, res) => {
 router.get('/patients/:id', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, dental_history as medical_history, created_at, updated_at FROM patients WHERE id=$1`,
+      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, dental_history as medical_history, created_at, updated_at FROM patients WHERE id=$1 AND deleted_at IS NULL`,
       [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
@@ -114,7 +113,7 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
 router.get('/patients/:id/medical-history', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, dental_history as medical_history FROM patients WHERE id=$1`, [req.params.id]);
+      `SELECT id, name, phone, dental_history as medical_history FROM patients WHERE id=$1 AND deleted_at IS NULL`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
   } catch (err) { handleError(res, err); }
@@ -138,7 +137,6 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
 });
 
 // ── PATIENT DOCUMENTS (Enhancement 6) ────────────────────────
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_FILE_BASE64_LEN = 14 * 1024 * 1024; // ~10 MB after base64 overhead
 
 router.get('/patients/:id/documents', validateUUID(), async (req, res) => {
@@ -226,7 +224,9 @@ router.post('/patients/import', adminOnly, async (req, res) => {
     let skipped = 0;
     const errors = [];
 
-    for (const row of records) {
+    for (let rowIdx = 0; rowIdx < records.length; rowIdx++) {
+      const row = records[rowIdx];
+      const rowNum = rowIdx + 2; // +1 for the header line, +1 for 1-based numbering
       try {
         const phone = (row.phone || row.Phone || row.PHONE || '').toString().trim().replace(/\s+/g, '').replace(/^\+/, '');
         const name = (row.name || row.Name || row.NAME || '').toString().trim();
@@ -236,12 +236,12 @@ router.post('/patients/import', adminOnly, async (req, res) => {
 
         if (!phone || !/^[+]?[0-9]{7,20}$/.test(phone)) {
           skipped++;
-          errors.push(`Row ${imported + skipped}: invalid phone "${phone}"`);
+          errors.push(`Row ${rowNum}: invalid phone "${phone}"`);
           continue;
         }
         if (!name || name.length < 1) {
           skipped++;
-          errors.push(`Row ${imported + skipped}: missing name`);
+          errors.push(`Row ${rowNum}: missing name`);
           continue;
         }
 
@@ -260,19 +260,33 @@ router.post('/patients/import', adminOnly, async (req, res) => {
           }
         }
 
-        await tenantQuery(s, `
-          INSERT INTO patients (phone, name, email, gender, date_of_birth)
-          VALUES ($1, $2, $3, $4, $5)
-          ON CONFLICT (phone) DO UPDATE SET
-            name=EXCLUDED.name, email=COALESCE(EXCLUDED.email, patients.email),
-            gender=COALESCE(EXCLUDED.gender, patients.gender),
-            date_of_birth=COALESCE(EXCLUDED.date_of_birth, patients.date_of_birth),
-            updated_at=NOW()
-        `, [phone, name, email, safeGender, safeDob]);
+        // patients.phone is NON-unique (family booking) so ON CONFLICT (phone)
+        // would raise 42P10. Update an existing profile matching phone+name, or
+        // insert a new one — keeps CSV re-imports idempotent per (phone, name).
+        const existing = await tenantQuery(s,
+          `SELECT id FROM patients WHERE phone=$1 AND lower(name)=lower($2) AND deleted_at IS NULL
+           ORDER BY created_at ASC LIMIT 1`,
+          [phone, name]);
+        if (existing.rows[0]) {
+          await tenantQuery(s, `
+            UPDATE patients SET
+              name=$2,
+              email=COALESCE($3, email),
+              gender=COALESCE($4, gender),
+              date_of_birth=COALESCE($5, date_of_birth),
+              updated_at=NOW()
+            WHERE id=$1
+          `, [existing.rows[0].id, name, email, safeGender, safeDob]);
+        } else {
+          await tenantQuery(s, `
+            INSERT INTO patients (phone, name, email, gender, date_of_birth)
+            VALUES ($1, $2, $3, $4, $5)
+          `, [phone, name, email, safeGender, safeDob]);
+        }
         imported++;
       } catch (rowErr) {
         skipped++;
-        errors.push(`Row ${imported + skipped}: ${rowErr.message}`);
+        errors.push(`Row ${rowNum}: ${rowErr.message}`);
       }
     }
 

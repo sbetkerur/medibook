@@ -22,14 +22,13 @@ const schemas = {
     tenant_slug: Joi.string().optional(),
   }),
 
+  // Super admin login. NOTE: no complexity rules here — complexity is enforced
+  // when a password is SET (resetPassword/changePassword). Enforcing it at login
+  // would lock out accounts whose existing password predates the policy, and
+  // leaks the password policy to unauthenticated callers.
   loginStrict: Joi.object({
     email: Joi.string().email().required(),
-    password: Joi.string().min(8)
-      .pattern(/[A-Z]/, 'uppercase letter')
-      .pattern(/[a-z]/, 'lowercase letter')
-      .pattern(/[0-9]/, 'digit')
-      .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
-      .required(),
+    password: Joi.string().min(6).required(),
   }),
 
   forgotPassword: Joi.object({
@@ -74,6 +73,15 @@ const schemas = {
     city: Joi.string().max(100).optional().allow('', null),
     phone: Joi.string().max(20).optional().allow('', null),
   }),
+
+  // Partial update — every field optional (PATCH previously reused createHospital,
+  // whose required `name` rejected e.g. a phone-only update with a 400).
+  updateHospital: Joi.object({
+    name: Joi.string().min(2).max(255).optional(),
+    address: Joi.string().max(500).optional().allow('', null),
+    city: Joi.string().max(100).optional().allow('', null),
+    phone: Joi.string().max(20).optional().allow('', null),
+  }).min(1).messages({ 'object.min': 'Provide at least one field to update' }),
 
   createDepartment: Joi.object({
     name: Joi.string().min(2).max(255).required(),
