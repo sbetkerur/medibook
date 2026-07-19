@@ -63,7 +63,7 @@ export default function Dashboard() {
   const [filterDate, setFilterDate] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [patientSearch, setPatientSearch] = useState('');
-  const [botPhone, setBotPhone] = useState('919999999999');
+  const [botPhone, setBotPhone] = useState('917795676142');
   const [botMessage, setBotMessage] = useState('Hi');
   const [botResponse, setBotResponse] = useState(null);
   const [botLoading, setBotLoading] = useState(false);
@@ -2632,7 +2632,7 @@ export default function Dashboard() {
                             type="tel"
                             value={settingsForm.notify_phone}
                             onChange={e => setSettingsForm(f => ({ ...f, notify_phone: e.target.value }))}
-                            placeholder="e.g. 919876543210"
+                            placeholder="e.g. 917795676142"
                             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                           />
                           <p className="text-xs text-gray-400 mt-1">An SMS will be sent to this number each time an appointment is booked via the WhatsApp bot.</p>
@@ -3060,7 +3060,7 @@ export default function Dashboard() {
                   <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number</label>
                   <input value={botPhone} onChange={e => setBotPhone(e.target.value)}
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    placeholder="919999999999" />
+                    placeholder="917795676142" />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Message</label>
@@ -3723,7 +3723,7 @@ export default function Dashboard() {
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Patient Phone *</label>
               <input value={walkinForm.patient_phone} onChange={e => setWalkinForm(f => ({ ...f, patient_phone: e.target.value }))}
-                placeholder="919876543210"
+                placeholder="917795676142"
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
             </div>
             <div>
@@ -3949,9 +3949,9 @@ export default function Dashboard() {
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Phone Number <span className="text-red-400">*</span></label>
             <input value={waMessagePhone} onChange={e => setWaMessagePhone(e.target.value)}
-              placeholder="919876543210"
+              placeholder="917795676142"
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-            <p className="text-xs text-gray-400 mt-1">Include country code, no + or spaces (e.g. 919876543210)</p>
+            <p className="text-xs text-gray-400 mt-1">Include country code, no + or spaces (e.g. 917795676142)</p>
           </div>
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Message <span className="text-red-400">*</span></label>

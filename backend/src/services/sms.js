@@ -24,7 +24,7 @@ function getTwilio() {
 
 /**
  * Send SMS fallback message.
- * @param {string} to - Phone number in E.164 format (e.g. +919876543210)
+ * @param {string} to - Phone number in E.164 format (e.g. +917795676142)
  * @param {string} body - SMS body text (max 160 chars for single segment)
  */
 async function sendSMS(to, body) {

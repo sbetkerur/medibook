@@ -120,7 +120,7 @@ const schemas = {
     phone: Joi.string().max(20).optional().allow('', null),
     notification_prefs: Joi.object().optional(),
     notify_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).optional().allow('', null)
-      .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +919876543210)' }),
+      .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +917795676142)' }),
   }),
 
   blockRange: Joi.object({

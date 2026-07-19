@@ -192,7 +192,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
     if (!value?.messages?.length) return;
 
     const msg = value.messages[0];
-    // Normalize phone: strip leading '+' so '919876543210' and '+919876543210' map to same user
+    // Normalize phone: strip leading '+' so '917795676142' and '+917795676142' map to same user
     const phone = (msg.from || '').replace(/^\+/, '');
     if (!/^\d{7,20}$/.test(phone)) {
       logger.warn('Webhook received invalid phone format', { phone: maskPhone(msg.from || '') });
@@ -484,7 +484,7 @@ let _testEndpointMutex = Promise.resolve();
 
 if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT === 'true') {
   router.post('/webhook/test', testEndpointLimiter, async (req, res) => {
-    const { phone = '919999999999', message = 'Hi', button_id, tenant_slug } = req.body;
+    const { phone = '917795676142', message = 'Hi', button_id, tenant_slug } = req.body;
     try {
       const r = tenant_slug
         ? await query(`SELECT * FROM tenants WHERE slug=$1 AND status='active'`, [tenant_slug])
