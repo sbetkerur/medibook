@@ -164,6 +164,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
   ctx.reschedule_booking_id = a.booking_id;
   ctx.reschedule_old_date = a.appointment_date;
   ctx.reschedule_old_time = a.appointment_time;
+  ctx._reschedule_dates = dates; // cache for numeric text-fallback replies ("1", "2", …)
 
   const sections = [{
     title: 'Available Dates',
@@ -179,16 +180,25 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
 }
 
 async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(choice)) {
-    await send.text('Please select a date from the list.');
-    return;
+  let resolvedDate = choice;
+  // Accept numeric input ("1", "2") when the list message fell back to numbered
+  // text (sendList failure path says "Reply with the number of your choice").
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(resolvedDate)) {
+    const n = parseInt(resolvedDate, 10);
+    const cachedDates = ctx._reschedule_dates || [];
+    if (n >= 1 && n <= cachedDates.length) {
+      resolvedDate = cachedDates[n - 1].date;
+    } else {
+      await send.text('Please select a date from the list.');
+      return;
+    }
   }
-  ctx.reschedule_new_date = choice;
+  ctx.reschedule_new_date = resolvedDate;
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
      ORDER BY start_time`,
-    [ctx.reschedule_doctor_id, choice]);
+    [ctx.reschedule_doctor_id, resolvedDate]);
   if (!slots.rows.length) {
     await send.text('No slots available for that date. Please pick another.\n\nReply *Hi* to start over.');
     return;
@@ -196,8 +206,8 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
   // Cap at 10 rows — WhatsApp list messages reject more than 10 rows per section.
   const visibleRescheduleSlots = slots.rows.slice(0, 10);
   ctx._reschedule_slots = visibleRescheduleSlots;
-  let dateLabel = choice;
-  try { dateLabel = format(parseISO(choice), 'EEE, d MMM'); } catch {}
+  let dateLabel = resolvedDate;
+  try { dateLabel = format(parseISO(resolvedDate), 'EEE, d MMM'); } catch {}
   const sections = [{
     title: 'Available Slots',
     rows: visibleRescheduleSlots.map(s => ({
@@ -241,17 +251,31 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
   // word "reschedule" and would otherwise match the positive pattern below.
   const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|btn_1|^2$/i.test(choice);
   if (!isNegative && /yes|reschedule|confirm|btn_0|^1$/.test(choice)) {
-    // Atomic: lock new slot + release old slot + update appointment
+    // Atomic: lock appointment row + lock new slot + release old slot + update appointment
     const rescheduled = await tenantTransaction(schema, async (client) => {
+      // Lock the appointment and re-check it is still confirmed — an admin may have
+      // cancelled/completed it while the patient was mid-flow. Without this guard we
+      // would book the new slot and rewrite a cancelled appointment's date, leaving
+      // an orphaned 'booked' slot nobody owns.
+      const apptCheck = await client.query(
+        `SELECT id, slot_id FROM appointments WHERE id=$1 AND status='confirmed' FOR UPDATE`,
+        [ctx.reschedule_appt_id]
+      );
+      if (!apptCheck.rows.length) return 'appt_gone';
       const lock = await client.query(
         `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
         [ctx.reschedule_new_slot_id]
       );
-      if (!lock.rows.length) return null; // slot taken
-      await client.query(
-        `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`,
-        [ctx.reschedule_old_slot_id]
-      );
+      if (!lock.rows.length) return 'slot_taken';
+      // Release the slot the appointment CURRENTLY holds (fresh from the locked row),
+      // not the possibly-stale one cached in session context.
+      const currentSlotId = apptCheck.rows[0].slot_id || ctx.reschedule_old_slot_id;
+      if (currentSlotId) {
+        await client.query(
+          `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`,
+          [currentSlotId]
+        );
+      }
       await client.query(
         `UPDATE appointments SET
            slot_id=$1, appointment_date=$2, appointment_time=$3,
@@ -259,9 +283,14 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
          WHERE id=$4`,
         [ctx.reschedule_new_slot_id, ctx.reschedule_new_date, ctx.reschedule_new_time, ctx.reschedule_appt_id]
       );
-      return true;
+      return 'ok';
     });
-    if (!rescheduled) {
+    if (rescheduled === 'appt_gone') {
+      await send.text('⚠️ This appointment is no longer active — it may have been cancelled or updated by the clinic. Reply *Hi* to check your appointments.');
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
+    if (rescheduled !== 'ok') {
       await send.text('⚠️ That slot was just taken! Reply *Hi* to pick another time.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;

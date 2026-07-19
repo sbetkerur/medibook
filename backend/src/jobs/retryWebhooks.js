@@ -5,6 +5,14 @@ const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
 
 async function retryFailedWebhooks() {
+  // Recover rows orphaned in 'processing' — a crash/redeploy between the claim
+  // and the terminal status update would otherwise strand them forever (the
+  // picker below only selects 'pending').
+  await query(`
+    UPDATE failed_webhooks SET status='pending'
+    WHERE status='processing' AND last_attempt_at < NOW() - INTERVAL '15 minutes'
+  `).catch(e => logger.warn('Failed to recover orphaned processing webhooks', { error: e.message }));
+
   // Fetch up to 20 pending webhooks ready for retry
   const r = await query(`
     SELECT fw.*, t.schema_name, t.name,

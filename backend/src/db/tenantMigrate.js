@@ -1,8 +1,12 @@
-const { pool } = require('./index');
+const { pool, validateSchemaName } = require('./index');
 
 async function createTenantSchema(schemaName) {
+  validateSchemaName(schemaName);
   const client = await pool.connect();
   try {
+    // Migration DDL (index builds on large tables) can legitimately exceed the
+    // pool's 10s app-query statement_timeout — lift it for this session only.
+    await client.query('SET statement_timeout TO 0');
     await client.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
     await client.query(`SET search_path TO "${schemaName}", public`);
 
@@ -272,8 +276,11 @@ async function createTenantSchema(schemaName) {
  * Called by migrate.js for every existing tenant.
  */
 async function runTenantMigrations(schemaName) {
+  validateSchemaName(schemaName);
   const client = await pool.connect();
   try {
+    // Same rationale as createTenantSchema: DDL may exceed the app's 10s cap.
+    await client.query('SET statement_timeout TO 0');
     await client.query(`SET search_path TO "${schemaName}", public`);
 
     // Add new columns to appointments (idempotent)
@@ -336,7 +343,23 @@ async function runTenantMigrations(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_appt_created_at ON appointments(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_bot_sessions_activity ON bot_sessions(last_activity);
       CREATE INDEX IF NOT EXISTS idx_wa_messages_phone ON wa_messages(phone);
-      DROP INDEX IF EXISTS idx_wa_messages_msg_id;
+      -- Rebuild idx_wa_messages_msg_id ONLY if it still has the legacy shape
+      -- (non-partial or non-unique). An unconditional DROP+CREATE here ran on
+      -- every boot for every tenant, taking an ACCESS EXCLUSIVE lock on
+      -- wa_messages and — once the table grew past what the rebuild could do
+      -- inside a statement timeout — aborting the rest of this migration file.
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM pg_index i
+          JOIN pg_class c ON c.oid = i.indexrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'idx_wa_messages_msg_id'
+            AND n.nspname = current_schema()
+            AND (i.indpred IS NULL OR NOT i.indisunique)
+        ) THEN
+          DROP INDEX idx_wa_messages_msg_id;
+        END IF;
+      END $$;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
       -- Email index for bounce handler (UPDATE patients SET email_status WHERE email=$1)
       CREATE INDEX IF NOT EXISTS idx_patients_email ON patients(email) WHERE email IS NOT NULL;
@@ -458,7 +481,10 @@ async function runTenantMigrations(schemaName) {
       END $$;
     `).catch(() => {});
 
-    // Add unique constraint on appointment_feedback to prevent duplicate feedback per appointment
+    // Add unique constraint on appointment_feedback to prevent duplicate feedback
+    // per appointment. Deduplicate first (keep the newest row) — a pre-constraint
+    // tenant can hold duplicates, and without the DELETE the ALTER fails on every
+    // boot while the bot's ON CONFLICT (appointment_id) insert errors at runtime.
     await client.query(`
       DO $$ BEGIN
         IF NOT EXISTS (
@@ -466,10 +492,14 @@ async function runTenantMigrations(schemaName) {
           WHERE conname = 'uq_feedback_appointment'
             AND conrelid = 'appointment_feedback'::regclass
         ) THEN
+          DELETE FROM appointment_feedback f1
+          USING appointment_feedback f2
+          WHERE f1.created_at < f2.created_at
+            AND f1.appointment_id = f2.appointment_id;
           ALTER TABLE appointment_feedback ADD CONSTRAINT uq_feedback_appointment UNIQUE (appointment_id);
         END IF;
       END $$;
-    `).catch(() => {}); // Non-fatal if constraint already exists with different method
+    `).catch((e) => console.error(`uq_feedback_appointment migration failed for ${schemaName}: ${e.message}`));
 
     // Enhancement 6: documents table for patient prescriptions/reports
     await client.query(`

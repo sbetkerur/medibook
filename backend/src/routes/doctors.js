@@ -248,8 +248,16 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
     // Delete all future available slots for this doctor first, then re-create.
     let slotsGenerated = 0;
     try {
+      // IST date, not UTC CURRENT_DATE: between 00:00 and 05:30 IST the UTC
+      // date is a day behind, so '> CURRENT_DATE' deleted IST-today's slots
+      // while the generator (which starts at IST-tomorrow) never recreated
+      // them. Also skip slots referenced by appointments — a cancelled
+      // appointment keeps its slot_id, so deleting the released slot violates
+      // the appointments FK and aborts the regeneration.
       await tenantQuery(s,
-        `DELETE FROM time_slots WHERE doctor_id=$1 AND status='available' AND slot_date > CURRENT_DATE`,
+        `DELETE FROM time_slots WHERE doctor_id=$1 AND status='available'
+           AND slot_date > (timezone('Asia/Kolkata', NOW()))::date
+           AND id NOT IN (SELECT slot_id FROM appointments WHERE slot_id IS NOT NULL)`,
         [req.params.id]);
       const { generateSlotsForDoctor } = require('../jobs/slotGenerator');
       slotsGenerated = await generateSlotsForDoctor(s, req.params.id);
@@ -427,7 +435,15 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
     const s = req.tenant.schema_name;
     const safeDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
     if (clear) {
-      await tenantQuery(s, `DELETE FROM time_slots WHERE doctor_id=$1 AND status IN ('available','blocked') AND slot_date >= CURRENT_DATE`, [doctor_id]);
+      // Future-only in IST ('>=' + UTC CURRENT_DATE wiped IST-today's remaining
+      // availability, which the generator never recreates), and never rows still
+      // referenced by an appointment (FK violation — cancelled appointments keep
+      // their slot_id).
+      await tenantQuery(s,
+        `DELETE FROM time_slots WHERE doctor_id=$1 AND status IN ('available','blocked')
+           AND slot_date > (timezone('Asia/Kolkata', NOW()))::date
+           AND id NOT IN (SELECT slot_id FROM appointments WHERE slot_id IS NOT NULL)`,
+        [doctor_id]);
     }
     const docR = await tenantQuery(s, `SELECT id FROM doctors WHERE id=$1`, [doctor_id]);
     if (!docR.rows[0]) return res.status(404).json({ error: 'Doctor not found' });

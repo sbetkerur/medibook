@@ -345,6 +345,12 @@ router.post('/auth/change-password', changePasswordLimiter, authMiddleware, vali
         `UPDATE users SET password_hash=$1 WHERE id=$2`, [hash, id]);
     }
 
+    // Revoke all outstanding refresh tokens — a password change must evict
+    // anyone holding a stolen refresh token. The current session keeps its
+    // access token until expiry (≤1h) and then must log in again.
+    await query(`UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`, [id])
+      .catch(e => logger.warn('Refresh-token revocation failed after password change', { error: e.message }));
+
     // Audit log
     await query(`INSERT INTO admin_access_logs (user_id, email, event, ip_address, user_agent) VALUES ($1,$2,'password_changed',$3,$4)`,
       [id, email || req.user.email, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
@@ -409,12 +415,22 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
 
     const hash = await bcrypt.hash(password, 12);
 
+    let resetUserId = null;
     if (tenantSchema) {
-      await tenantQuery(tenantSchema,
-        `UPDATE users SET password_hash=$1 WHERE email=$2`, [hash, reset.email]);
+      const upd = await tenantQuery(tenantSchema,
+        `UPDATE users SET password_hash=$1 WHERE email=$2 RETURNING id`, [hash, reset.email]);
+      resetUserId = upd.rows[0]?.id || null;
     } else {
       // Super admin
-      await query(`UPDATE super_admins SET password_hash=$1 WHERE email=$2`, [hash, reset.email]);
+      const upd = await query(`UPDATE super_admins SET password_hash=$1 WHERE email=$2 RETURNING id`, [hash, reset.email]);
+      resetUserId = upd.rows[0]?.id || null;
+    }
+
+    // Revoke all outstanding refresh tokens — resetting the password is the
+    // account-recovery path, so it must end any session an attacker holds.
+    if (resetUserId) {
+      await query(`UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`, [resetUserId])
+        .catch(e => logger.warn('Refresh-token revocation failed after password reset', { error: e.message }));
     }
 
     res.json({ success: true, message: 'Password updated successfully' });

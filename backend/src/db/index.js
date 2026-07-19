@@ -95,4 +95,4 @@ async function tenantTransaction(schemaName, callback) {
   }
 }
 
-module.exports = { pool, query, tenantQuery, tenantTransaction };
+module.exports = { pool, query, tenantQuery, tenantTransaction, validateSchemaName };

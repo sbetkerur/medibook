@@ -11,8 +11,13 @@ const TENANT_CACHE_TTL_MS = 5000;
 const tenantCache = new Map(); // key: tenantId → { tenant, expiresAt }
 
 async function authMiddleware(req, res, next) {
-  // Support token in Authorization header (normal) or ?token= query param (SSE, EventSource)
-  const token = ((req.headers.authorization || '').replace('Bearer ', '') || req.query.token || '').trim();
+  // Support token in Authorization header (normal) or ?token= query param.
+  // The query-param form exists ONLY for EventSource (SSE), which can't set
+  // headers — accepting it everywhere would let tokens leak into proxy access
+  // logs, browser history and Referer headers on any admin call.
+  const isSSE = req.path.endsWith('/events');
+  const headerToken = (req.headers.authorization || '').replace('Bearer ', '');
+  const token = (headerToken || (isSSE ? req.query.token : '') || '').trim();
   if (!token) return res.status(401).json({ error: ERRORS.NO_TOKEN });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);

@@ -17,15 +17,30 @@ async function runMigration(client, version, name, sqlFn) {
     console.log(`  ⏭  Migration ${version} (${name}) already applied`);
     return;
   }
-  await sqlFn();
-  await client.query(
-    `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, [version, name]);
+  // Run the migration body and its version record atomically. Without this, a
+  // deploy killed mid-migration leaves data-mutating migrations (e.g. 18's
+  // in-place token hashing) half-applied and unrecorded, so the next boot
+  // re-runs them on already-migrated rows.
+  await client.query('BEGIN');
+  try {
+    await sqlFn();
+    await client.query(
+      `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, [version, name]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  }
   console.log(`  ✅ Migration ${version}: ${name}`);
 }
 
 async function migrate() {
   const client = await pool.connect();
   try {
+    // Serialize migrations across concurrently booting instances — two
+    // containers interleaving a data-mutating migration (e.g. 18's token
+    // hashing) would double-apply it before either records the version.
+    await client.query(`SELECT pg_advisory_lock(824619001)`);
     console.log('Running migrations...');
 
     // ── PUBLIC SCHEMA — platform-level tables ──────────────────
@@ -140,6 +155,8 @@ async function migrate() {
         ('reminders'),
         ('feedback'),
         ('backup'),
+        ('weekly_backup'),
+        ('weekly_digest'),
         ('webhook_retry')
       ON CONFLICT (job_name) DO NOTHING;
     `);
@@ -430,27 +447,30 @@ async function migrate() {
     console.log('✅ Super admin created: admin@medibook.com / SuperAdmin@123');
     console.log('✅ audit_logs, cron_jobs, admin_access_logs tables created');
 
-  } finally {
-    client.release();
-  }
-
-  // ── RUN TENANT MIGRATIONS for existing schemas ───────────────
-  try {
-    const { runTenantMigrations } = require('./tenantMigrate');
-    const tenantsR = await pool.query(`SELECT schema_name, name FROM tenants`);
-    if (tenantsR.rows.length > 0) {
-      console.log(`Running tenant migrations for ${tenantsR.rows.length} existing schemas...`);
-      for (const t of tenantsR.rows) {
-        try {
-          await runTenantMigrations(t.schema_name);
-          console.log(`✅ Tenant migrations applied: ${t.name} (${t.schema_name})`);
-        } catch (err) {
-          console.error(`❌ Tenant migration failed for ${t.schema_name}:`, err.message);
+    // ── RUN TENANT MIGRATIONS for existing schemas ───────────────
+    // Still inside the advisory lock: tenant migrations include data-mutating
+    // steps (dedup + ALTER) that concurrent boots must not interleave.
+    try {
+      const { runTenantMigrations } = require('./tenantMigrate');
+      const tenantsR = await pool.query(`SELECT schema_name, name FROM tenants`);
+      if (tenantsR.rows.length > 0) {
+        console.log(`Running tenant migrations for ${tenantsR.rows.length} existing schemas...`);
+        for (const t of tenantsR.rows) {
+          try {
+            await runTenantMigrations(t.schema_name);
+            console.log(`✅ Tenant migrations applied: ${t.name} (${t.schema_name})`);
+          } catch (err) {
+            console.error(`❌ Tenant migration failed for ${t.schema_name}:`, err.message);
+          }
         }
       }
+    } catch (err) {
+      console.error('Failed to run tenant schema migrations:', err.message);
     }
-  } catch (err) {
-    console.error('Failed to run tenant schema migrations:', err.message);
+
+  } finally {
+    await client.query(`SELECT pg_advisory_unlock(824619001)`).catch(() => {});
+    client.release();
   }
 }
 

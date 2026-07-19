@@ -2,7 +2,6 @@ require('dotenv').config();
 const bcrypt = require('bcryptjs');
 const { query, tenantQuery, pool } = require('./index');
 const { createTenantSchema, runTenantMigrations } = require('./tenantMigrate');
-const { addDays, format } = require('date-fns');
 
 async function seed() {
   console.log('Seeding Smile Dental Clinic data...\n');
@@ -42,7 +41,10 @@ async function seed() {
     `SELECT * FROM hospitals WHERE name='Smile Dental - Banjara Hills'`)).rows[0];
   if (!hospital) {
     // Rename the old single-branch record if it exists
-    const old = (await tenantQuery(schema, `SELECT * FROM hospitals LIMIT 1`)).rows[0];
+    // Deterministic pick, and never grab the KPHB branch — renaming it would
+    // orphan the KPHB lookup below and cascade into duplicate doctors.
+    const old = (await tenantQuery(schema,
+      `SELECT * FROM hospitals WHERE name <> 'Smile Dental - KPHB' ORDER BY created_at LIMIT 1`)).rows[0];
     if (old) {
       await tenantQuery(schema,
         `UPDATE hospitals SET name='Smile Dental - Banjara Hills', address='Banjara Hills, Road No. 10', phone='040-99887766' WHERE id=$1`,
@@ -197,46 +199,28 @@ async function seed() {
   console.log('✅ Schedules set (Mon–Fri 10AM–5PM lunch 1–2PM, Sat 10AM–1PM)');
 
   // ── TIME SLOTS: next 7 days ───────────────────────────────────
-  // Clear existing available slots before regenerating
-  for (const doc of doctorIds) {
-    await tenantQuery(schema,
-      `DELETE FROM time_slots WHERE doctor_id=$1 AND status IN ('available','blocked') AND slot_date >= CURRENT_DATE`,
-      [doc.id]);
-  }
-
+  // Clear future unbooked availability, then delegate regeneration to the
+  // single source of truth (generateSlotsForDoctor) so doctor leaves, clinic
+  // holidays and admin-blocked slots are honoured. Constraints on the DELETE:
+  // - 'available' only: 'blocked' / blocked_by_leave slots must survive a
+  //   reseed, otherwise leave days come back bookable on every deploy
+  // - exclude slots referenced by appointments: a cancelled appointment keeps
+  //   its slot_id while the slot returns to 'available', so deleting the slot
+  //   violates the appointments.slot_id FK and aborts the seed
+  // - future-only in IST: regeneration starts at IST-tomorrow, so deleting
+  //   today's rows would wipe same-day availability on every deploy
+  const { generateSlotsForDoctor } = require('../jobs/slotGenerator');
   let slotCount = 0;
-  const today = new Date();
-  const LUNCH_START = 13 * 60; // 13:00 in minutes
-  const LUNCH_END   = 14 * 60; // 14:00 in minutes
-
   for (const doc of doctorIds) {
-    for (let i = 1; i <= 7; i++) {
-      const date = addDays(today, i);
-      const dow  = date.getDay();
-      if (dow === 0) continue; // Skip Sunday only (Saturday is half-day)
-      const dateStr = format(date, 'yyyy-MM-dd');
-      // Saturday ends at 13:00 (no lunch break); Mon–Fri ends at 17:00
-      const endTime = dow === 6 ? 13 * 60 : 17 * 60;
-      let cur = 10 * 60; // 10:00 AM
-      while (cur + doc.duration <= endTime) {
-        // Skip lunch window on Mon–Fri only (13:00–14:00)
-        if (dow !== 6 && cur < LUNCH_END && cur + doc.duration > LUNCH_START) {
-          cur = LUNCH_END;
-          continue;
-        }
-        const st = `${String(Math.floor(cur / 60)).padStart(2,'0')}:${String(cur % 60).padStart(2,'0')}`;
-        const et = `${String(Math.floor((cur + doc.duration) / 60)).padStart(2,'0')}:${String((cur + doc.duration) % 60).padStart(2,'0')}`;
-        await tenantQuery(schema, `
-          INSERT INTO time_slots (doctor_id, hospital_id, slot_date, start_time, end_time, status)
-          VALUES ($1,$2,$3,$4,$5,'available')
-          ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING
-        `, [doc.id, doc.hospital_id, dateStr, st, et]);
-        cur += doc.duration;
-        slotCount++;
-      }
-    }
+    await tenantQuery(schema, `
+      DELETE FROM time_slots
+      WHERE doctor_id=$1 AND status='available'
+        AND slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+        AND id NOT IN (SELECT slot_id FROM appointments WHERE slot_id IS NOT NULL)
+    `, [doc.id]);
+    slotCount += await generateSlotsForDoctor(schema, doc.id, false, 7);
   }
-  console.log(`✅ ${slotCount} time slots generated (7 days, Mon–Fri 10–13+14–17, Sat 10–13)\n`);
+  console.log(`✅ ${slotCount} time slots generated (7 days via generateSlotsForDoctor)\n`);
 
   console.log(`─────────────────────────────────────────
  CREDENTIALS

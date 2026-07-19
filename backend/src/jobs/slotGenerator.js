@@ -266,7 +266,7 @@ async function cleanupExpiredSlots(schema) {
   try {
     const r = await tenantQuery(schema,
       `UPDATE time_slots SET status='expired'
-       WHERE slot_date < CURRENT_DATE AND status='available'
+       WHERE slot_date < (timezone('Asia/Kolkata', NOW()))::date AND status='available'
        RETURNING id`);
     // Hard-delete expired slot records older than 90 days (prevents unbounded growth)
     await tenantQuery(schema,
@@ -416,7 +416,10 @@ function startSlotGeneratorCron() {
 
 function startBackupReminderCron() {
   // Every Sunday at 2 AM IST (20:30 UTC Saturday)
-  const backupTask = cron.schedule('30 20 * * 6', async () => {
+  // withCronLock: without it every scaled-out instance runs its own pg_dump.
+  // Own job_name ('weekly_backup'): this and backupManager's daily job used to
+  // share job_name='backup', so each overwrote the other's failure status.
+  const backupTask = cron.schedule('30 20 * * 6', () => withCronLock('cron:weekly_backup', 3600, async () => {
     logger.info('Starting weekly database backup...');
     try {
       const { exec } = require('child_process');
@@ -467,7 +470,7 @@ function startBackupReminderCron() {
 
       // Update cron status
       await query(
-        `UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='backup'`
+        `UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='weekly_backup'`
       ).catch(() => {});
 
       // Prune backups older than 30 days
@@ -483,11 +486,11 @@ function startBackupReminderCron() {
     } catch (err) {
       logger.error('Database backup failed', { error: err.message });
       await query(
-        `UPDATE cron_jobs SET last_run_at=NOW(), last_status='error', last_error=$1 WHERE job_name='backup'`,
+        `UPDATE cron_jobs SET last_run_at=NOW(), last_status='error', last_error=$1 WHERE job_name='weekly_backup'`,
         [err.message?.slice(0, 500)]
       ).catch(() => {});
     }
-  });
+  }));
   logger.info('Database backup cron registered (weekly Sunday 2AM IST)');
   return backupTask;
 }

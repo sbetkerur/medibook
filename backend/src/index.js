@@ -51,6 +51,15 @@ if (!process.env.RESEND_API_KEY) {
 if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
   logger.warn('META credentials not configured — WhatsApp messaging requires real credentials in production');
 }
+// Without a real META_APP_SECRET the webhook route cannot verify signatures and
+// would process forged POSTs — an attacker spoofing messages[].from could drive
+// the bot as any patient. Fail fast in production instead of failing open.
+const PLACEHOLDER_APP_SECRETS = ['', 'your_app_secret', 'changeme', 'placeholder'];
+if (process.env.NODE_ENV === 'production' &&
+    PLACEHOLDER_APP_SECRETS.includes((process.env.META_APP_SECRET || '').trim())) {
+  logger.error('FATAL: META_APP_SECRET is not set (or is a placeholder). Webhook signatures cannot be verified. Exiting.');
+  process.exit(1);
+}
 if (!process.env.FRONTEND_URL) {
   if (process.env.NODE_ENV === 'production') {
     logger.warn('FRONTEND_URL is not set — CORS will allow all origins. Set FRONTEND_URL=https://your-frontend.up.railway.app to restrict access.');
@@ -133,10 +142,13 @@ app.use((req, res, next) => {
   runWithContext({ requestId: req.id }, next);
 });
 
-// Raw body for webhook signature verification
-app.use('/api/webhook', express.json({
+// Raw body for webhook signature verification (both mount paths — the /v1
+// alias previously got the generic parser, so its signatures never matched)
+const webhookJsonParser = express.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+});
+app.use('/api/webhook', webhookJsonParser);
+app.use('/api/v1/webhook', webhookJsonParser);
 app.use(express.json({ limit: '12mb' })); // increased for document base64 uploads (Enhancement 6)
 app.use(express.urlencoded({ extended: true }));
 
@@ -146,6 +158,7 @@ const webhookLimiter = rateLimit({ windowMs: 60 * 1000, max: 2000 });
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many login attempts' }, skip: () => process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development' });
 
 app.use('/api/auth', authLimiter);
+app.use('/api/v1/auth', authLimiter); // auth routes are also mounted under /api/v1
 const webhookIpLimiter = rateLimit({ windowMs: 60 * 1000, max: 100, keyGenerator: (req) => req.ip, message: { error: 'Too many requests from this IP' } });
 app.use('/api/webhook', webhookIpLimiter);
 app.use('/api/webhook', webhookLimiter);
@@ -354,8 +367,10 @@ app.get('/health', async (req, res) => {
 // ── METRICS ENDPOINT ──────────────────────────────────────────
 app.get('/metrics', async (req, res) => {
   if (process.env.METRICS_SECRET) {
-    const auth = (req.headers.authorization || '').replace('Bearer ', '');
-    if (auth !== process.env.METRICS_SECRET) {
+    const crypto = require('crypto');
+    const auth = Buffer.from((req.headers.authorization || '').replace('Bearer ', ''));
+    const secret = Buffer.from(process.env.METRICS_SECRET);
+    if (auth.length !== secret.length || !crypto.timingSafeEqual(auth, secret)) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
   }
@@ -438,6 +453,12 @@ process.on('SIGTERM', () => {
   logger.info('SIGTERM received, shutting down gracefully...');
   // Stop all cron tasks so no new DB queries are issued
   cronTasks.forEach(t => { try { t.stop(); } catch (_) {} });
+  // server.close() only completes once every connection is idle — SSE streams
+  // (dashboard EventSource) are never idle, so force-close connections after a
+  // short drain and hard-exit as a failsafe so Railway doesn't have to SIGKILL
+  // us with the pool/queues still open.
+  setTimeout(() => { try { server.closeAllConnections?.(); } catch (_) {} }, 5000).unref();
+  setTimeout(() => { logger.error('Graceful shutdown timed out — forcing exit'); process.exit(1); }, 15000).unref();
   server.close(async () => {
     const { pool } = require('./db');
     const { shutdown: shutdownWorker } = require('./jobs/botWorker');

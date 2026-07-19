@@ -442,6 +442,10 @@ router.post('/tenants/:id/impersonate', validateUUID(), async (req, res) => {
         tenant_slug: tenant.slug,
         impersonated_by: req.user.id,
         impersonation: true,
+        // jti so the token participates in blacklist revocation like every
+        // other access token — without it there is no way to kill a misused
+        // impersonation session before its 15-minute expiry.
+        jti: require('crypto').randomUUID(),
       },
       process.env.JWT_SECRET,
       { expiresIn: '15m' }

@@ -40,9 +40,19 @@ async function runBackup() {
       timeout: 10 * 60 * 1000,
     });
 
-    pgdump.stdout.on('data', (chunk) => {
-      sizeBytes += chunk.length;
-      writeStream.write(chunk);
+    pgdump.stdout.on('data', (chunk) => { sizeBytes += chunk.length; });
+    // pipe() gives backpressure (manual write() buffered the whole dump in
+    // memory on slow disks) and ends the stream when pg_dump's stdout ends.
+    pgdump.stdout.pipe(writeStream);
+
+    // A disk-full/permission error here was previously an unhandled 'error'
+    // event while pg_dump still exited 0 — the truncated backup got recorded
+    // as success.
+    let streamError = null;
+    writeStream.on('error', (err) => {
+      streamError = err;
+      logger.error('Backup write stream error', { error: err.message });
+      try { pgdump.kill(); } catch (_) {}
     });
 
     pgdump.stderr.on('data', (data) => {
@@ -52,11 +62,19 @@ async function runBackup() {
       }
     });
 
-    pgdump.on('close', async (code) => {
-      writeStream.end();
+    pgdump.on('close', (code) => {
+      // Only report success once the file is fully flushed to disk.
+      if (writeStream.writableFinished || streamError) finalize(code);
+      else {
+        writeStream.once('finish', () => finalize(code));
+        writeStream.once('error', () => finalize(code));
+      }
+    });
+
+    async function finalize(code) {
       const durationMs = Date.now() - startedAt;
 
-      if (code === 0) {
+      if (code === 0 && !streamError) {
         logger.info(`Backup completed: ${fileName} (${Math.round(sizeBytes / 1024)}KB, ${durationMs}ms)`);
         try {
           await query(`
@@ -78,7 +96,9 @@ async function runBackup() {
 
         resolve({ filePath, sizeBytes, durationMs });
       } else {
-        const errMsg = `pg_dump exited with code ${code}`;
+        const errMsg = streamError
+          ? `backup write failed: ${streamError.message}`
+          : `pg_dump exited with code ${code}`;
         logger.error('Backup failed', { code, durationMs });
         try {
           await query(`
@@ -90,7 +110,7 @@ async function runBackup() {
         try { fs.unlinkSync(filePath); } catch (_) {}
         reject(new Error(errMsg));
       }
-    });
+    }
 
     pgdump.on('error', async (err) => {
       writeStream.end();

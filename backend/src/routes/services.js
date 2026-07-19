@@ -2,7 +2,8 @@
 const router = require('express').Router();
 const { tenantQuery } = require('../db');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
-const { handleError } = require('../utils/errors');
+const { handleError, validateUUID, UUID_RE } = require('../utils/errors');
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const rateLimit = require('express-rate-limit');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
@@ -13,6 +14,9 @@ router.use(rateLimit({ windowMs: 60 * 1000, max: 120 }));
 router.get('/services', async (req, res) => {
   try {
     const { hospital_id, category, include_inactive } = req.query;
+    if (hospital_id && !UUID_RE.test(hospital_id)) {
+      return res.status(400).json({ error: 'Invalid hospital_id format' });
+    }
     const where = ['1=1'];
     const params = [];
     if (hospital_id) { params.push(hospital_id); where.push(`hospital_id=$${params.length}`); }
@@ -29,6 +33,9 @@ router.post('/services', adminOnly, async (req, res) => {
   try {
     const { name, description, category, duration_minutes, price, hospital_id } = req.body;
     if (!name?.trim()) return res.status(400).json({ error: 'name is required' });
+    if (hospital_id && !UUID_RE.test(hospital_id)) {
+      return res.status(400).json({ error: 'Invalid hospital_id format' });
+    }
     const r = await tenantQuery(req.tenant.schema_name,
       `INSERT INTO clinic_services (hospital_id, name, description, category, duration_minutes, price)
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
@@ -40,7 +47,7 @@ router.post('/services', adminOnly, async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-router.patch('/services/:id', adminOnly, async (req, res) => {
+router.patch('/services/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     const { name, description, category, duration_minutes, price, is_active } = req.body;
     const sets = [], params = [];
@@ -59,7 +66,7 @@ router.patch('/services/:id', adminOnly, async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-router.delete('/services/:id', adminOnly, async (req, res) => {
+router.delete('/services/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     await tenantQuery(req.tenant.schema_name,
       `UPDATE clinic_services SET is_active=false WHERE id=$1`, [req.params.id]);
@@ -89,6 +96,12 @@ router.post('/holidays', adminOnly, async (req, res) => {
     if (!holiday_date || !name?.trim()) {
       return res.status(400).json({ error: 'holiday_date and name are required' });
     }
+    if (!DATE_RE.test(holiday_date) || isNaN(Date.parse(holiday_date))) {
+      return res.status(400).json({ error: 'holiday_date must be a valid YYYY-MM-DD date' });
+    }
+    if (hospital_id && !UUID_RE.test(hospital_id)) {
+      return res.status(400).json({ error: 'Invalid hospital_id format' });
+    }
     const r = await tenantQuery(req.tenant.schema_name,
       `INSERT INTO clinic_holidays (hospital_id, holiday_date, name, created_by_user_id)
        VALUES ($1,$2,$3,$4) RETURNING *`,
@@ -102,7 +115,7 @@ router.post('/holidays', adminOnly, async (req, res) => {
   }
 });
 
-router.delete('/holidays/:id', adminOnly, async (req, res) => {
+router.delete('/holidays/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
       `DELETE FROM clinic_holidays WHERE id=$1 RETURNING *`, [req.params.id]);

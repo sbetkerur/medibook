@@ -118,7 +118,17 @@ const schemas = {
     name: Joi.string().min(2).max(255).optional(),
     address: Joi.string().max(500).optional().allow('', null),
     phone: Joi.string().max(20).optional().allow('', null),
-    notification_prefs: Joi.object().optional(),
+    // Keys here are merged into the top level of tenants.settings — the same
+    // jsonb blob that holds server-controlled keys (rate_limits,
+    // alert_webhook_url). Allowlist explicitly so a tenant admin can never
+    // inject those.
+    notification_prefs: Joi.object({
+      email_on_booking: Joi.boolean(),
+      reminder_24h_enabled: Joi.boolean(),
+      reminder_2h_enabled: Joi.boolean(),
+      reminder_hours_before_24: Joi.number().integer().min(1).max(168),
+      reminder_hours_before_2: Joi.number().integer().min(1).max(24),
+    }).optional(),
     notify_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).optional().allow('', null)
       .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +917795676142)' }),
   }),
@@ -166,7 +176,12 @@ const schemas = {
     name: Joi.string().min(2).max(255).required(),
     slug: Joi.string().min(2).max(100).pattern(/^[a-z0-9-]+$/).required(),
     owner_email: Joi.string().email().required(),
-    owner_password: Joi.string().min(8).optional(),
+    owner_password: Joi.string().min(8)
+      .pattern(/[A-Z]/, 'uppercase letter')
+      .pattern(/[a-z]/, 'lowercase letter')
+      .pattern(/[0-9]/, 'digit')
+      .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
+      .optional(),
     owner_name: Joi.string().max(255).optional().allow('', null),
     plan: Joi.string().valid('starter', 'growth', 'professional', 'enterprise').optional().default('starter'),
   }),

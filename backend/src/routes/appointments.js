@@ -26,6 +26,15 @@ router.get('/appointments', async (req, res) => {
       return res.status(400).json({ error: 'Invalid doctor_id format' });
     }
 
+    // Validate date params up front — garbage here reached the SQL cast and
+    // surfaced as a 500 on the main dashboard list.
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    for (const [name, val] of [['date', date], ['from', from], ['to', to]]) {
+      if (val && !DATE_RE.test(val)) {
+        return res.status(400).json({ error: `Invalid ${name} — expected YYYY-MM-DD` });
+      }
+    }
+
     const where = ['1=1'];
     const params = [];
     if (date) { params.push(date); where.push(`a.appointment_date=$${params.length}`); }
@@ -119,12 +128,16 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
       updated = await tenantTransaction(s, async (client) => {
         const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
         const statusParam = ids.length + 1;
-        // Only cancel appointments that are in a cancellable state ('confirmed' or 'no_show')
+        // Derive cancellable source states from APPOINTMENT_TRANSITIONS — the
+        // previous hard-coded ('confirmed','no_show') allowed no_show→cancelled,
+        // a transition the single-appointment route correctly rejects.
+        const cancellableSources = Object.keys(APPOINTMENT_TRANSITIONS)
+          .filter(from => APPOINTMENT_TRANSITIONS[from].includes('cancelled'));
         const r = await client.query(`
           UPDATE appointments SET status=$${statusParam}, updated_at=NOW(),
             cancellation_reason=$${statusParam + 1}, cancelled_at=NOW(), cancelled_by_user_id=$${statusParam + 2}
-          WHERE id IN (${placeholders}) AND status IN ('confirmed','no_show') RETURNING id, slot_id, doctor_id
-        `, [...ids, status, cancellation_reason, req.user.id]);
+          WHERE id IN (${placeholders}) AND status = ANY($${statusParam + 3}) RETURNING id, slot_id, doctor_id
+        `, [...ids, status, cancellation_reason, req.user.id, cancellableSources]);
 
         const slotIds = r.rows.map(a => a.slot_id).filter(Boolean);
         if (slotIds.length) {
@@ -232,16 +245,29 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       });
       if (!r) return res.status(409).json({ error: 'Appointment is not in a cancellable state (already cancelled or completed)' });
     } else {
-      // Non-cancel updates don't need the transaction overhead
+      // Non-cancel updates don't need the transaction overhead, but a status
+      // change must still be guarded against the status read above — otherwise
+      // a concurrent cancel can commit between the check and this UPDATE and
+      // e.g. a 'completed' lands on a cancelled row whose slot was released.
       const updates = ['updated_at=NOW()'];
       const params = [];
       if (status) { params.push(status); updates.push(`status=$${params.length}`); }
       if (notes !== undefined) { params.push(notes); updates.push(`notes=$${params.length}`); }
       if (note_category) { params.push(note_category); updates.push(`note_category=$${params.length}`); }
       params.push(req.params.id);
+      const idParam = params.length;
+      let guard = '';
+      if (status) {
+        params.push(oldR.rows[0].status);
+        guard = ` AND status=$${params.length}`;
+      }
       r = await tenantQuery(s,
-        `UPDATE appointments SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`, params);
-      if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
+        `UPDATE appointments SET ${updates.join(',')} WHERE id=$${idParam}${guard} RETURNING *`, params);
+      if (!r.rows[0]) {
+        return status
+          ? res.status(409).json({ error: 'Appointment status changed concurrently — reload and retry' })
+          : res.status(404).json({ error: 'Appointment not found' });
+      }
     }
 
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_APPOINTMENT', 'appointment', req.params.id,
@@ -373,8 +399,10 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
     const patient_phone = rawPhone.replace(/^\+/, '');
     const s = req.tenant.schema_name;
 
-    // Reject appointments in the past
-    const today = new Date().toISOString().slice(0, 10);
+    // Reject appointments in the past — IST "today", matching the Joi validator
+    // (UTC is a day behind IST between 18:30 and 23:59 UTC, which let admins
+    // create appointments dated yesterday).
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     if (appointment_date < today) {
       return res.status(400).json({ error: 'appointment_date cannot be in the past' });
     }
@@ -497,6 +525,9 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     if (follow_up_days < 1 || follow_up_days > 365) {
       return res.status(400).json({ error: 'follow_up_days must be between 1 and 365' });
     }
+    if (doctor_id && !UUID_RE.test(doctor_id)) {
+      return res.status(400).json({ error: 'Invalid doctor_id format' });
+    }
     const s = req.tenant.schema_name;
 
     // Get original appointment
@@ -513,6 +544,14 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     }
 
     const targetDoctorId = doctor_id || orig.doctor_id;
+    // The target doctor may differ from the original's — verify they're active
+    // and use THEIR hospital for the new appointment (the original's hospital_id
+    // is wrong when the follow-up doctor practices at another branch).
+    const targetDocR = await tenantQuery(s,
+      `SELECT id, hospital_id FROM doctors WHERE id=$1 AND is_active=true`, [targetDoctorId]);
+    if (!targetDocR.rows[0]) {
+      return res.status(400).json({ error: 'Follow-up doctor not found or is deactivated' });
+    }
     const { addDays, format } = require('date-fns');
     const followUpDate = format(addDays(new Date(orig.appointment_date), follow_up_days), 'yyyy-MM-dd');
 
@@ -522,14 +561,25 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     let followUp;
     try {
       followUp = await tenantTransaction(s, async (client) => {
+        // Lock the ORIGINAL appointment first — every multi-table writer must
+        // take locks in appointment → slot order (the bot reschedule does), or
+        // two of them meeting on the same rows deadlock.
+        await client.query(`SELECT id FROM appointments WHERE id=$1 FOR UPDATE`, [req.params.id]);
         // Lock the first available slot on or after the follow-up date.
-        // FOR UPDATE SKIP LOCKED serialises against concurrent bookers without blocking.
+        // FOR UPDATE SKIP LOCKED serialises against concurrent bookers without
+        // blocking. Skip clinic-holiday dates — holiday creation doesn't block
+        // already-generated slots, so they're still 'available' here.
         const slotR = await client.query(`
-          SELECT id, slot_date::text, start_time::text
-          FROM time_slots
+          SELECT id, hospital_id, slot_date::text, start_time::text
+          FROM time_slots ts
           WHERE doctor_id=$1
             AND slot_date >= $2
             AND status='available'
+            AND NOT EXISTS (
+              SELECT 1 FROM clinic_holidays ch
+              WHERE ch.holiday_date = ts.slot_date
+                AND (ch.hospital_id = ts.hospital_id OR ch.hospital_id IS NULL)
+            )
           ORDER BY slot_date, start_time
           LIMIT 1
           FOR UPDATE SKIP LOCKED
@@ -545,7 +595,7 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
         const { bookingId, row } = await insertAppointmentWithRetry(client, {
           patientId: orig.patient_id,
           doctorId: targetDoctorId,
-          hospitalId: orig.hospital_id,
+          hospitalId: slot.hospital_id || targetDocR.rows[0].hospital_id,
           slotId: slot.id,
           appointmentDate: slot.slot_date,
           appointmentTime: slot.start_time,

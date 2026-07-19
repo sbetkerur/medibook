@@ -97,9 +97,14 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
         upcoming_appointments: parseInt(upcoming.rows[0].count),
       });
     }
+    // Scrub the phone too — it's the primary identifier, so keeping it made
+    // "anonymised" records trivially re-identifiable. Replacement must satisfy
+    // the phone CHECK (^[0-9]{7,20}$); the '000' prefix can't collide with a
+    // real number (stored numbers never start with 0).
     const r = await tenantQuery(s, `
       UPDATE patients SET
         name='[Deleted]', email=NULL, date_of_birth=NULL, gender=NULL,
+        phone='000' || lpad(floor(random() * 1e15)::bigint::text, 15, '0'),
         dental_history='{}', deleted_at=NOW(), opted_out=true, updated_at=NOW()
       WHERE id=$1 RETURNING id
     `, [req.params.id]);

@@ -47,16 +47,22 @@ const RELEASE_LOCK_SCRIPT = `
  * @param {Function} fn       - async function to run when lock is acquired
  */
 async function withCronLock(lockName, ttlSeconds, fn) {
-  const client = getRedisClient();
-
-  if (!client) {
-    // No Redis — run unconditionally (single-instance is safe)
-    return fn();
+  // The TTL argument is required — calling withCronLock(name, fn) would
+  // silently treat the function as the TTL and never run the job.
+  if (typeof ttlSeconds !== 'number' || typeof fn !== 'function') {
+    throw new Error(`withCronLock("${lockName}") requires (lockName, ttlSeconds, fn)`);
   }
+
+  // No Redis configured — single-instance deployment; run directly.
+  // (Attempting the localhost default here would fail on every tick and, in
+  // production, skip every cron: no slots, no reminders, no retries.)
+  if (!process.env.REDIS_URL) return fn();
+
+  const client = getRedisClient();
+  if (!client) return fn();
 
   // Unique token per acquisition — used for atomic release via Lua script
   const lockToken = require('crypto').randomBytes(16).toString('hex');
-
   try {
     await client.connect().catch(() => {}); // no-op if already connected
     // SET lockName <token> NX EX ttlSeconds — atomic acquire
@@ -65,23 +71,29 @@ async function withCronLock(lockName, ttlSeconds, fn) {
       logger.info(`Cron lock "${lockName}" held by another instance — skipping`);
       return;
     }
-    // We hold the lock — run the job, then release atomically
-    try {
-      await fn();
-    } finally {
-      // Only DEL if we still own the lock (Lua script is atomic)
-      await client.eval(RELEASE_LOCK_SCRIPT, 1, lockName, lockToken).catch(() => {});
-    }
   } catch (redisErr) {
-    // In production with multiple instances, running without a lock risks duplicate cron work
-    // (double-sending reminders, double-generating slots). Skip instead.
+    // Redis IS configured but unreachable. With multiple instances, running
+    // without a lock risks duplicate cron work (double-sent reminders), so
+    // skip in production; dev/staging is single-instance, run unlocked.
     if (process.env.NODE_ENV === 'production') {
       logger.error(`Cron lock "${lockName}" Redis error in production — skipping to prevent duplicate runs`, { error: redisErr.message });
       return;
     }
-    // Dev/staging: run unconditionally (single instance, safe)
     logger.warn(`Cron lock "${lockName}" Redis error, running without lock`, { error: redisErr.message });
+    return fn();
+  }
+
+  // We hold the lock — run the job OUTSIDE the Redis try/catch so a job error
+  // is never mistaken for a Redis error (which used to re-run the job in dev).
+  try {
     await fn();
+    // Success: keep the lock until its TTL expires. Callers size ttlSeconds
+    // just under the cron interval as an interval guard — releasing early
+    // would let another instance's slightly-later tick duplicate the run.
+  } catch (jobErr) {
+    // Failure: release so the next tick can retry without waiting out the TTL.
+    await client.eval(RELEASE_LOCK_SCRIPT, 1, lockName, lockToken).catch(() => {});
+    logger.error(`Cron "${lockName}" job failed`, { error: jobErr.message });
   }
 }
 

@@ -119,9 +119,25 @@ router.get('/events', (req, res) => {
     try { res.write(': heartbeat\n\n'); } catch (_) {}
   }, 30 * 1000);
 
+  // Close the stream when the connecting token expires. Auth ran once at
+  // connect; without this a revoked/expired session (e.g. fired staff) keeps
+  // receiving live patient data for as long as the socket stays open. The
+  // frontend reconnects with a fresh token on 'medibook:token-refreshed'.
+  let expiryTimer = null;
+  if (req.user?.exp) {
+    const msUntilExpiry = req.user.exp * 1000 - Date.now();
+    expiryTimer = setTimeout(() => {
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'token_expired' })}\n\n`);
+        res.end();
+      } catch (_) {}
+    }, Math.max(msUntilExpiry, 0));
+  }
+
   // Cleanup on disconnect
   req.on('close', () => {
     clearInterval(heartbeat);
+    if (expiryTimer) clearTimeout(expiryTimer);
     clientSet.delete(res);
     if (clientSet.size === 0) _clients.delete(tenantId);
     logger.info('SSE client disconnected', { tenantId, remaining: clientSet.size });
