@@ -32,6 +32,64 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// ── Token refresh (cross-tab safe) ───────────────────────────
+// Refresh tokens are STRICTLY one-time-use server-side. If two tabs (e.g. the
+// dashboard and the reception queue display) refresh concurrently with the same
+// stored refresh_token, the loser gets a 401 and would wipe localStorage —
+// destroying the winner's freshly-written valid session and logging the whole
+// clinic out. So:
+//   1. Serialize refresh across tabs with the Web Locks API where available.
+//   2. Inside the lock, if another tab already rotated the token (the stored
+//      access token differs from the one that just failed), reuse it instead of
+//      burning our (now stale) refresh token.
+//   3. On refresh failure, if the stored refresh_token differs from the one we
+//      sent, another tab won the race — recover with its session instead of
+//      clearing storage.
+async function performTokenRefresh(failedAccessToken) {
+  const doRefresh = async () => {
+    const refreshToken = localStorage.getItem('refresh_token');
+    if (!refreshToken) {
+      const e = new Error('No refresh token');
+      e.code = 'NO_REFRESH_TOKEN';
+      throw e;
+    }
+    try {
+      const { data } = await axios.post(`${API_PROXY_BASE}/auth/refresh`, { refresh_token: refreshToken });
+      if (!data.token) throw new Error('Refresh response missing token');
+      localStorage.setItem('token', data.token);
+      if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
+      resetSessionTimers();
+      // Notify long-lived consumers of the old token (e.g. the dashboard's SSE
+      // EventSource, which embeds the token in its URL) so they can reconnect.
+      window.dispatchEvent(new CustomEvent('medibook:token-refreshed', { detail: { token: data.token } }));
+      return data.token;
+    } catch (refreshErr) {
+      // Another tab may have rotated the token while we were in flight (possible
+      // when Web Locks are unavailable). Its session is valid — recover with it.
+      const current = localStorage.getItem('refresh_token');
+      if (current && current !== refreshToken) {
+        const freshAccess = localStorage.getItem('token');
+        if (freshAccess) return freshAccess;
+      }
+      throw refreshErr;
+    }
+  };
+
+  const lockedRefresh = async () => {
+    // While we waited for the lock, another tab may have refreshed already.
+    // Only reuse the stored token if it differs from the one that just 401'd
+    // (a same-token 401 means expiry/revocation — a real refresh is needed).
+    const stored = localStorage.getItem('token');
+    if (stored && failedAccessToken && stored !== failedAccessToken) return stored;
+    return doRefresh();
+  };
+
+  if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+    return navigator.locks.request('medibook:token-refresh', lockedRefresh);
+  }
+  return lockedRefresh();
+}
+
 // ── Response interceptor: auto-refresh on 401 ────────────────
 api.interceptors.response.use(
   (res) => res,
@@ -42,14 +100,13 @@ api.interceptors.response.use(
     if (
       err.response?.status === 401 &&
       typeof window !== 'undefined' &&
+      originalRequest &&
       !originalRequest._retried &&
       !originalRequest.url?.includes('/auth/refresh') &&
       !originalRequest.url?.includes('/auth/login') &&
       !originalRequest.url?.includes('/auth/superadmin/login')
     ) {
-      const refreshToken = localStorage.getItem('refresh_token');
-
-      if (!refreshToken) {
+      if (!localStorage.getItem('refresh_token')) {
         // No refresh token available — redirect to login
         localStorage.removeItem('token');
         localStorage.removeItem('user');
@@ -58,7 +115,7 @@ api.interceptors.response.use(
       }
 
       if (isRefreshing) {
-        // Another refresh is in-flight — queue this request
+        // Another refresh is in-flight in this tab — queue this request
         return new Promise((resolve, reject) => {
           failedQueue.push({ resolve, reject });
         }).then((newToken) => {
@@ -69,25 +126,20 @@ api.interceptors.response.use(
 
       originalRequest._retried = true;
       isRefreshing = true;
+      const failedAccessToken =
+        String(originalRequest.headers?.Authorization || '').replace(/^Bearer\s+/i, '') || null;
 
       try {
-        const { data } = await axios.post(`${API_PROXY_BASE}/auth/refresh`, { refresh_token: refreshToken });
-        if (!data.token) throw new Error('Refresh response missing token');
-        localStorage.setItem('token', data.token);
-        if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
-        resetSessionTimers();
-        // Notify long-lived consumers of the old token (e.g. the dashboard's SSE
-        // EventSource, which embeds the token in its URL) so they can reconnect.
-        window.dispatchEvent(new CustomEvent('medibook:token-refreshed', { detail: { token: data.token } }));
+        const newToken = await performTokenRefresh(failedAccessToken);
+        api.defaults.headers.common.Authorization = `Bearer ${newToken}`;
+        processQueue(null, newToken);
 
-        api.defaults.headers.common.Authorization = `Bearer ${data.token}`;
-        processQueue(null, data.token);
-
-        originalRequest.headers.Authorization = `Bearer ${data.token}`;
+        originalRequest.headers.Authorization = `Bearer ${newToken}`;
         return api(originalRequest);
       } catch (refreshErr) {
         processQueue(refreshErr, null);
-        // Refresh failed — clear session and redirect
+        // Refresh genuinely failed (and no other tab holds a valid session) —
+        // clear session and redirect
         localStorage.removeItem('token');
         localStorage.removeItem('refresh_token');
         localStorage.removeItem('user');

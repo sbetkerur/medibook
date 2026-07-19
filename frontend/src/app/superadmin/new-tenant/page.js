@@ -32,7 +32,8 @@ export default function NewTenantPage() {
   useEffect(() => {
     const u = localStorage.getItem('user');
     if (!u) { router.push('/login'); return; }
-    const parsed = JSON.parse(u);
+    let parsed;
+    try { parsed = JSON.parse(u); } catch { router.push('/login'); return; }
     if (parsed.role !== 'super_admin') { router.push('/dashboard'); return; }
     api.get('/superadmin/plans').then(r => setPlans(r.data.plans || [])).catch(() => {});
   }, []);

@@ -2,8 +2,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import api from '@/lib/api';
+import { todayIST, todayISTDisplay } from '@/lib/dateIST';
 import toast from 'react-hot-toast';
-import { format } from 'date-fns';
+
+const IST_CLOCK = new Intl.DateTimeFormat('en-GB', {
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
+});
 
 export default function ReceptionPage() {
   const router = useRouter();
@@ -45,7 +49,9 @@ export default function ReceptionPage() {
 
   const fetchAppointments = useCallback(async () => {
     try {
-      const today = format(new Date(), 'yyyy-MM-dd');
+      // IST, not device-local: a display set to another timezone must still
+      // show the IST day's queue.
+      const today = todayIST();
       const { data } = await api.get(`/admin/appointments?date=${today}&limit=100`);
       const sorted = (data.appointments || []).sort((a, b) => {
         const timeA = a.appointment_time || '';
@@ -87,7 +93,7 @@ export default function ReceptionPage() {
     return classes[status] || 'bg-gray-400 text-white';
   }
 
-  const today = format(new Date(), 'EEEE, d MMMM yyyy');
+  const today = todayISTDisplay();
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col">
@@ -103,7 +109,7 @@ export default function ReceptionPage() {
         <div className="flex flex-wrap items-center gap-4 sm:gap-8">
           <div className="text-right">
             <div className="text-3xl sm:text-4xl font-mono font-bold text-blue-400">
-              {format(currentTime, 'HH:mm:ss')}
+              {IST_CLOCK.format(currentTime)}
             </div>
             <div className="text-sm text-gray-400 mt-1">
               Last updated {secondsSinceUpdate}s ago

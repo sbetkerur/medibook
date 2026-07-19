@@ -1,7 +1,8 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import api, { clearSessionTimers, resetSessionTimers } from '@/lib/api';
+import { todayIST } from '@/lib/dateIST';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
@@ -141,6 +142,9 @@ export default function Dashboard() {
   const [notifications, setNotifications] = useState([]);
   const [notifCount, setNotifCount] = useState(0);
   const [showNotifDropdown, setShowNotifDropdown] = useState(false);
+  // Keys (appointment id + booking_id) of notifications already shown, so SSE
+  // and the 30s poll never double-insert or re-count the same booking.
+  const notifSeenKeys = useRef(new Set());
 
   // Calendar state
   const [calendarDate, setCalendarDate] = useState(new Date());
@@ -150,12 +154,6 @@ export default function Dashboard() {
 
   // Analytics summary state
   const [analyticsSummary, setAnalyticsSummary] = useState(null);
-
-  // Dark mode
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== 'undefined') return localStorage.getItem('darkMode') === 'true';
-    return false;
-  });
 
   // Confirm modal state
   const [confirmModal, setConfirmModal] = useState(null); // {title, message, onConfirm, danger}
@@ -261,6 +259,11 @@ export default function Dashboard() {
   const [notesText, setNotesText] = useState('');
   const [notesSaving, setNotesSaving] = useState(false);
 
+  // Role gate: the backend enforces adminOnly on staff CRUD, settings PATCH,
+  // walk-ins, bulk updates, imports, WhatsApp sends, audit logs, etc. Staff
+  // users must not see UI that can only 403.
+  const isAdmin = user?.role === 'admin';
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     const u = localStorage.getItem('user');
@@ -300,10 +303,26 @@ export default function Dashboard() {
             });
             // Silently refresh stats so counters update
             fetchStats(true);
-            setNotifications(prev => [
-              { id: Date.now(), message: `New booking: ${payload?.patientName} at ${payload?.time}`, read: false, created_at: new Date().toISOString() },
-              ...prev.slice(0, 19),
-            ]);
+            // Normalize to the same shape as /admin/notifications/recent so the
+            // dropdown (which renders patient_name / doctor_name / booking_id)
+            // displays SSE-delivered bookings correctly.
+            const key = payload?.bookingId || `sse-${Date.now()}`;
+            if (!notifSeenKeys.current.has(key)) {
+              notifSeenKeys.current.add(key);
+              setNotifications(prev => [
+                {
+                  id: key,
+                  booking_id: payload?.bookingId,
+                  patient_name: payload?.patientName,
+                  doctor_name: payload?.doctorName,
+                  appointment_date: payload?.date,
+                  appointment_time: payload?.time,
+                  created_at: new Date().toISOString(),
+                },
+                ...prev.slice(0, 19),
+              ]);
+              setNotifCount(c => c + 1);
+            }
           }
         } catch (_) {}
       };
@@ -321,6 +340,13 @@ export default function Dashboard() {
       if (e.key === 'g') { gPressed = true; clearTimeout(gTimer); gTimer = setTimeout(() => { gPressed = false; }, 1000); return; }
       if (gPressed) {
         const navMap = { o: 'overview', a: 'appointments', d: 'doctors', p: 'patients', n: 'analytics', s: 'settings', t: 'test', l: 'audit' };
+        // Audit logs are admin-only on the backend — read the role fresh from
+        // localStorage (this closure was created before `user` state resolved).
+        if (navMap[e.key] === 'audit') {
+          let role = null;
+          try { role = JSON.parse(localStorage.getItem('user') || '{}').role; } catch (_) {}
+          if (role !== 'admin') { gPressed = false; return; }
+        }
         if (navMap[e.key]) { setTab(navMap[e.key]); gPressed = false; }
       }
       if (e.key === '?') {
@@ -340,11 +366,6 @@ export default function Dashboard() {
       if (es) es.close();
     };
   }, []);
-
-  useEffect(() => {
-    localStorage.setItem('darkMode', String(darkMode));
-    document.documentElement.classList.toggle('dark', darkMode);
-  }, [darkMode]);
 
   const fetchStats = useCallback(async (silent = false) => {
     if (silent) setStatsRefreshing(true);
@@ -455,7 +476,13 @@ export default function Dashboard() {
       setSettings(data);
       setSettingsForm({
         name: data.clinic_name || '',
-        notification_prefs: data.settings?.notification_prefs || {},
+        // PATCH /settings merges these keys into the TOP level of tenants.settings,
+        // so read them back from there (settings.notification_prefs never exists).
+        notification_prefs: {
+          email_on_booking: data.settings?.email_on_booking,
+          reminder_24h_enabled: data.settings?.reminder_24h_enabled,
+          reminder_2h_enabled: data.settings?.reminder_2h_enabled,
+        },
         notify_phone: data.notify_phone || '',
       });
     } catch { toast.error('Failed to load settings'); }
@@ -538,10 +565,20 @@ export default function Dashboard() {
     try {
       const startDate = `${year}-${String(month + 1).padStart(2, '0')}-01`;
       const endDate = `${year}-${String(month + 1).padStart(2, '0')}-${new Date(year, month + 1, 0).getDate()}`;
-      const { data } = await api.get(`/admin/appointments?from=${startDate}&to=${endDate}&limit=200&page=1&status=confirmed,completed`);
+      // The backend caps `limit` at 100 and sorts DESC — a busy month can exceed
+      // that, silently dropping the earliest days. Page through until has_more
+      // is false (safety cap of 10 pages = 1000 appointments).
+      const all = [];
+      for (let page = 1; page <= 10; page++) {
+        const { data } = await api.get(
+          `/admin/appointments?from=${startDate}&to=${endDate}&limit=100&page=${page}&status=confirmed,completed`
+        );
+        all.push(...(data.appointments || []));
+        if (!data.has_more) break;
+      }
       // Group by date
       const byDate = {};
-      (data.appointments || []).forEach(a => {
+      all.forEach(a => {
         const d = a.appointment_date;
         if (!byDate[d]) byDate[d] = [];
         byDate[d].push(a);
@@ -554,16 +591,22 @@ export default function Dashboard() {
     try {
       const { data } = await api.get('/admin/notifications/recent');
       const newOnes = data.notifications || [];
-      if (newOnes.length > 0) {
-        setNotifications(prev => {
-          const existingIds = new Set(prev.map(n => n.id));
-          const incoming = newOnes.filter(n => !existingIds.has(n.id));
-          if (incoming.length > 0) {
-            toast(`🔔 ${incoming.length} new booking${incoming.length > 1 ? 's' : ''}!`, { icon: '📅' });
-          }
-          return [...incoming, ...prev].slice(0, 20);
+      // Dedup against everything already shown (SSE entries are keyed by
+      // booking_id; polled entries carry the appointment UUID) via the seen-set
+      // ref, so StrictMode double-invoked updaters can't double-count.
+      const incoming = newOnes.filter(
+        n => !notifSeenKeys.current.has(n.id) && !notifSeenKeys.current.has(n.booking_id)
+      );
+      if (incoming.length > 0) {
+        incoming.forEach(n => {
+          if (n.id) notifSeenKeys.current.add(n.id);
+          if (n.booking_id) notifSeenKeys.current.add(n.booking_id);
         });
-        setNotifCount(newOnes.length);
+        toast(`🔔 ${incoming.length} new booking${incoming.length > 1 ? 's' : ''}!`, { icon: '📅' });
+        setNotifications(prev => [...incoming, ...prev].slice(0, 20));
+        // Count only genuinely new bookings, so "Clear" stays cleared for
+        // bookings the admin has already seen.
+        setNotifCount(c => c + incoming.length);
       }
     } catch { /* silent */ }
   }, []);
@@ -911,7 +954,7 @@ export default function Dashboard() {
 
   async function openSlotsViewer(doc) {
     setSlotsDoctor(doc);
-    const today = format(new Date(), 'yyyy-MM-dd');
+    const today = todayIST();
     setSlotsDate(today);
     setSlots([]);
     setShowSlotsModal(true);
@@ -982,6 +1025,7 @@ export default function Dashboard() {
           if (data) await fetchAllHospitalDepts(data);
         }
         else if (tab === 'staff') await fetchStaff();
+        else if (tab === 'slots') { if (!doctors.length) await fetchDoctors(); }
         else if (tab === 'leaves') { const { data } = await api.get('/admin/doctors'); setLeavesDoctorList(data.doctors || []); }
         else if (tab === 'settings') await fetchSettings();
         else if (tab === 'audit') await fetchAuditLogs(1);
@@ -1019,7 +1063,10 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (tab === 'patients') {
-      const t = setTimeout(fetchPatients, 400);
+      // Reset to page 1 on a new search — otherwise searching from page 2+
+      // requests that page of the filtered results and shows a false
+      // "No patients found".
+      const t = setTimeout(() => { setPatientPage(1); fetchPatients(1); }, 400);
       return () => clearTimeout(t);
     }
   }, [patientSearch]);
@@ -1233,29 +1280,39 @@ export default function Dashboard() {
 
   async function printReceipt(apptId) {
     try {
-      const token = localStorage.getItem('token');
-      const resp = await fetch(`/api/proxy/api/admin/appointments/${apptId}/receipt`, {
-        headers: { Authorization: `Bearer ${token}` },
+      // Go through the api instance (not raw fetch) so an expired token is
+      // auto-refreshed instead of surfacing "Receipt not available".
+      const resp = await api.get(`/admin/appointments/${apptId}/receipt`, {
+        responseType: 'text',
+        transformResponse: [(d) => d],
       });
-      if (!resp.ok) { toast.error('Receipt not available'); return; }
-      const html = await resp.text();
-      const blob = new Blob([html], { type: 'text/html' });
+      const blob = new Blob([resp.data], { type: 'text/html' });
       const url = URL.createObjectURL(blob);
       const w = window.open(url, '_blank');
       if (w) setTimeout(() => URL.revokeObjectURL(url), 5000);
     } catch { toast.error('Failed to load receipt'); }
   }
 
-  async function exportCSV() {
-    if (!appointments.length) { toast.error('No data to export'); return; }
+  // Excel/Sheets execute cells starting with = + - @ as formulas. Patient names
+  // come from WhatsApp (attacker-controlled), so neutralize them with a leading
+  // apostrophe before quoting.
+  function csvCell(v) {
+    let s = String(v ?? '');
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+
+  async function exportCSV(rowsOverride) {
+    const source = rowsOverride || appointments;
+    if (!source.length) { toast.error('No data to export'); return; }
     const h = ['Booking ID', 'Patient', 'Phone', 'Doctor', 'Department', 'Date', 'Time', 'Type', 'Status'];
-    const rows = appointments.map(a => [
+    const rows = source.map(a => [
       a.booking_id, a.patient_name, a.patient_phone,
       `Dr. ${a.doctor_name}`, a.department_name || '',
       a.appointment_date, a.appointment_time?.slice(0, 5),
       a.visit_type || 'in_person', a.status
     ]);
-    const csv = [h, ...rows].map(r => r.map(v => `"${String(v || '').replace(/"/g, '""')}"`).join(',')).join('\n');
+    const csv = [h, ...rows].map(r => r.map(csvCell).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const link = document.createElement('a');
     const objectUrl = URL.createObjectURL(blob);
@@ -1385,7 +1442,8 @@ export default function Dashboard() {
           <button className="md:hidden text-gray-400 hover:text-gray-600 p-1" onClick={() => setSidebarOpen(false)}>✕</button>
         </div>
         <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
-          {NAV.map(item => (
+          {/* Audit logs endpoint is admin-only (403 for staff) — hide the tab */}
+          {NAV.filter(item => isAdmin || item.id !== 'audit').map(item => (
             <button key={item.id} onClick={() => { setTab(item.id); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                 tab === item.id ? 'bg-blue-50 text-blue-600' : 'text-gray-600 hover:bg-gray-50'
@@ -1425,7 +1483,7 @@ export default function Dashboard() {
               </button>
             )}
             {tab === 'appointments' && (
-              <button onClick={exportCSV}
+              <button onClick={() => exportCSV()}
                 className="p-2 sm:px-3 sm:py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition" title="Export CSV">
                 📥<span className="hidden sm:inline"> Export CSV</span>
               </button>
@@ -1464,14 +1522,9 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
-            <button onClick={fetchStats}
+            <button onClick={() => fetchStats()}
               className="p-2 sm:px-3 sm:py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition" title="Refresh">
               🔄<span className="hidden sm:inline"> Refresh</span>
-            </button>
-            <button onClick={() => setDarkMode(v => !v)}
-              className="p-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition"
-              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
-              {darkMode ? '☀️' : '🌙'}
             </button>
           </div>
         </header>
@@ -1630,7 +1683,16 @@ export default function Dashboard() {
                   <button onClick={() => setTab('appointments')} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">View All Appointments</button>
                   <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Dentists</button>
                   <button onClick={() => setTab('test')} className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700 transition">Test WhatsApp Bot</button>
-                  <button onClick={() => { setTab('appointments'); setTimeout(exportCSV, 500); }} className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">Export CSV</button>
+                  <button onClick={async () => {
+                    // Fetch fresh rows instead of racing the appointments tab's
+                    // state via setTimeout — the old approach exported whatever
+                    // stale (usually empty) list was in memory.
+                    setTab('appointments');
+                    try {
+                      const { data } = await api.get('/admin/appointments?limit=100&page=1');
+                      exportCSV(data.appointments || []);
+                    } catch { toast.error('Failed to export'); }
+                  }} className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">Export CSV</button>
                 </div>
               </div>
             </div>
@@ -1655,6 +1717,7 @@ export default function Dashboard() {
                     className="text-sm text-blue-600 hover:underline">Clear filters</button>
                 )}
                 <span className="text-sm text-gray-400 ml-auto">{apptTotal > 0 ? `${apptTotal} total` : `${appointments.length} records`}</span>
+                {isAdmin && (<>
                 <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(''); setWaMessageText(''); }}
                   className="px-3 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition flex items-center gap-1.5">
                   📤 Message Patient
@@ -1663,9 +1726,10 @@ export default function Dashboard() {
                   className="px-3 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-1.5">
                   + Walk-in
                 </button>
+                </>)}
               </div>
 
-              {selectedApptIds.size > 0 && (
+              {isAdmin && selectedApptIds.size > 0 && (
                 <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 flex flex-wrap items-center gap-3">
                   <span className="text-sm font-medium text-blue-700">{selectedApptIds.size} selected</span>
                   <button onClick={() => bulkUpdateAppointments('completed')} disabled={bulkUpdating}
@@ -1698,8 +1762,10 @@ export default function Dashboard() {
                           <div className="flex items-center gap-1.5 mt-0.5">
                             <a href={`https://wa.me/${a.patient_phone}`} target="_blank" rel="noreferrer"
                               className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
+                            {isAdmin && (
                             <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(a.patient_phone || ''); setWaMessageText(''); }}
                               className="text-xs text-green-500 hover:text-green-700">📤</button>
+                            )}
                           </div>
                         </div>
                         <Badge status={a.status} />
@@ -1747,6 +1813,7 @@ export default function Dashboard() {
                     <thead className="bg-gray-50 border-b border-gray-200">
                       <tr>
                         <th className="px-3 py-3 w-8">
+                          {isAdmin && (
                           <input type="checkbox"
                             checked={appointments.length > 0 && appointments.every(a => selectedApptIds.has(a.id))}
                             onChange={e => {
@@ -1754,6 +1821,7 @@ export default function Dashboard() {
                               else setSelectedApptIds(new Set());
                             }}
                             className="rounded border-gray-300 text-blue-600" />
+                          )}
                         </th>
                         {['Booking ID', 'Patient', 'Doctor', 'Date', 'Time', 'Type', 'Status', 'Actions'].map(h => (
                           <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
@@ -1764,6 +1832,7 @@ export default function Dashboard() {
                       {appointments.map(a => (
                         <tr key={a.id} className={`hover:bg-gray-50 transition-colors ${selectedApptIds.has(a.id) ? 'bg-blue-50' : ''}`}>
                           <td className="px-3 py-3">
+                            {isAdmin && (
                             <input type="checkbox" checked={selectedApptIds.has(a.id)}
                               onChange={e => {
                                 const next = new Set(selectedApptIds);
@@ -1771,6 +1840,7 @@ export default function Dashboard() {
                                 setSelectedApptIds(next);
                               }}
                               className="rounded border-gray-300 text-blue-600" />
+                            )}
                           </td>
                           <td className="px-4 py-3 font-mono text-xs font-medium text-blue-600">{a.booking_id}</td>
                           <td className="px-4 py-3">
@@ -1778,9 +1848,11 @@ export default function Dashboard() {
                             <div className="flex items-center gap-1.5">
                               <a href={`https://wa.me/${a.patient_phone}`} target="_blank" rel="noreferrer"
                                 className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
+                              {isAdmin && (
                               <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(a.patient_phone || ''); setWaMessageText(''); }}
                                 title="Send WhatsApp message"
                                 className="text-xs text-green-500 hover:text-green-700">📤</button>
+                              )}
                             </div>
                           </td>
                           <td className="px-4 py-3 text-gray-700 text-sm">Dr. {a.doctor_name}</td>
@@ -1873,6 +1945,7 @@ export default function Dashboard() {
                     <span className="text-sm text-gray-500">Show inactive</span>
                   </label>
                 </div>
+                {isAdmin && (
                 <div className="flex items-center gap-2">
                   <label className={`px-3 py-2 text-sm border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition whitespace-nowrap ${importingDoctors ? 'opacity-50 pointer-events-none' : ''}`}>
                     {importingDoctors ? '⏳ Importing...' : '📤 Import CSV'}
@@ -1883,6 +1956,7 @@ export default function Dashboard() {
                     + Add Doctor
                   </button>
                 </div>
+                )}
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                 {doctors.map(d => (
@@ -1908,22 +1982,28 @@ export default function Dashboard() {
                       <p className="mt-2 text-xs text-red-400 font-medium">⚠️ Inactive — hidden from bot</p>
                     )}
                     <div className="mt-4 pt-3 border-t border-gray-100 grid grid-cols-2 gap-2">
+                      {isAdmin && (
                       <button onClick={() => openEditDoctor(d)}
                         className="px-3 py-2 text-xs font-medium border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
                         ✏️ Edit
                       </button>
+                      )}
+                      {isAdmin && (
                       <button onClick={() => openSchedule(d)}
                         className="px-3 py-2 text-xs font-medium border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 transition">
                         📅 Schedule
                       </button>
+                      )}
                       <button onClick={() => openSlotsViewer(d)}
                         className="px-3 py-2 text-xs font-medium border border-green-200 text-green-600 rounded-lg hover:bg-green-50 transition">
                         ⏰ View Slots
                       </button>
+                      {isAdmin && (
                       <button onClick={() => toggleDoctorStatus(d)}
                         className={`px-3 py-2 text-xs font-medium border rounded-lg transition ${d.is_active ? 'border-red-200 text-red-500 hover:bg-red-50' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
                         {d.is_active ? '🚫 Deactivate' : '✅ Activate'}
                       </button>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -1949,10 +2029,12 @@ export default function Dashboard() {
                   onChange={e => setPatientSearch(e.target.value)}
                   className="w-full max-w-sm border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
+                {isAdmin && (
                 <label className={`px-3 py-1.5 text-sm border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition whitespace-nowrap ${importingPatients ? 'opacity-50 pointer-events-none' : ''}`}>
                   {importingPatients ? '⏳ Importing...' : '📤 Import CSV'}
                   <input type="file" accept=".csv" className="hidden" onChange={importPatientsCSV} disabled={importingPatients} />
                 </label>
+                )}
               </div>
               {patientTotal > 0 && (
                 <p className="text-sm text-gray-400">{patientTotal} patient{patientTotal !== 1 ? 's' : ''} total</p>
@@ -1975,6 +2057,7 @@ export default function Dashboard() {
                           <div>{p.visit_count} visits</div>
                         </div>
                       </div>
+                      {isAdmin && (
                       <div className="flex gap-2 mt-3">
                         <button onClick={e => { e.stopPropagation(); openEditPatient(p); }}
                           className="px-3 py-2 text-xs text-blue-600 border border-blue-200 bg-blue-50 rounded-lg hover:bg-blue-100 transition">
@@ -1985,6 +2068,7 @@ export default function Dashboard() {
                           🗑 Delete
                         </button>
                       </div>
+                      )}
                     </div>
                   ))}
                   {!patients.length && (
@@ -2018,12 +2102,14 @@ export default function Dashboard() {
                           {p.created_at ? (() => { try { return format(parseISO(p.created_at), 'd MMM yyyy'); } catch { return ''; } })() : '—'}
                         </td>
                         <td className="px-4 py-3">
+                          {isAdmin && (
                           <div className="flex gap-2">
                             <button onClick={e => { e.stopPropagation(); openEditPatient(p); }}
                               className="text-xs text-blue-600 hover:underline whitespace-nowrap">✏️ Edit</button>
                             <button onClick={e => { e.stopPropagation(); deletePatient(p); }}
                               className="text-xs text-red-500 hover:underline whitespace-nowrap">🗑</button>
                           </div>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -2057,10 +2143,12 @@ export default function Dashboard() {
             <div className="space-y-6">
               <div className="flex items-center justify-between">
                 <p className="text-sm text-gray-500">{hospitals.length} hospital{hospitals.length !== 1 ? 's' : ''}</p>
+                {isAdmin && (
                 <button onClick={() => { setEditingHospital(null); setHospitalForm({ name: '', address: '', city: '', phone: '' }); setShowHospitalModal(true); }}
                   className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
                   + Add Hospital
                 </button>
+                )}
               </div>
 
               {hospitals.length === 0 ? (
@@ -2068,10 +2156,12 @@ export default function Dashboard() {
                   <div className="text-5xl mb-3">🏥</div>
                   <p className="text-gray-500 font-medium">No hospitals yet</p>
                   <p className="text-gray-400 text-sm mt-1">Add your first hospital to get started</p>
+                  {isAdmin && (
                   <button onClick={() => setShowHospitalModal(true)}
                     className="mt-4 px-5 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
                     + Add Hospital
                   </button>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-4">
@@ -2088,6 +2178,7 @@ export default function Dashboard() {
                               {h.phone && <span>📞 {h.phone}</span>}
                             </div>
                           </div>
+                          {isAdmin && (
                           <div className="flex items-center gap-2 shrink-0 ml-3">
                             <button onClick={() => openEditHospital(h)}
                               className="px-3 py-1.5 text-xs font-medium bg-gray-50 text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-100 transition">
@@ -2103,6 +2194,7 @@ export default function Dashboard() {
                               🗑
                             </button>
                           </div>
+                          )}
                         </div>
                         <div className="px-5 py-3">
                           <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
@@ -2117,10 +2209,12 @@ export default function Dashboard() {
                                   className="flex items-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-700 text-sm rounded-lg border border-blue-100 group">
                                   <span>{d.name}</span>
                                   {d.description && <span className="text-blue-400 ml-1 text-xs">— {d.description}</span>}
+                                  {isAdmin && (<>
                                   <button onClick={() => openEditDept(d, h)}
                                     className="ml-1 text-blue-400 hover:text-blue-600 opacity-0 group-hover:opacity-100 transition text-xs">✏️</button>
                                   <button onClick={() => deleteDept(d, h)}
                                     className="text-red-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition text-xs">✕</button>
+                                  </>)}
                                 </div>
                               ))}
                             </div>
@@ -2399,10 +2493,12 @@ export default function Dashboard() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <p className="text-sm text-gray-500">{services.length} treatment{services.length !== 1 ? 's' : ''} in catalog</p>
+                {isAdmin && (
                 <button onClick={() => { setEditingService(null); setServiceForm({ name: '', description: '', category: '', duration_minutes: '30', price: '', hospital_id: hospitals[0]?.id || '' }); setShowServiceModal(true); }}
                   className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition">
                   + Add Service
                 </button>
+                )}
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                 {services.map(svc => (
@@ -2412,12 +2508,14 @@ export default function Dashboard() {
                         <h3 className="font-semibold text-gray-900 text-sm truncate">{svc.name}</h3>
                         {svc.category && <span className="text-xs text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">{svc.category}</span>}
                       </div>
+                      {isAdmin && (
                       <div className="flex gap-1 ml-2 shrink-0">
                         <button onClick={() => openEditService(svc)}
                           className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition">✏️</button>
                         <button onClick={() => deleteService(svc)}
                           className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition">🗑️</button>
                       </div>
+                      )}
                     </div>
                     {svc.description && <p className="text-xs text-gray-500 mb-3 line-clamp-2">{svc.description}</p>}
                     <div className="flex items-center gap-3 text-xs text-gray-600">
@@ -2441,7 +2539,8 @@ export default function Dashboard() {
           {/* ── HOLIDAYS (A4) ── */}
           {tab === 'holidays' && !tabLoading && (
             <div className="space-y-4">
-              {/* Add holiday form */}
+              {/* Add holiday form (holiday CRUD is admin-only server-side) */}
+              {isAdmin && (
               <div className="bg-white rounded-xl p-5 shadow-sm">
                 <h3 className="font-semibold text-gray-800 mb-4">Add Clinic Holiday / Closure</h3>
                 <form onSubmit={addHoliday} className="flex flex-wrap gap-3 items-end">
@@ -2476,6 +2575,7 @@ export default function Dashboard() {
                   ⚠️ Holidays block new slot generation and hide available slots on that day. Already-confirmed appointments are not affected.
                 </p>
               </div>
+              )}
 
               {/* Holidays list */}
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
@@ -2512,10 +2612,12 @@ export default function Dashboard() {
                               {h.created_at ? (() => { try { return format(parseISO(h.created_at), 'd MMM yy'); } catch { return '—'; } })() : '—'}
                             </td>
                             <td className="px-4 py-3">
+                              {isAdmin && (
                               <button onClick={() => deleteHoliday(h)}
                                 className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition">
                                 Remove
                               </button>
+                              )}
                             </td>
                           </tr>
                         ))}
@@ -2532,10 +2634,12 @@ export default function Dashboard() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <p className="text-sm text-gray-500">{staff.length} team member{staff.length !== 1 ? 's' : ''}</p>
+                {isAdmin && (
                 <button onClick={() => { setEditingStaff(null); setStaffForm({ name: '', email: '', password: '', role: 'staff' }); setShowStaffModal(true); }}
                   className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition">
                   + Add Staff
                 </button>
+                )}
               </div>
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
                 <div className="overflow-x-auto">
@@ -2563,6 +2667,7 @@ export default function Dashboard() {
                           </span>
                         </td>
                         <td className="px-4 py-3">
+                          {isAdmin && (
                           <div className="flex gap-2">
                             <button onClick={() => { setEditingStaff(m); setStaffForm({ name: m.name, email: m.email, password: '', role: m.role }); setShowStaffModal(true); }}
                               className="px-2 py-1 text-xs border border-gray-200 text-gray-600 rounded hover:bg-gray-50 transition">
@@ -2575,6 +2680,7 @@ export default function Dashboard() {
                               </button>
                             )}
                           </div>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -2640,10 +2746,14 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="pt-4">
-                      <button type="submit" disabled={settingsSaving}
-                        className="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-                        {settingsSaving ? 'Saving...' : '💾 Save Settings'}
-                      </button>
+                      {isAdmin ? (
+                        <button type="submit" disabled={settingsSaving}
+                          className="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
+                          {settingsSaving ? 'Saving...' : '💾 Save Settings'}
+                        </button>
+                      ) : (
+                        <p className="text-xs text-gray-400">Only clinic admins can change these settings.</p>
+                      )}
                     </div>
                   </form>
                 )}
@@ -2802,7 +2912,7 @@ export default function Dashboard() {
                       if (!day) return <div key={`e-${i}`} className="border-r border-b border-gray-100 min-h-[76px]" />;
                       const dateStr = formatCalDate(calendarDate.getFullYear(), calendarDate.getMonth(), day);
                       const dayAppts = calendarAppts[dateStr] || [];
-                      const todayStr = format(new Date(), 'yyyy-MM-dd');
+                      const todayStr = todayIST();
                       const isToday = dateStr === todayStr;
                       const isSelected = selectedCalDay === dateStr;
                       return (
@@ -2891,7 +3001,8 @@ export default function Dashboard() {
                     </div>
                   ) : (
                     <div className="space-y-4">
-                      {/* Add leave form */}
+                      {/* Add leave form (leave CRUD is admin-only server-side) */}
+                      {isAdmin && (
                       <div className="bg-white rounded-xl p-5 shadow-sm">
                         <h3 className="font-semibold text-gray-800 mb-4">Add Leave — Dr. {leavesDoctor.name}</h3>
                         <div className="flex flex-wrap gap-3 items-end">
@@ -2899,7 +3010,7 @@ export default function Dashboard() {
                             <label className="block text-xs font-medium text-gray-700 mb-1">Leave Date *</label>
                             <input type="date" value={leaveDate}
                               onChange={e => setLeaveDate(e.target.value)}
-                              min={format(new Date(), 'yyyy-MM-dd')}
+                              min={todayIST()}
                               className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
                           </div>
                           <div className="flex-1 min-w-[160px]">
@@ -2918,6 +3029,7 @@ export default function Dashboard() {
                           ⚠️ Adding a leave blocks all available slots on that day. Already-booked appointments are not affected.
                         </p>
                       </div>
+                      )}
 
                       {/* Existing leaves */}
                       <div className="bg-white rounded-xl shadow-sm overflow-hidden">
@@ -2945,10 +3057,12 @@ export default function Dashboard() {
                                   </div>
                                   {l.reason && <div className="text-xs text-gray-400 mt-0.5">{l.reason}</div>}
                                 </div>
+                                {isAdmin && (
                                 <button onClick={() => removeLeave(leavesDoctor.id, l.leave_date)}
                                   className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition">
                                   Remove
                                 </button>
+                                )}
                               </div>
                             ))}
                           </div>
@@ -2962,7 +3076,7 @@ export default function Dashboard() {
           )}
 
           {/* ── AUDIT LOGS ── */}
-          {tab === 'audit' && !tabLoading && (
+          {tab === 'audit' && isAdmin && !tabLoading && (
             <div className="space-y-4">
               {/* Filters */}
               <div className="bg-white rounded-xl p-4 shadow-sm flex flex-wrap gap-3 items-end">
@@ -3083,6 +3197,7 @@ export default function Dashboard() {
                     ))}
                   </div>
                 </div>
+                {isAdmin && (
                 <div className="pt-1 border-t border-gray-100 flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs text-gray-400">If the bot gets stuck, reset the session to start fresh.</span>
                   <button onClick={resetBotSession} disabled={botResetting}
@@ -3090,6 +3205,7 @@ export default function Dashboard() {
                     {botResetting ? 'Resetting...' : '🔄 Reset Session'}
                   </button>
                 </div>
+                )}
               </div>
 
               {botResponse && (
@@ -3400,7 +3516,7 @@ export default function Dashboard() {
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-gray-800">🩺 Medical History</h3>
-                {!medHistoryEditing ? (
+                {!isAdmin ? null : !medHistoryEditing ? (
                   <button onClick={() => setMedHistoryEditing(true)}
                     className="text-xs text-blue-600 hover:underline">Edit</button>
                 ) : (
@@ -3479,6 +3595,7 @@ export default function Dashboard() {
           <div className="border-t border-gray-100 pt-4">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold text-gray-800">📎 Documents & Prescriptions</h3>
+              {isAdmin && (
               <label className={`cursor-pointer px-3 py-1.5 text-xs bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition ${docUploading ? 'opacity-50 pointer-events-none' : ''}`}>
                 {docUploading ? 'Uploading...' : '+ Upload'}
                 <input type="file" className="hidden" accept=".pdf,.jpg,.jpeg,.png,.docx"
@@ -3510,6 +3627,7 @@ export default function Dashboard() {
                     }
                   }} />
               </label>
+              )}
             </div>
             {patientDocuments.length === 0 ? (
               <div className="text-center text-gray-400 py-6 text-sm">No documents uploaded yet</div>
@@ -3541,6 +3659,7 @@ export default function Dashboard() {
                           } catch { toast.error('Download failed'); }
                         }}
                         className="text-xs text-blue-600 hover:underline px-2 py-1">Download</button>
+                      {isAdmin && (
                       <button
                         onClick={async () => {
                           if (!window.confirm(`Delete "${doc.file_name}"?`)) return;
@@ -3551,6 +3670,7 @@ export default function Dashboard() {
                           } catch { toast.error('Delete failed'); }
                         }}
                         className="text-xs text-red-400 hover:text-red-600 px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity">✕</button>
+                      )}
                     </div>
                   </div>
                 ))}

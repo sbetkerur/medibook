@@ -1,12 +1,13 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
 import api from '@/lib/api';
+import { todayIST } from '@/lib/dateIST';
 import toast from 'react-hot-toast';
-import { format } from 'date-fns';
 
 export default function SlotsTab({ doctors }) {
   const [selDoctor, setSelDoctor] = useState('');
-  const [selDate, setSelDate] = useState(format(new Date(), 'yyyy-MM-dd'));
+  // IST, not device-local — the product timezone is Asia/Kolkata.
+  const [selDate, setSelDate] = useState(todayIST());
   const [slots, setSlots] = useState([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
 

@@ -1,7 +1,7 @@
 'use client';
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import api from '@/lib/api';
+import api, { clearSessionTimers } from '@/lib/api';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
@@ -44,10 +44,20 @@ export default function SuperAdminPage() {
   useEffect(() => {
     const u = localStorage.getItem('user');
     if (!u) { router.push('/login'); return; }
-    const parsed = JSON.parse(u);
+    let parsed;
+    try { parsed = JSON.parse(u); } catch { router.push('/login'); return; }
     if (parsed.role !== 'super_admin') { router.push('/dashboard'); return; }
     fetchAll();
   }, []);
+
+  async function logout() {
+    // Revoke the session server-side (jti blacklist + refresh-token revocation)
+    // — clearing localStorage alone leaves the tokens valid for up to 1h / 30d.
+    try { await api.post('/auth/logout'); } catch (_) {}
+    clearSessionTimers();
+    localStorage.clear();
+    router.push('/login');
+  }
 
   async function fetchAll() {
     setLoading(true);
@@ -177,7 +187,7 @@ export default function SuperAdminPage() {
           <span className="text-xl font-bold text-blue-600">🏥 MediBook</span>
           <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full font-medium">Super Admin</span>
         </div>
-        <button onClick={() => { localStorage.clear(); router.push('/login'); }}
+        <button onClick={logout}
           className="text-sm text-gray-500 hover:text-red-500 transition">Sign Out</button>
       </nav>
 

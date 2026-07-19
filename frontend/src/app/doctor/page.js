@@ -2,8 +2,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import api from '@/lib/api';
+import { todayIST, todayISTDisplay } from '@/lib/dateIST';
 import toast from 'react-hot-toast';
-import { format } from 'date-fns';
 
 export default function DoctorPage() {
   const router = useRouter();
@@ -17,8 +17,10 @@ export default function DoctorPage() {
   const [saving, setSaving] = useState(false);
   const [completing, setCompleting] = useState(false);
 
-  const today = format(new Date(), 'yyyy-MM-dd');
-  const todayDisplay = format(new Date(), 'EEEE, d MMMM yyyy');
+  // Product timezone is IST — a device set to another timezone (e.g. a UTC
+  // kiosk) must still show the IST day's schedule.
+  const today = todayIST();
+  const todayDisplay = todayISTDisplay();
 
   useEffect(() => {
     const token = localStorage.getItem('token');
