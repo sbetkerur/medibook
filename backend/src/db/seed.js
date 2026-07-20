@@ -231,9 +231,18 @@ async function seed() {
 ─────────────────────────────────────────`);
 
   await pool.end();
+  // generateSlotsForDoctor's public-holiday cache opens the shared Redis
+  // client; its live socket keeps the event loop alive after the pool closes,
+  // so the seed process never exits. entrypoint.sh runs migrate → seed → start
+  // on every Railway boot — a hung seed blocks the whole deployment.
+  require('../utils/redisClient').closeClient();
 }
 
-seed().catch(err => {
+seed().then(() => {
+  // Deterministic exit even if some transitively-required module still holds
+  // an open handle (see Redis note above).
+  process.exit(0);
+}).catch(err => {
   // Use console.error here since logger may not be initialized when seed fails at startup
   process.stderr.write(`Seed failed: ${err.message}\n${err.stack || ''}\n`);
   process.exit(1);
