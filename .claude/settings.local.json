@@ -131,7 +131,25 @@
       "Bash('/c/Program Files/Google/Chrome/Application/chrome.exe' --headless=new --disable-gpu --no-first-run --user-data-dir=C:/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/0dcc843c-fc11-4ad8-b960-b8e524d5e920/scratchpad/chrome-profile --no-pdf-header-footer '--print-to-pdf=C:\\\\claude_projects\\\\medibook\\\\MEDIBOOK_QR_KIT.pdf' file:///C:/claude_projects/medibook/MEDIBOOK_QR_KIT.html)",
       "Bash('/c/Program Files/Google/Chrome/Application/chrome.exe' --headless=new --disable-gpu --no-first-run --user-data-dir=C:/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/0dcc843c-fc11-4ad8-b960-b8e524d5e920/scratchpad/chrome-profile-2 --no-pdf-header-footer '--print-to-pdf=C:\\\\claude_projects\\\\medibook\\\\MEDIBOOK_QR_KIT.pdf' file:///C:/claude_projects/medibook/MEDIBOOK_QR_KIT.html)",
       "WebFetch(domain:skydentalclinics.com)",
-      "WebFetch(domain:www.chiseldental.co.in)"
+      "WebFetch(domain:www.chiseldental.co.in)",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; $ids=@{backend='1ffb0480-cbd8-4691-a0c0-3e2b9564200e';frontend='3206713e-c779-44fb-832c-dcb9d9f67e0d'}; $deadline=\\(Get-Date\\).AddMinutes\\(12\\); while\\(\\(Get-Date\\) -lt $deadline\\){ $out=@\\(\\); $done=$true; foreach\\($svc in $ids.Keys\\){ $list=railway deployment list --service $svc 2>$null | Out-String; $line=\\($list -split \"`n\" | Where-Object { $_ -match $ids[$svc] }\\) -join ''; $out += \"$svc : $line\".Trim\\(\\); if\\($line -notmatch 'SUCCESS|FAILED|CRASHED|REMOVED'\\){ $done=$false } }; if\\($done\\){ break }; Start-Sleep -Seconds 30 }; $out)",
+      "Bash(git check-ignore *)",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; $ids=@{backend='eabf3b35-8c1e-4c4b-a207-b7738825a6c9';frontend='c6060ec8-bd05-416e-ad09-aaa19bfbe05c'}; $deadline=\\(Get-Date\\).AddMinutes\\(14\\); while\\(\\(Get-Date\\) -lt $deadline\\){ $out=@\\(\\); $done=$true; foreach\\($svc in $ids.Keys\\){ $list=railway deployment list --service $svc 2>$null | Out-String; $line=\\($list -split \"`n\" | Where-Object { $_ -match $ids[$svc] }\\) -join ''; $out += \"$svc : $line\".Trim\\(\\); if\\($line -notmatch 'SUCCESS|FAILED|CRASHED|REMOVED'\\){ $done=$false } }; if\\($done\\){ break }; Start-Sleep -Seconds 30 }; $out)",
+      "PowerShell(git *)",
+      "PowerShell(railway status *)",
+      "PowerShell(railway deployment *)",
+      "PowerShell($d = railway deployment list --service backend --json | ConvertFrom-Json; $d | Select-Object -First 4 | ForEach-Object { [PSCustomObject]@{ created = $_.createdAt; status = $_.status; commit = if \\($_.meta.commitHash\\) { $_.meta.commitHash.Substring\\(0,7\\) } else { $_.meta.commitMessage } } } | Format-Table -AutoSize; Get-Date -Format o)",
+      "PowerShell(ConvertTo-Json *)",
+      "PowerShell(railway up *)",
+      "PowerShell($deadline = \\(Get-Date\\).AddMinutes\\(9\\); do { Start-Sleep -Seconds 30; $b = \\(railway deployment list --service backend --json | ConvertFrom-Json\\)[0]; $f = \\(railway deployment list --service frontend --json | ConvertFrom-Json\\)[0]; $bs = $b.status; $fs = $f.status; Write-Output \"backend=$bs frontend=$fs\" } while \\(\\(Get-Date\\) -lt $deadline -and \\(\\($bs -notin 'SUCCESS','FAILED','CRASHED'\\) -or \\($fs -notin 'SUCCESS','FAILED','CRASHED'\\)\\)\\); Write-Output \"FINAL backend=$bs frontend=$fs\")",
+      "PowerShell($v = railway variables --service backend --kv 2>$null; $v -split \"`n\" | Where-Object { $_ -match '^\\(META_|FRONTEND_URL|BACKEND\\)' } | ForEach-Object { $name, $val = $_ -split '=', 2; $shown = if \\($val.Length -gt 12\\) { $val.Substring\\(0, 8\\) + '...\\(' + $val.Length + ' chars\\)' } else { $val }; \"$name = $shown\" })",
+      "WebFetch(domain:developers.facebook.com)",
+      "Bash(git -C /c/claude_projects/medibook status --short)",
+      "Bash(git -C /c/claude_projects/medibook log --oneline -15)",
+      "Bash(git *)",
+      "Bash(docker compose *)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(tasklist)"
     ]
   }
 }
