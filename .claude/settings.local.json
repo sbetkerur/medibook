@@ -149,7 +149,13 @@
       "Bash(git *)",
       "Bash(docker compose *)",
       "Bash(echo \"EXIT: $?\")",
-      "Bash(tasklist)"
+      "Bash(tasklist)",
+      "Bash(echo \"seed exit=$?\")",
+      "PowerShell(Get-CimInstance *)",
+      "Bash(echo \"unit exit=$?\")",
+      "Bash(echo \"integration exit=$?\")",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; $ids=@{backend='ae76ab19-ab27-4388-9324-a98f22589e6f';frontend='cd27ddc8-22a7-487c-8d79-12a874c583b9'}; $deadline=\\(Get-Date\\).AddMinutes\\(12\\); $final=@{}; while\\(\\(Get-Date\\) -lt $deadline\\){ $done=$true; foreach\\($svc in @\\($ids.Keys\\)\\){ $list = railway deployment list --service $svc --json 2>$null | ConvertFrom-Json; $dep = $list | Where-Object { $_.id -eq $ids[$svc] }; $status = if \\($dep\\) { $dep.status } else { 'NOT_FOUND' }; $final[$svc] = $status; if \\($status -notin @\\('SUCCESS','FAILED','CRASHED','REMOVED'\\)\\) { $done=$false } }; if\\($done\\){ break }; Start-Sleep -Seconds 30 }; foreach\\($svc in $final.Keys\\){ \"$svc = $\\($final[$svc]\\)\" })",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; $v = railway variables --service frontend --kv 2>$null; $burl = \\(\\($v -split \"`n\" | Where-Object { $_ -match '^BACKEND_URL=' }\\) -split '=',2\\)[1]; \"backend: $burl\"; try { $h = Invoke-RestMethod -Uri \"$burl/health\" -TimeoutSec 20; $h | ConvertTo-Json -Compress } catch { \"health check failed: $\\($_.Exception.Message\\)\" })"
     ]
   }
 }
