@@ -6,12 +6,24 @@ import { todayIST } from '@/lib/dateIST';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import Modal from '@/components/ui/Modal';
 import ConfirmModal from '@/components/ui/ConfirmModal';
 import StatCard from '@/components/ui/StatCard';
 import Badge from '@/components/ui/Badge';
 import SlotsTab from '@/components/tabs/SlotsTab';
+import DoctorsTab from '@/components/tabs/DoctorsTab';
+import PatientsTab from '@/components/tabs/PatientsTab';
+import HospitalsTab from '@/components/tabs/HospitalsTab';
+import FeedbackTab from '@/components/tabs/FeedbackTab';
+import AnalyticsTab from '@/components/tabs/AnalyticsTab';
+import ServicesTab from '@/components/tabs/ServicesTab';
+import HolidaysTab from '@/components/tabs/HolidaysTab';
+import StaffTab from '@/components/tabs/StaffTab';
+import SettingsTab from '@/components/tabs/SettingsTab';
+import CalendarTab from '@/components/tabs/CalendarTab';
+import LeavesTab from '@/components/tabs/LeavesTab';
+import AuditTab from '@/components/tabs/AuditTab';
+import TestBotTab from '@/components/tabs/TestBotTab';
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
@@ -47,6 +59,15 @@ const NAV = [
 
 // StatCard, Badge, SlotsTab imported from @/components/ui and @/components/tabs
 
+// Builds a wa.me deep link from a stored phone number. Numbers are stored
+// inconsistently (with/without a leading '+', occasional spaces/dashes from
+// CSV imports) — wa.me only accepts digits, so strip everything else once
+// here instead of re-deriving it at every call site.
+function waLink(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return `https://wa.me/${digits}`;
+}
+
 export default function Dashboard() {
   const router = useRouter();
   const [tab, setTab] = useState('overview');
@@ -54,7 +75,6 @@ export default function Dashboard() {
   const [appointments, setAppointments] = useState([]);
   const [doctors, setDoctors] = useState([]);
   const [patients, setPatients] = useState([]);
-  const [analytics, setAnalytics] = useState(null);
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [tabLoading, setTabLoading] = useState(false);
@@ -64,10 +84,6 @@ export default function Dashboard() {
   const [filterDate, setFilterDate] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [patientSearch, setPatientSearch] = useState('');
-  const [botPhone, setBotPhone] = useState('917795676142');
-  const [botMessage, setBotMessage] = useState('Hi');
-  const [botResponse, setBotResponse] = useState(null);
-  const [botLoading, setBotLoading] = useState(false);
 
   // Doctor management state
   const [hospitals, setHospitals] = useState([]);
@@ -123,20 +139,9 @@ export default function Dashboard() {
   const [patientDocuments, setPatientDocuments] = useState([]);
   const [docUploading, setDocUploading] = useState(false);
 
-  // Staff management state
-  const [staff, setStaff] = useState([]);
-  const [showStaffModal, setShowStaffModal] = useState(false);
-  const [editingStaff, setEditingStaff] = useState(null);
-  const [staffForm, setStaffForm] = useState({ name: '', email: '', password: '', role: 'staff' });
-  const [staffSaving, setStaffSaving] = useState(false);
-
-  // Settings state
+  // Settings state (`settings` is shared with DoctorsTab; the editable form
+  // and save state live inside SettingsTab)
   const [settings, setSettings] = useState(null);
-  const [settingsForm, setSettingsForm] = useState({
-    notify_phone: '',
-    name: '', notification_prefs: {}
-  });
-  const [settingsSaving, setSettingsSaving] = useState(false);
 
   // Notifications state
   const [notifications, setNotifications] = useState([]);
@@ -145,12 +150,20 @@ export default function Dashboard() {
   // Keys (appointment id + booking_id) of notifications already shown, so SSE
   // and the 30s poll never double-insert or re-count the same booking.
   const notifSeenKeys = useRef(new Set());
-
-  // Calendar state
-  const [calendarDate, setCalendarDate] = useState(new Date());
-  const [calendarAppts, setCalendarAppts] = useState([]);
-  const [selectedCalDay, setSelectedCalDay] = useState(null);
-  const [calDayAppts, setCalDayAppts] = useState([]);
+  // Companion insertion-order array so the Set above can be capped cheaply —
+  // a reception desk left open all day would otherwise grow this without
+  // bound. When it exceeds NOTIF_SEEN_CAP, the oldest keys are evicted.
+  const notifSeenOrder = useRef([]);
+  const NOTIF_SEEN_CAP = 500;
+  const addSeenKey = (key) => {
+    if (!key || notifSeenKeys.current.has(key)) return;
+    notifSeenKeys.current.add(key);
+    notifSeenOrder.current.push(key);
+    if (notifSeenOrder.current.length > NOTIF_SEEN_CAP) {
+      const evicted = notifSeenOrder.current.splice(0, notifSeenOrder.current.length - NOTIF_SEEN_CAP);
+      evicted.forEach(k => notifSeenKeys.current.delete(k));
+    }
+  };
 
   // Analytics summary state
   const [analyticsSummary, setAnalyticsSummary] = useState(null);
@@ -162,27 +175,10 @@ export default function Dashboard() {
   const [onboarding, setOnboarding] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
 
-  // Doctor leaves state
-  const [leavesDoctor, setLeavesDoctor] = useState(null);
-  const [leaves, setLeaves] = useState([]);
-  const [leavesLoading, setLeavesLoading] = useState(false);
-  const [leaveDate, setLeaveDate] = useState('');
-  const [leaveReason, setLeaveReason] = useState('');
-  const [leaveSaving, setLeaveSaving] = useState(false);
-  const [leavesDoctorList, setLeavesDoctorList] = useState([]);
-
   // Medical history edit state
   const [medHistory, setMedHistory] = useState({ blood_type: '', allergies: '', conditions: '', medications: '', notes: '' });
   const [medHistoryEditing, setMedHistoryEditing] = useState(false);
   const [medHistorySaving, setMedHistorySaving] = useState(false);
-
-  // Feedback state
-  const [feedback, setFeedback] = useState([]);
-  const [feedbackPage, setFeedbackPage] = useState(1);
-  const [feedbackHasMore, setFeedbackHasMore] = useState(false);
-  const [feedbackAvgRating, setFeedbackAvgRating] = useState(null);
-  const [feedbackTotal, setFeedbackTotal] = useState(0);
-  const [feedbackDistribution, setFeedbackDistribution] = useState([]);
 
   // Hospital edit state
   const [editingHospital, setEditingHospital] = useState(null);
@@ -198,10 +194,6 @@ export default function Dashboard() {
   const [importingPatients, setImportingPatients] = useState(false);
   const [importingDoctors, setImportingDoctors] = useState(false);
 
-  // Change password state
-  const [changePwdForm, setChangePwdForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
-  const [changingPwd, setChangingPwd] = useState(false);
-
   // Cancel appointment state
   const [cancellingAppt, setCancellingAppt] = useState(null); // appointment object
   const [cancelReason, setCancelReason] = useState('');
@@ -216,17 +208,6 @@ export default function Dashboard() {
   });
   const [walkinSaving, setWalkinSaving] = useState(false);
 
-  // Bot session reset state
-  const [botResetting, setBotResetting] = useState(false);
-
-  // Audit logs state
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [auditPage, setAuditPage] = useState(1);
-  const [auditHasMore, setAuditHasMore] = useState(false);
-  const [auditTotal, setAuditTotal] = useState(0);
-  const [auditFrom, setAuditFrom] = useState('');
-  const [auditTo, setAuditTo] = useState('');
-  const [auditAction, setAuditAction] = useState('');
 
   // Bulk appointment update state
   const [selectedApptIds, setSelectedApptIds] = useState(new Set());
@@ -237,22 +218,6 @@ export default function Dashboard() {
   const [waMessagePhone, setWaMessagePhone] = useState('');
   const [waMessageText, setWaMessageText] = useState('');
   const [waSending, setWaSending] = useState(false);
-
-  // Services (treatment catalog) state — A1
-  const [services, setServices] = useState([]);
-  const [showServiceModal, setShowServiceModal] = useState(false);
-  const [editingService, setEditingService] = useState(null);
-  const [serviceForm, setServiceForm] = useState({ name: '', description: '', category: '', duration_minutes: '30', price: '', hospital_id: '' });
-  const [serviceSaving, setServiceSaving] = useState(false);
-
-  // Holidays state — A4
-  const [holidays, setHolidays] = useState([]);
-  const [holidayForm, setHolidayForm] = useState({ hospital_id: '', holiday_date: '', name: '' });
-  const [holidaySaving, setHolidaySaving] = useState(false);
-
-  // Revenue analytics state — A6
-  const [revenueData, setRevenueData] = useState(null);
-  const [revenueMonths, setRevenueMonths] = useState(6);
 
   // Appointment notes inline editing — A5
   const [editingNotesId, setEditingNotesId] = useState(null);
@@ -308,7 +273,7 @@ export default function Dashboard() {
             // displays SSE-delivered bookings correctly.
             const key = payload?.bookingId || `sse-${Date.now()}`;
             if (!notifSeenKeys.current.has(key)) {
-              notifSeenKeys.current.add(key);
+              addSeenKey(key);
               setNotifications(prev => [
                 {
                   id: key,
@@ -456,35 +421,12 @@ export default function Dashboard() {
     }
   }
 
-  const fetchAnalytics = useCallback(async () => {
-    try {
-      const { data } = await api.get('/admin/analytics');
-      setAnalytics(data);
-    } catch { toast.error('Failed to load analytics'); }
-  }, []);
-
-  const fetchStaff = useCallback(async () => {
-    try {
-      const { data } = await api.get('/admin/staff');
-      setStaff(data.staff || []);
-    } catch { toast.error('Failed to load staff'); }
-  }, []);
-
+  // `settings` is shared (read by DoctorsTab), so it stays here and is passed to
+  // SettingsTab, which derives its editable form from it.
   const fetchSettings = useCallback(async () => {
     try {
       const { data } = await api.get('/admin/settings');
       setSettings(data);
-      setSettingsForm({
-        name: data.clinic_name || '',
-        // PATCH /settings merges these keys into the TOP level of tenants.settings,
-        // so read them back from there (settings.notification_prefs never exists).
-        notification_prefs: {
-          email_on_booking: data.settings?.email_on_booking,
-          reminder_24h_enabled: data.settings?.reminder_24h_enabled,
-          reminder_2h_enabled: data.settings?.reminder_2h_enabled,
-        },
-        notify_phone: data.notify_phone || '',
-      });
     } catch { toast.error('Failed to load settings'); }
   }, []);
 
@@ -495,95 +437,11 @@ export default function Dashboard() {
     } catch { /* silent */ }
   }, []);
 
-  const fetchFeedback = useCallback(async (page = 1) => {
-    try {
-      const { data } = await api.get(`/admin/feedback?page=${page}&limit=25`);
-      setFeedback(data.feedback || []);
-      setFeedbackPage(page);
-      setFeedbackHasMore(data.has_more || false);
-      setFeedbackAvgRating(data.avg_rating);
-      setFeedbackTotal(data.total || 0);
-      setFeedbackDistribution(data.distribution || []);
-    } catch { toast.error('Failed to load feedback'); }
-  }, []);
-
-  const fetchAuditLogs = useCallback(async (page = 1) => {
-    try {
-      const params = new URLSearchParams({ page: String(page), limit: '50' });
-      if (auditFrom) params.set('from', auditFrom);
-      if (auditTo) params.set('to', auditTo);
-      if (auditAction) params.set('action', auditAction);
-      const { data } = await api.get(`/admin/audit-logs?${params}`);
-      setAuditLogs(data.logs || []);
-      setAuditPage(page);
-      setAuditHasMore(data.has_more || false);
-      setAuditTotal(data.total || 0);
-    } catch { toast.error('Failed to load audit logs'); }
-  }, [auditFrom, auditTo, auditAction]);
-
-  const fetchServices = useCallback(async () => {
-    try {
-      const { data } = await api.get('/admin/services');
-      setServices(data.services || []);
-    } catch { toast.error('Failed to load services'); }
-  }, []);
-
-  const fetchHolidays = useCallback(async () => {
-    try {
-      const { data } = await api.get('/admin/holidays');
-      setHolidays(data.holidays || []);
-    } catch { toast.error('Failed to load holidays'); }
-  }, []);
-
-  const fetchRevenue = useCallback(async (months) => {
-    try {
-      const m = months || revenueMonths;
-      const { data } = await api.get(`/admin/analytics/revenue?months=${m}`);
-      setRevenueData(data);
-    } catch { /* silent — revenue section shows no-data state */ }
-  }, [revenueMonths]);
-
   const fetchOnboarding = useCallback(async () => {
     try {
       const { data } = await api.get('/admin/onboarding/status');
       setOnboarding(data);
       if (!data.all_done && !data.onboarding_completed) setShowOnboarding(true);
-    } catch { /* silent */ }
-  }, []);
-
-  const fetchLeaves = useCallback(async (doctorId) => {
-    if (!doctorId) return;
-    setLeavesLoading(true);
-    try {
-      const { data } = await api.get(`/admin/doctors/${doctorId}/leaves`);
-      setLeaves(data.leaves || []);
-    } catch { toast.error('Failed to load leaves'); }
-    finally { setLeavesLoading(false); }
-  }, []);
-
-  const fetchCalendarAppts = useCallback(async (year, month) => {
-    try {
-      const startDate = `${year}-${String(month + 1).padStart(2, '0')}-01`;
-      const endDate = `${year}-${String(month + 1).padStart(2, '0')}-${new Date(year, month + 1, 0).getDate()}`;
-      // The backend caps `limit` at 100 and sorts DESC — a busy month can exceed
-      // that, silently dropping the earliest days. Page through until has_more
-      // is false (safety cap of 10 pages = 1000 appointments).
-      const all = [];
-      for (let page = 1; page <= 10; page++) {
-        const { data } = await api.get(
-          `/admin/appointments?from=${startDate}&to=${endDate}&limit=100&page=${page}&status=confirmed,completed`
-        );
-        all.push(...(data.appointments || []));
-        if (!data.has_more) break;
-      }
-      // Group by date
-      const byDate = {};
-      all.forEach(a => {
-        const d = a.appointment_date;
-        if (!byDate[d]) byDate[d] = [];
-        byDate[d].push(a);
-      });
-      setCalendarAppts(byDate);
     } catch { /* silent */ }
   }, []);
 
@@ -599,8 +457,8 @@ export default function Dashboard() {
       );
       if (incoming.length > 0) {
         incoming.forEach(n => {
-          if (n.id) notifSeenKeys.current.add(n.id);
-          if (n.booking_id) notifSeenKeys.current.add(n.booking_id);
+          if (n.id) addSeenKey(n.id);
+          if (n.booking_id) addSeenKey(n.booking_id);
         });
         toast(`🔔 ${incoming.length} new booking${incoming.length > 1 ? 's' : ''}!`, { icon: '📅' });
         setNotifications(prev => [...incoming, ...prev].slice(0, 20));
@@ -771,24 +629,6 @@ export default function Dashboard() {
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to update patient');
     } finally { setPatientEditSaving(false); }
-  }
-
-  async function changePassword(e) {
-    e.preventDefault();
-    if (changePwdForm.new_password !== changePwdForm.confirm_password) {
-      return toast.error('New passwords do not match');
-    }
-    setChangingPwd(true);
-    try {
-      await api.post('/auth/change-password', {
-        current_password: changePwdForm.current_password,
-        new_password: changePwdForm.new_password,
-      });
-      toast.success('Password changed successfully');
-      setChangePwdForm({ current_password: '', new_password: '', confirm_password: '' });
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to change password');
-    } finally { setChangingPwd(false); }
   }
 
   async function openPatientHistory(patient) {
@@ -978,8 +818,11 @@ export default function Dashboard() {
 
   async function toggleSlotStatus(slot) {
     const newStatus = slot.status === 'available' ? 'blocked' : 'available';
+    // Canonical payload shape shared with SlotsTab.js — see backend
+    // routes/doctors.js PATCH /slots/:id, which checks `action` first.
+    const action = newStatus === 'blocked' ? 'block' : 'unblock';
     try {
-      await api.patch(`/admin/slots/${slot.id}`, { status: newStatus });
+      await api.patch(`/admin/slots/${slot.id}`, { action });
       setSlots(prev => prev.map(s => s.id === slot.id ? { ...s, status: newStatus } : s));
       toast.success(`Slot ${newStatus === 'blocked' ? 'blocked' : 'unblocked'}`);
     } catch (err) {
@@ -1016,23 +859,15 @@ export default function Dashboard() {
         if (tab === 'appointments') await fetchAppointments();
         else if (tab === 'doctors') await fetchDoctors();
         else if (tab === 'patients') await fetchPatients();
-        else if (tab === 'feedback') await fetchFeedback(1);
-        else if (tab === 'analytics') { await fetchAnalytics(); await fetchAnalyticsSummary(); await fetchRevenue(); }
-        else if (tab === 'services') { await fetchServices(); if (!hospitals.length) await fetchHospitals(); }
-        else if (tab === 'holidays') { await fetchHolidays(); if (!hospitals.length) await fetchHospitals(); }
+        else if (tab === 'analytics') await fetchAnalyticsSummary();
+        else if (tab === 'services') { if (!hospitals.length) await fetchHospitals(); }
+        else if (tab === 'holidays') { if (!hospitals.length) await fetchHospitals(); }
         else if (tab === 'hospitals') {
           const data = await fetchHospitals();
           if (data) await fetchAllHospitalDepts(data);
         }
-        else if (tab === 'staff') await fetchStaff();
         else if (tab === 'slots') { if (!doctors.length) await fetchDoctors(); }
-        else if (tab === 'leaves') { const { data } = await api.get('/admin/doctors'); setLeavesDoctorList(data.doctors || []); }
         else if (tab === 'settings') await fetchSettings();
-        else if (tab === 'audit') await fetchAuditLogs(1);
-        else if (tab === 'calendar') {
-          const now = calendarDate;
-          await fetchCalendarAppts(now.getFullYear(), now.getMonth());
-        }
       } finally {
         setTabLoading(false);
       }
@@ -1070,38 +905,6 @@ export default function Dashboard() {
       return () => clearTimeout(t);
     }
   }, [patientSearch]);
-
-  async function addLeave() {
-    if (!leavesDoctor || !leaveDate) return toast.error('Select a doctor and date');
-    setLeaveSaving(true);
-    try {
-      await api.post(`/admin/doctors/${leavesDoctor.id}/leaves`, { dates: [leaveDate], reason: leaveReason || null });
-      toast.success('Leave added');
-      setLeaveDate('');
-      setLeaveReason('');
-      fetchLeaves(leavesDoctor.id);
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to add leave');
-    } finally { setLeaveSaving(false); }
-  }
-
-  async function removeLeave(doctorId, leaveDate) {
-    setConfirmModal({
-      title: 'Remove Leave?',
-      message: `Remove leave for ${leaveDate}? Available slots will be restored.`,
-      danger: false,
-      onConfirm: async () => {
-        setConfirmModal(null);
-        try {
-          await api.delete(`/admin/doctors/${doctorId}/leaves/${leaveDate}`);
-          toast.success('Leave removed');
-          fetchLeaves(doctorId);
-        } catch (err) {
-          toast.error(err.response?.data?.error || 'Failed to remove leave');
-        }
-      },
-    });
-  }
 
   async function saveMedHistory() {
     if (!selectedPatient) return;
@@ -1147,17 +950,6 @@ export default function Dashboard() {
     });
   }
 
-  async function resetBotSession() {
-    if (!botPhone) return toast.error('Enter a phone number first');
-    setBotResetting(true);
-    try {
-      await api.delete(`/admin/bot-sessions/${botPhone}`);
-      toast.success(`Session reset for ${botPhone}`);
-      setBotResponse(null);
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'No active session found');
-    } finally { setBotResetting(false); }
-  }
 
   async function bulkUpdateAppointments(status) {
     if (selectedApptIds.size === 0) return toast.error('No appointments selected');
@@ -1189,81 +981,6 @@ export default function Dashboard() {
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to send message');
     } finally { setWaSending(false); }
-  }
-
-  async function saveService(e) {
-    e.preventDefault();
-    if (!serviceForm.name.trim()) return toast.error('Service name is required');
-    setServiceSaving(true);
-    try {
-      const payload = { ...serviceForm, duration_minutes: Number(serviceForm.duration_minutes) || 30, price: Number(serviceForm.price) || 0 };
-      if (editingService) {
-        await api.patch(`/admin/services/${editingService.id}`, payload);
-        toast.success('Service updated');
-      } else {
-        await api.post('/admin/services', payload);
-        toast.success('Service added');
-      }
-      setShowServiceModal(false);
-      setEditingService(null);
-      setServiceForm({ name: '', description: '', category: '', duration_minutes: '30', price: '', hospital_id: '' });
-      fetchServices();
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to save service');
-    } finally { setServiceSaving(false); }
-  }
-
-  function openEditService(svc) {
-    setEditingService(svc);
-    setServiceForm({ name: svc.name || '', description: svc.description || '', category: svc.category || '', duration_minutes: String(svc.duration_minutes || 30), price: String(svc.price || ''), hospital_id: svc.hospital_id || '' });
-    setShowServiceModal(true);
-  }
-
-  function deleteService(svc) {
-    setConfirmModal({
-      title: `Remove "${svc.name}"?`,
-      message: 'This service will be deactivated and hidden from bookings.',
-      danger: true,
-      onConfirm: async () => {
-        setConfirmModal(null);
-        try {
-          await api.delete(`/admin/services/${svc.id}`);
-          toast.success('Service removed');
-          fetchServices();
-        } catch (err) { toast.error(err.response?.data?.error || 'Failed to remove'); }
-      },
-    });
-  }
-
-  async function addHoliday(e) {
-    e.preventDefault();
-    if (!holidayForm.holiday_date || !holidayForm.name.trim()) return toast.error('Date and name are required');
-    setHolidaySaving(true);
-    try {
-      await api.post('/admin/holidays', holidayForm);
-      toast.success('Holiday added');
-      setHolidayForm(f => ({ ...f, holiday_date: '', name: '' }));
-      fetchHolidays();
-    } catch (err) {
-      const msg = err.response?.data?.error || 'Failed to add holiday';
-      toast.error(msg.includes('already') ? 'A holiday already exists on that date' : msg);
-    } finally { setHolidaySaving(false); }
-  }
-
-  function deleteHoliday(holiday) {
-    setConfirmModal({
-      title: `Remove holiday "${holiday.name}"?`,
-      message: `This will remove the closure on ${holiday.holiday_date} and allow new bookings on that day.`,
-      danger: false,
-      onConfirm: async () => {
-        setConfirmModal(null);
-        try {
-          await api.delete(`/admin/holidays/${holiday.id}`);
-          toast.success('Holiday removed');
-          fetchHolidays();
-        } catch (err) { toast.error(err.response?.data?.error || 'Failed to remove'); }
-      },
-    });
   }
 
   async function saveApptNotes(apptId) {
@@ -1323,16 +1040,6 @@ export default function Dashboard() {
     toast.success('CSV exported!');
   }
 
-  async function testBot() {
-    setBotLoading(true);
-    setBotResponse(null);
-    try {
-      const { data } = await api.post('/webhook/test', { phone: botPhone, message: botMessage });
-      setBotResponse(data);
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Bot test failed');
-    } finally { setBotLoading(false); }
-  }
 
   async function logout() {
     try { await api.post('/auth/logout'); } catch (_) {}
@@ -1344,79 +1051,6 @@ export default function Dashboard() {
 
   function printAnalytics() {
     window.print();
-  }
-
-  // Staff handlers
-  async function saveStaff(e) {
-    e.preventDefault();
-    if (!staffForm.name || !staffForm.email) return toast.error('Name and email required');
-    if (!editingStaff && !staffForm.password) return toast.error('Password required for new staff');
-    setStaffSaving(true);
-    try {
-      if (editingStaff) {
-        const payload = { name: staffForm.name, role: staffForm.role };
-        if (staffForm.password) payload.password = staffForm.password;
-        await api.patch(`/admin/staff/${editingStaff.id}`, payload);
-        toast.success('Staff updated');
-      } else {
-        await api.post('/admin/staff', staffForm);
-        toast.success('Staff member added');
-      }
-      setShowStaffModal(false);
-      setStaffForm({ name: '', email: '', password: '', role: 'staff' });
-      setEditingStaff(null);
-      fetchStaff();
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to save staff');
-    } finally { setStaffSaving(false); }
-  }
-
-  function deactivateStaff(member) {
-    setConfirmModal({
-      title: `Deactivate ${member.name}?`,
-      message: 'They will lose access to the dashboard immediately.',
-      danger: true,
-      onConfirm: async () => {
-        setConfirmModal(null);
-        try {
-          await api.delete(`/admin/staff/${member.id}`);
-          toast.success('Staff member deactivated');
-          fetchStaff();
-        } catch (err) {
-          toast.error(err.response?.data?.error || 'Failed to deactivate');
-        }
-      },
-    });
-  }
-
-  // Settings save
-  async function saveSettings(e) {
-    e.preventDefault();
-    setSettingsSaving(true);
-    try {
-      const payload = {};
-      if (settingsForm.name) payload.name = settingsForm.name;
-      payload.notify_phone = settingsForm.notify_phone || '';
-      await api.patch('/admin/settings', payload);
-      toast.success('Settings saved!');
-      fetchSettings();
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to save settings');
-    } finally { setSettingsSaving(false); }
-  }
-
-  // Calendar helpers
-  function getCalendarDays(year, month) {
-    const firstDay = new Date(year, month, 1).getDay();
-    const daysInMonth = new Date(year, month + 1, 0).getDate();
-    const days = [];
-    for (let i = 0; i < firstDay; i++) days.push(null);
-    for (let d = 1; d <= daysInMonth; d++) days.push(d);
-    return days;
-  }
-
-  function formatCalDate(year, month, day) {
-    return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
   }
 
   return (
@@ -1760,7 +1394,7 @@ export default function Dashboard() {
                         <div className="min-w-0">
                           <div className="font-medium text-gray-900 truncate">{a.patient_name}</div>
                           <div className="flex items-center gap-1.5 mt-0.5">
-                            <a href={`https://wa.me/${a.patient_phone}`} target="_blank" rel="noreferrer"
+                            <a href={waLink(a.patient_phone)} target="_blank" rel="noreferrer"
                               className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
                             {isAdmin && (
                             <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(a.patient_phone || ''); setWaMessageText(''); }}
@@ -1846,7 +1480,7 @@ export default function Dashboard() {
                           <td className="px-4 py-3">
                             <div className="font-medium text-gray-900 text-sm">{a.patient_name}</div>
                             <div className="flex items-center gap-1.5">
-                              <a href={`https://wa.me/${a.patient_phone}`} target="_blank" rel="noreferrer"
+                              <a href={waLink(a.patient_phone)} target="_blank" rel="noreferrer"
                                 className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
                               {isAdmin && (
                               <button onClick={() => { setShowWaMessageModal(true); setWaMessagePhone(a.patient_phone || ''); setWaMessageText(''); }}
@@ -1921,1239 +1555,124 @@ export default function Dashboard() {
 
           {/* ── DOCTORS ── */}
           {tab === 'doctors' && !tabLoading && (
-            <div className="space-y-4">
-              {/* Plan quota warning */}
-              {settings && settings.plan_limits && settings.usage && settings.usage.active_doctors >= settings.plan_limits.max_doctors && (
-                <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 flex items-center gap-3">
-                  <span className="text-xl">⚠️</span>
-                  <div>
-                    <p className="text-sm font-medium text-amber-800">Dentist limit reached ({settings.usage.active_doctors}/{settings.plan_limits.max_doctors})</p>
-                    <p className="text-xs text-amber-600">Upgrade your plan to add more dentists.</p>
-                  </div>
-                </div>
-              )}
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <p className="text-sm text-gray-500">{doctors.length} dentist{doctors.length !== 1 ? 's' : ''}</p>
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <div className="relative">
-                      <input type="checkbox" className="sr-only" checked={showInactive}
-                        onChange={e => setShowInactive(e.target.checked)} />
-                      <div className={`w-8 h-4 rounded-full transition-colors ${showInactive ? 'bg-blue-500' : 'bg-gray-300'}`} />
-                      <div className={`absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full shadow transition-transform ${showInactive ? 'translate-x-4' : ''}`} />
-                    </div>
-                    <span className="text-sm text-gray-500">Show inactive</span>
-                  </label>
-                </div>
-                {isAdmin && (
-                <div className="flex items-center gap-2">
-                  <label className={`px-3 py-2 text-sm border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition whitespace-nowrap ${importingDoctors ? 'opacity-50 pointer-events-none' : ''}`}>
-                    {importingDoctors ? '⏳ Importing...' : '📤 Import CSV'}
-                    <input type="file" accept=".csv" className="hidden" onChange={importDoctorsCSV} disabled={importingDoctors} />
-                  </label>
-                  <button onClick={openAddDoctor}
-                    className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
-                    + Add Doctor
-                  </button>
-                </div>
-                )}
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {doctors.map(d => (
-                  <div key={d.id} className="bg-white rounded-xl p-5 shadow-sm border border-gray-100 hover:border-blue-200 transition flex flex-col">
-                    <div className="flex items-start gap-3">
-                      <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center text-xl shrink-0">👨‍⚕️</div>
-                      <div className="flex-1 min-w-0">
-                        <h3 className="font-semibold text-gray-900 truncate">Dr. {d.name}</h3>
-                        <p className="text-sm text-blue-600 truncate">{d.specialization}</p>
-                        <p className="text-xs text-gray-400 truncate">{d.qualification}</p>
-                        <p className="text-xs text-gray-500 mt-1 truncate">🏥 {d.hospital_name}</p>
-                      </div>
-                    </div>
-                    <div className="mt-4 flex items-center justify-between text-sm">
-                      <span className="text-green-600 font-medium">{d.consultation_fee > 0 ? `₹${d.consultation_fee}` : 'Free'}</span>
-                      <div className="text-right text-xs text-gray-500">
-                        <div>{d.total_appointments} appts</div>
-                        <div>{d.available_slots} open slots</div>
-                      </div>
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400">{d.slot_duration_minutes}min slots · {d.department_name || 'No dept'}</div>
-                    {!d.is_active && (
-                      <p className="mt-2 text-xs text-red-400 font-medium">⚠️ Inactive — hidden from bot</p>
-                    )}
-                    <div className="mt-4 pt-3 border-t border-gray-100 grid grid-cols-2 gap-2">
-                      {isAdmin && (
-                      <button onClick={() => openEditDoctor(d)}
-                        className="px-3 py-2 text-xs font-medium border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
-                        ✏️ Edit
-                      </button>
-                      )}
-                      {isAdmin && (
-                      <button onClick={() => openSchedule(d)}
-                        className="px-3 py-2 text-xs font-medium border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 transition">
-                        📅 Schedule
-                      </button>
-                      )}
-                      <button onClick={() => openSlotsViewer(d)}
-                        className="px-3 py-2 text-xs font-medium border border-green-200 text-green-600 rounded-lg hover:bg-green-50 transition">
-                        ⏰ View Slots
-                      </button>
-                      {isAdmin && (
-                      <button onClick={() => toggleDoctorStatus(d)}
-                        className={`px-3 py-2 text-xs font-medium border rounded-lg transition ${d.is_active ? 'border-red-200 text-red-500 hover:bg-red-50' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
-                        {d.is_active ? '🚫 Deactivate' : '✅ Activate'}
-                      </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
-                {!doctors.length && (
-                  <div className="col-span-3 text-center py-16">
-                    <div className="text-4xl mb-3">🦷</div>
-                    <p className="text-gray-500 font-medium">No dentists yet</p>
-                    <p className="text-gray-400 text-sm mt-1">Click "Add Dentist" to get started</p>
-                  </div>
-                )}
-              </div>
-            </div>
+            <DoctorsTab
+              doctors={doctors}
+              settings={settings}
+              isAdmin={isAdmin}
+              showInactive={showInactive}
+              setShowInactive={setShowInactive}
+              importingDoctors={importingDoctors}
+              importDoctorsCSV={importDoctorsCSV}
+              openAddDoctor={openAddDoctor}
+              openEditDoctor={openEditDoctor}
+              openSchedule={openSchedule}
+              openSlotsViewer={openSlotsViewer}
+              toggleDoctorStatus={toggleDoctorStatus}
+            />
           )}
 
           {/* ── PATIENTS ── */}
           {tab === 'patients' && !tabLoading && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-3">
-                <input
-                  type="text"
-                  placeholder="Search by name, phone or email..."
-                  value={patientSearch}
-                  onChange={e => setPatientSearch(e.target.value)}
-                  className="w-full max-w-sm border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                {isAdmin && (
-                <label className={`px-3 py-1.5 text-sm border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50 transition whitespace-nowrap ${importingPatients ? 'opacity-50 pointer-events-none' : ''}`}>
-                  {importingPatients ? '⏳ Importing...' : '📤 Import CSV'}
-                  <input type="file" accept=".csv" className="hidden" onChange={importPatientsCSV} disabled={importingPatients} />
-                </label>
-                )}
-              </div>
-              {patientTotal > 0 && (
-                <p className="text-sm text-gray-400">{patientTotal} patient{patientTotal !== 1 ? 's' : ''} total</p>
-              )}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                {/* Mobile patient cards */}
-                <div className="md:hidden divide-y divide-gray-100">
-                  {patients.map(p => (
-                    <div key={`mob-${p.id}`} className="p-4">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="font-medium text-gray-900 cursor-pointer truncate" onClick={() => openPatientHistory(p)}>
-                            {p.name || '—'}
-                          </div>
-                          <a href={`https://wa.me/${p.phone}`} target="_blank" rel="noreferrer"
-                            className="text-xs text-green-600 hover:underline">+{p.phone}</a>
-                        </div>
-                        <div className="text-xs text-gray-400 text-right shrink-0">
-                          <div className="capitalize">{p.gender || '—'}</div>
-                          <div>{p.visit_count} visits</div>
-                        </div>
-                      </div>
-                      {isAdmin && (
-                      <div className="flex gap-2 mt-3">
-                        <button onClick={e => { e.stopPropagation(); openEditPatient(p); }}
-                          className="px-3 py-2 text-xs text-blue-600 border border-blue-200 bg-blue-50 rounded-lg hover:bg-blue-100 transition">
-                          ✏️ Edit
-                        </button>
-                        <button onClick={e => { e.stopPropagation(); deletePatient(p); }}
-                          className="px-3 py-2 text-xs text-red-500 border border-red-200 bg-red-50 rounded-lg hover:bg-red-100 transition">
-                          🗑 Delete
-                        </button>
-                      </div>
-                      )}
-                    </div>
-                  ))}
-                  {!patients.length && (
-                    <div className="px-4 py-12 text-center text-gray-400">No patients found</div>
-                  )}
-                </div>
-                {/* Desktop table */}
-                <div className="hidden md:block overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead className="bg-gray-50 border-b border-gray-200">
-                    <tr>
-                      {['Name', 'Phone', 'Gender', 'DOB', 'Visits', 'Since', ''].map(h => (
-                        <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-50">
-                    {patients.map(p => (
-                      <tr key={p.id} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-4 py-3 font-medium text-gray-900 hover:text-blue-600 cursor-pointer" onClick={() => openPatientHistory(p)}>{p.name || '—'}</td>
-                        <td className="px-4 py-3">
-                          <a href={`https://wa.me/${p.phone}`} target="_blank" rel="noreferrer"
-                            className="text-green-600 hover:underline">+{p.phone}</a>
-                        </td>
-                        <td className="px-4 py-3 capitalize text-gray-600">{p.gender || '—'}</td>
-                        <td className="px-4 py-3 text-gray-500 text-xs">
-                          {p.date_of_birth ? (() => { try { return format(parseISO(p.date_of_birth), 'd MMM yyyy'); } catch { return p.date_of_birth; } })() : '—'}
-                        </td>
-                        <td className="px-4 py-3 text-gray-600">{p.visit_count}</td>
-                        <td className="px-4 py-3 text-gray-400 text-xs">
-                          {p.created_at ? (() => { try { return format(parseISO(p.created_at), 'd MMM yyyy'); } catch { return ''; } })() : '—'}
-                        </td>
-                        <td className="px-4 py-3">
-                          {isAdmin && (
-                          <div className="flex gap-2">
-                            <button onClick={e => { e.stopPropagation(); openEditPatient(p); }}
-                              className="text-xs text-blue-600 hover:underline whitespace-nowrap">✏️ Edit</button>
-                            <button onClick={e => { e.stopPropagation(); deletePatient(p); }}
-                              className="text-xs text-red-500 hover:underline whitespace-nowrap">🗑</button>
-                          </div>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                    {!patients.length && (
-                      <tr><td colSpan={7} className="px-4 py-12 text-center text-gray-400">No patients found</td></tr>
-                    )}
-                  </tbody>
-                </table>
-                </div>
-              </div>
-              {(patientPage > 1 || patientHasMore) && (
-                <div className="flex items-center justify-between mt-2">
-                  <button onClick={() => { const p = patientPage - 1; setPatientPage(p); fetchPatients(p); }}
-                    disabled={patientPage === 1}
-                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                    ← Previous
-                  </button>
-                  <span className="text-sm text-gray-500">Page {patientPage}</span>
-                  <button onClick={() => { const p = patientPage + 1; setPatientPage(p); fetchPatients(p); }}
-                    disabled={!patientHasMore}
-                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                    Next →
-                  </button>
-                </div>
-              )}
-            </div>
+            <PatientsTab
+              patients={patients}
+              isAdmin={isAdmin}
+              patientSearch={patientSearch}
+              setPatientSearch={setPatientSearch}
+              patientTotal={patientTotal}
+              patientPage={patientPage}
+              setPatientPage={setPatientPage}
+              patientHasMore={patientHasMore}
+              fetchPatients={fetchPatients}
+              importingPatients={importingPatients}
+              importPatientsCSV={importPatientsCSV}
+              waLink={waLink}
+              openPatientHistory={openPatientHistory}
+              openEditPatient={openEditPatient}
+              deletePatient={deletePatient}
+            />
           )}
 
           {/* ── HOSPITALS ── */}
           {tab === 'hospitals' && !tabLoading && (
-            <div className="space-y-6">
-              <div className="flex items-center justify-between">
-                <p className="text-sm text-gray-500">{hospitals.length} hospital{hospitals.length !== 1 ? 's' : ''}</p>
-                {isAdmin && (
-                <button onClick={() => { setEditingHospital(null); setHospitalForm({ name: '', address: '', city: '', phone: '' }); setShowHospitalModal(true); }}
-                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
-                  + Add Hospital
-                </button>
-                )}
-              </div>
-
-              {hospitals.length === 0 ? (
-                <div className="text-center py-16 bg-white rounded-xl shadow-sm">
-                  <div className="text-5xl mb-3">🏥</div>
-                  <p className="text-gray-500 font-medium">No hospitals yet</p>
-                  <p className="text-gray-400 text-sm mt-1">Add your first hospital to get started</p>
-                  {isAdmin && (
-                  <button onClick={() => setShowHospitalModal(true)}
-                    className="mt-4 px-5 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
-                    + Add Hospital
-                  </button>
-                  )}
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {hospitals.map(h => {
-                    const depts = deptsByHospital[h.id] || [];
-                    return (
-                      <div key={h.id} className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                        <div className="px-5 py-4 flex items-start justify-between border-b border-gray-50">
-                          <div>
-                            <h3 className="font-semibold text-gray-900 text-base">{h.name}</h3>
-                            <div className="flex flex-wrap gap-3 mt-1 text-sm text-gray-500">
-                              {h.city && <span>📍 {h.city}</span>}
-                              {h.address && <span>{h.address}</span>}
-                              {h.phone && <span>📞 {h.phone}</span>}
-                            </div>
-                          </div>
-                          {isAdmin && (
-                          <div className="flex items-center gap-2 shrink-0 ml-3">
-                            <button onClick={() => openEditHospital(h)}
-                              className="px-3 py-1.5 text-xs font-medium bg-gray-50 text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-100 transition">
-                              ✏️ Edit
-                            </button>
-                            <button
-                              onClick={() => { setDeptHospital(h); setDeptForm({ name: '', description: '' }); setEditingDept(null); setShowDeptModal(true); }}
-                              className="px-3 py-1.5 text-xs font-medium bg-green-50 text-green-600 border border-green-200 rounded-lg hover:bg-green-100 transition">
-                              + Dept
-                            </button>
-                            <button onClick={() => deleteHospital(h)}
-                              className="px-3 py-1.5 text-xs font-medium bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition">
-                              🗑
-                            </button>
-                          </div>
-                          )}
-                        </div>
-                        <div className="px-5 py-3">
-                          <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
-                            Departments ({depts.length})
-                          </p>
-                          {depts.length === 0 ? (
-                            <p className="text-sm text-gray-400 italic">No departments yet — add one to start booking</p>
-                          ) : (
-                            <div className="flex flex-wrap gap-2">
-                              {depts.map(d => (
-                                <div key={d.id}
-                                  className="flex items-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-700 text-sm rounded-lg border border-blue-100 group">
-                                  <span>{d.name}</span>
-                                  {d.description && <span className="text-blue-400 ml-1 text-xs">— {d.description}</span>}
-                                  {isAdmin && (<>
-                                  <button onClick={() => openEditDept(d, h)}
-                                    className="ml-1 text-blue-400 hover:text-blue-600 opacity-0 group-hover:opacity-100 transition text-xs">✏️</button>
-                                  <button onClick={() => deleteDept(d, h)}
-                                    className="text-red-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition text-xs">✕</button>
-                                  </>)}
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+            <HospitalsTab
+              hospitals={hospitals}
+              isAdmin={isAdmin}
+              deptsByHospital={deptsByHospital}
+              setEditingHospital={setEditingHospital}
+              setHospitalForm={setHospitalForm}
+              setShowHospitalModal={setShowHospitalModal}
+              openEditHospital={openEditHospital}
+              deleteHospital={deleteHospital}
+              setDeptHospital={setDeptHospital}
+              setDeptForm={setDeptForm}
+              setEditingDept={setEditingDept}
+              setShowDeptModal={setShowDeptModal}
+              openEditDept={openEditDept}
+              deleteDept={deleteDept}
+            />
           )}
 
           {/* ── FEEDBACK ── */}
           {tab === 'feedback' && !tabLoading && (
-            <div className="space-y-4">
-              {/* Summary row */}
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                <div className="bg-white rounded-xl p-5 border-l-4 border-yellow-400 shadow-sm col-span-2 lg:col-span-1">
-                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Avg Rating</p>
-                  <p className="text-3xl font-bold text-gray-900 mt-1">
-                    {feedbackAvgRating ? `${feedbackAvgRating} ⭐` : '—'}
-                  </p>
-                  <p className="text-xs text-gray-400 mt-1">{feedbackTotal} total reviews</p>
-                </div>
-                {/* Star distribution */}
-                <div className="bg-white rounded-xl p-5 shadow-sm col-span-2 lg:col-span-3">
-                  <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Rating Distribution</p>
-                  <div className="space-y-1.5">
-                    {[5,4,3,2,1].map(star => {
-                      const found = feedbackDistribution.find(d => parseInt(d.rating) === star);
-                      const count = found ? parseInt(found.count) : 0;
-                      const pct = feedbackTotal > 0 ? Math.round((count / feedbackTotal) * 100) : 0;
-                      return (
-                        <div key={star} className="flex items-center gap-2 text-sm">
-                          <span className="text-xs text-gray-500 w-4">{star}⭐</span>
-                          <div className="flex-1 bg-gray-100 rounded-full h-2">
-                            <div className="bg-yellow-400 h-2 rounded-full transition-all" style={{ width: `${pct}%` }} />
-                          </div>
-                          <span className="text-xs text-gray-500 w-10 text-right">{count}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-
-              {/* Feedback list */}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-gray-50 border-b border-gray-200">
-                      <tr>
-                        {['Patient', 'Doctor', 'Date', 'Rating', 'Comment'].map(h => (
-                          <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-50">
-                      {feedback.map(f => (
-                        <tr key={f.id} className="hover:bg-gray-50 transition-colors">
-                          <td className="px-4 py-3 font-medium text-gray-900">{f.patient_name || '—'}</td>
-                          <td className="px-4 py-3 text-gray-700">Dr. {f.doctor_name}</td>
-                          <td className="px-4 py-3 text-gray-500 text-xs whitespace-nowrap">
-                            {f.appointment_date ? (() => { try { return format(parseISO(f.appointment_date), 'd MMM yy'); } catch { return f.appointment_date; } })() : '—'}
-                          </td>
-                          <td className="px-4 py-3">
-                            <span className="text-yellow-500 font-medium">{'⭐'.repeat(f.rating)}</span>
-                            <span className="text-gray-400 ml-1 text-xs">({f.rating}/5)</span>
-                          </td>
-                          <td className="px-4 py-3 text-gray-600 max-w-xs truncate" title={f.comment || ''}>
-                            {f.comment || <span className="text-gray-300 italic">No comment</span>}
-                          </td>
-                        </tr>
-                      ))}
-                      {!feedback.length && (
-                        <tr>
-                          <td colSpan={5} className="px-4 py-12 text-center text-gray-400">
-                            No feedback yet — it will appear here after patients rate their appointments
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {(feedbackPage > 1 || feedbackHasMore) && (
-                <div className="flex items-center justify-between mt-2">
-                  <button onClick={() => fetchFeedback(feedbackPage - 1)} disabled={feedbackPage === 1}
-                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                    ← Previous
-                  </button>
-                  <span className="text-sm text-gray-500">Page {feedbackPage}</span>
-                  <button onClick={() => fetchFeedback(feedbackPage + 1)} disabled={!feedbackHasMore}
-                    className="px-4 py-2 text-sm border border-gray-300 rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                    Next →
-                  </button>
-                </div>
-              )}
-            </div>
+            <FeedbackTab />
           )}
 
           {/* ── ANALYTICS ── */}
           {tab === 'analytics' && !tabLoading && (
-            <div className="space-y-4">
-              {analytics ? (
-                <>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* By Status */}
-                    <div className="bg-white rounded-xl p-5 shadow-sm">
-                      <h3 className="font-semibold text-gray-800 mb-4">Appointments by Status (30 days)</h3>
-                      <div className="space-y-3">
-                        {analytics.by_status?.map(s => {
-                          const colors = { confirmed:'bg-green-500', cancelled:'bg-red-400', completed:'bg-blue-500', no_show:'bg-gray-400' };
-                          const total = analytics.by_status.reduce((sum, x) => sum + parseInt(x.count), 0);
-                          const pct = total ? Math.round(parseInt(s.count) / total * 100) : 0;
-                          return (
-                            <div key={s.status}>
-                              <div className="flex justify-between text-sm mb-1">
-                                <span className="capitalize text-gray-700">{s.status?.replace('_',' ')}</span>
-                                <span className="font-medium">{s.count} ({pct}%)</span>
-                              </div>
-                              <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-                                <div className={`h-full ${colors[s.status] || 'bg-gray-400'} rounded-full`} style={{ width: pct + '%' }} />
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                    {/* By Doctor — BarChart */}
-                    <div className="bg-white rounded-xl p-5 shadow-sm">
-                      <h3 className="font-semibold text-gray-800 mb-4">Top Dentists (30 days)</h3>
-                      {analytics.by_doctor?.length > 0 ? (
-                        <ResponsiveContainer width="100%" height={200}>
-                          <BarChart data={analytics.by_doctor.slice(0, 6).map(d => ({ name: d.name.split(' ')[0], count: parseInt(d.count) }))} layout="vertical">
-                            <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
-                            <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} width={70} />
-                            <Tooltip formatter={(v) => [v, 'Appointments']} />
-                            <Bar dataKey="count" fill="#10b981" radius={[0, 4, 4, 0]} />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      ) : (
-                        <p className="text-gray-400 text-sm">No data yet</p>
-                      )}
-                    </div>
-                  </div>
-                  {/* Daily trend — Recharts LineChart */}
-                  <div className="bg-white rounded-xl p-5 shadow-sm">
-                    <h3 className="font-semibold text-gray-800 mb-4">Daily Appointments (30 days)</h3>
-                    {analytics.by_day?.length > 0 ? (
-                      <ResponsiveContainer width="100%" height={200}>
-                        <LineChart data={analytics.by_day.map(d => ({ date: d.date?.slice(5), count: parseInt(d.count) }))}>
-                          <XAxis dataKey="date" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
-                          <YAxis tick={{ fontSize: 11 }} allowDecimals={false} width={30} />
-                          <Tooltip formatter={(v) => [v, 'Appointments']} />
-                          <Line type="monotone" dataKey="count" stroke="#3b82f6" strokeWidth={2} dot={false} />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    ) : (
-                      <p className="text-gray-400 text-sm py-8 text-center">No data yet — book appointments to see trends</p>
-                    )}
-                  </div>
-                  {/* By Department */}
-                  {analytics.by_department?.length > 0 && (
-                    <div className="bg-white rounded-xl p-5 shadow-sm">
-                      <h3 className="font-semibold text-gray-800 mb-4">By Department (30 days)</h3>
-                      <ResponsiveContainer width="100%" height={180}>
-                        <BarChart data={analytics.by_department.map(d => ({ name: d.name || 'Other', count: parseInt(d.count) }))}>
-                          <XAxis dataKey="name" tick={{ fontSize: 11 }} />
-                          <YAxis tick={{ fontSize: 11 }} allowDecimals={false} width={30} />
-                          <Tooltip formatter={(v) => [v, 'Appointments']} />
-                          <Bar dataKey="count" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="text-center text-gray-400 py-12">Loading analytics...</div>
-              )}
-
-              {/* ── REVENUE SECTION (A6) ── */}
-              <div className="bg-white rounded-xl p-5 shadow-sm">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="font-semibold text-gray-800">💰 Revenue Analytics</h3>
-                  <select value={revenueMonths}
-                    onChange={e => { const m = Number(e.target.value); setRevenueMonths(m); fetchRevenue(m); }}
-                    className="border border-gray-300 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                    {[3, 6, 12, 24].map(m => <option key={m} value={m}>Last {m} months</option>)}
-                  </select>
-                </div>
-                {revenueData ? (
-                  <div className="space-y-5">
-                    {/* KPI cards */}
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
-                      <div className="bg-green-50 rounded-lg p-4 text-center">
-                        <div className="text-2xl font-bold text-green-700">₹{(revenueData.total_revenue || 0).toLocaleString('en-IN')}</div>
-                        <div className="text-xs text-green-600 mt-1">Total Revenue ({revenueMonths}m)</div>
-                      </div>
-                      <div className="bg-blue-50 rounded-lg p-4 text-center">
-                        <div className="text-2xl font-bold text-blue-700">{revenueData.monthly?.length || 0}</div>
-                        <div className="text-xs text-blue-600 mt-1">Active Months</div>
-                      </div>
-                      <div className="bg-purple-50 rounded-lg p-4 text-center">
-                        <div className="text-2xl font-bold text-purple-700">
-                          ₹{revenueData.monthly?.length ? Math.round((revenueData.total_revenue || 0) / revenueData.monthly.length).toLocaleString('en-IN') : 0}
-                        </div>
-                        <div className="text-xs text-purple-600 mt-1">Avg Monthly</div>
-                      </div>
-                    </div>
-                    {/* Monthly revenue bar chart */}
-                    {revenueData.monthly?.length > 0 && (
-                      <div>
-                        <h4 className="text-sm font-semibold text-gray-700 mb-3">Monthly Revenue (₹)</h4>
-                        <ResponsiveContainer width="100%" height={180}>
-                          <BarChart data={revenueData.monthly.map(m => ({ month: m.month?.slice(0, 7), revenue: parseInt(m.revenue) || 0 }))}>
-                            <XAxis dataKey="month" tick={{ fontSize: 10 }} />
-                            <YAxis tick={{ fontSize: 10 }} tickFormatter={v => `₹${(v/1000).toFixed(0)}k`} width={50} />
-                            <Tooltip formatter={(v) => [`₹${v.toLocaleString('en-IN')}`, 'Revenue']} />
-                            <Bar dataKey="revenue" fill="#22c55e" radius={[4, 4, 0, 0]} />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </div>
-                    )}
-                    {/* Top earning dentists */}
-                    {revenueData.by_doctor?.length > 0 && (
-                      <div>
-                        <h4 className="text-sm font-semibold text-gray-700 mb-3">Top Earning Dentists</h4>
-                        <div className="space-y-2">
-                          {revenueData.by_doctor.slice(0, 5).map((d, i) => {
-                            const maxRev = revenueData.by_doctor[0]?.revenue || 1;
-                            const pct = Math.round((d.revenue / maxRev) * 100);
-                            return (
-                              <div key={d.name} className="flex items-center gap-3">
-                                <span className="text-xs font-bold text-gray-400 w-4">#{i + 1}</span>
-                                <span className="text-sm text-gray-700 w-28 truncate">Dr. {d.name}</span>
-                                <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
-                                  <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${pct}%` }} />
-                                </div>
-                                <span className="text-sm font-semibold text-gray-800 w-24 text-right">₹{parseInt(d.revenue).toLocaleString('en-IN')}</span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-                    {/* Revenue by treatment */}
-                    {revenueData.by_treatment?.length > 0 && (
-                      <div>
-                        <h4 className="text-sm font-semibold text-gray-700 mb-3">Revenue by Treatment</h4>
-                        <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
-                          {revenueData.by_treatment.slice(0, 6).map(t => (
-                            <div key={t.treatment} className="bg-gray-50 rounded-lg p-3">
-                              <div className="text-xs text-gray-500 truncate">{t.treatment}</div>
-                              <div className="text-sm font-bold text-gray-800 mt-1">₹{parseInt(t.revenue).toLocaleString('en-IN')}</div>
-                              <div className="text-xs text-gray-400">{t.count} appts</div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="text-center text-gray-400 py-8 text-sm">
-                    Revenue data will appear here once you have completed appointments with consultation fees set.
-                  </div>
-                )}
-              </div>
-            </div>
+            <AnalyticsTab />
           )}
 
           {/* ── SERVICES (A1) ── */}
           {tab === 'services' && !tabLoading && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <p className="text-sm text-gray-500">{services.length} treatment{services.length !== 1 ? 's' : ''} in catalog</p>
-                {isAdmin && (
-                <button onClick={() => { setEditingService(null); setServiceForm({ name: '', description: '', category: '', duration_minutes: '30', price: '', hospital_id: hospitals[0]?.id || '' }); setShowServiceModal(true); }}
-                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition">
-                  + Add Service
-                </button>
-                )}
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {services.map(svc => (
-                  <div key={svc.id} className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 hover:shadow-md transition">
-                    <div className="flex items-start justify-between mb-2">
-                      <div className="flex-1 min-w-0">
-                        <h3 className="font-semibold text-gray-900 text-sm truncate">{svc.name}</h3>
-                        {svc.category && <span className="text-xs text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">{svc.category}</span>}
-                      </div>
-                      {isAdmin && (
-                      <div className="flex gap-1 ml-2 shrink-0">
-                        <button onClick={() => openEditService(svc)}
-                          className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition">✏️</button>
-                        <button onClick={() => deleteService(svc)}
-                          className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition">🗑️</button>
-                      </div>
-                      )}
-                    </div>
-                    {svc.description && <p className="text-xs text-gray-500 mb-3 line-clamp-2">{svc.description}</p>}
-                    <div className="flex items-center gap-3 text-xs text-gray-600">
-                      <span className="bg-gray-100 px-2 py-1 rounded">⏱ {svc.duration_minutes} min</span>
-                      {svc.price > 0 && <span className="bg-green-50 text-green-700 px-2 py-1 rounded font-semibold">₹{svc.price.toLocaleString('en-IN')}</span>}
-                      {svc.hospital_name && <span className="text-gray-400 truncate">{svc.hospital_name}</span>}
-                    </div>
-                  </div>
-                ))}
-                {!services.length && (
-                  <div className="col-span-3 text-center py-16 bg-white rounded-xl shadow-sm">
-                    <div className="text-4xl mb-3">💊</div>
-                    <p className="text-gray-500 font-medium">No services yet</p>
-                    <p className="text-gray-400 text-sm mt-1">Add treatments like Root Canal, Cleaning, Braces consultation, etc.</p>
-                  </div>
-                )}
-              </div>
-            </div>
+            <ServicesTab
+              hospitals={hospitals}
+              isAdmin={isAdmin}
+              setConfirmModal={setConfirmModal}
+            />
           )}
 
           {/* ── HOLIDAYS (A4) ── */}
           {tab === 'holidays' && !tabLoading && (
-            <div className="space-y-4">
-              {/* Add holiday form (holiday CRUD is admin-only server-side) */}
-              {isAdmin && (
-              <div className="bg-white rounded-xl p-5 shadow-sm">
-                <h3 className="font-semibold text-gray-800 mb-4">Add Clinic Holiday / Closure</h3>
-                <form onSubmit={addHoliday} className="flex flex-wrap gap-3 items-end">
-                  <div>
-                    <label className="block text-xs font-medium text-gray-700 mb-1">Clinic Branch</label>
-                    <select value={holidayForm.hospital_id}
-                      onChange={e => setHolidayForm(f => ({ ...f, hospital_id: e.target.value }))}
-                      className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                      <option value="">— All Branches —</option>
-                      {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-gray-700 mb-1">Date <span className="text-red-400">*</span></label>
-                    <input type="date" value={holidayForm.holiday_date}
-                      onChange={e => setHolidayForm(f => ({ ...f, holiday_date: e.target.value }))}
-                      className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-                  </div>
-                  <div className="flex-1 min-w-[180px]">
-                    <label className="block text-xs font-medium text-gray-700 mb-1">Holiday Name <span className="text-red-400">*</span></label>
-                    <input value={holidayForm.name}
-                      onChange={e => setHolidayForm(f => ({ ...f, name: e.target.value }))}
-                      placeholder="e.g. Diwali, Republic Day, Clinic Renovation"
-                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-                  </div>
-                  <button type="submit" disabled={holidaySaving}
-                    className="px-4 py-2 bg-orange-600 text-white text-sm font-medium rounded-lg hover:bg-orange-700 disabled:opacity-50 transition whitespace-nowrap">
-                    {holidaySaving ? 'Adding...' : '+ Add Holiday'}
-                  </button>
-                </form>
-                <p className="text-xs text-gray-400 mt-3">
-                  ⚠️ Holidays block new slot generation and hide available slots on that day. Already-confirmed appointments are not affected.
-                </p>
-              </div>
-              )}
-
-              {/* Holidays list */}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
-                  <h3 className="font-medium text-gray-800">Scheduled Holidays</h3>
-                  <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">{holidays.length} date{holidays.length !== 1 ? 's' : ''}</span>
-                </div>
-                {holidays.length === 0 ? (
-                  <div className="px-5 py-12 text-center">
-                    <div className="text-3xl mb-2">🗓️</div>
-                    <p className="text-gray-500 font-medium text-sm">No holidays scheduled</p>
-                    <p className="text-gray-400 text-xs mt-1">Add clinic closures to prevent bookings on those days</p>
-                  </div>
-                ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead className="bg-gray-50 border-b border-gray-200">
-                        <tr>
-                          {['Date', 'Holiday', 'Branch', 'Added'].map(h => (
-                            <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
-                          ))}
-                          <th className="px-4 py-3 w-20" />
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-50">
-                        {holidays.map(h => (
-                          <tr key={h.id} className="hover:bg-gray-50 transition-colors">
-                            <td className="px-4 py-3 font-medium text-gray-900 whitespace-nowrap">
-                              {(() => { try { return format(parseISO(h.holiday_date), 'EEE, d MMM yyyy'); } catch { return h.holiday_date; } })()}
-                            </td>
-                            <td className="px-4 py-3 text-gray-700">{h.name}</td>
-                            <td className="px-4 py-3 text-gray-500 text-xs">{h.hospital_name || <span className="text-gray-400 italic">All branches</span>}</td>
-                            <td className="px-4 py-3 text-gray-400 text-xs">
-                              {h.created_at ? (() => { try { return format(parseISO(h.created_at), 'd MMM yy'); } catch { return '—'; } })() : '—'}
-                            </td>
-                            <td className="px-4 py-3">
-                              {isAdmin && (
-                              <button onClick={() => deleteHoliday(h)}
-                                className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition">
-                                Remove
-                              </button>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            </div>
+            <HolidaysTab
+              hospitals={hospitals}
+              isAdmin={isAdmin}
+              setConfirmModal={setConfirmModal}
+            />
           )}
 
           {/* ── STAFF ── */}
           {tab === 'staff' && !tabLoading && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <p className="text-sm text-gray-500">{staff.length} team member{staff.length !== 1 ? 's' : ''}</p>
-                {isAdmin && (
-                <button onClick={() => { setEditingStaff(null); setStaffForm({ name: '', email: '', password: '', role: 'staff' }); setShowStaffModal(true); }}
-                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition">
-                  + Add Staff
-                </button>
-                )}
-              </div>
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead className="bg-gray-50 border-b border-gray-200">
-                    <tr>
-                      {['Name', 'Email', 'Role', 'Status', 'Actions'].map(h => (
-                        <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-50">
-                    {staff.map(m => (
-                      <tr key={m.id} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-4 py-3 font-medium text-gray-900">{m.name}</td>
-                        <td className="px-4 py-3 text-gray-600 text-sm">{m.email}</td>
-                        <td className="px-4 py-3">
-                          <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${m.role === 'admin' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
-                            {m.role}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3">
-                          <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${m.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-500'}`}>
-                            {m.is_active ? 'Active' : 'Inactive'}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3">
-                          {isAdmin && (
-                          <div className="flex gap-2">
-                            <button onClick={() => { setEditingStaff(m); setStaffForm({ name: m.name, email: m.email, password: '', role: m.role }); setShowStaffModal(true); }}
-                              className="px-2 py-1 text-xs border border-gray-200 text-gray-600 rounded hover:bg-gray-50 transition">
-                              ✏️ Edit
-                            </button>
-                            {m.is_active && (
-                              <button onClick={() => deactivateStaff(m)}
-                                className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded hover:bg-red-50 transition">
-                                🚫 Deactivate
-                              </button>
-                            )}
-                          </div>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                    {!staff.length && (
-                      <tr><td colSpan={5} className="px-4 py-12 text-center text-gray-400">No staff members yet. Add one to get started.</td></tr>
-                    )}
-                  </tbody>
-                </table>
-                </div>
-              </div>
-            </div>
+            <StaffTab
+              isAdmin={isAdmin}
+              setConfirmModal={setConfirmModal}
+            />
           )}
 
           {/* ── SETTINGS ── */}
           {tab === 'settings' && !tabLoading && (
-            <div className="max-w-2xl space-y-6">
-              <div className="bg-white rounded-xl p-6 shadow-sm">
-                <h2 className="font-semibold text-gray-800 mb-5">Clinic Settings</h2>
-                {settings === null ? (
-                  <div className="text-gray-400 py-8 text-center">Loading settings...</div>
-                ) : (
-                  <form onSubmit={saveSettings} className="space-y-4">
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Clinic Name</label>
-                      <input value={settingsForm.name}
-                        onChange={e => setSettingsForm(f => ({ ...f, name: e.target.value }))}
-                        placeholder="Demo Clinic Hyderabad"
-                        className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                    </div>
-                    <div className="pt-3 border-t border-gray-100">
-                      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">WhatsApp Integration</h3>
-                      <p className="text-xs text-gray-500 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
-                        📱 WhatsApp is configured globally via a shared phone number. Contact your platform administrator to update credentials.
-                      </p>
-                    </div>
-                    <div className="pt-3 border-t border-gray-100">
-                      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Notifications</h3>
-                      <div className="space-y-3">
-                        <label className="flex items-center gap-3 cursor-pointer select-none">
-                          <div className="relative">
-                            <input type="checkbox" className="sr-only"
-                              checked={settingsForm.notification_prefs?.email_on_booking !== false}
-                              onChange={e => setSettingsForm(f => ({ ...f, notification_prefs: { ...f.notification_prefs, email_on_booking: e.target.checked } }))} />
-                            <div className={`w-10 h-5 rounded-full transition-colors ${settingsForm.notification_prefs?.email_on_booking !== false ? 'bg-blue-500' : 'bg-gray-300'}`} />
-                            <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${settingsForm.notification_prefs?.email_on_booking !== false ? 'translate-x-5' : ''}`} />
-                          </div>
-                          <span className="text-sm text-gray-700">Email notification on new booking</span>
-                        </label>
-                        <div>
-                          <label className="block text-xs font-medium text-gray-700 mb-1">
-                            SMS notification number
-                            <span className="text-gray-400 font-normal ml-1">(optional — requires Twilio)</span>
-                          </label>
-                          <input
-                            type="tel"
-                            value={settingsForm.notify_phone}
-                            onChange={e => setSettingsForm(f => ({ ...f, notify_phone: e.target.value }))}
-                            placeholder="e.g. 917795676142"
-                            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                          />
-                          <p className="text-xs text-gray-400 mt-1">An SMS will be sent to this number each time an appointment is booked via the WhatsApp bot.</p>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="pt-4">
-                      {isAdmin ? (
-                        <button type="submit" disabled={settingsSaving}
-                          className="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-                          {settingsSaving ? 'Saving...' : '💾 Save Settings'}
-                        </button>
-                      ) : (
-                        <p className="text-xs text-gray-400">Only clinic admins can change these settings.</p>
-                      )}
-                    </div>
-                  </form>
-                )}
-              </div>
-              {settings && (
-                <div className="space-y-3">
-                  {/* Plan Usage */}
-                  {settings.plan_limits && (
-                    <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-100">
-                      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
-                        Plan Usage — <span className="text-blue-600 normal-case font-medium">{settings.plan_limits.name}</span>
-                        {settings.plan_limits.price_monthly > 0 && (
-                          <span className="text-gray-400 font-normal ml-1">(₹{settings.plan_limits.price_monthly}/mo)</span>
-                        )}
-                      </h3>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        {/* Dentists */}
-                        <div>
-                          <div className="flex justify-between text-sm mb-1">
-                            <span className="text-gray-600">Dentists</span>
-                            <span className="font-medium text-gray-900">
-                              {settings.usage?.active_doctors ?? '—'} / {settings.plan_limits.max_doctors === 999 ? '∞' : settings.plan_limits.max_doctors}
-                            </span>
-                          </div>
-                          {settings.usage?.active_doctors != null && settings.plan_limits.max_doctors !== 999 && (
-                            <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-                              <div
-                                className={`h-full rounded-full transition-all ${
-                                  settings.usage.active_doctors / settings.plan_limits.max_doctors >= 0.9 ? 'bg-red-500' :
-                                  settings.usage.active_doctors / settings.plan_limits.max_doctors >= 0.7 ? 'bg-yellow-500' : 'bg-green-500'
-                                }`}
-                                style={{ width: `${Math.min(100, Math.round(settings.usage.active_doctors / settings.plan_limits.max_doctors * 100))}%` }}
-                              />
-                            </div>
-                          )}
-                        </div>
-                        {/* Appointments this month */}
-                        <div>
-                          <div className="flex justify-between text-sm mb-1">
-                            <span className="text-gray-600">Appts this month</span>
-                            <span className="font-medium text-gray-900">
-                              {settings.usage?.appointments_this_month ?? '—'} / {settings.plan_limits.max_appointments_per_month === 99999 ? '∞' : settings.plan_limits.max_appointments_per_month}
-                            </span>
-                          </div>
-                          {settings.usage?.appointments_this_month != null && settings.plan_limits.max_appointments_per_month !== 99999 && (
-                            <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-                              <div
-                                className={`h-full rounded-full transition-all ${
-                                  settings.usage.appointments_this_month / settings.plan_limits.max_appointments_per_month >= 0.9 ? 'bg-red-500' :
-                                  settings.usage.appointments_this_month / settings.plan_limits.max_appointments_per_month >= 0.7 ? 'bg-yellow-500' : 'bg-blue-500'
-                                }`}
-                                style={{ width: `${Math.min(100, Math.round(settings.usage.appointments_this_month / settings.plan_limits.max_appointments_per_month * 100))}%` }}
-                              />
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {/* Account info */}
-                  <div className="bg-gray-50 rounded-xl p-4 border border-gray-200 text-xs text-gray-500 space-y-1.5">
-                    <p><strong className="text-gray-700">Tenant slug:</strong> {settings.slug}</p>
-                    <p><strong className="text-gray-700">Plan:</strong> {settings.plan}</p>
-                    <p><strong className="text-gray-700">Owner:</strong> {settings.owner_email}</p>
-                    <p><strong className="text-gray-700">Status:</strong> {settings.status}</p>
-                  </div>
-                </div>
-              )}
-
-              {/* Change Password */}
-              <div className="bg-white rounded-xl p-6 shadow-sm">
-                <h2 className="font-semibold text-gray-800 mb-1">Change Password</h2>
-                <p className="text-xs text-gray-400 mb-5">Update your account password. Must be 8+ chars with uppercase, lowercase and a digit.</p>
-                <form onSubmit={changePassword} className="space-y-3">
-                  <div>
-                    <label className="block text-xs font-medium text-gray-700 mb-1">Current Password</label>
-                    <input type="password" value={changePwdForm.current_password}
-                      onChange={e => setChangePwdForm(f => ({ ...f, current_password: e.target.value }))}
-                      placeholder="Enter current password"
-                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">New Password</label>
-                      <input type="password" value={changePwdForm.new_password}
-                        onChange={e => setChangePwdForm(f => ({ ...f, new_password: e.target.value }))}
-                        placeholder="New password"
-                        className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Confirm New Password</label>
-                      <input type="password" value={changePwdForm.confirm_password}
-                        onChange={e => setChangePwdForm(f => ({ ...f, confirm_password: e.target.value }))}
-                        placeholder="Confirm new password"
-                        className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-                          changePwdForm.confirm_password && changePwdForm.new_password !== changePwdForm.confirm_password
-                            ? 'border-red-300 bg-red-50' : 'border-gray-300'
-                        }`} required />
-                    </div>
-                  </div>
-                  {changePwdForm.confirm_password && changePwdForm.new_password !== changePwdForm.confirm_password && (
-                    <p className="text-xs text-red-500">Passwords do not match</p>
-                  )}
-                  <div className="pt-2">
-                    <button type="submit" disabled={changingPwd || (changePwdForm.confirm_password && changePwdForm.new_password !== changePwdForm.confirm_password)}
-                      className="px-6 py-2.5 bg-gray-800 text-white rounded-lg text-sm font-medium hover:bg-gray-900 disabled:opacity-50 transition">
-                      {changingPwd ? 'Changing...' : '🔒 Change Password'}
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div>
+            <SettingsTab
+              settings={settings}
+              fetchSettings={fetchSettings}
+              isAdmin={isAdmin}
+            />
           )}
 
           {/* ── CALENDAR ── */}
           {tab === 'calendar' && !tabLoading && (
-            <div className="space-y-4">
-              <div className="flex flex-wrap items-center gap-3">
-                <button
-                  onClick={() => {
-                    const d = new Date(calendarDate.getFullYear(), calendarDate.getMonth() - 1, 1);
-                    setCalendarDate(d); setSelectedCalDay(null);
-                    fetchCalendarAppts(d.getFullYear(), d.getMonth());
-                  }}
-                  className="p-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition text-gray-600">← Prev</button>
-                <h2 className="font-semibold text-gray-800 text-base min-w-[160px] text-center">
-                  {calendarDate.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}
-                </h2>
-                <button
-                  onClick={() => {
-                    const d = new Date(calendarDate.getFullYear(), calendarDate.getMonth() + 1, 1);
-                    setCalendarDate(d); setSelectedCalDay(null);
-                    fetchCalendarAppts(d.getFullYear(), d.getMonth());
-                  }}
-                  className="p-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition text-gray-600">Next →</button>
-                <button
-                  onClick={() => {
-                    const d = new Date();
-                    const first = new Date(d.getFullYear(), d.getMonth(), 1);
-                    setCalendarDate(first); setSelectedCalDay(null);
-                    fetchCalendarAppts(first.getFullYear(), first.getMonth());
-                  }}
-                  className="px-3 py-1.5 text-sm border border-blue-300 text-blue-600 rounded-lg hover:bg-blue-50 transition">
-                  Today
-                </button>
-              </div>
-              <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
-                <div className="flex-1 min-w-0 bg-white rounded-xl shadow-sm overflow-hidden">
-                  <div className="grid grid-cols-7 border-b border-gray-200 bg-gray-50">
-                    {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
-                      <div key={d} className="py-2 text-center text-xs font-semibold text-gray-400 uppercase">{d}</div>
-                    ))}
-                  </div>
-                  <div className="grid grid-cols-7">
-                    {getCalendarDays(calendarDate.getFullYear(), calendarDate.getMonth()).map((day, i) => {
-                      if (!day) return <div key={`e-${i}`} className="border-r border-b border-gray-100 min-h-[76px]" />;
-                      const dateStr = formatCalDate(calendarDate.getFullYear(), calendarDate.getMonth(), day);
-                      const dayAppts = calendarAppts[dateStr] || [];
-                      const todayStr = todayIST();
-                      const isToday = dateStr === todayStr;
-                      const isSelected = selectedCalDay === dateStr;
-                      return (
-                        <div key={day}
-                          onClick={() => { setSelectedCalDay(dateStr); setCalDayAppts(dayAppts); }}
-                          className={`border-r border-b border-gray-100 min-h-[76px] p-2 cursor-pointer transition-colors
-                            ${isSelected ? 'bg-blue-50' : 'hover:bg-gray-50'}`}>
-                          <div className={`text-sm font-medium mb-1 w-6 h-6 flex items-center justify-center rounded-full mx-auto
-                            ${isToday ? 'bg-blue-600 text-white' : 'text-gray-700'}`}>
-                            {day}
-                          </div>
-                          {dayAppts.length > 0 && (
-                            <div className={`text-xs px-1 py-0.5 rounded text-center font-medium
-                              ${dayAppts.length >= 5 ? 'bg-red-100 text-red-700' : dayAppts.length >= 3 ? 'bg-yellow-100 text-yellow-700' : 'bg-green-100 text-green-700'}`}>
-                              {dayAppts.length} appt{dayAppts.length !== 1 ? 's' : ''}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-                {selectedCalDay && (
-                  <div className="w-full lg:w-72 lg:shrink-0 bg-white rounded-xl shadow-sm overflow-hidden">
-                    <div className="px-4 py-3 border-b border-gray-100 bg-gray-50">
-                      <h3 className="font-semibold text-gray-800 text-sm">
-                        {(() => { try { return format(parseISO(selectedCalDay), 'EEEE, d MMMM'); } catch { return selectedCalDay; } })()}
-                      </h3>
-                      <p className="text-xs text-gray-400 mt-0.5">{calDayAppts.length} appointment{calDayAppts.length !== 1 ? 's' : ''}</p>
-                    </div>
-                    <div className="divide-y divide-gray-50 max-h-[440px] overflow-y-auto">
-                      {calDayAppts.length === 0 ? (
-                        <div className="px-4 py-8 text-center text-gray-400 text-sm">No appointments this day</div>
-                      ) : calDayAppts.map(a => (
-                        <div key={a.id} className="px-4 py-3">
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-sm font-semibold text-blue-600">{a.appointment_time?.slice(0, 5)}</span>
-                            <Badge status={a.status} />
-                          </div>
-                          <div className="text-sm font-medium text-gray-900">{a.patient_name}</div>
-                          <div className="text-xs text-gray-500">Dr. {a.doctor_name}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
+            <CalendarTab />
           )}
 
           {/* ── DOCTOR LEAVES ── */}
           {tab === 'leaves' && !tabLoading && (
-            <div className="space-y-4">
-              <div className="flex flex-col md:flex-row gap-4 md:gap-6 md:items-start">
-                {/* Doctor selector */}
-                <div className="w-full md:w-56 md:shrink-0">
-                  <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Select Doctor</label>
-                  <div className="space-y-1">
-                    {leavesDoctorList.length === 0 ? (
-                      <div className="text-sm text-gray-400 p-3 bg-white rounded-xl shadow-sm text-center">
-                        <div className="text-2xl mb-1">🦷</div>
-                        No dentists found
-                      </div>
-                    ) : leavesDoctorList.map(d => (
-                      <button key={d.id}
-                        onClick={() => { setLeavesDoctor(d); fetchLeaves(d.id); }}
-                        className={`w-full text-left px-3 py-2.5 rounded-lg text-sm font-medium transition-colors border ${
-                          leavesDoctor?.id === d.id
-                            ? 'bg-blue-50 text-blue-700 border-blue-200'
-                            : 'bg-white text-gray-700 hover:bg-gray-50 border-transparent'
-                        }`}>
-                        Dr. {d.name}
-                        <div className="text-xs font-normal text-gray-400 mt-0.5 truncate">{d.specialization || 'General'}</div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Leave management panel */}
-                <div className="flex-1 min-w-0">
-                  {!leavesDoctor ? (
-                    <div className="text-center py-16 bg-white rounded-xl shadow-sm">
-                      <div className="text-5xl mb-3">🏖️</div>
-                      <p className="text-gray-500 font-medium">Select a doctor</p>
-                      <p className="text-gray-400 text-sm mt-1">Choose a doctor from the list to manage their leaves</p>
-                    </div>
-                  ) : (
-                    <div className="space-y-4">
-                      {/* Add leave form (leave CRUD is admin-only server-side) */}
-                      {isAdmin && (
-                      <div className="bg-white rounded-xl p-5 shadow-sm">
-                        <h3 className="font-semibold text-gray-800 mb-4">Add Leave — Dr. {leavesDoctor.name}</h3>
-                        <div className="flex flex-wrap gap-3 items-end">
-                          <div>
-                            <label className="block text-xs font-medium text-gray-700 mb-1">Leave Date *</label>
-                            <input type="date" value={leaveDate}
-                              onChange={e => setLeaveDate(e.target.value)}
-                              min={todayIST()}
-                              className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                          </div>
-                          <div className="flex-1 min-w-[160px]">
-                            <label className="block text-xs font-medium text-gray-700 mb-1">Reason (optional)</label>
-                            <input value={leaveReason}
-                              onChange={e => setLeaveReason(e.target.value)}
-                              placeholder="e.g. Medical conference, personal leave"
-                              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                          </div>
-                          <button onClick={addLeave} disabled={leaveSaving || !leaveDate}
-                            className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition whitespace-nowrap">
-                            {leaveSaving ? 'Adding...' : '+ Add Leave'}
-                          </button>
-                        </div>
-                        <p className="text-xs text-gray-400 mt-2">
-                          ⚠️ Adding a leave blocks all available slots on that day. Already-booked appointments are not affected.
-                        </p>
-                      </div>
-                      )}
-
-                      {/* Existing leaves */}
-                      <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                        <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
-                          <h3 className="font-medium text-gray-800">Scheduled Leaves</h3>
-                          <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">
-                            {leaves.length} date{leaves.length !== 1 ? 's' : ''}
-                          </span>
-                        </div>
-                        {leavesLoading ? (
-                          <div className="px-5 py-10 text-center text-gray-400 text-sm">Loading leaves...</div>
-                        ) : leaves.length === 0 ? (
-                          <div className="px-5 py-12 text-center">
-                            <div className="text-3xl mb-2">✅</div>
-                            <p className="text-gray-500 font-medium text-sm">No leaves scheduled</p>
-                            <p className="text-gray-400 text-xs mt-1">Dr. {leavesDoctor.name} is available on all working days</p>
-                          </div>
-                        ) : (
-                          <div className="divide-y divide-gray-50">
-                            {leaves.map(l => (
-                              <div key={l.id} className="px-5 py-3 flex items-center justify-between">
-                                <div>
-                                  <div className="text-sm font-medium text-gray-900">
-                                    {(() => { try { return format(parseISO(l.leave_date), 'EEEE, d MMMM yyyy'); } catch { return l.leave_date; } })()}
-                                  </div>
-                                  {l.reason && <div className="text-xs text-gray-400 mt-0.5">{l.reason}</div>}
-                                </div>
-                                {isAdmin && (
-                                <button onClick={() => removeLeave(leavesDoctor.id, l.leave_date)}
-                                  className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition">
-                                  Remove
-                                </button>
-                                )}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
+            <LeavesTab
+              isAdmin={isAdmin}
+              setConfirmModal={setConfirmModal}
+            />
           )}
 
           {/* ── AUDIT LOGS ── */}
           {tab === 'audit' && isAdmin && !tabLoading && (
-            <div className="space-y-4">
-              {/* Filters */}
-              <div className="bg-white rounded-xl p-4 shadow-sm flex flex-wrap gap-3 items-end">
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">From</label>
-                  <input type="date" value={auditFrom} onChange={e => setAuditFrom(e.target.value)}
-                    className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">To</label>
-                  <input type="date" value={auditTo} onChange={e => setAuditTo(e.target.value)}
-                    className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Action</label>
-                  <input value={auditAction} onChange={e => setAuditAction(e.target.value)}
-                    placeholder="e.g. CREATE_DOCTOR"
-                    className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm w-44 focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                </div>
-                <button onClick={() => fetchAuditLogs(1)}
-                  className="px-4 py-1.5 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">
-                  Search
-                </button>
-                <span className="text-sm text-gray-400 ml-auto">{auditTotal} records</span>
-              </div>
-
-              {/* Table */}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-gray-50 border-b border-gray-200">
-                      <tr>
-                        {['Timestamp', 'Role', 'Action', 'Resource', 'Resource ID', 'IP'].map(h => (
-                          <th key={h} className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100">
-                      {auditLogs.map(log => (
-                        <tr key={log.id} className="hover:bg-gray-50">
-                          <td className="px-4 py-2.5 text-xs text-gray-500 whitespace-nowrap">
-                            {log.created_at ? new Date(log.created_at).toLocaleString('en-IN') : '—'}
-                          </td>
-                          <td className="px-4 py-2.5">
-                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${log.actor_role === 'admin' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
-                              {log.actor_role || '—'}
-                            </span>
-                          </td>
-                          <td className="px-4 py-2.5 font-mono text-xs font-medium text-gray-800">{log.action || '—'}</td>
-                          <td className="px-4 py-2.5 text-gray-600 text-xs">{log.resource_type || '—'}</td>
-                          <td className="px-4 py-2.5 font-mono text-xs text-gray-400 truncate max-w-[120px]">{log.resource_id || '—'}</td>
-                          <td className="px-4 py-2.5 text-xs text-gray-400">{log.ip_address || '—'}</td>
-                        </tr>
-                      ))}
-                      {!auditLogs.length && (
-                        <tr><td colSpan={6} className="px-4 py-8 text-center text-gray-400">No audit log entries found</td></tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-                {(auditLogs.length > 0 || auditPage > 1) && (
-                  <div className="px-4 py-3 border-t border-gray-100 flex items-center gap-3">
-                    <button disabled={auditPage <= 1}
-                      onClick={() => fetchAuditLogs(auditPage - 1)}
-                      className="px-3 py-1.5 border border-gray-300 text-sm rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                      ← Prev
-                    </button>
-                    <span className="text-sm text-gray-500">Page {auditPage}</span>
-                    <button disabled={!auditHasMore}
-                      onClick={() => fetchAuditLogs(auditPage + 1)}
-                      className="px-3 py-1.5 border border-gray-300 text-sm rounded-lg disabled:opacity-40 hover:bg-gray-50 transition">
-                      Next →
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
+            <AuditTab />
           )}
 
           {/* ── SLOTS ── */}
@@ -3163,110 +1682,7 @@ export default function Dashboard() {
 
           {/* ── BOT TESTER ── */}
           {tab === 'test' && !tabLoading && (
-            <div className="max-w-2xl space-y-4">
-              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800">
-                <strong>🤖 WhatsApp Bot Tester</strong><br/>
-                Test the bot without a real WhatsApp connection. Messages are intercepted locally.
-              </div>
-
-              <div className="bg-white rounded-xl p-5 shadow-sm space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number</label>
-                  <input value={botPhone} onChange={e => setBotPhone(e.target.value)}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    placeholder="917795676142" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Message</label>
-                  <input value={botMessage} onChange={e => setBotMessage(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && testBot()}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    placeholder="Hi" />
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <button onClick={testBot} disabled={botLoading}
-                    className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition">
-                    {botLoading ? 'Sending...' : '📨 Send Message'}
-                  </button>
-                  <div className="flex gap-2 flex-wrap">
-                    {['Hi', 'Book', 'My Appointments', 'Status'].map(m => (
-                      <button key={m} onClick={() => { setBotMessage(m); }}
-                        className="px-3 py-2 border border-gray-200 text-gray-600 rounded-lg text-xs hover:bg-gray-50 transition">
-                        {m}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {isAdmin && (
-                <div className="pt-1 border-t border-gray-100 flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-xs text-gray-400">If the bot gets stuck, reset the session to start fresh.</span>
-                  <button onClick={resetBotSession} disabled={botResetting}
-                    className="px-3 py-1.5 text-xs border border-orange-200 text-orange-600 rounded-lg hover:bg-orange-50 disabled:opacity-50 transition whitespace-nowrap">
-                    {botResetting ? 'Resetting...' : '🔄 Reset Session'}
-                  </button>
-                </div>
-                )}
-              </div>
-
-              {botResponse && (
-                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                  <div className="px-5 py-3 border-b border-gray-100 bg-gray-50 flex items-center justify-between">
-                    <span className="text-sm font-semibold text-gray-700">
-                      🤖 Bot replied ({botResponse.responses?.length || 0} message{botResponse.responses?.length !== 1 ? 's' : ''})
-                    </span>
-                    <span className="text-xs text-gray-400">{botResponse.tenant}</span>
-                  </div>
-                  {/* WhatsApp-style chat bubbles */}
-                  <div className="p-4 space-y-3 bg-[#e5ddd5] min-h-[80px]">
-                    {/* Outgoing user message */}
-                    <div className="flex justify-end">
-                      <div className="bg-[#dcf8c6] rounded-lg rounded-tr-none px-3 py-2 max-w-xs shadow-sm">
-                        <p className="text-sm text-gray-800">{botResponse.message}</p>
-                        <p className="text-xs text-gray-400 text-right mt-0.5">You</p>
-                      </div>
-                    </div>
-                    {/* Bot responses */}
-                    {botResponse.responses?.map((r, i) => (
-                      <div key={i} className="flex justify-start">
-                        <div className="bg-white rounded-lg rounded-tl-none px-3 py-2 max-w-sm shadow-sm">
-                          <p className="text-sm text-gray-800 whitespace-pre-wrap">{r.text}</p>
-                          {r.buttons && (
-                            <div className="mt-2 pt-2 border-t border-gray-100 flex flex-col gap-1.5">
-                              {r.buttons.map((b, bi) => (
-                                <button key={bi}
-                                  onClick={() => { setBotMessage(String(b)); }}
-                                  className="text-sm text-blue-600 py-1 border border-blue-200 rounded-lg hover:bg-blue-50 transition text-center">
-                                  {b}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                          {r.sections && r.sections.map((s, si) => (
-                            <div key={si} className="mt-2 pt-2 border-t border-gray-100">
-                              {s.title && <p className="text-xs font-semibold text-gray-500 mb-1.5">{s.title}</p>}
-                              <div className="flex flex-col gap-1">
-                                {s.rows?.map((row, ri) => (
-                                  <button key={ri}
-                                    onClick={() => setBotMessage(row.id || row.title)}
-                                    className="text-left text-sm px-2 py-1.5 border border-gray-200 rounded-lg hover:bg-gray-50 transition">
-                                    <span className="font-medium text-gray-800">{row.title}</span>
-                                    {row.description && <span className="text-xs text-gray-400 ml-1">· {row.description}</span>}
-                                  </button>
-                                ))}
-                              </div>
-                            </div>
-                          ))}
-                          <p className="text-xs text-gray-400 text-right mt-1">MediBook Bot</p>
-                        </div>
-                      </div>
-                    ))}
-                    {!botResponse.responses?.length && (
-                      <div className="text-center text-gray-500 text-sm py-4">Bot sent no response — check backend logs</div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
+            <TestBotTab isAdmin={isAdmin} />
           )}
 
           </ErrorBoundary>
@@ -3987,70 +2403,6 @@ export default function Dashboard() {
       </div>
     )}
 
-    {/* ── ADD / EDIT SERVICE MODAL (A1) ── */}
-    {showServiceModal && (
-      <Modal title={editingService ? `Edit "${editingService.name}"` : 'Add Treatment Service'} onClose={() => { setShowServiceModal(false); setEditingService(null); }}>
-        <form onSubmit={saveService} className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Service Name <span className="text-red-400">*</span></label>
-            <input value={serviceForm.name} onChange={e => setServiceForm(f => ({ ...f, name: e.target.value }))}
-              placeholder="e.g. Root Canal Treatment, Teeth Cleaning"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Category</label>
-            <select value={serviceForm.category} onChange={e => setServiceForm(f => ({ ...f, category: e.target.value }))}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              <option value="">— Select category —</option>
-              {['Preventive', 'Restorative', 'Cosmetic', 'Orthodontics', 'Surgery', 'Endodontics', 'Periodontics', 'Pediatric', 'Other'].map(c => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Description</label>
-            <textarea value={serviceForm.description} onChange={e => setServiceForm(f => ({ ...f, description: e.target.value }))}
-              rows={2} placeholder="Brief description of the treatment"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">Duration (minutes)</label>
-              <select value={serviceForm.duration_minutes} onChange={e => setServiceForm(f => ({ ...f, duration_minutes: e.target.value }))}
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                {[15, 20, 30, 45, 60, 90, 120].map(m => <option key={m} value={m}>{m} min</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">Price (₹)</label>
-              <input type="number" min="0" value={serviceForm.price}
-                onChange={e => setServiceForm(f => ({ ...f, price: e.target.value }))}
-                placeholder="0"
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Branch (optional)</label>
-            <select value={serviceForm.hospital_id} onChange={e => setServiceForm(f => ({ ...f, hospital_id: e.target.value }))}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              <option value="">— All Branches —</option>
-              {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
-            </select>
-          </div>
-          <div className="flex gap-3 pt-2">
-            <button type="button" onClick={() => { setShowServiceModal(false); setEditingService(null); }}
-              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
-              Cancel
-            </button>
-            <button type="submit" disabled={serviceSaving}
-              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-              {serviceSaving ? 'Saving...' : editingService ? 'Update Service' : 'Add Service'}
-            </button>
-          </div>
-        </form>
-      </Modal>
-    )}
-
     {/* ── CONFIRM MODAL ── */}
     {confirmModal && (
       <ConfirmModal
@@ -4098,54 +2450,6 @@ export default function Dashboard() {
       </Modal>
     )}
 
-    {/* ── ADD / EDIT STAFF MODAL ── */}
-    {showStaffModal && (
-      <Modal title={editingStaff ? `Edit ${editingStaff.name}` : 'Add Staff Member'} onClose={() => { setShowStaffModal(false); setEditingStaff(null); }}>
-        <form onSubmit={saveStaff} className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Full Name *</label>
-            <input value={staffForm.name} onChange={e => setStaffForm(f => ({ ...f, name: e.target.value }))}
-              placeholder="e.g. Ravi Kumar"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Email *</label>
-            <input type="email" value={staffForm.email}
-              onChange={e => setStaffForm(f => ({ ...f, email: e.target.value }))}
-              placeholder="ravi@clinic.com"
-              disabled={!!editingStaff}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:text-gray-400" required />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">
-              Password {editingStaff && <span className="text-gray-400 font-normal">(leave blank to keep existing)</span>}
-            </label>
-            <input type="password" value={staffForm.password}
-              onChange={e => setStaffForm(f => ({ ...f, password: e.target.value }))}
-              placeholder={editingStaff ? 'New password (optional)' : 'Set a password *'}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Role</label>
-            <select value={staffForm.role} onChange={e => setStaffForm(f => ({ ...f, role: e.target.value }))}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              <option value="staff">Staff</option>
-              <option value="admin">Admin</option>
-            </select>
-          </div>
-          <div className="flex gap-3 pt-2">
-            <button type="button" onClick={() => { setShowStaffModal(false); setEditingStaff(null); }}
-              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
-              Cancel
-            </button>
-            <button type="submit" disabled={staffSaving}
-              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-              {staffSaving ? 'Saving...' : editingStaff ? 'Update Staff' : 'Add Staff'}
-            </button>
-          </div>
-        </form>
-      </Modal>
-    )}
     </>
   );
 }
