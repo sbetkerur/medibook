@@ -1,8 +1,69 @@
 const Redis = require('ioredis');
+const crypto = require('crypto');
 const { Queue, Worker } = require('bullmq');
 const botEngine = require('../services/botEngine');
 const { query } = require('../db');
 const logger = require('../utils/logger');
+const { getClient: getLockRedisClient } = require('../utils/redisClient');
+
+// ── Per-phone job lock ────────────────────────────────────────────
+// Worker concurrency is 5: two rapid messages from the same phone can be
+// picked up by two slots at once, both calling getSession/updateSession on
+// the same row — a classic lost-update race (second writer's stale context
+// clobbers the first writer's progress). A short Redis lock keyed by
+// tenant+phone serializes processing per phone without affecting throughput
+// across different phones.
+const PHONE_LOCK_TTL_MS = 15000;       // safety net if a holder crashes before releasing
+const PHONE_LOCK_MAX_WAIT_MS = 12000;  // give the current holder time to finish its turn
+const PHONE_LOCK_POLL_MS = 250;
+
+// Atomic release: only DEL if our token still owns the lock (mirrors
+// utils/cronLock.js) — otherwise a slow job could delete a lock that has since
+// expired and been re-acquired by someone else.
+const RELEASE_PHONE_LOCK_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Acquire a short-lived per-phone lock, polling for up to PHONE_LOCK_MAX_WAIT_MS
+ * if another job currently holds it. Fails OPEN (returns as if acquired) on
+ * Redis errors so a Redis blip never blocks bot replies entirely — the queue's
+ * own Redis connection already governs whether jobs run at all.
+ * @returns {Promise<{acquired: boolean, token: string|null}>}
+ */
+async function acquirePhoneLock(lockKey) {
+  const client = getLockRedisClient();
+  const token = crypto.randomBytes(16).toString('hex');
+  const deadline = Date.now() + PHONE_LOCK_MAX_WAIT_MS;
+  while (true) {
+    try {
+      const result = await client.set(lockKey, token, 'NX', 'PX', PHONE_LOCK_TTL_MS);
+      if (result === 'OK') return { acquired: true, token };
+    } catch (err) {
+      logger.warn('Phone lock acquire failed, processing without lock', { error: err.message });
+      return { acquired: false, token: null, redisError: true };
+    }
+    if (Date.now() >= deadline) return { acquired: false, token: null };
+    await sleep(PHONE_LOCK_POLL_MS);
+  }
+}
+
+async function releasePhoneLock(lockKey, token) {
+  if (!token) return;
+  try {
+    await getLockRedisClient().eval(RELEASE_PHONE_LOCK_SCRIPT, 1, lockKey, token);
+  } catch (err) {
+    logger.warn('Phone lock release failed (will expire via TTL)', { error: err.message });
+  }
+}
 
 let botQueue = null;
 let dlQueue = null;  // dead-letter queue for failed jobs
@@ -118,7 +179,22 @@ function startBotWorker() {
     const { phone, text, buttonId, tenantId } = job.data;
     const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [tenantId]);
     if (!r.rows[0]) return;
-    await botEngine.handle({ phone, text, buttonId, tenant: r.rows[0] });
+
+    // Serialize per phone (see acquirePhoneLock above) so two concurrent
+    // worker slots never run getSession/updateSession for the same phone at
+    // the same time. If we can't get the lock within the wait window (holder
+    // still running, or Redis briefly unreachable), process anyway rather
+    // than dropping the patient's message — better a rare race than silence.
+    const lockKey = `botlock:${tenantId}:${phone}`;
+    const { acquired, token } = await acquirePhoneLock(lockKey);
+    if (!acquired) {
+      logger.warn('Phone lock not acquired before deadline — processing anyway', { phone, tenantId });
+    }
+    try {
+      await botEngine.handle({ phone, text, buttonId, tenant: r.rows[0] });
+    } finally {
+      if (acquired) await releasePhoneLock(lockKey, token);
+    }
   }, {
     connection,
     concurrency: 5,
@@ -141,6 +217,29 @@ function startBotWorker() {
         logger.warn('Job moved to dead-letter queue', { jobId: job.id, phone: job.data?.phone });
       } catch (dlErr) {
         logger.error('Failed to write to dead-letter queue', { error: dlErr.message });
+      }
+
+      // The dead-letter queue above is only inspected for DEPTH every 5
+      // minutes (see the setInterval in setup()) — no per-message retry, no
+      // admin alert. The sync fallback path in routes/webhook.js already has
+      // exactly this problem solved: it inserts into failed_webhooks, and
+      // jobs/retryWebhooks.js's cron picks rows up on a backoff schedule and
+      // replays them via botEngine.handle({ phone, text, buttonId, tenant })
+      // — the same call this worker itself makes — then emails super admins
+      // if all retries are exhausted. Insert a matching row here so a bot job
+      // that exhausted its BullMQ attempts gets the same automatic
+      // retry-with-backoff and alerting instead of silently waiting in a
+      // queue nobody actively drains.
+      try {
+        const { phone, text, buttonId, tenantId } = job.data || {};
+        if (phone && tenantId) {
+          await query(`
+            INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, error_message, next_retry_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '2 minutes')
+          `, [phone, tenantId, text || null, buttonId || null, 'text', err.message?.slice(0, 500)]);
+        }
+      } catch (fwErr) {
+        logger.error('Failed to record bot job failure in failed_webhooks', { error: fwErr.message });
       }
     }
   });

@@ -5,8 +5,22 @@ const { validate, schemas } = require('../middleware/validate');
 const { VALID_APPOINTMENT_STATUSES, APPOINTMENT_TRANSITIONS, UUID_RE, validateUUID, handleError } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
+const { setTenantId } = require('../utils/requestContext');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
+
+// Populate tenantId on this request's AsyncLocalStorage context (see
+// utils/requestContext.js) now that index.js's tenant-resolution middleware
+// has already run and set req.tenant. Ideally this one-liner would live
+// globally in index.js's request-context setup right after tenant resolution;
+// it's added per-route-file here instead because of this task's file-ownership
+// constraints (index.js may only be touched for its backup-cron registration).
+// Other admin route files won't carry tenantId in their logs until the same
+// line is added there too.
+router.use((req, res, next) => {
+  if (req.tenant?.id) setTenantId(req.tenant.id);
+  next();
+});
 
 // ── LIST APPOINTMENTS ─────────────────────────────────────────
 router.get('/appointments', async (req, res) => {
@@ -555,16 +569,36 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     const { addDays, format } = require('date-fns');
     const followUpDate = format(addDays(new Date(orig.appointment_date), follow_up_days), 'yyyy-MM-dd');
 
+    // Plan quota: the walk-in route enforces this before creating an appointment —
+    // without the same check here, "schedule follow-up" was an unmetered back door
+    // around the monthly appointment cap.
+    const { insertAppointmentWithRetry, checkMonthlyQuota } = require('../services/bookingCore');
+    const quota = await checkMonthlyQuota(req.tenant);
+    if (!quota.allowed) {
+      return res.status(403).json({
+        error: `Monthly appointment limit reached for your plan (${quota.used}/${quota.limit}). Upgrade to book more appointments.`,
+        quota_exceeded: true,
+      });
+    }
+
     // Single transaction: find + lock slot, insert follow-up, link to original.
     // Prevents an orphaned 'booked' slot if any later statement fails.
-    const { insertAppointmentWithRetry } = require('../services/bookingCore');
     let followUp;
     try {
       followUp = await tenantTransaction(s, async (client) => {
         // Lock the ORIGINAL appointment first — every multi-table writer must
         // take locks in appointment → slot order (the bot reschedule does), or
         // two of them meeting on the same rows deadlock.
-        await client.query(`SELECT id FROM appointments WHERE id=$1 FOR UPDATE`, [req.params.id]);
+        const lockedOrig = await client.query(
+          `SELECT id, follow_up_appointment_id FROM appointments WHERE id=$1 FOR UPDATE`, [req.params.id]);
+        // Re-check under the row lock: the outer check above ran before the
+        // transaction started, so two near-simultaneous requests can both pass
+        // it and both reach here. Only the first to acquire the lock may proceed.
+        if (lockedOrig.rows[0]?.follow_up_appointment_id) {
+          const err = new Error('FOLLOWUP_EXISTS');
+          err.code = 'FOLLOWUP_EXISTS';
+          throw err;
+        }
         // Lock the first available slot on or after the follow-up date.
         // FOR UPDATE SKIP LOCKED serialises against concurrent bookers without
         // blocking. Skip clinic-holiday dates — holiday creation doesn't block
@@ -590,7 +624,17 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
           throw err;
         }
         const slot = slotR.rows[0];
-        await client.query(`UPDATE time_slots SET status='booked' WHERE id=$1`, [slot.id]);
+        // Guard with AND status='available', matching the booking-integrity
+        // pattern used elsewhere — currently redundant with the FOR UPDATE SKIP
+        // LOCKED lock above, but keeps this statement safe on its own if the
+        // locking logic above it is ever refactored.
+        const slotUpdateR = await client.query(
+          `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available'`, [slot.id]);
+        if (slotUpdateR.rowCount === 0) {
+          const err = new Error('SLOT_TAKEN');
+          err.code = 'SLOT_TAKEN';
+          throw err;
+        }
 
         const { bookingId, row } = await insertAppointmentWithRetry(client, {
           patientId: orig.patient_id,
@@ -613,6 +657,12 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     } catch (txErr) {
       if (txErr.code === 'NO_SLOT') {
         return res.status(404).json({ error: `No available slots found after ${followUpDate} for the selected doctor` });
+      }
+      if (txErr.code === 'SLOT_TAKEN') {
+        return res.status(409).json({ error: 'Slot is no longer available — please retry' });
+      }
+      if (txErr.code === 'FOLLOWUP_EXISTS') {
+        return res.status(409).json({ error: 'Follow-up already scheduled for this appointment' });
       }
       throw txErr;
     }

@@ -429,17 +429,19 @@ const server = app.listen(PORT, () => {
   logger.info(`   Webhook test: POST http://localhost:${PORT}/api/webhook/test`);
 
   if (process.env.NODE_ENV !== 'test') {
-    const { startSlotGeneratorCron, startBackupReminderCron } = require('./jobs/slotGenerator');
+    const { startSlotGeneratorCron } = require('./jobs/slotGenerator');
     const { startReminderCron } = require('./jobs/reminders');
     const { startBotWorker } = require('./jobs/botWorker');
     const { startWebhookRetryCron } = require('./jobs/retryWebhooks');
     const { startBackupCron } = require('./jobs/backupManager');
     const { startSessionCleanerCron } = require('./jobs/sessionCleaner');
-    // Track cron tasks so we can stop them gracefully before DB closes
+    // Track cron tasks so we can stop them gracefully before DB closes.
+    // Only ONE backup cron is registered (backupManager's spawn()-based daily
+    // job) — slotGenerator.js's exec()-based weekly startBackupReminderCron was
+    // removed as a duplicate, drifting implementation of the same job.
     cronTasks = [
       ...startSlotGeneratorCron(),
       ...startReminderCron(),
-      startBackupReminderCron(),
       startWebhookRetryCron(),
       startBackupCron(),
       startSessionCleanerCron(),

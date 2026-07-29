@@ -170,8 +170,9 @@ export function getApiError(err, fallback = 'Something went wrong') {
 // current time. This ensures page reloads don't reset the countdown and
 // the warning fires 60 minutes before the token truly expires.
 
-let _warnTimer   = null;
-let _expireTimer = null;
+let _warnTimer    = null;
+let _expireTimer  = null;
+let _refreshTimer = null;
 
 function parseTokenExp(token) {
   try {
@@ -185,10 +186,41 @@ function parseTokenExp(token) {
   }
 }
 
+// Proactively refresh the access token ahead of its expiry, instead of
+// waiting for some other request to 401 first. Without this, a staff member
+// idle on a tab that makes no API calls (e.g. Settings, with only a
+// long-lived SSE connection open) would never trigger the reactive 401
+// refresh path, and long-lived consumers like the dashboard's SSE
+// EventSource would silently stop working once the token actually expired.
+// Shares `isRefreshing`/`failedQueue` with the reactive 401 path so a
+// request that 401s while this is in flight queues instead of firing a
+// second, redundant refresh.
+async function proactiveRefresh() {
+  if (typeof window === 'undefined') return;
+  if (!localStorage.getItem('refresh_token')) return; // nothing to refresh with — the expiry timer below handles logout
+  if (isRefreshing) return; // a refresh (reactive or proactive) is already in flight
+
+  isRefreshing = true;
+  try {
+    const newToken = await performTokenRefresh(null);
+    api.defaults.headers.common.Authorization = `Bearer ${newToken}`;
+    processQueue(null, newToken);
+  } catch (err) {
+    // Swallow failures here — this is a best-effort early refresh. If it
+    // genuinely can't refresh, the next real API call will 401 and go
+    // through the reactive path (which does force a logout on failure), or
+    // the expiry timer below will retry once more as a last resort.
+    processQueue(err, null);
+  } finally {
+    isRefreshing = false;
+  }
+}
+
 export function resetSessionTimers() {
   if (typeof window === 'undefined') return;
   clearTimeout(_warnTimer);
   clearTimeout(_expireTimer);
+  clearTimeout(_refreshTimer);
 
   const token = localStorage.getItem('token');
   if (!token) return;
@@ -205,7 +237,15 @@ export function resetSessionTimers() {
   // so msUntilExpiry − 3600000 ≤ 0 immediately after login and the timer never fired.
   const WARN_BEFORE_MS = 5 * 60 * 1000; // 5 minutes
   const msUntilWarn = msUntilExpiry - WARN_BEFORE_MS;
+
+  // Proactively refresh at the same 5-minute-before-expiry mark. Scheduled
+  // BEFORE the warn timer below (with the same delay) so, given same-delay
+  // timers fire in scheduling order, the refresh resolves first: on success
+  // it calls resetSessionTimers() again, which clears the about-to-fire warn
+  // timer before it runs — so an active tab that refreshes in time never
+  // sees the "session expiring" toast at all.
   if (msUntilWarn > 0) {
+    _refreshTimer = setTimeout(() => { proactiveRefresh(); }, msUntilWarn);
     _warnTimer = setTimeout(() => {
       // Dispatch a custom event; dashboard listens and shows a toast
       window.dispatchEvent(new CustomEvent('medibook:session-warning', {
@@ -215,13 +255,19 @@ export function resetSessionTimers() {
   }
 
   _expireTimer = setTimeout(() => {
-    // If a refresh token is present the interceptor already tried to refresh.
-    // If we reach here the refresh also failed — force logout.
+    // The proactive refresh above should already have renewed the session by
+    // now. If it failed (e.g. a transient network blip) and no other request
+    // happened to trigger the reactive 401 path either (a fully idle tab),
+    // make one last-resort attempt here rather than leaving the session dead
+    // until the user's next action. If there's no refresh token at all, the
+    // session truly can't be renewed — force logout.
     const hasRefresh = !!localStorage.getItem('refresh_token');
     if (!hasRefresh) {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
       window.location.href = '/login?reason=expired';
+    } else {
+      proactiveRefresh();
     }
   }, msUntilExpiry);
 }
@@ -229,6 +275,7 @@ export function resetSessionTimers() {
 export function clearSessionTimers() {
   clearTimeout(_warnTimer);
   clearTimeout(_expireTimer);
+  clearTimeout(_refreshTimer);
 }
 
 // Start timers immediately if a token already exists (e.g. after page reload)

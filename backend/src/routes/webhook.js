@@ -147,6 +147,15 @@ router.post('/webhook/whatsapp', async (req, res) => {
         logger.warn('Unsigned webhook request rejected — META_APP_SECRET is configured');
         return;
       }
+      // req.rawBody is captured by the express.json() verify callback mounted on
+      // /api/webhook and /api/v1/webhook in index.js. If it's ever missing (e.g.
+      // future middleware reordering, or this route mounted under a path that
+      // parses JSON without the verify hook), re-serializing req.body will NEVER
+      // byte-match what Meta actually signed — that failure must be diagnosable
+      // as "rawBody missing", not lumped in with genuinely forged signatures.
+      if (!req.rawBody) {
+        logger.error('Webhook rawBody missing — check middleware mount order/verify callback wiring; falling back to re-serialized body (signature check will likely fail)');
+      }
       const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
       const expected = 'sha256=' + crypto
         .createHmac('sha256', META_APP_SECRET)
@@ -157,7 +166,11 @@ router.post('/webhook/whatsapp', async (req, res) => {
       const sigBuf = Buffer.from(String(sig));
       const expectedBuf = Buffer.from(expected);
       if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
-        logger.warn('Invalid Meta webhook signature — ignoring');
+        if (!req.rawBody) {
+          logger.error('Webhook signature check failed with fallback rawBody — root cause is very likely the missing rawBody logged above, not a forged signature');
+        } else {
+          logger.warn('Invalid Meta webhook signature — ignoring');
+        }
         return;
       }
     } else if (process.env.NODE_ENV === 'production' && !sig) {
@@ -183,7 +196,14 @@ router.post('/webhook/whatsapp', async (req, res) => {
           if (!gs?.rows[0]?.tenant_id) continue;
           const tr = await query(`SELECT schema_name FROM tenants WHERE id=$1`, [gs.rows[0].tenant_id]).catch(() => null);
           if (tr?.rows[0]) {
-            wa.updateMessageStatus(tr.rows[0].schema_name, status.id, status.status).catch(() => {});
+            wa.updateMessageStatus(tr.rows[0].schema_name, status.id, status.status).catch(err => {
+              logger.error('Failed to persist WhatsApp delivery status update', {
+                waMessageId: status.id,
+                status: status.status,
+                tenantSchema: tr.rows[0].schema_name,
+                error: err.message,
+              });
+            });
           }
         }
 

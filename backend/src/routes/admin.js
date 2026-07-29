@@ -374,10 +374,13 @@ router.delete('/bot-sessions/:phone', adminOnly, async (req, res) => {
   try {
     const phone = req.params.phone.replace(/[^0-9+]/g, '');
     if (!phone) return res.status(400).json({ error: 'Invalid phone number' });
-    const r = await tenantQuery(req.tenant.schema_name,
-      `UPDATE bot_sessions SET state='idle', context='{}', last_activity=NOW() WHERE phone=$1 RETURNING id`,
-      [phone]);
-    if (!r.rows[0]) return res.status(404).json({ error: 'No active session for that phone number' });
+    const existing = await tenantQuery(req.tenant.schema_name,
+      `SELECT id FROM bot_sessions WHERE phone=$1`, [phone]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'No active session for that phone number' });
+    // Reset through the sanctioned bot/utils.js helper (same encryption/upsert
+    // path as every other session write) rather than a raw UPDATE.
+    const { resetSessionToIdle } = require('../services/bot/utils');
+    await resetSessionToIdle(req.tenant.schema_name, phone);
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role, 'RESET_BOT_SESSION', 'bot_session', phone,
       null, null, req.ip);
     res.json({ success: true, message: `Bot session reset for ${phone}` });

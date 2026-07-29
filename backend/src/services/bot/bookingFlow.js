@@ -604,7 +604,33 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       [ctx.slot_id]);
 
     if (!slotUpdate.rows.length) {
+      // Idempotency check — before we tell the patient "someone else booked
+      // it", check whether it was actually THEM. If a prior run of this exact
+      // job already committed (transaction succeeded but the process died or
+      // the session-reset write failed before the job could be marked done),
+      // BullMQ retries with the same stale CONFIRM_BOOKING context and lands
+      // back here. The slot is correctly no longer 'available' — but it's our
+      // own earlier commit, not a stranger's. Look for a confirmed appointment
+      // on this exact slot for this exact phone (must run BEFORE the ROLLBACK
+      // below, since search_path is only set for the life of this transaction).
+      const existing = await client.query(
+        `SELECT a.booking_id FROM appointments a
+         JOIN patients p ON p.id = a.patient_id
+         WHERE a.slot_id = $1 AND a.status = 'confirmed' AND p.phone = $2
+         ORDER BY a.created_at DESC LIMIT 1`,
+        [ctx.slot_id, phone]
+      );
       await client.query('ROLLBACK');
+      if (existing.rows.length) {
+        await send.text(
+          `✅ *Booking Already Confirmed*\n\n` +
+          `Looks like this appointment is already booked — no action needed!\n\n` +
+          `🪪 Booking ID: *${existing.rows[0].booking_id}*\n\n` +
+          `Reply *Hi* for the main menu, or *My Appointments* to view details.`
+        );
+        await updateSession(schema, phone, STATES.IDLE, {});
+        return;
+      }
       await send.text(
         '⚠️ *Slot no longer available*\n\n' +
         'Someone just booked that slot. Please choose a different time.\n\n' +
@@ -654,6 +680,20 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     return;
   } finally {
     client.release();
+  }
+
+  // Reset the session to IDLE as the very next statement after commit — this
+  // shrinks the window in which a crash (or a failed write here) could leave
+  // the session stuck in CONFIRM_BOOKING with stale context, which would make
+  // a BullMQ retry re-enter completeBooking for an already-booked slot (see
+  // the idempotency check above, which exists precisely to handle that case
+  // if this write is ever missed). Wrapped in try/catch so a failure here
+  // never prevents the confirmation message below from reaching the patient —
+  // the booking itself already committed successfully.
+  try {
+    await updateSession(schema, phone, STATES.IDLE, {});
+  } catch (err) {
+    logger.warn('Post-booking session reset failed — will be retried on the patient\'s next message', { phone, error: err.message });
   }
 
   let dateLabel = ctx.appointment_date;
@@ -771,7 +811,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     })(),
   ]);
 
-  await updateSession(schema, phone, STATES.IDLE, {});
+  // Session was already reset to IDLE immediately after commit, above.
   logger.info(`✅ Booking confirmed: ${bookingId}`, { phone, tenant: tenant.name });
   try { require('../../utils/metrics').increment('appointments_booked_total'); } catch (_) {}
 

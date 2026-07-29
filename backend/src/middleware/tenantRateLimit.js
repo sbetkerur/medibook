@@ -19,20 +19,35 @@ const PLAN_LIMITS = {
 function getEndpointLimit(tenant, reqPath, planLimit) {
   const customLimits = tenant?.settings?.rate_limits;
   if (!customLimits || typeof customLimits !== 'object') return planLimit;
-  // Check exact path match or prefix match
+  // Check exact path match, or a full path-segment prefix match (the configured
+  // path followed by "/" or end-of-string). Plain startsWith() would let a limit
+  // configured for "/appointments" also match "/appointments-export".
   for (const [pattern, limit] of Object.entries(customLimits)) {
     const normalized = pattern.replace(/^\/admin(?=\/)/, '');
-    if (reqPath === normalized || reqPath.startsWith(normalized)) {
+    if (reqPath === normalized || reqPath.startsWith(normalized + '/')) {
       return typeof limit === 'number' ? limit : planLimit;
     }
   }
   return planLimit;
 }
 
+// Debounce rate-limit alert webhooks per tenant — without this, a tenant sitting
+// above 90% usage gets a webhook POST on every single request (dozens per minute),
+// flooding their alert endpoint. Mirrors the last-sent-timestamp debounce pattern
+// used for the DB pool-exhaustion warning in db/index.js.
+const ALERT_DEBOUNCE_MS = 5 * 60 * 1000; // at most one alert per tenant per 5 minutes
+const lastAlertSentAt = new Map(); // tenantId -> timestamp
+
 // Send alert webhook (fire-and-forget)
 async function sendRateLimitAlert(tenant, endpoint, count, limit) {
   const alertUrl = tenant?.settings?.alert_webhook_url;
   if (!alertUrl || typeof alertUrl !== 'string' || !alertUrl.startsWith('https://')) return;
+
+  const now = Date.now();
+  const lastSent = lastAlertSentAt.get(tenant.id) || 0;
+  if (now - lastSent < ALERT_DEBOUNCE_MS) return;
+  lastAlertSentAt.set(tenant.id, now);
+
   try {
     await axios.post(alertUrl, {
       event: 'rate_limit_warning',

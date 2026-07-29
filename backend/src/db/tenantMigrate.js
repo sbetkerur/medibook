@@ -1,4 +1,5 @@
 const { pool, validateSchemaName } = require('./index');
+const logger = require('../utils/logger');
 
 async function createTenantSchema(schemaName) {
   validateSchemaName(schemaName);
@@ -642,6 +643,17 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE doctors ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL;
       CREATE INDEX IF NOT EXISTS idx_doctors_user_id ON doctors(user_id) WHERE user_id IS NOT NULL;
     `);
+
+    // Defense-in-depth against the follow-up TOCTOU race (POST /appointments/:id/followup):
+    // the route now re-checks follow_up_appointment_id under a row lock, but this
+    // partial unique index guards every write path against two follow-ups ever
+    // pointing back at the same original appointment. Best-effort: if a tenant
+    // somehow already has duplicate follow_up_appointment_id values, index
+    // creation fails and is skipped rather than blocking every future boot.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_appt_followup_unique
+        ON appointments(follow_up_appointment_id) WHERE follow_up_appointment_id IS NOT NULL;
+    `).catch(err => logger.warn('Could not create idx_appt_followup_unique (likely pre-existing duplicate data)', { schema: schemaName, error: err.message }));
 
   } finally {
     await client.query('RESET search_path').catch(() => {});

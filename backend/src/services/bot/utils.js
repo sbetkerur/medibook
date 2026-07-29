@@ -123,6 +123,19 @@ async function updateSession(schemaName, phone, state, context) {
     [phone, state, encryptedContext]);
 }
 
+/**
+ * Reset a bot session to idle with empty context. Thin wrapper around
+ * updateSession() so every reset site — botEngine's opt-out handler, the
+ * admin bot-session-reset route, and the sessionCleaner cron — goes through
+ * the same encryption/upsert/size-check guarantees instead of hand-rolling a
+ * raw `UPDATE bot_sessions SET state='idle', context='{}' ...`. Those raw
+ * writes were harmless while context was always literally empty, but would
+ * silently skip encryption if ever reused to reset with non-empty context.
+ */
+async function resetSessionToIdle(schemaName, phone) {
+  return updateSession(schemaName, phone, STATES.IDLE, {});
+}
+
 async function getPatient(schemaName, phone) {
   const r = await tenantQuery(schemaName,
     `SELECT id, phone, name, email, date_of_birth, gender, visit_count FROM patients WHERE phone=$1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, [phone]);
@@ -176,6 +189,7 @@ module.exports = {
   fuzzyFind,
   getSession,
   updateSession,
+  resetSessionToIdle,
   getPatient,
   getPatients,
   logMessage,

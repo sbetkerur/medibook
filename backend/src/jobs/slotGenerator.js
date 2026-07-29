@@ -414,86 +414,13 @@ function startSlotGeneratorCron() {
   return [slotTask, cleanupTask];
 }
 
-function startBackupReminderCron() {
-  // Every Sunday at 2 AM IST (20:30 UTC Saturday)
-  // withCronLock: without it every scaled-out instance runs its own pg_dump.
-  // Own job_name ('weekly_backup'): this and backupManager's daily job used to
-  // share job_name='backup', so each overwrote the other's failure status.
-  const backupTask = cron.schedule('30 20 * * 6', () => withCronLock('cron:weekly_backup', 3600, async () => {
-    logger.info('Starting weekly database backup...');
-    try {
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-      const path = require('path');
-      const fs = require('fs');
-
-      const dbUrl = process.env.DATABASE_URL;
-      if (!dbUrl) {
-        logger.warn('DATABASE_URL not set — skipping backup');
-        return;
-      }
-
-      // Parse DATABASE_URL to extract PGPASSWORD separately — avoids shell injection
-      // when the password contains special characters like $, `, (), etc.
-      let pgEnv = { ...process.env };
-      try {
-        const parsed = new URL(dbUrl);
-        if (parsed.password) {
-          pgEnv.PGPASSWORD = decodeURIComponent(parsed.password);
-          parsed.password = '';
-        }
-        // Build a safe connection string without credentials for pg_dump
-        pgEnv.PGSAFE_URL = parsed.toString();
-      } catch (_) {
-        // If URL parsing fails, fall back to passing dbUrl (no credentials in plain host:port form)
-        pgEnv.PGSAFE_URL = dbUrl;
-      }
-
-      const backupDir = process.env.BACKUP_DIR || path.join(process.cwd(), 'backups');
-      // Create backup dir if needed
-      if (!fs.existsSync(backupDir)) {
-        fs.mkdirSync(backupDir, { recursive: true });
-      }
-
-      const timestamp = new Date().toISOString().slice(0, 10);
-      const backupFile = path.join(backupDir, `medibook_${timestamp}.sql`);
-
-      await execAsync(
-        `pg_dump "${pgEnv.PGSAFE_URL}" --no-password -f "${backupFile}"`,
-        { timeout: 5 * 60 * 1000, env: pgEnv } // 5 min timeout
-      );
-
-      const stats = fs.statSync(backupFile);
-      const sizeMb = Math.round(stats.size / 1024 / 1024 * 10) / 10;
-      logger.info(`Database backup complete: ${backupFile} (${sizeMb} MB)`);
-
-      // Update cron status
-      await query(
-        `UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='weekly_backup'`
-      ).catch(() => {});
-
-      // Prune backups older than 30 days
-      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-      const files = fs.readdirSync(backupDir).filter(f => f.startsWith('medibook_') && f.endsWith('.sql'));
-      for (const f of files) {
-        const fPath = path.join(backupDir, f);
-        if (fs.statSync(fPath).mtimeMs < cutoff) {
-          fs.unlinkSync(fPath);
-          logger.info(`Pruned old backup: ${f}`);
-        }
-      }
-    } catch (err) {
-      logger.error('Database backup failed', { error: err.message });
-      await query(
-        `UPDATE cron_jobs SET last_run_at=NOW(), last_status='error', last_error=$1 WHERE job_name='weekly_backup'`,
-        [err.message?.slice(0, 500)]
-      ).catch(() => {});
-    }
-  }));
-  logger.info('Database backup cron registered (weekly Sunday 2AM IST)');
-  return backupTask;
-}
+// NOTE: the weekly backup cron that used to live here (startBackupReminderCron,
+// exec()-based pg_dump) was removed — it duplicated jobs/backupManager.js's
+// spawn()-based daily backup cron (startBackupCron), and the two independent
+// implementations drifted (different schedules, different job_name in
+// cron_jobs, no stream error/backpressure handling here vs. proper handling
+// there). backupManager.js's cron is now the single source of truth; see its
+// registration in index.js.
 
 /**
  * Regenerate slots for a single doctor after their schedule changes.
@@ -633,5 +560,4 @@ module.exports = {
   computeDaySlotTimes,
   updateNoShowScores,
   cleanupExpiredSlots,
-  startBackupReminderCron,
 };

@@ -35,6 +35,8 @@ async function authMiddleware(req, res, next) {
       } catch (err) {
         // Only silently allow through if the table doesn't exist yet (first deploy).
         // Use the PostgreSQL error code for "undefined_table" (more reliable than message matching).
+        // Any other DB error fails CLOSED (denies the request) — kept consistent
+        // with checkIPAllowlist below, which now also fails closed on DB errors.
         if (err.code === '42P01') {
           // table not yet created — allow through
         } else {
@@ -153,9 +155,11 @@ async function checkIPAllowlist(tenantId, clientIp) {
       logger.warn('checkIPAllowlist: invalid client IP format', { clientIp });
       return false;
     }
-    // Other DB errors — fail open so a DB blip doesn't lock out all admins
-    logger.warn('checkIPAllowlist DB error, allowing through', { error: err.message });
-    return true;
+    // Other DB errors fail CLOSED (deny) — kept consistent with the JWT blacklist
+    // check above. An allowlist that fails OPEN on a DB blip defeats its own
+    // purpose: an attacker-adjacent DB error would grant access instead of denying it.
+    logger.warn('checkIPAllowlist DB error, denying access (fail closed)', { error: err.message });
+    return false;
   }
 }
 

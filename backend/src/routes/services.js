@@ -50,6 +50,9 @@ router.post('/services', adminOnly, async (req, res) => {
 router.patch('/services/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     const { name, description, category, duration_minutes, price, is_active } = req.body;
+    if (name !== undefined && typeof name !== 'string') {
+      return res.status(400).json({ error: 'name must be a string' });
+    }
     const sets = [], params = [];
     if (name !== undefined)             { params.push(name.trim());             sets.push(`name=$${params.length}`); }
     if (description !== undefined)      { params.push(description);             sets.push(`description=$${params.length}`); }

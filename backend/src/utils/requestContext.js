@@ -24,4 +24,16 @@ function getTenantId() {
   return storage.getStore()?.tenantId;
 }
 
-module.exports = { runWithContext, getContext, getRequestId, getTenantId };
+// Populate tenantId on the ALREADY-RUNNING context for this request, once
+// tenant resolution has happened further down the middleware chain. The
+// AsyncLocalStorage store is the same object reference for the lifetime of
+// the request (runWithContext wraps the whole chain via next()), so mutating
+// it here is visible to everything downstream, including logger.js.
+// Previously getTenantId() was dead code — nothing ever called this, so it
+// always returned undefined and tenantId never appeared in logs.
+function setTenantId(tenantId) {
+  const store = storage.getStore();
+  if (store) store.tenantId = tenantId;
+}
+
+module.exports = { runWithContext, getContext, getRequestId, getTenantId, setTenantId };

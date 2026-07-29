@@ -4,8 +4,17 @@ const rateLimit = require('express-rate-limit');
 const { tenantQuery } = require('../db');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
+const { setTenantId } = require('../utils/requestContext');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
+
+// Populate tenantId on this request's AsyncLocalStorage context — see the
+// matching comment in routes/appointments.js for why this lives per-route-file
+// rather than once in index.js's request-context setup.
+router.use((req, res, next) => {
+  if (req.tenant?.id) setTenantId(req.tenant.id);
+  next();
+});
 
 const patientLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 
@@ -204,6 +213,155 @@ router.delete('/patients/:id/documents/:docId', adminOnly, validateUUID(), async
 // ── BULK IMPORT PATIENTS via CSV ──────────────────────────────
 const { parse } = require('csv-parse/sync');
 
+// Rows are validated/normalized synchronously (cheap), then written in chunks
+// of IMPORT_CHUNK_SIZE via multi-row VALUES INSERT/UPDATE instead of one
+// query per row — a 500-row import used to be ~1000 sequential round trips
+// (one SELECT + one INSERT/UPDATE per row), risking a proxy/load-balancer
+// timeout on large imports. If a chunk's batched queries fail for any reason,
+// we fall back to the original row-by-row logic for just that chunk so a
+// single bad row can't sink 99 good ones.
+const IMPORT_CHUNK_SIZE = 100;
+
+function normalizeImportRow(row, rowNum) {
+  const phone = (row.phone || row.Phone || row.PHONE || '').toString().trim().replace(/\s+/g, '').replace(/^\+/, '');
+  const name = (row.name || row.Name || row.NAME || '').toString().trim();
+  const email = (row.email || row.Email || row.EMAIL || '').toString().trim() || null;
+  const gender = (row.gender || row.Gender || row.GENDER || '').toString().trim().toLowerCase() || null;
+  const dob = (row.date_of_birth || row.dob || row.DOB || row['Date of Birth'] || '').toString().trim() || null;
+
+  if (!phone || !/^[+]?[0-9]{7,20}$/.test(phone)) {
+    return { error: `Row ${rowNum}: invalid phone "${phone}"` };
+  }
+  if (!name || name.length < 1) {
+    return { error: `Row ${rowNum}: missing name` };
+  }
+
+  const validGenders = ['male', 'female', 'other', null];
+  const safeGender = validGenders.includes(gender) ? gender : null;
+
+  // Normalize DOB to YYYY-MM-DD
+  let safeDob = null;
+  if (dob) {
+    const ddmmyyyy = dob.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+    const yyyymmdd = dob.match(/^\d{4}-\d{2}-\d{2}$/);
+    if (ddmmyyyy) {
+      safeDob = `${ddmmyyyy[3]}-${ddmmyyyy[2].padStart(2,'0')}-${ddmmyyyy[1].padStart(2,'0')}`;
+    } else if (yyyymmdd) {
+      safeDob = dob;
+    }
+  }
+
+  return { row: { rowNum, phone, name, email, gender: safeGender, dob: safeDob } };
+}
+
+// Original per-row logic (SELECT then INSERT/UPDATE) — used as the fallback
+// when a chunk's batched queries throw, so the failure can be isolated to
+// whichever specific row(s) actually caused it.
+async function importRowSingle(s, row) {
+  // patients.phone is NON-unique (family booking) so ON CONFLICT (phone)
+  // would raise 42P10. Update an existing profile matching phone+name, or
+  // insert a new one — keeps CSV re-imports idempotent per (phone, name).
+  const existing = await tenantQuery(s,
+    `SELECT id FROM patients WHERE phone=$1 AND lower(name)=lower($2) AND deleted_at IS NULL
+     ORDER BY created_at ASC LIMIT 1`,
+    [row.phone, row.name]);
+  if (existing.rows[0]) {
+    await tenantQuery(s, `
+      UPDATE patients SET
+        name=$2, email=COALESCE($3, email), gender=COALESCE($4, gender),
+        date_of_birth=COALESCE($5, date_of_birth), updated_at=NOW()
+      WHERE id=$1
+    `, [existing.rows[0].id, row.name, row.email, row.gender, row.dob]);
+  } else {
+    await tenantQuery(s, `
+      INSERT INTO patients (phone, name, email, gender, date_of_birth)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [row.phone, row.name, row.email, row.gender, row.dob]);
+  }
+}
+
+// Batched happy-path for one chunk: one SELECT to find existing (phone, name)
+// matches, one multi-row UPDATE for matches, one multi-row INSERT for the
+// rest — 2-3 round trips instead of up to 2 * chunk.length.
+async function importChunkBatched(s, chunk) {
+  // Fold rows that share (phone, lower(name)) within THIS chunk — mirrors the
+  // original sequential behaviour where a later duplicate row in the same CSV
+  // updates whatever the earlier one already wrote (name always takes the
+  // latest value; email/gender/dob keep the latest non-null value, matching
+  // the COALESCE(new, existing) chain the row-by-row path produced).
+  const merged = new Map();
+  for (const row of chunk) {
+    const key = `${row.phone}|${row.name.toLowerCase()}`;
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, { ...row });
+    } else {
+      prev.name = row.name;
+      if (row.email != null) prev.email = row.email;
+      if (row.gender != null) prev.gender = row.gender;
+      if (row.dob != null) prev.dob = row.dob;
+    }
+  }
+  const rows = [...merged.values()];
+  if (!rows.length) return;
+
+  const phones = rows.map(r => r.phone);
+  const lnames = rows.map(r => r.name.toLowerCase());
+  const existingR = await tenantQuery(s, `
+    SELECT DISTINCT ON (phone, lower(name)) id, phone, lower(name) AS lname
+    FROM patients
+    WHERE deleted_at IS NULL
+      AND (phone, lower(name)) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+    ORDER BY phone, lower(name), created_at ASC
+  `, [phones, lnames]);
+  const existingMap = new Map();
+  for (const er of existingR.rows) existingMap.set(`${er.phone}|${er.lname}`, er.id);
+
+  const toUpdate = [];
+  const toInsert = [];
+  for (const row of rows) {
+    const key = `${row.phone}|${row.name.toLowerCase()}`;
+    const existingId = existingMap.get(key);
+    if (existingId) toUpdate.push({ ...row, id: existingId });
+    else toInsert.push(row);
+  }
+
+  if (toUpdate.length) {
+    await tenantQuery(s, `
+      UPDATE patients AS p SET
+        name = v.name,
+        email = COALESCE(v.email, p.email),
+        gender = COALESCE(v.gender, p.gender),
+        date_of_birth = COALESCE(v.dob::date, p.date_of_birth),
+        updated_at = NOW()
+      FROM (
+        SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[])
+        AS v(id, name, email, gender, dob)
+      ) AS v
+      WHERE p.id = v.id
+    `, [
+      toUpdate.map(r => r.id),
+      toUpdate.map(r => r.name),
+      toUpdate.map(r => r.email),
+      toUpdate.map(r => r.gender),
+      toUpdate.map(r => r.dob),
+    ]);
+  }
+
+  if (toInsert.length) {
+    await tenantQuery(s, `
+      INSERT INTO patients (phone, name, email, gender, date_of_birth)
+      SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::date[])
+    `, [
+      toInsert.map(r => r.phone),
+      toInsert.map(r => r.name),
+      toInsert.map(r => r.email),
+      toInsert.map(r => r.gender),
+      toInsert.map(r => r.dob),
+    ]);
+  }
+}
+
 router.post('/patients/import', adminOnly, async (req, res) => {
   try {
     const { csv_data } = req.body; // base64 or raw CSV string
@@ -229,69 +387,36 @@ router.post('/patients/import', adminOnly, async (req, res) => {
     let skipped = 0;
     const errors = [];
 
+    // Phase 1: validate & normalize every row (in-memory, no DB round trips).
+    const validRows = [];
     for (let rowIdx = 0; rowIdx < records.length; rowIdx++) {
-      const row = records[rowIdx];
       const rowNum = rowIdx + 2; // +1 for the header line, +1 for 1-based numbering
+      const { row, error } = normalizeImportRow(records[rowIdx], rowNum);
+      if (error) {
+        skipped++;
+        errors.push(error);
+      } else {
+        validRows.push(row);
+      }
+    }
+
+    // Phase 2: write valid rows in chunks, batched per chunk with a per-row
+    // fallback if a chunk's batched queries throw.
+    for (let i = 0; i < validRows.length; i += IMPORT_CHUNK_SIZE) {
+      const chunk = validRows.slice(i, i + IMPORT_CHUNK_SIZE);
       try {
-        const phone = (row.phone || row.Phone || row.PHONE || '').toString().trim().replace(/\s+/g, '').replace(/^\+/, '');
-        const name = (row.name || row.Name || row.NAME || '').toString().trim();
-        const email = (row.email || row.Email || row.EMAIL || '').toString().trim() || null;
-        const gender = (row.gender || row.Gender || row.GENDER || '').toString().trim().toLowerCase() || null;
-        const dob = (row.date_of_birth || row.dob || row.DOB || row['Date of Birth'] || '').toString().trim() || null;
-
-        if (!phone || !/^[+]?[0-9]{7,20}$/.test(phone)) {
-          skipped++;
-          errors.push(`Row ${rowNum}: invalid phone "${phone}"`);
-          continue;
-        }
-        if (!name || name.length < 1) {
-          skipped++;
-          errors.push(`Row ${rowNum}: missing name`);
-          continue;
-        }
-
-        const validGenders = ['male', 'female', 'other', null];
-        const safeGender = validGenders.includes(gender) ? gender : null;
-
-        // Normalize DOB to YYYY-MM-DD
-        let safeDob = null;
-        if (dob) {
-          const ddmmyyyy = dob.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-          const yyyymmdd = dob.match(/^\d{4}-\d{2}-\d{2}$/);
-          if (ddmmyyyy) {
-            safeDob = `${ddmmyyyy[3]}-${ddmmyyyy[2].padStart(2,'0')}-${ddmmyyyy[1].padStart(2,'0')}`;
-          } else if (yyyymmdd) {
-            safeDob = dob;
+        await importChunkBatched(s, chunk);
+        imported += chunk.length;
+      } catch (batchErr) {
+        for (const row of chunk) {
+          try {
+            await importRowSingle(s, row);
+            imported++;
+          } catch (rowErr) {
+            skipped++;
+            errors.push(`Row ${row.rowNum}: ${rowErr.message}`);
           }
         }
-
-        // patients.phone is NON-unique (family booking) so ON CONFLICT (phone)
-        // would raise 42P10. Update an existing profile matching phone+name, or
-        // insert a new one — keeps CSV re-imports idempotent per (phone, name).
-        const existing = await tenantQuery(s,
-          `SELECT id FROM patients WHERE phone=$1 AND lower(name)=lower($2) AND deleted_at IS NULL
-           ORDER BY created_at ASC LIMIT 1`,
-          [phone, name]);
-        if (existing.rows[0]) {
-          await tenantQuery(s, `
-            UPDATE patients SET
-              name=$2,
-              email=COALESCE($3, email),
-              gender=COALESCE($4, gender),
-              date_of_birth=COALESCE($5, date_of_birth),
-              updated_at=NOW()
-            WHERE id=$1
-          `, [existing.rows[0].id, name, email, safeGender, safeDob]);
-        } else {
-          await tenantQuery(s, `
-            INSERT INTO patients (phone, name, email, gender, date_of_birth)
-            VALUES ($1, $2, $3, $4, $5)
-          `, [phone, name, email, safeGender, safeDob]);
-        }
-        imported++;
-      } catch (rowErr) {
-        skipped++;
-        errors.push(`Row ${rowNum}: ${rowErr.message}`);
       }
     }
 

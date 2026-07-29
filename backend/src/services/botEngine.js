@@ -12,6 +12,7 @@ const {
   STATES,
   getSession,
   updateSession,
+  resetSessionToIdle,
   getPatient,
   logMessage,
 } = require('./bot/utils');
@@ -173,8 +174,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     await tenantQuery(schema,
       `UPDATE patients SET opted_out=true, updated_at=NOW() WHERE phone=$1`, [phone])
       .catch(err => logger.warn('Opt-out patient update failed', { phone, error: err.message }));
-    await tenantQuery(schema,
-      `UPDATE bot_sessions SET state='idle', context='{}' WHERE phone=$1`, [phone])
+    await resetSessionToIdle(schema, phone)
       .catch(err => logger.warn('Opt-out session reset failed', { phone, error: err.message }));
     await wa.sendText(phone,
       `You have been unsubscribed from ${tenant.name} WhatsApp notifications.\n\nTo re-subscribe, reply *START*.`,
@@ -510,13 +510,18 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSession);
   }
   if (session.state === STATES.CONFIRM_BOOKING) {
-    if (/^(yes|confirm|ok|sure|haan)$|^btn_0|^1$/.test(choice)) {
-      return completeBooking(phone, schema, tenant, send, ctx);
-    }
-    if (/\bno\b|\bcancel\b|\bnahi\b|btn_1|^2$/.test(choice)) {
+    // Check negative intent FIRST — replies like "no, don't confirm" contain
+    // words ("confirm") that would otherwise match the positive pattern below
+    // and book an appointment the patient just declined. Mirrors
+    // handleRescheduleConfirm/handleCancelConfirm in appointmentFlow.js.
+    const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bcancel\b|\bnahi\b|btn_1|^2$/i.test(choice);
+    if (isNegative) {
       await send.text('Booking cancelled. Reply *Hi* to start over anytime. 👋');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
+    }
+    if (/^(yes|confirm|ok|sure|haan)$|^btn_0|^1$/.test(choice)) {
+      return completeBooking(phone, schema, tenant, send, ctx);
     }
     await send.buttons('Please confirm your booking:', ['✅ Confirm', '❌ Cancel']);
     return;

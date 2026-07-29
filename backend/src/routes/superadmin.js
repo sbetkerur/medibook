@@ -2,7 +2,7 @@ const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
-const { query, tenantQuery } = require('../db');
+const { query, tenantQuery, validateSchemaName } = require('../db');
 const { createTenantSchema, runTenantMigrations } = require('../db/tenantMigrate');
 const { authMiddleware, invalidateTenantCache } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
@@ -78,30 +78,46 @@ router.get('/stats', async (req, res) => {
     if (!cacheHit) {
       const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
       const tenantSchemas = await query(`SELECT schema_name FROM tenants WHERE status='active'`);
-      const schemasForUnion = tenantSchemas.rows.filter(t => SCHEMA_RE.test(t.schema_name)).slice(0, 100);
-      if (schemasForUnion.length > 0) {
+      const validSchemas = tenantSchemas.rows.filter(t => SCHEMA_RE.test(t.schema_name));
+      const invalidCount = tenantSchemas.rows.length - validSchemas.length;
+      if (invalidCount > 0) {
+        logger.warn(`Cross-tenant stats: skipping ${invalidCount} tenant(s) with a schema_name that failed validation`, { invalidCount });
+      }
+
+      // Process ALL active tenants in fixed-size batches (rather than capping at
+      // an arbitrary 100) so platform totals never silently undercount once there
+      // are more tenants than a single UNION ALL query should reasonably hold.
+      const BATCH_SIZE = 100;
+      let apptTotal = 0;
+      let patientTotal = 0;
+      for (let i = 0; i < validSchemas.length; i += BATCH_SIZE) {
+        const batch = validSchemas.slice(i, i + BATCH_SIZE);
         try {
-          const apptParts = schemasForUnion.map(t =>
+          const apptParts = batch.map(t =>
             `SELECT COUNT(*) AS cnt FROM "${t.schema_name}".appointments WHERE created_at >= NOW() - INTERVAL '30 days'`
           );
           const apptR = await query(
             `SELECT SUM(cnt)::bigint AS total FROM (${apptParts.join(' UNION ALL ')}) x`
           );
-          totalAppointments = parseInt(apptR.rows[0].total) || 0;
+          apptTotal += parseInt(apptR.rows[0].total) || 0;
         } catch (err) {
-          logger.warn('Cross-tenant appointment count failed', { error: err.message });
+          logger.warn('Cross-tenant appointment count failed for a batch', { error: err.message, batchStart: i, batchSize: batch.length });
         }
         try {
-          const patientParts = schemasForUnion.map(t =>
+          const patientParts = batch.map(t =>
             `SELECT COUNT(*) AS cnt FROM "${t.schema_name}".patients`
           );
           const patientR = await query(
             `SELECT SUM(cnt)::bigint AS total FROM (${patientParts.join(' UNION ALL ')}) x`
           );
-          totalPatients = parseInt(patientR.rows[0].total) || 0;
+          patientTotal += parseInt(patientR.rows[0].total) || 0;
         } catch (err) {
-          logger.warn('Cross-tenant patient count failed', { error: err.message });
+          logger.warn('Cross-tenant patient count failed for a batch', { error: err.message, batchStart: i, batchSize: batch.length });
         }
+      }
+      if (validSchemas.length > 0) {
+        totalAppointments = apptTotal;
+        totalPatients = patientTotal;
       }
     }
 
@@ -203,7 +219,16 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
     } catch (setupErr) {
       // Rollback: drop schema and delete tenant record to leave no orphans
       logger.error('Tenant setup failed — rolling back', { slug, error: setupErr.message });
-      await query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
+      // Defense-in-depth: validate the schema name before interpolating it into a
+      // DROP SCHEMA statement, same as every other place that builds tenant SQL.
+      // Joi validation upstream already constrains `slug`, so this should never
+      // throw in practice — but a DROP SCHEMA typo here would be catastrophic.
+      try {
+        validateSchemaName(schema);
+        await query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
+      } catch (validationErr) {
+        logger.error('Refusing to drop schema — failed schema name validation', { schema, error: validationErr.message });
+      }
       await query(`DELETE FROM tenants WHERE id=$1`, [tenant.id]).catch(() => {});
       throw setupErr;
     }

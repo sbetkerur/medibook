@@ -129,6 +129,36 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+// Shared helper behind /auth/refresh and /auth/reset-password: both need to lock
+// a single-use token row (SELECT ... FOR UPDATE) inside a transaction so two
+// simultaneous requests can't both consume the same token, then let the caller
+// validate the row and any related state before deciding whether to commit.
+//
+// `callback(client, row)` runs inside BEGIN/COMMIT (row is undefined if no match)
+// and must return either:
+//   - { abort: true, status, body } to ROLLBACK and have the route send that response, or
+//   - { value } to COMMIT and continue processing `value` after the transaction closes.
+async function withRowLock(selectSql, selectParams, callback) {
+  const { pool } = require('../db');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query(selectSql, selectParams);
+    const outcome = await callback(client, r.rows[0]);
+    if (outcome.abort) {
+      await client.query('ROLLBACK');
+      return outcome;
+    }
+    await client.query('COMMIT');
+    return outcome;
+  } catch (txErr) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw txErr;
+  } finally {
+    client.release();
+  }
+}
+
 // Helper: issue a refresh token (30-day, one-time-use). Only the SHA-256 hash
 // is persisted; the raw token goes to the client.
 async function issueRefreshToken(userId, userRole, tenantId = null) {
@@ -163,30 +193,19 @@ router.post('/auth/refresh', refreshLimiter, async (req, res) => {
     // it lets anyone who reads the stored hash replay it as the token itself,
     // defeating the point of hashing. Tokens issued before hashing are converted
     // in place by public-schema migration 18 (hash_plaintext_tokens).
-    const { pool } = require('../db');
-    const client = await pool.connect();
-    let rt;
-    try {
-      await client.query('BEGIN');
-      const r = await client.query(
-        `SELECT * FROM refresh_tokens
-         WHERE token=$1 AND used=false AND expires_at > NOW()
-         FOR UPDATE`,
-        [hashToken(refresh_token)]
-      );
-      if (!r.rows[0]) {
-        await client.query('ROLLBACK');
-        return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    const outcome = await withRowLock(
+      `SELECT * FROM refresh_tokens
+       WHERE token=$1 AND used=false AND expires_at > NOW()
+       FOR UPDATE`,
+      [hashToken(refresh_token)],
+      async (client, row) => {
+        if (!row) return { abort: true, status: 401, body: { error: 'Invalid or expired refresh token' } };
+        await client.query(`UPDATE refresh_tokens SET used=true WHERE id=$1`, [row.id]);
+        return { value: row };
       }
-      rt = r.rows[0];
-      await client.query(`UPDATE refresh_tokens SET used=true WHERE id=$1`, [rt.id]);
-      await client.query('COMMIT');
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      throw txErr;
-    } finally {
-      client.release();
-    }
+    );
+    if (outcome.abort) return res.status(outcome.status).json(outcome.body);
+    const rt = outcome.value;
 
     let tokenPayload = { id: rt.user_id, role: rt.user_role };
 
@@ -371,47 +390,34 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
     // reset requests from both consuming the same token. Tenant validity is
     // checked BEFORE marking the token used — otherwise a suspended-clinic
     // user's only reset token would be burned by a failed attempt.
-    const { pool } = require('../db');
-    const client = await pool.connect();
-    let reset;
-    let tenantSchema = null;
-    try {
-      await client.query('BEGIN');
+    const outcome = await withRowLock(
       // Lookup is HASH-ONLY — same rationale as /auth/refresh: a raw-value
       // fallback would let a leaked stored hash be replayed as the token itself.
       // Pre-hashing rows are converted by migration 18 (hash_plaintext_tokens).
-      const r = await client.query(
-        `SELECT * FROM password_resets WHERE token=$1 AND used=false AND expires_at > NOW() FOR UPDATE`,
-        [hashToken(token)]
-      );
-      if (!r.rows[0]) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Invalid or expired reset token' });
-      }
-      reset = r.rows[0];
+      `SELECT * FROM password_resets WHERE token=$1 AND used=false AND expires_at > NOW() FOR UPDATE`,
+      [hashToken(token)],
+      async (client, row) => {
+        if (!row) return { abort: true, status: 400, body: { error: 'Invalid or expired reset token' } };
 
-      if (reset.tenant_id) {
-        // Tenant user — verify tenant still exists and is active before consuming the token
-        const tenantR = await client.query(`SELECT schema_name, status FROM tenants WHERE id=$1`, [reset.tenant_id]);
-        if (!tenantR.rows[0]) {
-          await client.query('ROLLBACK');
-          return res.status(410).json({ error: 'This clinic no longer exists. Contact support.' });
+        let tenantSchema = null;
+        if (row.tenant_id) {
+          // Tenant user — verify tenant still exists and is active before consuming the token
+          const tenantR = await client.query(`SELECT schema_name, status FROM tenants WHERE id=$1`, [row.tenant_id]);
+          if (!tenantR.rows[0]) {
+            return { abort: true, status: 410, body: { error: 'This clinic no longer exists. Contact support.' } };
+          }
+          if (tenantR.rows[0].status !== 'active') {
+            return { abort: true, status: 403, body: { error: 'This clinic account is suspended. Contact support.' } };
+          }
+          tenantSchema = tenantR.rows[0].schema_name;
         }
-        if (tenantR.rows[0].status !== 'active') {
-          await client.query('ROLLBACK');
-          return res.status(403).json({ error: 'This clinic account is suspended. Contact support.' });
-        }
-        tenantSchema = tenantR.rows[0].schema_name;
-      }
 
-      await client.query(`UPDATE password_resets SET used=true WHERE id=$1`, [reset.id]);
-      await client.query('COMMIT');
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      throw txErr;
-    } finally {
-      client.release();
-    }
+        await client.query(`UPDATE password_resets SET used=true WHERE id=$1`, [row.id]);
+        return { value: { reset: row, tenantSchema } };
+      }
+    );
+    if (outcome.abort) return res.status(outcome.status).json(outcome.body);
+    const { reset, tenantSchema } = outcome.value;
 
     const hash = await bcrypt.hash(password, 12);
 
