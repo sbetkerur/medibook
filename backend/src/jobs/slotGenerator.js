@@ -176,7 +176,17 @@ async function generateSlotsForTenant(schema) {
     for (const l of leavesR.rows) {
       leaveSet.add(`${l.doctor_id}:${l.leave_date}`);
     }
-  } catch (_) { /* doctor_leaves table may not exist in all schemas yet */ }
+  } catch (err) {
+    // Fail CLOSED. This used to swallow every error and leave leaveSet empty,
+    // after which nothing was skipped — so a transient statement timeout on
+    // this SELECT generated a full day of bookable slots for every date a
+    // dentist is on leave, and patients booked with an absent dentist. The
+    // count looked HIGHER than normal and the cron reported success.
+    // 42P01 (undefined_table) is the only tolerable case: a schema created
+    // before doctor_leaves existed genuinely has no leaves to honour.
+    if (err.code !== '42P01') throw err;
+    logger.warn('doctor_leaves table missing — skipping leave checks', { schema });
+  }
 
   // Build holiday sets — hospital-specific (hospitalId:date) and clinic-wide (null hospital_id)
   let holidaySet = new Set(); // Set of "hospitalId:dateStr"
@@ -192,7 +202,13 @@ async function generateSlotsForTenant(schema) {
         clinicWideHolidays.add(h.holiday_date);
       }
     }
-  } catch (_) { /* clinic_holidays table may not exist in all schemas yet */ }
+  } catch (err) {
+    // Fail closed for the same reason as doctor_leaves: an empty holiday set
+    // means slots get generated on days the clinic is shut, and patients book
+    // appointments nobody will be there for.
+    if (err.code !== '42P01') throw err;
+    logger.warn('clinic_holidays table missing — skipping holiday checks', { schema });
+  }
 
   // Optionally skip Indian public holidays (feature flag: skip_public_holidays)
   let publicHolidaySet = new Set();
@@ -263,26 +279,50 @@ async function generateSlotsForTenant(schema) {
 
 // Mark past available slots as expired; purge old records; clean stale sessions
 async function cleanupExpiredSlots(schema) {
+  // Each purge is isolated. These used to share one try block, so the first
+  // failure skipped every later statement — permanently, since the failing
+  // condition (a slot older than 90 days) stays true on every subsequent night.
+  // The session and message purges silently stopped running as a result.
+  const step = async (label, sql) => {
+    try {
+      await tenantQuery(schema, sql);
+    } catch (err) {
+      logger.error(`cleanupExpiredSlots: ${label} failed`, { schema, error: err.message });
+    }
+  };
+
+  let expiredCount = 0;
   try {
     const r = await tenantQuery(schema,
       `UPDATE time_slots SET status='expired'
        WHERE slot_date < (timezone('Asia/Kolkata', NOW()))::date AND status='available'
        RETURNING id`);
-    // Hard-delete expired slot records older than 90 days (prevents unbounded growth)
-    await tenantQuery(schema,
-      `DELETE FROM time_slots WHERE status='expired' AND slot_date < ${IST_TODAY_SQL} - INTERVAL '90 days'`);
-    // Purge bot sessions: inactive 30+ days OR stuck mid-flow for 7+ days
-    await tenantQuery(schema,
-      `DELETE FROM bot_sessions WHERE last_activity < NOW() - INTERVAL '30 days'
-          OR (state != 'idle' AND last_activity < NOW() - INTERVAL '7 days')`);
-    // Purge old wa_messages (keep 90 days to allow dedup lookups)
-    await tenantQuery(schema,
-      `DELETE FROM wa_messages WHERE created_at < NOW() - INTERVAL '90 days'`);
-    return r.rows.length;
+    expiredCount = r.rows.length;
   } catch (err) {
-    logger.error(`cleanupExpiredSlots failed for schema ${schema}`, { error: err.message });
-    return 0;
+    logger.error(`cleanupExpiredSlots: expiry sweep failed`, { schema, error: err.message });
   }
+
+  // Hard-delete expired slot records older than 90 days (prevents unbounded growth).
+  // appointments.slot_id REFERENCES time_slots(id) with NO ACTION, and cancelling
+  // an appointment releases the slot WITHOUT clearing slot_id — so a cancelled
+  // appointment keeps pointing at a slot that later expires. Deleting it raises
+  // 23503. Same guard as deleteFutureUnreferencedSlots() in routes/doctors.js.
+  await step('expired-slot purge', `
+    DELETE FROM time_slots
+    WHERE status='expired'
+      AND slot_date < ${IST_TODAY_SQL} - INTERVAL '90 days'
+      AND id NOT IN (SELECT slot_id FROM appointments WHERE slot_id IS NOT NULL)`);
+
+  // Purge bot sessions: inactive 30+ days OR stuck mid-flow for 7+ days
+  await step('bot_sessions purge', `
+    DELETE FROM bot_sessions WHERE last_activity < NOW() - INTERVAL '30 days'
+       OR (state != 'idle' AND last_activity < NOW() - INTERVAL '7 days')`);
+
+  // Purge old wa_messages (keep 90 days to allow dedup lookups)
+  await step('wa_messages purge',
+    `DELETE FROM wa_messages WHERE created_at < NOW() - INTERVAL '90 days'`);
+
+  return expiredCount;
 }
 
 // Clean up public-schema housekeeping: expired tokens, old audit logs, stale password resets
@@ -475,7 +515,12 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
        WHERE doctor_id=$1 AND leave_date BETWEEN $2 AND $3`,
       [doctorId, todayStr, lookaheadEnd]);
     for (const l of leavesR.rows) leaveSet.add(l.leave_date);
-  } catch (_) {}
+  } catch (err) {
+    // Fail closed — same reasoning as the nightly path. Generating a full day
+    // of bookable slots on a dentist's leave date is worse than failing loudly.
+    if (err.code !== '42P01') throw err;
+    logger.warn('doctor_leaves table missing — skipping leave checks', { schema });
+  }
 
   // Fetch clinic holidays (hospital-specific + clinic-wide) — the nightly cron
   // skips these, but this per-doctor path previously did not, so regenerating
@@ -487,7 +532,13 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
        WHERE holiday_date BETWEEN $1 AND $2 AND (hospital_id = $3 OR hospital_id IS NULL)`,
       [todayStr, lookaheadEnd, doc.hospital_id]);
     for (const h of holidaysR.rows) holidaySet.add(h.holiday_date);
-  } catch (_) { /* clinic_holidays table may not exist in all schemas yet */ }
+  } catch (err) {
+    // Fail closed for the same reason as doctor_leaves: an empty holiday set
+    // means slots get generated on days the clinic is shut, and patients book
+    // appointments nobody will be there for.
+    if (err.code !== '42P01') throw err;
+    logger.warn('clinic_holidays table missing — skipping holiday checks', { schema });
+  }
 
   // Indian public holidays (same feature flag the nightly cron honours)
   let publicHolidaySet = new Set();

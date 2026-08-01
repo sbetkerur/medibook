@@ -142,8 +142,18 @@ api.interceptors.response.use(
         return api(originalRequest);
       } catch (refreshErr) {
         processQueue(refreshErr, null);
-        // Refresh genuinely failed (and no other tab holds a valid session) —
-        // clear session and redirect
+
+        // Only a 401/403 from /auth/refresh means the refresh token is actually
+        // dead. Treating EVERY failure as "session over" destroyed valid 30-day
+        // sessions on a network blip, a 502 during a Railway redeploy, or a 429
+        // — and /auth/refresh is rate limited per IP, which an entire clinic
+        // shares behind one NAT address. Staff were being logged out and forced
+        // to re-enter passwords because a colleague's tab rotated a token.
+        const status = refreshErr?.response?.status;
+        if (status !== 401 && status !== 403) {
+          return Promise.reject(refreshErr);
+        }
+
         localStorage.removeItem('token');
         localStorage.removeItem('refresh_token');
         localStorage.removeItem('user');

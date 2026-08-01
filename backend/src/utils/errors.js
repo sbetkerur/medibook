@@ -3,6 +3,39 @@ const logger = require('./logger');
 
 // UUID validation middleware
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Is META_APP_SECRET a real secret, or a placeholder?
+ *
+ * SINGLE SOURCE OF TRUTH. index.js (startup fail-fast) and routes/webhook.js
+ * (runtime "should I verify signatures?") previously kept two DISJOINT lists,
+ * and .env.example shipped a value only one of them recognised. The two
+ * failure modes were both live:
+ *   - a value only webhook.js knew  → startup passed, signature verification
+ *     silently switched OFF, so anyone could POST a forged messages[].from and
+ *     drive the bot as any patient;
+ *   - a value only index.js knew    → signature verification stayed ON but
+ *     compared against a placeholder, rejecting every genuine Meta delivery.
+ * Both call sites must use this function.
+ */
+const PLACEHOLDER_APP_SECRETS = new Set([
+  '',
+  'your_app_secret',
+  'your_app_secret_here',
+  'changeme',
+  'placeholder',
+  'PLACEHOLDER',
+  'PLACEHOLDER_REPLACE_WITH_APP_SECRET',
+]);
+
+function isRealAppSecret(secret) {
+  const s = (secret || '').trim();
+  if (!s) return false;
+  if (PLACEHOLDER_APP_SECRETS.has(s)) return false;
+  // Anything still containing "placeholder" is a placeholder, whatever its shape.
+  if (/placeholder/i.test(s)) return false;
+  return true;
+}
 function validateUUID(param = 'id') {
   return (req, res, next) => {
     if (!UUID_RE.test(req.params[param])) {
@@ -38,7 +71,12 @@ const APPOINTMENT_TRANSITIONS = {
 
 const SLOT_LOOKAHEAD_DAYS = 14;
 const CRON_LOOKAHEAD_DAYS = 60; // must be >= SLOT_LOOKAHEAD_DAYS to keep a rolling buffer
-const FEEDBACK_BATCH_LIMIT = 10;
+// Per-run cap on outbound feedback/follow-up messages, per tenant. 10 was far
+// below a real clinic's daily throughput (a 6-dentist practice completes 50+),
+// and the job now marks what it sent so a backlog drains across later runs
+// instead of being dropped. Kept bounded so one busy tenant cannot monopolise
+// the WhatsApp send path.
+const FEEDBACK_BATCH_LIMIT = 100;
 
 // Centralised magic-number constants — import from here instead of hard-coding
 const LIMITS = {
@@ -68,6 +106,7 @@ module.exports = {
   VALID_APPOINTMENT_STATUSES,
   APPOINTMENT_TRANSITIONS,
   UUID_RE,
+  isRealAppSecret,
   SLOT_LOOKAHEAD_DAYS,
   CRON_LOOKAHEAD_DAYS,
   FEEDBACK_BATCH_LIMIT,

@@ -9,6 +9,7 @@ const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 const IST = 'Asia/Kolkata';
 const {
   STATES,
+  parseChoiceNumber,
   getPatient,
   getPatients,
   updateSession,
@@ -187,7 +188,7 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
   // Accept numeric input ("1", "2") when the list message fell back to numbered
   // text (sendList failure path says "Reply with the number of your choice").
   if (!/^\d{4}-\d{2}-\d{2}$/.test(resolvedDate)) {
-    const n = parseInt(resolvedDate, 10);
+    const n = parseChoiceNumber(resolvedDate);
     const cachedDates = ctx._reschedule_dates || [];
     if (n >= 1 && n <= cachedDates.length) {
       resolvedDate = cachedDates[n - 1].date;
@@ -244,7 +245,7 @@ async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, in
   // Numeric fallback mirrors the booking flow: when sendList degrades to
   // numbered text ("Reply with the number of your choice"), "1"/"2" must work
   // here too — without it this step dead-ended on the text-fallback path.
-  const num = parseInt(input, 10);
+  const num = parseChoiceNumber(input);
   const slot = slots.find(s =>
     s.id === choice ||
     s.start_time.slice(0, 5) === input ||

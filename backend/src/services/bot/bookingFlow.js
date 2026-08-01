@@ -12,6 +12,7 @@ const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
 const {
   STATES,
   fuzzyFind,
+  parseChoiceNumber,
   getPatient,
   getPatients,
   updateSession,
@@ -70,7 +71,7 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
     return _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows);
   }
 
-  const numChoice = parseInt(input, 10);
+  const numChoice = parseChoiceNumber(input);
   const words = (input || '').toLowerCase().split(/\s+/).filter(Boolean);
 
   const h =
@@ -80,14 +81,17 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
     (/^btn_(\d+)/i.test(choice)
       ? hospitalRows[parseInt(choice.match(/^btn_(\d+)/i)[1], 10)]
       : null) ||
-    // 3. Case-insensitive substring of the name
-    (input && hospitalRows.find(r => (r.name || '').toLowerCase().includes(input.toLowerCase()))) ||
+    // 3. Numeric selection ("1", "2", …) — MUST come before name matching.
+    //    Branch names commonly contain digits ("Smile Dental - Road No. 2"), so
+    //    a substring check ran first turned "2" (meaning branch 2, as the
+    //    numbered text fallback instructs) into a match on branch 1.
+    (!isNaN(numChoice) && numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null) ||
     // 4. All typed words present in name ("smile banjara" → "Smile Dental - Banjara Hills")
     (words.length > 1 && hospitalRows.find(r => words.every(w => (r.name || '').toLowerCase().includes(w)))) ||
-    // 5. Levenshtein fuzzy match
-    fuzzyFind(hospitalRows, input) ||
-    // 6. Numeric selection ("1", "2", …)
-    (!isNaN(numChoice) && numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null);
+    // 5. Exact / unique-substring / fuzzy match. fuzzyFind rather than a raw
+    //    .includes(): the latter had no length floor, so a single character
+    //    selected whichever branch happened to be first.
+    fuzzyFind(hospitalRows, input);
 
   if (!h) {
     // Re-prompt rather than cancelling — user may have mistyped
@@ -172,7 +176,7 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
     depts = r.rows;
     ctx._depts = depts;
   }
-  const deptNumChoice = parseInt(input);
+  const deptNumChoice = parseChoiceNumber(input);
   const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input)
     || (deptNumChoice >= 1 && deptNumChoice <= depts.length ? depts[deptNumChoice - 1] : null);
   if (!dept) {
@@ -240,7 +244,7 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
 async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, input) {
   const doctors = ctx._doctors || [];
   const cleanInput = input.toLowerCase().replace(/^dr\.?\s*/i, '').trim();
-  const docNumChoice = parseInt(input);
+  const docNumChoice = parseChoiceNumber(input);
   const doc = doctors.find(d => d.id === choice) || fuzzyFind(doctors, cleanInput)
     || (docNumChoice >= 1 && docNumChoice <= doctors.length ? doctors[docNumChoice - 1] : null);
   if (!doc) {
@@ -337,6 +341,14 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     return;
   }
 
+  // Cache BEFORE the date_hint shortcut below. handleSelectDate fails closed
+  // when _dates is empty (it will not accept a date that was never offered), so
+  // calling it with an unpopulated cache made it reject the date this function
+  // had just computed — and it returns without updateSession, so the session
+  // stayed in select_doctor with date_hint still stored. Every subsequent
+  // dentist tap re-entered the same dead end with no list to pick from.
+  ctx._dates = dates; // cache for numeric fallback selection
+
   // Smart-intent shortcut: if detectIntent() recognised a date in the user's
   // free text ("tomorrow", "friday", …) and that date has open slots, skip the
   // date picker and show the time slots directly.
@@ -346,13 +358,15 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     if (hintedDate) {
       return handleSelectDate(phone, schema, tenant, send, ctx, hintedDate.date);
     }
+    // Hint did not match an offered date — fall through to the picker below.
+    // The session write there also persists the date_hint deletion, so the
+    // patient is not stuck repeating a hint that can never resolve.
   }
 
   const sections = [{
     title: 'Available Dates',
     rows: dates.map(d => ({ id: d.date, title: d.label, description: `${d.slots} slots available` }))
   }];
-  ctx._dates = dates; // cache for numeric fallback selection
   await send.list(`📅 *Select Date*\n\nAvailable dates for Dr. ${doc.name}:`, 'Choose Date', sections);
   await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
 }
@@ -362,7 +376,7 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   let resolvedDate = choice;
   // Accept numeric input ("1", "2") when list fell back to text
   if (!/^\d{4}-\d{2}-\d{2}$/.test(resolvedDate)) {
-    const n = parseInt(resolvedDate);
+    const n = parseChoiceNumber(resolvedDate);
     if (n >= 1 && n <= cachedDates.length) {
       resolvedDate = cachedDates[n - 1].date;
     } else {
@@ -455,7 +469,7 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
 
 async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input) {
   const slots = ctx._slots || [];
-  const num = parseInt(input, 10);
+  const num = parseChoiceNumber(input);
   const slot = slots.find(s => s.id === choice)                             // list reply (ID)
     || slots.find(s => s.start_time.slice(0, 5) === choice || s.start_time.slice(0, 5) === input) // time match (typed or button title)
     || (!isNaN(num) && num >= 1 && num <= slots.length ? slots[num - 1] : null); // typed number
@@ -511,13 +525,19 @@ async function handleSelectPatient(phone, schema, send, ctx, choice, input) {
     return;
   }
 
-  // Match by patient ID (list reply) or by name
-  const numChoice = parseInt(input, 10);
+  // Match by patient ID (list reply) or by name.
+  // Strict digits only: parseInt('3c1b…') === 3, so a stale list-reply UUID used
+  // to resolve to an arbitrary person in this list.
+  const typedName = input.replace(/^👤\s*/, '').trim();
+  const numChoice = parseChoiceNumber(typedName);
   const selected =
     patients.find(p => p.id === choice) ||
-    patients.find(p => (p.name || '').toLowerCase() === input.toLowerCase()) ||
-    patients.find(p => (p.name || '').toLowerCase().includes(input.toLowerCase().replace(/^👤\s*/, ''))) ||
-    (!isNaN(numChoice) && numChoice >= 1 && numChoice <= patients.length ? patients[numChoice - 1] : null);
+    patients.find(p => (p.name || '').toLowerCase() === typedName.toLowerCase()) ||
+    (!isNaN(numChoice) && numChoice >= 1 && numChoice <= patients.length ? patients[numChoice - 1] : null) ||
+    // fuzzyFind, not a raw .includes(): family profiles routinely share a
+    // surname, and "nita" matches both "Sunita" and "Anita". Booking the wrong
+    // family member is worse than asking again, so ambiguity must return null.
+    fuzzyFind(patients, typedName);
 
   if (!selected) {
     await send.text('Please select a person from the options, or tap *Add new person*.');

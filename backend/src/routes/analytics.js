@@ -235,7 +235,11 @@ router.get('/analytics/cohorts', analyticsLimiter, async (req, res) => {
 });
 
 // ── DATA EXPORT ───────────────────────────────────────────────
-router.get('/analytics/export', analyticsLimiter, async (req, res) => {
+// adminOnly: this is a bulk PHI extract — up to 10,000 rows of patient name,
+// phone, email, gender and date of birth in a single request. Every other bulk
+// or sensitive endpoint is admin-gated (audit logs, access logs, patient import,
+// patient edit); this one was reachable by any 'staff' or 'doctor' login.
+router.get('/analytics/export', adminOnly, analyticsLimiter, async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const { format = 'csv', type = 'appointments', days = 30 } = req.query;

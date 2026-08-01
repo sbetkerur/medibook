@@ -44,10 +44,26 @@ pool.on('connect', () => {
   }
 });
 
+// PostgreSQL truncates EVERY identifier — including double-quoted ones — to
+// NAMEDATALEN-1 = 63 bytes, silently. Two tenants whose schema names differ
+// only after byte 63 therefore resolve to the SAME physical schema:
+// CREATE SCHEMA IF NOT EXISTS no-ops for the second, its users land in the
+// first tenant's tables, and SET LOCAL search_path points both at one schema.
+// Every tenancy control in this codebase is downstream of the schema NAME, so
+// that single collision defeats all of them at once. Bound it here, where all
+// tenant SQL funnels through, rather than trusting each caller.
+const MAX_SCHEMA_NAME_LEN = 63;
+
 // Validate schema name to prevent SQL injection via interpolation
 function validateSchemaName(schemaName) {
   if (!schemaName || !/^tenant_[a-z0-9_]+$/.test(schemaName)) {
     throw new Error(`Invalid schema name: "${schemaName}"`);
+  }
+  if (Buffer.byteLength(schemaName, 'utf8') > MAX_SCHEMA_NAME_LEN) {
+    throw new Error(
+      `Schema name exceeds PostgreSQL's ${MAX_SCHEMA_NAME_LEN}-byte identifier limit ` +
+      `and would collide with another tenant after truncation: "${schemaName}"`
+    );
   }
 }
 

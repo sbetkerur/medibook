@@ -8,6 +8,7 @@ const wa = require('../services/whatsapp');
 const logger = require('../utils/logger');
 const { handleReminderConfirmation } = require('../jobs/reminders');
 const { isEnabled } = require('../utils/featureFlags');
+const { isRealAppSecret } = require('../utils/errors');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -110,7 +111,7 @@ function processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageTy
 
 // Startup warning if META_APP_SECRET looks like a placeholder
 const { META_APP_SECRET } = process.env;
-if (!META_APP_SECRET || META_APP_SECRET === 'PLACEHOLDER_REPLACE_WITH_APP_SECRET' || META_APP_SECRET === 'your_app_secret_here') {
+if (!isRealAppSecret(META_APP_SECRET)) {
   logger.warn('META_APP_SECRET is not configured — webhook signature verification is disabled. Set it in production!');
 }
 
@@ -135,9 +136,8 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
   try {
     const sig = req.headers['x-hub-signature-256'];
-    const hasRealSecret = META_APP_SECRET &&
-      META_APP_SECRET !== 'PLACEHOLDER_REPLACE_WITH_APP_SECRET' &&
-      META_APP_SECRET !== 'your_app_secret_here';
+    // Shared with index.js's startup fail-fast — see isRealAppSecret().
+    const hasRealSecret = isRealAppSecret(META_APP_SECRET);
 
     // If META_APP_SECRET is properly configured, always require and verify the signature
     // regardless of NODE_ENV — this prevents unsigned requests even in staging/dev if

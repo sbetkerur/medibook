@@ -67,9 +67,8 @@ if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
 // Without a real META_APP_SECRET the webhook route cannot verify signatures and
 // would process forged POSTs — an attacker spoofing messages[].from could drive
 // the bot as any patient. Fail fast in production instead of failing open.
-const PLACEHOLDER_APP_SECRETS = ['', 'your_app_secret', 'changeme', 'placeholder'];
 if (process.env.NODE_ENV === 'production' &&
-    PLACEHOLDER_APP_SECRETS.includes((process.env.META_APP_SECRET || '').trim())) {
+    !require('./utils/errors').isRealAppSecret(process.env.META_APP_SECRET)) {
   logger.error('FATAL: META_APP_SECRET is not set (or is a placeholder). Webhook signatures cannot be verified. Exiting.');
   process.exit(1);
 }

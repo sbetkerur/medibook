@@ -197,16 +197,46 @@ export default function Dashboard() {
   // Cancel appointment state
   const [cancellingAppt, setCancellingAppt] = useState(null); // appointment object
   const [cancelReason, setCancelReason] = useState('');
+  // Bulk cancellation reuses the same reason prompt — the backend requires a
+  // reason for bulk cancels too, and the bulk path never collected one.
+  const [bulkCancelling, setBulkCancelling] = useState(false);
   const [apptTotal, setApptTotal] = useState(0);
   const [patientTotal, setPatientTotal] = useState(0);
 
   // Walk-in appointment state
   const [showWalkinModal, setShowWalkinModal] = useState(false);
+  // Available slots for the walk-in modal. Without a slot_id the backend does
+  // not lock anything (routes/appointments.js only locks `if (slot_id)`), so a
+  // walk-in booked at 10:30 left that slot 'available' and the WhatsApp bot
+  // happily offered the same 10:30 to a patient — two bookings, one chair.
+  const [walkinSlots, setWalkinSlots] = useState([]);
+  const [walkinSlotsLoading, setWalkinSlotsLoading] = useState(false);
   const [walkinForm, setWalkinForm] = useState({
     patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '',
-    appointment_date: '', appointment_time: '', visit_type: 'in_person', notes: '',
+    appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '',
   });
   const [walkinSaving, setWalkinSaving] = useState(false);
+
+  // Load the doctor's open slots once both doctor and date are chosen, so the
+  // receptionist books a real slot that gets locked rather than free-typing a
+  // time the bot has no idea is taken.
+  useEffect(() => {
+    const { doctor_id, appointment_date } = walkinForm;
+    // Clear any previously picked slot — it belongs to the old doctor/date and
+    // would otherwise still be submitted after the selector visually resets.
+    setWalkinForm(f => (f.slot_id ? { ...f, slot_id: '', appointment_time: '' } : f));
+    if (!showWalkinModal || !doctor_id || !appointment_date) { setWalkinSlots([]); return; }
+    let cancelled = false;
+    setWalkinSlotsLoading(true);
+    api.get(`/admin/slots?doctor_id=${doctor_id}&date=${appointment_date}`)
+      .then(({ data }) => {
+        if (cancelled) return;
+        setWalkinSlots((data.slots || []).filter(s => s.status === 'available'));
+      })
+      .catch(() => { if (!cancelled) setWalkinSlots([]); })
+      .finally(() => { if (!cancelled) setWalkinSlotsLoading(false); });
+    return () => { cancelled = true; };
+  }, [showWalkinModal, walkinForm.doctor_id, walkinForm.appointment_date]);
 
 
   // Bulk appointment update state
@@ -922,10 +952,15 @@ export default function Dashboard() {
     e.preventDefault();
     setWalkinSaving(true);
     try {
-      await api.post('/admin/appointments', walkinForm);
+      // '__manual__' is a UI sentinel for the unreserved path — never send it as
+      // a slot id, or the backend's slot lookup fails with a confusing error.
+      const { slot_id, ...rest } = walkinForm;
+      await api.post('/admin/appointments',
+        slot_id && slot_id !== '__manual__' ? { ...rest, slot_id } : rest);
       toast.success('Walk-in appointment created!');
       setShowWalkinModal(false);
-      setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', visit_type: 'in_person', notes: '' });
+      setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
+      setWalkinSlots([]);
       fetchAppointments();
       fetchStats();
     } catch (err) {
@@ -951,13 +986,22 @@ export default function Dashboard() {
   }
 
 
-  async function bulkUpdateAppointments(status) {
+  async function bulkUpdateAppointments(status, cancellationReason) {
     if (selectedApptIds.size === 0) return toast.error('No appointments selected');
+    // The backend rejects bulk cancellation without a reason, and nothing in the
+    // UI collected one — so "✕ Cancel All" could never succeed, it only ever
+    // surfaced a validation error. The single-appointment path already prompts.
+    if (status === 'cancelled' && !cancellationReason) {
+      setCancelReason('');
+      setBulkCancelling(true);
+      return;
+    }
     setBulkUpdating(true);
     try {
       const { data } = await api.patch('/admin/appointments/bulk', {
         ids: [...selectedApptIds],
         status,
+        ...(cancellationReason ? { cancellation_reason: cancellationReason } : {}),
       });
       toast.success(`${data.updated} appointment${data.updated !== 1 ? 's' : ''} marked as ${status.replace('_', ' ')}`);
       setSelectedApptIds(new Set());
@@ -1356,7 +1400,7 @@ export default function Dashboard() {
                   className="px-3 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition flex items-center gap-1.5">
                   📤 Message Patient
                 </button>
-                <button onClick={() => { if (!hospitals.length) fetchHospitals(); if (!doctors.length) fetchDoctors(); setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', visit_type: 'in_person', notes: '' }); setShowWalkinModal(true); }}
+                <button onClick={() => { if (!hospitals.length) fetchHospitals(); if (!doctors.length) fetchDoctors(); setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' }); setWalkinSlots([]); setShowWalkinModal(true); }}
                   className="px-3 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-1.5">
                   + Walk-in
                 </button>
@@ -2251,6 +2295,50 @@ export default function Dashboard() {
       </div>
     )}
 
+    {/* ── BULK CANCEL REASON MODAL ── */}
+    {bulkCancelling && (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+          <h3 className="text-base font-semibold text-gray-900 mb-1">
+            Cancel {selectedApptIds.size} appointment{selectedApptIds.size !== 1 ? 's' : ''}
+          </h3>
+          <p className="text-sm text-gray-600 mb-4">
+            The reason is sent to each patient, so keep it something you are happy for them to read.
+          </p>
+          <div className="mb-5">
+            <label className="block text-xs font-medium text-gray-700 mb-1">
+              Reason for cancellation <span className="text-red-500">*</span>
+            </label>
+            <textarea
+              value={cancelReason}
+              onChange={e => setCancelReason(e.target.value)}
+              placeholder="e.g. Doctor unavailable, Clinic closed for emergency..."
+              rows={3}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-400 resize-none"
+              autoFocus
+            />
+          </div>
+          <div className="flex gap-3">
+            <button onClick={() => { setBulkCancelling(false); setCancelReason(''); }}
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              Keep Appointments
+            </button>
+            <button
+              onClick={() => {
+                const reason = cancelReason.trim();
+                setBulkCancelling(false);
+                setCancelReason('');
+                bulkUpdateAppointments('cancelled', reason);
+              }}
+              disabled={!cancelReason.trim() || bulkUpdating}
+              className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50 transition">
+              Confirm Cancel
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
     {/* ── WALK-IN APPOINTMENT MODAL ── */}
     {showWalkinModal && (
       <Modal title="New Walk-in Appointment" onClose={() => setShowWalkinModal(false)}>
@@ -2297,10 +2385,63 @@ export default function Dashboard() {
             </div>
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Time *</label>
-              <input type="time" value={walkinForm.appointment_time} onChange={e => setWalkinForm(f => ({ ...f, appointment_time: e.target.value }))}
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+              {/* Slot picker, not a free-text time: selecting a real slot sends
+                  slot_id, which is what makes the backend lock it against the bot. */}
+              <select
+                value={walkinForm.slot_id}
+                onChange={e => {
+                  const v = e.target.value;
+                  const slot = walkinSlots.find(s => s.id === v);
+                  setWalkinForm(f => ({
+                    ...f,
+                    slot_id: v,
+                    appointment_time: slot ? String(slot.start_time).slice(0, 5) : '',
+                  }));
+                }}
+                disabled={!walkinForm.doctor_id || !walkinForm.appointment_date || walkinSlotsLoading}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+                required
+              >
+                <option value="">
+                  {!walkinForm.doctor_id || !walkinForm.appointment_date
+                    ? '— Pick doctor and date first —'
+                    : walkinSlotsLoading ? 'Loading slots…'
+                    : walkinSlots.length ? '— Select an open slot —'
+                    : 'No open slots for this doctor/date'}
+                </option>
+                {walkinSlots.map(s => (
+                  <option key={s.id} value={s.id}>
+                    {String(s.start_time).slice(0, 5)}
+                    {s.end_time ? ` – ${String(s.end_time).slice(0, 5)}` : ''}
+                  </option>
+                ))}
+                {/* Escape hatch: a genuine walk-in can arrive outside the
+                    schedule, or before slots have been generated. Requiring a
+                    slot in every case would block the feature's actual purpose —
+                    but this path reserves nothing, so it is opt-in and labelled. */}
+                <option value="__manual__">Other time (slot NOT reserved)</option>
+              </select>
             </div>
           </div>
+          {walkinForm.slot_id === '__manual__' && (
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Time (unreserved) *</label>
+              <input type="time" value={walkinForm.appointment_time}
+                onChange={e => setWalkinForm(f => ({ ...f, appointment_time: e.target.value }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-400" required />
+              <p className="text-xs text-amber-600 mt-1">
+                ⚠️ No slot is reserved for this time, so the WhatsApp bot can still offer it to
+                another patient. Use a listed slot whenever one is available.
+              </p>
+            </div>
+          )}
+          {walkinForm.doctor_id && walkinForm.appointment_date && !walkinSlotsLoading && !walkinSlots.length && (
+            <p className="text-xs text-amber-600">
+              No open slots — the dentist may be on leave, the clinic closed, or slots not yet
+              generated for this date. Generate slots from the Dentists tab, pick another date,
+              or use &ldquo;Other time&rdquo; to book without reserving.
+            </p>
+          )}
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Visit Type</label>
             <select value={walkinForm.visit_type} onChange={e => setWalkinForm(f => ({ ...f, visit_type: e.target.value }))}

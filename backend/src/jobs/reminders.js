@@ -303,14 +303,27 @@ async function sendFeedbackRequests() {
       JOIN patients p ON p.id=a.patient_id
       JOIN doctors d ON d.id=a.doctor_id
       WHERE a.status IN ('completed', 'no_show')
-        AND a.appointment_date = ${IST_TODAY_SQL} - INTERVAL '1 day'
+        -- Window is a RANGE, not exactly "yesterday". With a hard LIMIT and a
+        -- single-day window, every patient past the limit was dropped forever,
+        -- because that date is never "yesterday" again. Combined with
+        -- feedback_request_sent below, the backlog now drains over later runs.
+        AND a.appointment_date BETWEEN ${IST_TODAY_SQL} - INTERVAL '3 days'
+                                   AND ${IST_TODAY_SQL} - INTERVAL '1 day'
         AND a.follow_up_sent IS NOT TRUE
+        AND a.feedback_request_sent IS NOT TRUE
         AND NOT EXISTS (
           SELECT 1 FROM appointment_feedback af WHERE af.appointment_id=a.id
         )
         AND p.opted_out IS NOT TRUE
+      ORDER BY a.appointment_date, a.id
       LIMIT $1
     `, [FEEDBACK_BATCH_LIMIT]);
+
+    if (appts.rows.length === FEEDBACK_BATCH_LIMIT) {
+      logger.warn('Feedback batch hit its limit — remaining patients roll over to the next run', {
+        tenant: tenant.slug, limit: FEEDBACK_BATCH_LIMIT,
+      });
+    }
 
     for (const appt of appts.rows) {
       try {
@@ -341,6 +354,10 @@ async function sendFeedbackRequests() {
             appt.doctor_name
           );
         }
+        // Mark AFTER a successful send so a failed send is retried on the next
+        // run rather than silently consumed (same policy as reminder_*_sent).
+        await tenantQuery(tenant.schema_name,
+          `UPDATE appointments SET feedback_request_sent=true WHERE id=$1`, [appt.id]);
         logger.info(`Feedback request sent for appointment ${appt.id}`);
       } catch (err) {
         logger.error(`Feedback request failed for appointment ${appt.id}`, { error: err.message });

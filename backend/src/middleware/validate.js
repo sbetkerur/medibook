@@ -181,7 +181,11 @@ const schemas = {
 
   createTenant: Joi.object({
     name: Joi.string().min(2).max(255).required(),
-    slug: Joi.string().min(2).max(100).pattern(/^[a-z0-9-]+$/).required(),
+    // Max 56, not 100: the schema name is 'tenant_' + slug with '-' → '_', and
+    // PostgreSQL truncates identifiers at 63 bytes. 7 + 56 = 63 exactly. A
+    // longer slug would silently share a schema with another tenant — see the
+    // limit check in db/index.js validateSchemaName().
+    slug: Joi.string().min(2).max(56).pattern(/^[a-z0-9-]+$/).required(),
     owner_email: Joi.string().email().required(),
     owner_password: Joi.string().min(8)
       .pattern(/[A-Z]/, 'uppercase letter')

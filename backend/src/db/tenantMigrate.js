@@ -266,6 +266,12 @@ async function createTenantSchema(schemaName) {
 
     console.log(`✅ Schema "${schemaName}" created successfully`);
   } finally {
+    // RESET BOTH. statement_timeout is per-session state and the pool sets it
+    // as a connection parameter (db/index.js), so a connection released after
+    // 'SET statement_timeout TO 0' keeps NO timeout for the rest of its life —
+    // silently disabling the pool-starvation guard for that slot. Tenant
+    // creation runs this at runtime from the super admin console.
+    await client.query('RESET statement_timeout').catch(() => {});
     await client.query('RESET search_path').catch(() => {});
     client.release();
   }
@@ -562,6 +568,11 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS follow_up_days INTEGER;
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sms_fallback_sent BOOLEAN DEFAULT false;
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS follow_up_sent BOOLEAN DEFAULT false;
+      -- Marks that a feedback REQUEST was sent (distinct from appointment_feedback,
+      -- which only exists once a patient actually replies). Without it the daily
+      -- feedback job had no way to resume: it took LIMIT n from a window fixed to
+      -- "yesterday", so everyone past the limit was never contacted at all.
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS feedback_request_sent BOOLEAN DEFAULT false;
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS effective_fee INTEGER DEFAULT 0;
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS payment_status VARCHAR(20) DEFAULT 'pending';
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS payment_collected_at TIMESTAMPTZ;
@@ -656,6 +667,12 @@ async function runTenantMigrations(schemaName) {
     `).catch(err => logger.warn('Could not create idx_appt_followup_unique (likely pre-existing duplicate data)', { schema: schemaName, error: err.message }));
 
   } finally {
+    // RESET BOTH. statement_timeout is per-session state and the pool sets it
+    // as a connection parameter (db/index.js), so a connection released after
+    // 'SET statement_timeout TO 0' keeps NO timeout for the rest of its life —
+    // silently disabling the pool-starvation guard for that slot. Tenant
+    // creation runs this at runtime from the super admin console.
+    await client.query('RESET statement_timeout').catch(() => {});
     await client.query('RESET search_path').catch(() => {});
     client.release();
   }

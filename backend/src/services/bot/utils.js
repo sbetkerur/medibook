@@ -54,6 +54,22 @@ function levenshtein(a, b) {
   return dp[m][n];
 }
 
+/**
+ * Parse a "reply with a number" selection, STRICTLY.
+ *
+ * parseInt() is wrong here: it parses a leading digit run out of anything, so
+ * parseInt('3c1b2d3e-…') === 3 and parseInt('09:30 – 10:00') === 9. WhatsApp
+ * keeps earlier list rows tappable forever, so a stale tap delivers a UUID row
+ * id or a formatted row title into a handler expecting "1".."N" — which used to
+ * silently select an unrelated date or time slot and carry on booking.
+ *
+ * Returns NaN unless the whole (trimmed) string is digits.
+ */
+function parseChoiceNumber(input) {
+  const s = String(input == null ? '' : input).trim();
+  return /^\d+$/.test(s) ? parseInt(s, 10) : NaN;
+}
+
 // Substring matching below this length is not evidence of intent — it is a
 // coin flip. "a" is a substring of most names, so a one-character reply used to
 // resolve to whichever doctor happened to be first in the list.
@@ -210,6 +226,7 @@ module.exports = {
   genBookingId,
   levenshtein,
   fuzzyFind,
+  parseChoiceNumber,
   getSession,
   updateSession,
   resetSessionToIdle,

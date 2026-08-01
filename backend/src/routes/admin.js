@@ -138,6 +138,33 @@ router.post('/staff', adminOnly, validate(schemas.createStaff), async (req, res)
 router.patch('/staff/:id', adminOnly, validateUUID(), validate(schemas.updateStaff), async (req, res) => {
   try {
     const { name, email, password, role, is_active } = req.body;
+
+    // Lockout guards — DELETE /staff/:id has always had these; PATCH wrote
+    // is_active and role straight through, so a sole admin could deactivate or
+    // demote themselves and lock the clinic out permanently. There is no API
+    // recovery: no super admin route reactivates a user or changes a role, so
+    // the only remedy was manual SQL against production.
+    const demotingSelf = req.params.id === req.user.id &&
+      ((typeof is_active === 'boolean' && !is_active) || (role && role !== 'admin'));
+    if (demotingSelf) {
+      return res.status(400).json({ error: 'You cannot deactivate or demote your own admin account' });
+    }
+
+    const losingAdmin = (typeof is_active === 'boolean' && !is_active) || (role && role !== 'admin');
+    if (losingAdmin) {
+      const targetR = await tenantQuery(req.tenant.schema_name,
+        `SELECT role, is_active FROM users WHERE id=$1`, [req.params.id]);
+      if (!targetR.rows[0]) return res.status(404).json({ error: 'Staff member not found' });
+
+      if (targetR.rows[0].role === 'admin' && targetR.rows[0].is_active) {
+        const others = await tenantQuery(req.tenant.schema_name,
+          `SELECT COUNT(*) FROM users WHERE role='admin' AND is_active=true AND id != $1`,
+          [req.params.id]);
+        if (parseInt(others.rows[0].count) < 1) {
+          return res.status(400).json({ error: 'Cannot deactivate or demote the last admin account' });
+        }
+      }
+    }
     const updates = [];
     const params = [];
     if (name) { params.push(name); updates.push(`name=$${params.length}`); }
