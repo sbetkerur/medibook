@@ -13,7 +13,11 @@ function getRedisClient() {
   if (redisClient) return redisClient;
   try {
     const Redis = require('ioredis');
-    const client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    // No localhost default: withCronLock returns early when REDIS_URL is unset,
+    // so this is only reached with a real URL. Keeping the fallback here meant
+    // one reordering away from every cron silently connecting to nothing.
+    if (!process.env.REDIS_URL) return null;
+    const client = new Redis(process.env.REDIS_URL, {
       maxRetriesPerRequest: 1,
       enableReadyCheck: false,
       lazyConnect: true,

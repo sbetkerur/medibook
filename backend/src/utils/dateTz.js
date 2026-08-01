@@ -14,6 +14,19 @@ const fromZonedTime = dateFnsTz.fromZonedTime || dateFnsTz.zonedTimeToUtc;
 // Inline these instead of CURRENT_DATE / date_trunc('month', NOW()) in any query
 // that means "the current calendar day/month for the clinic".
 const IST_TODAY_SQL = `(NOW() AT TIME ZONE 'Asia/Kolkata')::date`;
+
+// For comparing against a DATE column.
 const IST_MONTH_START_SQL = `date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')::date`;
 
-module.exports = { toZonedTime, fromZonedTime, IST_TODAY_SQL, IST_MONTH_START_SQL };
+// For comparing against a TIMESTAMPTZ column (created_at and friends).
+// IST_MONTH_START_SQL must NOT be used for this: comparing a timestamptz to a
+// date coerces the date at the SERVER timezone (UTC), which lands on 05:30 IST
+// on the 1st — reintroducing the same 5.5-hour skew the constants exist to
+// prevent. timezone('Asia/Kolkata', ts) reads the IST wall-clock month start
+// back as a proper timestamptz.
+const IST_MONTH_START_TS_SQL = `timezone('Asia/Kolkata', date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata'))`;
+
+module.exports = {
+  toZonedTime, fromZonedTime,
+  IST_TODAY_SQL, IST_MONTH_START_SQL, IST_MONTH_START_TS_SQL,
+};

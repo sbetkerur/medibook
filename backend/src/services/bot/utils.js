@@ -54,28 +54,51 @@ function levenshtein(a, b) {
   return dp[m][n];
 }
 
+// Substring matching below this length is not evidence of intent — it is a
+// coin flip. "a" is a substring of most names, so a one-character reply used to
+// resolve to whichever doctor happened to be first in the list.
+const MIN_SUBSTRING_MATCH_LEN = 3;
+
+/**
+ * Resolve free-text input to one of `items`.
+ *
+ * Returns null when the input is too short to be meaningful, matches nothing,
+ * or matches MORE THAN ONE item. Ambiguity must never be resolved by list
+ * order: this picks the doctor a patient is booked with, so a wrong guess is
+ * worse than asking again.
+ */
 function fuzzyFind(items, input, nameField = 'name') {
   if (!input || input.length === 0) return null;
   const lower = input.toLowerCase();
-  const exact = items.find(item =>
-    (item[nameField] || '').toLowerCase() === lower ||
-    (item[nameField] || '').toLowerCase().includes(lower)
-  );
-  if (exact) return exact;
+  const nameOf = item => (item[nameField] || '').toLowerCase();
+
+  // Exact name match wins outright, at any length, and is unambiguous by intent.
+  const exact = items.filter(item => nameOf(item) === lower);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return null; // two identically-named items — ask instead
+
+  // Substring match: long enough to be intentional, and unique.
+  if (lower.length >= MIN_SUBSTRING_MATCH_LEN) {
+    const partial = items.filter(item => nameOf(item).includes(lower));
+    if (partial.length === 1) return partial[0];
+    if (partial.length > 1) return null; // e.g. "sha" matching two doctors
+  }
+
   // Guard: skip levenshtein for very long inputs to prevent O(m*n) DoS
-  if (lower.length > 50) return null;
-  let best = null, bestDist = Infinity;
+  if (lower.length < MIN_SUBSTRING_MATCH_LEN || lower.length > 50) return null;
+
+  let best = null, bestDist = Infinity, bestTied = false;
   for (const item of items) {
     // Truncate long item names so levenshtein stays bounded
-    const name = (item[nameField] || '').toLowerCase().slice(0, 50);
+    const name = nameOf(item).slice(0, 50);
     const dist = levenshtein(lower, name);
     const threshold = Math.max(2, Math.floor(name.length * 0.4));
-    if (dist < bestDist && dist <= threshold) {
-      bestDist = dist;
-      best = item;
-    }
+    if (dist > threshold) continue;
+    if (dist < bestDist) { bestDist = dist; best = item; bestTied = false; }
+    else if (dist === bestDist) { bestTied = true; }
   }
-  return best;
+  // A tie means two names are equally close — no basis to prefer either.
+  return bestTied ? null : best;
 }
 
 async function getSession(schemaName, phone) {

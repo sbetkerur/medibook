@@ -67,7 +67,11 @@ via `utils/encryption.js`). Always read/write context through
 `getSession`/`updateSession` in `services/bot/utils.js`. "Hi" must always reset
 to the main menu from any state. Handlers live in `services/bot/bookingFlow.js`
 and `appointmentFlow.js`. In confirm steps, check negative intent ("no",
-"don't", "keep") BEFORE positive keywords.
+"don't", "keep") BEFORE positive keywords. `fuzzyFind` (`bot/utils.js`)
+returns null when input is under 3 chars or matches more than one item — it
+must never resolve ambiguity by list order, since that picks the dentist a
+patient is booked with. Callers re-prompt on null; they must not cancel the
+booking (see `tests/fuzzyFind.unit.test.js`).
 
 **Booking integrity.** Slot locking is the atomic
 `UPDATE time_slots SET status='booked' WHERE ... AND status='available'`
@@ -96,7 +100,10 @@ shim) for any "today" computation, and compare appointment date+time as a
 In SQL, never write bare `CURRENT_DATE`/`date_trunc('month', NOW())` for a
 clinic-facing "today"/"this month" — it's the UTC date, a day behind IST until
 05:30. Interpolate `IST_TODAY_SQL` / `IST_MONTH_START_SQL` from
-`utils/dateTz.js` instead. Past-slot guards must AND the same-day test
+`utils/dateTz.js` instead. Against a TIMESTAMPTZ column (`created_at`) use
+`IST_MONTH_START_TS_SQL` — comparing a timestamptz to the `::date` form
+coerces it at the server timezone (UTC) and reintroduces the same 5.5-hour
+skew. Monthly quota counts must match `bookingCore.checkMonthlyQuota`. Past-slot guards must AND the same-day test
 (`slot_date > today OR (slot_date = today AND start_time > now)`); the
 two-clause `OR start_time > now` form matches past dates.
 DATE columns are returned as strings (type parser in `db/index.js`).

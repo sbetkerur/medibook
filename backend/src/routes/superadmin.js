@@ -9,7 +9,7 @@ const { validate, schemas } = require('../middleware/validate');
 const { validateUUID, UUID_RE } = require('../utils/errors');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
-const { IST_TODAY_SQL } = require('../utils/dateTz');
+const { IST_TODAY_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const { getClient: getRedisClient } = require('../utils/redisClient');
 
 const STATS_CACHE_KEY = 'superadmin:stats:v1';
@@ -47,7 +47,7 @@ router.get('/stats', async (req, res) => {
       query(`SELECT plan, COUNT(*) as count FROM tenants GROUP BY plan ORDER BY count DESC`),
       query(`SELECT COUNT(*) as new_tenants FROM tenants WHERE created_at >= NOW() - INTERVAL '30 days'`),
       query(`SELECT COALESCE(SUM(p.price_monthly), 0) as mrr FROM tenants t LEFT JOIN plans p ON p.id=t.plan WHERE t.status='active'`),
-      query(`SELECT COUNT(*) FROM tenants WHERE created_at >= date_trunc('month', NOW())`),
+      query(`SELECT COUNT(*) FROM tenants WHERE created_at >= ${IST_MONTH_START_TS_SQL}`),
     ]);
     const mrr = parseInt(mrrR.rows[0].mrr) || 0;
 
@@ -706,7 +706,10 @@ router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
     const t = tenantR.rows[0];
 
     const [apptCount, doctorCount] = await Promise.all([
-      tenantQuery(t.schema_name, `SELECT COUNT(*) FROM appointments WHERE created_at >= date_trunc('month', NOW())`),
+      // Must match bookingCore.checkMonthlyQuota exactly — this panel reports the
+      // quota that route enforces, and a UTC month start made the two disagree
+      // for the first 5.5 hours of the 1st.
+      tenantQuery(t.schema_name, `SELECT COUNT(*) FROM appointments WHERE created_at >= ${IST_MONTH_START_TS_SQL}`),
       tenantQuery(t.schema_name, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
     ]);
 

@@ -176,6 +176,17 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
   const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input)
     || (deptNumChoice >= 1 && deptNumChoice <= depts.length ? depts[deptNumChoice - 1] : null);
   if (!dept) {
+    // Same reasoning as dentist selection: an unrecognised or ambiguous reply
+    // should re-ask, not discard the booking.
+    if (depts.length) {
+      await send.list(
+        `❓ I couldn't tell which treatment you meant.\n\nPlease pick one from the list:`,
+        'View Treatments',
+        [{ title: 'Treatments', rows: depts.map(d => ({ id: d.id, title: d.name })) }]
+      );
+      await updateSession(schema, phone, STATES.SELECT_DEPARTMENT, ctx);
+      return;
+    }
     await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
       ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
@@ -233,6 +244,23 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   const doc = doctors.find(d => d.id === choice) || fuzzyFind(doctors, cleanInput)
     || (docNumChoice >= 1 && docNumChoice <= doctors.length ? doctors[docNumChoice - 1] : null);
   if (!doc) {
+    // fuzzyFind deliberately returns null when input is too short or matches
+    // more than one dentist, rather than guessing by list order. Re-prompt —
+    // throwing the patient back to the main menu made an ambiguous reply cost
+    // them the whole booking flow.
+    if (doctors.length) {
+      await send.list(
+        `❓ I couldn't tell which dentist you meant.\n\nPlease pick one from the list:`,
+        'View Dentists',
+        [{ title: 'Dentists', rows: doctors.map(d => ({
+          id: d.id,
+          title: `Dr. ${d.name}`,
+          description: [d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : ''].filter(Boolean).join(' • '),
+        })) }]
+      );
+      await updateSession(schema, phone, STATES.SELECT_DOCTOR, ctx);
+      return;
+    }
     await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
       ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
     await updateSession(schema, phone, STATES.MAIN_MENU, {});

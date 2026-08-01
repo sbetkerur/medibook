@@ -155,9 +155,18 @@ async function checkIPAllowlist(tenantId, clientIp) {
       logger.warn('checkIPAllowlist: invalid client IP format', { clientIp });
       return false;
     }
-    // Other DB errors fail CLOSED (deny) — kept consistent with the JWT blacklist
-    // check above. An allowlist that fails OPEN on a DB blip defeats its own
-    // purpose: an attacker-adjacent DB error would grant access instead of denying it.
+    // Fail closed ONLY for tenants that actually have an allowlist. For the
+    // vast majority that have never configured one, denying on an unrelated DB
+    // blip locked every admin out of a feature they do not use — and reported
+    // it as "your IP address is not in the allowed list", which sends whoever
+    // debugs it in completely the wrong direction. A stale "no allowlist
+    // exists" reading is sufficient evidence here: the worst case is that a
+    // brand-new allowlist is not enforced for up to ALLOWLIST_CACHE_TTL_MS,
+    // which is already true of the fast path above.
+    if (cached && cached.exists === false) {
+      logger.warn('checkIPAllowlist DB error — tenant has no allowlist (stale cache), allowing', { error: err.message });
+      return true;
+    }
     logger.warn('checkIPAllowlist DB error, denying access (fail closed)', { error: err.message });
     return false;
   }
