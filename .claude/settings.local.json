@@ -176,7 +176,8 @@
       "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"BACKUP_DIR=/data/backups\")",
       "Bash(BACKEND_URL=https://backend-production-f66a.up.railway.app npm start)",
       "PowerShell($p = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess; if \\($p\\) { Stop-Process -Id $p -Force; \"killed $p\" } else { \"nothing on 3000\" })",
-      "Bash(BACKEND_URL=https://backend-production-f66a.up.railway.app npm run dev)"
+      "Bash(BACKEND_URL=https://backend-production-f66a.up.railway.app npm run dev)",
+      "PowerShell($p = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess; if \\($p\\) { Stop-Process -Id $p -Force; \"stopped local dev server \\($p\\)\" } else { \"nothing on 3000\" })"
     ]
   }
 }

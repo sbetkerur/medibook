@@ -472,7 +472,9 @@ async function migrate() {
 
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
-    console.log(`✅ Super admin ensured: ${superEmail}`);
+    // Only claim this when a super admin was actually seeded — otherwise the
+    // "no super admin seeded" warning above and this line contradict each other.
+    if (superPassword) console.log(`✅ Super admin ensured: ${superEmail}`);
     console.log('✅ audit_logs, cron_jobs, admin_access_logs tables created');
 
     // ── RUN TENANT MIGRATIONS for existing schemas ───────────────
