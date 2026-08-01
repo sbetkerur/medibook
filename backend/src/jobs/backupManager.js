@@ -55,8 +55,12 @@ async function runBackup() {
 
     let sizeBytes = 0;
     const writeStream = fs.createWriteStream(filePath);
-    const pgdump = spawn('pg_dump', [dbUrl, '--no-password'], {
-      env: { ...process.env, PGPASSWORD: '' },
+    // Pass the connection string via PGDATABASE rather than argv: process
+    // arguments are world-readable via /proc (any `ps` in the container), and
+    // DATABASE_URL embeds the Postgres password. libpq accepts a full URI in
+    // PGDATABASE, so pg_dump needs no connection argument at all.
+    const pgdump = spawn('pg_dump', ['--no-password'], {
+      env: { ...process.env, PGDATABASE: dbUrl },
       timeout: 10 * 60 * 1000,
     });
 

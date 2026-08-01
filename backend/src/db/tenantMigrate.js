@@ -8,6 +8,15 @@ async function createTenantSchema(schemaName) {
     // Migration DDL (index builds on large tables) can legitimately exceed the
     // pool's 10s app-query statement_timeout — lift it for this session only.
     await client.query('SET statement_timeout TO 0');
+    // ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE BEFORE it
+    // evaluates IF NOT EXISTS, so these run on every boot even when every column
+    // already exists. With no lock_timeout and an unlimited statement_timeout, a
+    // rolling deploy could queue behind a live read on appointments — and a
+    // QUEUED ACCESS EXCLUSIVE request blocks every later reader, turning a stuck
+    // deploy into a booking outage on the still-serving old container. Fail fast
+    // instead: entrypoint.sh aborts, the old container keeps serving, and the
+    // deploy can be retried off-peak.
+    await client.query("SET lock_timeout TO '5s'");
     await client.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
     await client.query(`SET search_path TO "${schemaName}", public`);
 
@@ -272,6 +281,7 @@ async function createTenantSchema(schemaName) {
     // silently disabling the pool-starvation guard for that slot. Tenant
     // creation runs this at runtime from the super admin console.
     await client.query('RESET statement_timeout').catch(() => {});
+    await client.query('RESET lock_timeout').catch(() => {});
     await client.query('RESET search_path').catch(() => {});
     client.release();
   }
@@ -288,6 +298,15 @@ async function runTenantMigrations(schemaName) {
   try {
     // Same rationale as createTenantSchema: DDL may exceed the app's 10s cap.
     await client.query('SET statement_timeout TO 0');
+    // ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE BEFORE it
+    // evaluates IF NOT EXISTS, so these run on every boot even when every column
+    // already exists. With no lock_timeout and an unlimited statement_timeout, a
+    // rolling deploy could queue behind a live read on appointments — and a
+    // QUEUED ACCESS EXCLUSIVE request blocks every later reader, turning a stuck
+    // deploy into a booking outage on the still-serving old container. Fail fast
+    // instead: entrypoint.sh aborts, the old container keeps serving, and the
+    // deploy can be retried off-peak.
+    await client.query("SET lock_timeout TO '5s'");
     await client.query(`SET search_path TO "${schemaName}", public`);
 
     // Add new columns to appointments (idempotent)
@@ -673,6 +692,7 @@ async function runTenantMigrations(schemaName) {
     // silently disabling the pool-starvation guard for that slot. Tenant
     // creation runs this at runtime from the super admin console.
     await client.query('RESET statement_timeout').catch(() => {});
+    await client.query('RESET lock_timeout').catch(() => {});
     await client.query('RESET search_path').catch(() => {});
     client.release();
   }

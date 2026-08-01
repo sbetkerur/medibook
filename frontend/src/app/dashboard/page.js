@@ -177,6 +177,9 @@ export default function Dashboard() {
 
   // Medical history edit state
   const [medHistory, setMedHistory] = useState({ blood_type: '', allergies: '', conditions: '', medications: '', notes: '' });
+  // True when the medical-history fetch failed, so the UI can say "unavailable"
+  // rather than render empty fields as "Not recorded".
+  const [medHistoryFailed, setMedHistoryFailed] = useState(false);
   const [medHistoryEditing, setMedHistoryEditing] = useState(false);
   const [medHistorySaving, setMedHistorySaving] = useState(false);
 
@@ -678,8 +681,17 @@ export default function Dashboard() {
       if (medData.status === 'fulfilled') {
         const mh = medData.value.data.patient?.medical_history || {};
         setMedHistory({ blood_type: mh.blood_type || '', allergies: mh.allergies || '', conditions: mh.conditions || '', medications: mh.medications || '', notes: mh.notes || '' });
+        setMedHistoryFailed(false);
+      } else {
+        // A rejection here used to be dropped silently, leaving medHistory at
+        // its reset '' values — so a failed load rendered "Not recorded" in the
+        // Allergies row, indistinguishable from a patient who genuinely has
+        // none. For a clinician that is a dangerous default; say so instead.
+        setMedHistoryFailed(true);
+        toast.error('Could not load medical history — do not rely on the fields below');
       }
       if (docsData.status === 'fulfilled') setPatientDocuments(docsData.value.data.documents || []);
+      // Promise.allSettled never rejects, so the surrounding catch was dead code.
     } catch { toast.error('Failed to load history'); }
     finally { setPatientHistoryLoading(false); }
   }
@@ -802,9 +814,15 @@ export default function Dashboard() {
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to save schedule');
       setScheduleSaving(false);
-      return;
+      // Report failure to the caller. "Save & Generate Slots" awaited this and
+      // ignored the result, so a rejected save (e.g. end time before start
+      // time) still generated slots — from the PREVIOUSLY saved hours — and
+      // then reported "168 slots generated". The admin believed the new hours
+      // were live while patients were booked into the old window.
+      return false;
     }
     setScheduleSaving(false);
+    return true;
   }
 
   async function generateSlots() {
@@ -922,6 +940,21 @@ export default function Dashboard() {
     if (tab === 'appointments') { setApptPage(1); fetchAppointments(1); }
   }, [filterDate, filterStatus]);
 
+  // Drop selected appointments that are no longer on screen. Selection used to
+  // survive pagination and filter changes, so ticking 5 rows on page 1 and
+  // paging forward left the banner reading "5 selected" while the checkboxes
+  // were all clear — and "Mark Completed" then acted on 5 appointments the
+  // admin could no longer see. Pruning to the visible set keeps the intent
+  // (a refresh on the same page preserves the ticks) without that trap.
+  useEffect(() => {
+    setSelectedApptIds(prev => {
+      if (!prev.size) return prev;
+      const visible = new Set(appointments.map(a => a.id));
+      const next = new Set([...prev].filter(id => visible.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [appointments]);
+
   useEffect(() => {
     if (tab === 'doctors') fetchDoctors();
   }, [showInactive]);
@@ -974,6 +1007,10 @@ export default function Dashboard() {
       message: `This will permanently anonymise ${patient.name || 'this patient'}'s personal data (GDPR). Appointment history is preserved. This cannot be undone.`,
       danger: true,
       onConfirm: async () => {
+        // ConfirmModal does not self-close, and every other handler dismisses it
+        // first. Without this the dialog stayed up after a successful delete, so
+        // clicking Confirm again fired a second DELETE for the same patient.
+        setConfirmModal(null);
         try {
           await api.delete(`/admin/patients/${patient.id}`);
           toast.success('Patient record anonymised');
@@ -1050,7 +1087,22 @@ export default function Dashboard() {
       const blob = new Blob([resp.data], { type: 'text/html' });
       const url = URL.createObjectURL(blob);
       const w = window.open(url, '_blank');
-      if (w) setTimeout(() => URL.revokeObjectURL(url), 5000);
+      if (w) {
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        return;
+      }
+      // window.open() runs after an await, so it is outside the user-gesture
+      // task and browsers block it by default. Previously this did nothing at
+      // all — no message, and the blob URL leaked. Fall back to a download,
+      // which is not gesture-restricted.
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `receipt-${apptId}.html`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      toast('Popup blocked — receipt downloaded instead', { icon: '⬇️' });
     } catch { toast.error('Failed to load receipt'); }
   }
 
@@ -2009,8 +2061,11 @@ export default function Dashboard() {
                           placeholder={placeholder}
                           className="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
                       ) : (
-                        <div className={`text-sm px-2.5 py-1.5 rounded-lg ${medHistory[key] ? 'text-gray-800 bg-gray-50' : 'text-gray-300 italic'}`}>
-                          {medHistory[key] || 'Not recorded'}
+                        <div className={`text-sm px-2.5 py-1.5 rounded-lg ${
+                          medHistory[key] ? 'text-gray-800 bg-gray-50'
+                            : medHistoryFailed ? 'text-amber-700 bg-amber-50 italic'
+                            : 'text-gray-300 italic'}`}>
+                          {medHistory[key] || (medHistoryFailed ? '⚠️ Unavailable — failed to load' : 'Not recorded')}
                         </div>
                       )}
                     </div>
@@ -2252,7 +2307,7 @@ export default function Dashboard() {
             className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
             {scheduleSaving ? 'Saving...' : '💾 Save Schedule'}
           </button>
-          <button onClick={async () => { await saveSchedule(); await generateSlots(); }}
+          <button onClick={async () => { if (await saveSchedule()) await generateSlots(); }}
             disabled={scheduleSaving || generatingSlots}
             className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition">
             {generatingSlots ? 'Generating...' : '⚡ Save & Generate Slots'}

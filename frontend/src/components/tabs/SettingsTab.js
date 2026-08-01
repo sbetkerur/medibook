@@ -38,6 +38,12 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
       const payload = {};
       if (settingsForm.name) payload.name = settingsForm.name;
       payload.notify_phone = settingsForm.notify_phone || '';
+      // notification_prefs was bound to the toggle but never sent, so switching
+      // it off showed "Settings saved!" and then fetchSettings() flipped it
+      // straight back on from the server. The backend accepts and merges it.
+      if (settingsForm.notification_prefs) {
+        payload.notification_prefs = settingsForm.notification_prefs;
+      }
       await api.patch('/admin/settings', payload);
       toast.success('Settings saved!');
       fetchSettings();

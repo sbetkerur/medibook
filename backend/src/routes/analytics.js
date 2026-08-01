@@ -8,7 +8,13 @@ const { adminOnly } = require('./adminHelpers');
 
 const { LIMITS, handleError } = require('../utils/errors');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
-const analyticsLimiter = rateLimit({
+// One rateLimit() instance is ONE shared counter. Attaching a single instance
+// to all seven analytics endpoints meant the Analytics tab — which fires three
+// requests on every mount — exhausted the whole budget by its second visit
+// inside a minute, and the dashboard showed "Failed to load analytics" with a
+// 429 the user cannot distinguish from a server fault. Each endpoint gets its
+// own bucket; the shared budget is what was wrong, not the limit itself.
+const makeAnalyticsLimiter = () => rateLimit({
   windowMs: 60 * 1000, max: LIMITS.ANALYTICS_RATE_LIMIT_PER_MIN,
   keyGenerator: (req) => req.user?.id || req.ip, // per-user, not per-IP
   message: { error: 'Too many analytics requests. Slow down.' },
@@ -16,7 +22,7 @@ const analyticsLimiter = rateLimit({
 });
 
 // ── MAIN ANALYTICS ────────────────────────────────────────────
-router.get('/analytics', analyticsLimiter, async (req, res) => {
+router.get('/analytics', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
@@ -52,7 +58,7 @@ router.get('/analytics', analyticsLimiter, async (req, res) => {
 });
 
 // ── ANALYTICS SUMMARY ─────────────────────────────────────────
-router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
+router.get('/analytics/summary', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
@@ -87,7 +93,7 @@ router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
 });
 
 // ── HEATMAP ───────────────────────────────────────────────────
-router.get('/analytics/heatmap', analyticsLimiter, async (req, res) => {
+router.get('/analytics/heatmap', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const d = Math.min(Math.max(parseInt(req.query.days) || 30, 7), 90);
@@ -106,7 +112,7 @@ router.get('/analytics/heatmap', analyticsLimiter, async (req, res) => {
 });
 
 // ── REVENUE DASHBOARD (A6) ────────────────────────────────────
-router.get('/analytics/revenue', analyticsLimiter, async (req, res) => {
+router.get('/analytics/revenue', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const months = Math.min(Math.max(parseInt(req.query.months) || 6, 1), 24);
@@ -159,7 +165,7 @@ router.get('/analytics/revenue', analyticsLimiter, async (req, res) => {
 });
 
 // ── NO-SHOW RISK SCORING ──────────────────────────────────────
-router.get('/analytics/noshowrisk', analyticsLimiter, async (req, res) => {
+router.get('/analytics/noshowrisk', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     // Upcoming appointments with patient's historical no-show rate
@@ -190,7 +196,7 @@ router.get('/analytics/noshowrisk', analyticsLimiter, async (req, res) => {
 });
 
 // ── PATIENT COHORT ANALYSIS ───────────────────────────────────
-router.get('/analytics/cohorts', analyticsLimiter, async (req, res) => {
+router.get('/analytics/cohorts', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const d = Math.min(Math.max(parseInt(req.query.days) || 90, 7), 365);
@@ -239,7 +245,7 @@ router.get('/analytics/cohorts', analyticsLimiter, async (req, res) => {
 // phone, email, gender and date of birth in a single request. Every other bulk
 // or sensitive endpoint is admin-gated (audit logs, access logs, patient import,
 // patient edit); this one was reachable by any 'staff' or 'doctor' login.
-router.get('/analytics/export', adminOnly, analyticsLimiter, async (req, res) => {
+router.get('/analytics/export', adminOnly, makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const { format = 'csv', type = 'appointments', days = 30 } = req.query;
