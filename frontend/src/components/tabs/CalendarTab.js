@@ -116,7 +116,10 @@ export default function CalendarTab() {
                   {dayAppts.length > 0 && (
                     <div className={`text-xs px-1 py-0.5 rounded text-center font-medium
                       ${dayAppts.length >= 5 ? 'bg-red-100 text-red-700' : dayAppts.length >= 3 ? 'bg-yellow-100 text-yellow-700' : 'bg-green-100 text-green-700'}`}>
-                      {dayAppts.length} appt{dayAppts.length !== 1 ? 's' : ''}
+                      {/* A 7-column grid leaves ~50px per cell on a phone, which
+                          cannot fit "3 appts" — show the bare count there. */}
+                      <span className="sm:hidden">{dayAppts.length}</span>
+                      <span className="hidden sm:inline">{dayAppts.length} appt{dayAppts.length !== 1 ? 's' : ''}</span>
                     </div>
                   )}
                 </div>

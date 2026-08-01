@@ -107,7 +107,32 @@ export default function HolidaysTab({ hospitals, isAdmin, setConfirmModal }) {
             <p className="text-gray-400 text-xs mt-1">Add clinic closures to prevent bookings on those days</p>
           </div>
         ) : (
-          <div className="overflow-x-auto">
+          <>
+          {/* Mobile holiday cards */}
+          <div className="md:hidden divide-y divide-gray-100">
+            {holidays.map(h => (
+              <div key={`mob-${h.id}`} className="p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="font-medium text-gray-900">
+                      {(() => { try { return format(parseISO(h.holiday_date), 'EEE, d MMM yyyy'); } catch { return h.holiday_date; } })()}
+                    </div>
+                    <div className="text-sm text-gray-700 break-words">{h.name}</div>
+                    <div className="text-xs text-gray-500 mt-0.5">
+                      {h.hospital_name || <span className="text-gray-400 italic">All branches</span>}
+                    </div>
+                  </div>
+                  {isAdmin && (
+                    <button onClick={() => deleteHoliday(h)}
+                      className="px-3 py-2 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition shrink-0">
+                      Remove
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="hidden md:block overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-gray-50 border-b border-gray-200">
                 <tr>
@@ -141,6 +166,7 @@ export default function HolidaysTab({ hospitals, isAdmin, setConfirmModal }) {
               </tbody>
             </table>
           </div>
+          </>
         )}
       </div>
     </div>

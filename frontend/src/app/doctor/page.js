@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import api from '@/lib/api';
 import { todayIST, todayISTDisplay } from '@/lib/dateIST';
@@ -76,9 +76,20 @@ export default function DoctorPage() {
     fetchAppointments(id || null);
   }
 
+  // On mobile the two panels stack, so the detail view sits BELOW a list capped
+  // at 45vh — tapping a patient changed content that was entirely off-screen and
+  // read as "nothing happened". Bring it into view. Desktop is side-by-side and
+  // already visible, so this is scoped to the stacked breakpoint.
+  const detailRef = useRef(null);
   function selectAppointment(appt) {
     setSelectedAppt(appt);
     setNotes(appt.notes || '');
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches) {
+      // Defer until the detail panel has rendered with the new appointment.
+      requestAnimationFrame(() => {
+        detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
   }
 
   async function saveNotes() {
@@ -195,13 +206,17 @@ export default function DoctorPage() {
       </div>
 
       {/* Right Column */}
-      <div className="flex-1 overflow-auto">
+      <div ref={detailRef} className="flex-1 overflow-auto">
         {!selectedAppt ? (
           <div className="flex items-center justify-center h-full">
             <div className="text-center text-gray-400">
               <div className="text-5xl mb-4">👨‍⚕️</div>
               <p className="text-lg font-medium">Select an appointment</p>
-              <p className="text-sm mt-1">Click a patient from the left panel to view details</p>
+              {/* The panels stack on mobile, so "left panel" is only true at md+. */}
+              <p className="text-sm mt-1">
+                <span className="md:hidden">Tap a patient above to view details</span>
+                <span className="hidden md:inline">Click a patient from the left panel to view details</span>
+              </p>
             </div>
           </div>
         ) : (

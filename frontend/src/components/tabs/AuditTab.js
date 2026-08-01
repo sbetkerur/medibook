@@ -64,7 +64,32 @@ export default function AuditTab() {
 
       {/* Table */}
       <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
+        {/* Mobile log cards — 6 columns of mostly-technical detail is unreadable
+            on a phone, so the least important fields drop to a second line. */}
+        <div className="md:hidden divide-y divide-gray-100">
+          {auditLogs.map(log => (
+            <div key={`mob-${log.id}`} className="p-4 space-y-1.5">
+              <div className="flex items-start justify-between gap-2">
+                <span className="font-mono text-xs font-medium text-gray-800 break-all">{log.action || '—'}</span>
+                <span className={`px-2 py-0.5 rounded-full text-xs font-medium shrink-0 ${log.actor_role === 'admin' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
+                  {log.actor_role || '—'}
+                </span>
+              </div>
+              <div className="text-xs text-gray-500">
+                {log.created_at ? new Date(log.created_at).toLocaleString('en-IN') : '—'}
+              </div>
+              <div className="text-xs text-gray-400 flex flex-wrap gap-x-3">
+                <span>{log.resource_type || '—'}</span>
+                {log.resource_id && <span className="font-mono break-all">{log.resource_id}</span>}
+                {log.ip_address && <span>{log.ip_address}</span>}
+              </div>
+            </div>
+          ))}
+          {!auditLogs.length && (
+            <div className="px-4 py-8 text-center text-gray-400">No audit log entries found</div>
+          )}
+        </div>
+        <div className="hidden md:block overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-gray-50 border-b border-gray-200">
               <tr>

@@ -63,7 +63,36 @@ export default function FeedbackTab() {
 
       {/* Feedback list */}
       <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-        <div className="overflow-x-auto">
+        {/* Mobile feedback cards. The comment is the point of this view, so it
+            wraps in full here rather than being truncated as it is in the table. */}
+        <div className="md:hidden divide-y divide-gray-100">
+          {feedback.map(f => (
+            <div key={`mob-${f.id}`} className="p-4 space-y-1.5">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="font-medium text-gray-900 truncate">{f.patient_name || '—'}</div>
+                  <div className="text-xs text-gray-500 truncate">Dr. {f.doctor_name}</div>
+                </div>
+                <div className="text-right shrink-0">
+                  <div className="text-yellow-500 text-sm">{'⭐'.repeat(f.rating)}</div>
+                  <div className="text-xs text-gray-400">({f.rating}/5)</div>
+                </div>
+              </div>
+              <div className="text-xs text-gray-400">
+                {f.appointment_date ? (() => { try { return format(parseISO(f.appointment_date), 'd MMM yy'); } catch { return f.appointment_date; } })() : '—'}
+              </div>
+              <div className="text-sm text-gray-600 break-words">
+                {f.comment || <span className="text-gray-300 italic">No comment</span>}
+              </div>
+            </div>
+          ))}
+          {!feedback.length && (
+            <div className="px-4 py-12 text-center text-gray-400">
+              No feedback yet — it will appear here after patients rate their appointments
+            </div>
+          )}
+        </div>
+        <div className="hidden md:block overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-gray-50 border-b border-gray-200">
               <tr>

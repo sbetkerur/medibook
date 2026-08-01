@@ -29,7 +29,9 @@ export default function DoctorsTab({
           </div>
         </div>
       )}
-      <div className="flex items-center justify-between">
+      {/* Count + inactive toggle on the left, import/add on the right. Four
+          controls do not fit a phone width, so allow the row to wrap. */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-4">
           <p className="text-sm text-gray-500">{doctors.length} dentist{doctors.length !== 1 ? 's' : ''}</p>
           <label className="flex items-center gap-2 cursor-pointer select-none">

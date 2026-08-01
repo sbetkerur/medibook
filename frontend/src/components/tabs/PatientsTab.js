@@ -23,7 +23,7 @@ export default function PatientsTab({
 }) {
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <input
           type="text"
           placeholder="Search by name, phone or email..."
