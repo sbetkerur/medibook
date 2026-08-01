@@ -1,4 +1,5 @@
 const Joi = require('joi');
+const { VALID_ROLES } = require('../utils/errors');
 
 // Middleware factory — validates req.body against a Joi schema
 function validate(schema) {
@@ -98,7 +99,10 @@ const schemas = {
       .pattern(/[0-9]/, 'digit')
       .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
       .required(),
-    role: Joi.string().valid('admin', 'staff').default('staff'),
+    // Must stay in sync with VALID_ROLES in utils/errors.js and the role select
+    // in frontend StaffTab.js — 'doctor' was missing here, so the /doctor page
+    // (which gates on role === 'doctor') could never actually be reached.
+    role: Joi.string().valid(...VALID_ROLES).default('staff'),
   }),
 
   updateStaff: Joi.object({
@@ -110,13 +114,16 @@ const schemas = {
       .pattern(/[0-9]/, 'digit')
       .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
       .optional(),
-    role: Joi.string().valid('admin', 'staff').optional(),
+    role: Joi.string().valid(...VALID_ROLES).optional(),
     is_active: Joi.boolean().optional(),
   }),
 
+  // name updates tenants.name; address/city/phone update the tenant's PRIMARY
+  // hospital row — the same one GET /settings reports under `hospital`.
   updateSettings: Joi.object({
     name: Joi.string().min(2).max(255).optional(),
     address: Joi.string().max(500).optional().allow('', null),
+    city: Joi.string().max(100).optional().allow('', null),
     phone: Joi.string().max(20).optional().allow('', null),
     // Keys here are merged into the top level of tenants.settings — the same
     // jsonb blob that holds server-controlled keys (rate_limits,

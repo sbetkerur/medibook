@@ -9,6 +9,7 @@ const { validate, schemas } = require('../middleware/validate');
 const { validateUUID } = require('../utils/errors');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
+const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { getClient: getRedisClient } = require('../utils/redisClient');
 
 const STATS_CACHE_KEY = 'superadmin:stats:v1';
@@ -36,7 +37,7 @@ router.get('/stats', async (req, res) => {
     // Return cached result if fresh (60s TTL) — this endpoint runs 6+ DB queries
     const redis = getRedisClient();
     try {
-      const cached = await redis.get(STATS_CACHE_KEY);
+      const cached = redis ? await redis.get(STATS_CACHE_KEY) : null;
       if (cached) return res.json({ ...JSON.parse(cached), from_cache: true });
     } catch (_) {}
 
@@ -60,7 +61,7 @@ router.get('/stats', async (req, res) => {
           SUM(appointments_month) as appointments_month,
           SUM(patients_total) as patients_total
         FROM tenant_stats_cache
-        WHERE stat_date = CURRENT_DATE
+        WHERE stat_date = ${IST_TODAY_SQL}
       `);
       if (cached.rows[0] && cached.rows[0].appointments_today !== null) {
         cachedStats = {
@@ -136,7 +137,7 @@ router.get('/stats', async (req, res) => {
     };
 
     // Cache result for 60 seconds
-    try { await redis.set(STATS_CACHE_KEY, JSON.stringify(result), 'EX', STATS_CACHE_TTL_S); } catch (_) {}
+    if (redis) { try { await redis.set(STATS_CACHE_KEY, JSON.stringify(result), 'EX', STATS_CACHE_TTL_S); } catch (_) {} }
 
     res.json(result);
   } catch (err) { handleError(res, err, 'GET /superadmin/stats'); }
@@ -367,7 +368,7 @@ router.get('/tenants/:id/health', validateUUID(), async (req, res) => {
       tenantQuery(s, `SELECT MAX(created_at) as last FROM appointments`),
       tenantQuery(s, `SELECT COUNT(*) FROM patients`),
       tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
-      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= CURRENT_DATE AND status='available'`),
+      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= ${IST_TODAY_SQL} AND status='available'`),
     ]);
     const v = (r, col = 'count') => r.status === 'fulfilled' ? (parseInt(r.value.rows[0]?.[col]) || 0) : 0;
     const lastActive = lastAppt.status === 'fulfilled' ? lastAppt.value.rows[0]?.last : null;
@@ -505,7 +506,7 @@ router.get('/tenants/:id/onboarding', validateUUID(), async (req, res) => {
     const [hospitals, doctors, slots, bookings] = await Promise.allSettled([
       tenantQuery(s, `SELECT COUNT(*) FROM hospitals WHERE is_active=true`),
       tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
-      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= CURRENT_DATE AND status='available'`),
+      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= ${IST_TODAY_SQL} AND status='available'`),
       tenantQuery(s, `SELECT COUNT(*) FROM appointments`),
     ]);
     const v = (r) => r.status === 'fulfilled' ? parseInt(r.value.rows[0]?.count || 0) : 0;
@@ -554,7 +555,7 @@ router.get('/rate-limits', async (req, res) => {
       const window = Math.floor(Date.now() / 60000);
       const tenants = await query(`SELECT id, name, slug, plan FROM tenants WHERE status='active'`);
       const keys = tenants.rows.map(t => `ratelimit:tenant:${t.id}:${window}`);
-      if (keys.length > 0) {
+      if (redis && keys.length > 0) {
         const counts = await redis.mget(...keys);
         liveTraffic = tenants.rows.map((t, i) => ({
           tenant_id: t.id,

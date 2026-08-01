@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
 const { addDays, format } = require('date-fns');
-const { toZonedTime } = require('../utils/dateTz');
+const { toZonedTime, IST_TODAY_SQL, IST_MONTH_START_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 
 const IST = 'Asia/Kolkata';
@@ -87,7 +87,7 @@ async function fetchPublicHolidays(year) {
   try {
     const { getClient } = require('../utils/redisClient');
     const redis = getClient();
-    const cached = await redis.get(cacheKey);
+    const cached = redis ? await redis.get(cacheKey) : null;
     if (cached) return new Set(JSON.parse(cached));
   } catch (_) {}
 
@@ -104,7 +104,7 @@ async function fetchPublicHolidays(year) {
     try {
       const { getClient } = require('../utils/redisClient');
       const redis = getClient();
-      await redis.set(cacheKey, JSON.stringify(dates), 'EX', 24 * 60 * 60);
+      if (redis) await redis.set(cacheKey, JSON.stringify(dates), 'EX', 24 * 60 * 60);
     } catch (_) {}
 
     return set;
@@ -122,7 +122,7 @@ async function updateNoShowScores(schema) {
         SELECT COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE a.status='no_show') / NULLIF(COUNT(*), 0), 2), 0)
         FROM appointments a
         WHERE a.doctor_id = d.id
-          AND a.appointment_date >= CURRENT_DATE - INTERVAL '90 days'
+          AND a.appointment_date >= ${IST_TODAY_SQL} - INTERVAL '90 days'
           AND a.status IN ('no_show','completed','cancelled')
       )
       WHERE d.is_active = true
@@ -270,7 +270,7 @@ async function cleanupExpiredSlots(schema) {
        RETURNING id`);
     // Hard-delete expired slot records older than 90 days (prevents unbounded growth)
     await tenantQuery(schema,
-      `DELETE FROM time_slots WHERE status='expired' AND slot_date < CURRENT_DATE - INTERVAL '90 days'`);
+      `DELETE FROM time_slots WHERE status='expired' AND slot_date < ${IST_TODAY_SQL} - INTERVAL '90 days'`);
     // Purge bot sessions: inactive 30+ days OR stuck mid-flow for 7+ days
     await tenantQuery(schema,
       `DELETE FROM bot_sessions WHERE last_activity < NOW() - INTERVAL '30 days'
@@ -345,16 +345,20 @@ function startSlotGeneratorCron() {
         for (const tenant of allTenants.rows) {
           try {
             const s = tenant.schema_name;
+            // Every date boundary here is IST — keep in lockstep with the live
+            // queries in routes/admin.js. Writing the cache row under the UTC
+            // CURRENT_DATE while the reader looked it up under the same UTC date
+            // meant the row written at 23:30 IST was still served as "today" for
+            // the first 5.5 hours of the NEXT IST day.
             const [todayAppts, monthAppts, totalPatients, activeSlots] = await Promise.allSettled([
-              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date = CURRENT_DATE AND status = 'confirmed'`),
-              // IST month start — keep in lockstep with the live query in routes/admin.js
-              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')::date AND status IN ('confirmed','completed')`),
-              tenantQuery(s, `SELECT COUNT(*) FROM patients`),
-              tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= CURRENT_DATE AND status = 'available'`),
+              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date = ${IST_TODAY_SQL} AND status = 'confirmed'`),
+              tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= ${IST_MONTH_START_SQL} AND status IN ('confirmed','completed')`),
+              tenantQuery(s, `SELECT COUNT(*) FROM patients WHERE deleted_at IS NULL`),
+              tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= ${IST_TODAY_SQL} AND status = 'available'`),
             ]);
             await query(`
               INSERT INTO tenant_stats_cache (tenant_id, stat_date, appointments_today, appointments_month, patients_total, active_slots, updated_at)
-              VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, NOW())
+              VALUES ($1, ${IST_TODAY_SQL}, $2, $3, $4, $5, NOW())
               ON CONFLICT (tenant_id, stat_date) DO UPDATE SET
                 appointments_today = EXCLUDED.appointments_today,
                 appointments_month = EXCLUDED.appointments_month,

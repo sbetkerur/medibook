@@ -7,6 +7,7 @@ const { adminOnly } = require('./adminHelpers');
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
 const { LIMITS, handleError } = require('../utils/errors');
+const { IST_TODAY_SQL } = require('../utils/dateTz');
 const analyticsLimiter = rateLimit({
   windowMs: 60 * 1000, max: LIMITS.ANALYTICS_RATE_LIMIT_PER_MIN,
   keyGenerator: (req) => req.user?.id || req.ip, // per-user, not per-IP
@@ -22,26 +23,26 @@ router.get('/analytics', analyticsLimiter, async (req, res) => {
     const [byDay, byDoctor, byStatus, byDept] = await Promise.all([
       tenantQuery(s, `
         SELECT appointment_date::text as date, COUNT(*) as count
-        FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+        FROM appointments WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
           AND status IN ('confirmed', 'completed')
         GROUP BY appointment_date ORDER BY appointment_date
       `, [d]),
       tenantQuery(s, `
         SELECT d.name, COUNT(a.id) as count, SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)) as revenue
         FROM appointments a JOIN doctors d ON d.id=a.doctor_id
-        WHERE a.appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL AND a.status IN ('confirmed', 'completed')
+        WHERE a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL AND a.status IN ('confirmed', 'completed')
         GROUP BY d.name ORDER BY count DESC LIMIT 10
       `, [d]),
       tenantQuery(s, `
         SELECT status, COUNT(*) as count FROM appointments
-        WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+        WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
           AND status != 'cancelled' GROUP BY status
       `, [d]),
       tenantQuery(s, `
         SELECT COALESCE(dep.name, 'General') as name, COUNT(a.id) as count FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=d.department_id
-        WHERE a.appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+        WHERE a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
           AND a.status IN ('confirmed', 'completed')
         GROUP BY COALESCE(dep.name, 'General') ORDER BY count DESC
       `, [d]),
@@ -60,14 +61,14 @@ router.get('/analytics/summary', analyticsLimiter, async (req, res) => {
         SELECT COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), doc.consultation_fee)), 0) as revenue
         FROM appointments a JOIN doctors doc ON doc.id=a.doctor_id
         WHERE a.status IN ('confirmed','completed')
-          AND a.appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+          AND a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
       `, [d]),
       tenantQuery(s, `
         SELECT COUNT(*) FILTER (WHERE status='no_show') as no_show_count, COUNT(*) as total_count
-        FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+        FROM appointments WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
           AND status != 'cancelled'
       `, [d]),
-      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL AND status != 'cancelled'`, [d]),
+      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL AND status != 'cancelled'`, [d]),
       tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg FROM appointment_feedback WHERE created_at >= NOW() - ($1::text || ' days')::INTERVAL`, [d]),
     ]);
     const safeVal = (r, fn) => r.status === 'fulfilled' ? fn(r.value.rows[0]) : null;
@@ -96,7 +97,7 @@ router.get('/analytics/heatmap', analyticsLimiter, async (req, res) => {
         EXTRACT(HOUR FROM appointment_time)::int as hour,
         COUNT(*) as count
       FROM appointments
-      WHERE appointment_date >= CURRENT_DATE - ($1::text || ' days')::INTERVAL
+      WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
         AND status IN ('confirmed', 'completed')
       GROUP BY day_of_week, hour ORDER BY day_of_week, hour
     `, [d]);
@@ -117,7 +118,7 @@ router.get('/analytics/revenue', analyticsLimiter, async (req, res) => {
                COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)), 0)::int AS revenue
         FROM appointments a JOIN doctors d ON d.id=a.doctor_id
         WHERE a.status IN ('confirmed','completed')
-          AND a.appointment_date >= CURRENT_DATE - ($1 * INTERVAL '1 month')
+          AND a.appointment_date >= ${IST_TODAY_SQL} - ($1 * INTERVAL '1 month')
         GROUP BY DATE_TRUNC('month', a.appointment_date)
         ORDER BY month_date
       `, [months]),
@@ -129,7 +130,7 @@ router.get('/analytics/revenue', analyticsLimiter, async (req, res) => {
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=d.department_id
         WHERE a.status IN ('confirmed','completed')
-          AND a.appointment_date >= CURRENT_DATE - ($1 * INTERVAL '1 month')
+          AND a.appointment_date >= ${IST_TODAY_SQL} - ($1 * INTERVAL '1 month')
         GROUP BY COALESCE(dep.name, 'General') ORDER BY revenue DESC
       `, [months]),
       tenantQuery(s, `
@@ -141,7 +142,7 @@ router.get('/analytics/revenue', analyticsLimiter, async (req, res) => {
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=d.department_id
         WHERE a.status IN ('confirmed','completed')
-          AND a.appointment_date >= CURRENT_DATE - ($1 * INTERVAL '1 month')
+          AND a.appointment_date >= ${IST_TODAY_SQL} - ($1 * INTERVAL '1 month')
         GROUP BY d.name, dep.name, d.specialization
         ORDER BY revenue DESC LIMIT 10
       `, [months]),
@@ -180,7 +181,7 @@ router.get('/analytics/noshowrisk', analyticsLimiter, async (req, res) => {
         AND prev.appointment_date < a.appointment_date
         AND prev.status IN ('no_show', 'completed', 'cancelled')
       WHERE a.status = 'confirmed'
-        AND a.appointment_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+        AND a.appointment_date BETWEEN ${IST_TODAY_SQL} AND ${IST_TODAY_SQL} + INTERVAL '7 days'
       GROUP BY a.id, a.booking_id, a.appointment_date, a.appointment_time, d.name, p.name, p.phone
       ORDER BY no_show_rate DESC, a.appointment_date, a.appointment_time
     `);

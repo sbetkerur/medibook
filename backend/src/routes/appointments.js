@@ -566,8 +566,12 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     if (!targetDocR.rows[0]) {
       return res.status(400).json({ error: 'Follow-up doctor not found or is deactivated' });
     }
-    const { addDays, format } = require('date-fns');
-    const followUpDate = format(addDays(new Date(orig.appointment_date), follow_up_days), 'yyyy-MM-dd');
+    // parseISO, not new Date(): appointment_date is a "YYYY-MM-DD" string (see
+    // the DATE type parser in db/index.js), which new Date() reads as UTC
+    // midnight while format() renders in server-local time — off by one day on
+    // any host that isn't UTC. Every other date site in the codebase uses parseISO.
+    const { addDays, format, parseISO } = require('date-fns');
+    const followUpDate = format(addDays(parseISO(String(orig.appointment_date).slice(0, 10)), follow_up_days), 'yyyy-MM-dd');
 
     // Plan quota: the walk-in route enforces this before creating an appointment —
     // without the same check here, "schedule follow-up" was an unmetered back door
@@ -603,11 +607,16 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
         // FOR UPDATE SKIP LOCKED serialises against concurrent bookers without
         // blocking. Skip clinic-holiday dates — holiday creation doesn't block
         // already-generated slots, so they're still 'available' here.
+        // GREATEST(followUpDate, IST today): when the ORIGINAL appointment is
+        // old enough that original_date + follow_up_days is already in the past,
+        // a plain `slot_date >= $2` would happily book a slot that has gone by.
         const slotR = await client.query(`
           SELECT id, hospital_id, slot_date::text, start_time::text
           FROM time_slots ts
           WHERE doctor_id=$1
-            AND slot_date >= $2
+            AND slot_date >= GREATEST($2::date, (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
+            AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                 OR start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time)
             AND status='available'
             AND NOT EXISTS (
               SELECT 1 FROM clinic_holidays ch

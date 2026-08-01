@@ -4,6 +4,7 @@ const { tenantQuery } = require('../db');
 const { validate, schemas } = require('../middleware/validate');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
+const { IST_TODAY_SQL } = require('../utils/dateTz');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -54,13 +55,13 @@ router.delete('/hospitals/:id', adminOnly, validateUUID(), async (req, res) => {
       WHERE id=$1 AND is_active=true
         AND NOT EXISTS (
           SELECT 1 FROM appointments
-          WHERE hospital_id=$1 AND status='confirmed' AND appointment_date >= CURRENT_DATE
+          WHERE hospital_id=$1 AND status='confirmed' AND appointment_date >= ${IST_TODAY_SQL}
         )
       RETURNING id
     `, [req.params.id]);
     if (!r.rows[0]) {
       const exists = await tenantQuery(s,
-        `SELECT id, (SELECT COUNT(*) FROM appointments WHERE hospital_id=$1 AND status='confirmed' AND appointment_date >= CURRENT_DATE) as upcoming FROM hospitals WHERE id=$1`,
+        `SELECT id, (SELECT COUNT(*) FROM appointments WHERE hospital_id=$1 AND status='confirmed' AND appointment_date >= ${IST_TODAY_SQL}) as upcoming FROM hospitals WHERE id=$1`,
         [req.params.id]);
       if (!exists.rows[0]) return res.status(404).json({ error: 'Hospital not found' });
       const cnt = parseInt(exists.rows[0].upcoming);

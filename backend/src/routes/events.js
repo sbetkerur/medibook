@@ -28,8 +28,12 @@ function getSubscriber() {
   if (_subscriber) return _subscriber;
   try {
     const { getClient } = require('../utils/redisClient');
+    const base = getClient();
+    // No Redis — SSE still works in-process (single instance); publish() falls
+    // back to the direct broadcast it always does first.
+    if (!base) return null;
     // Duplicate the shared client for subscriber mode
-    _subscriber = getClient().duplicate();
+    _subscriber = base.duplicate();
     _subscriber.subscribe('medibook:sse', (err) => {
       if (err) logger.warn('SSE Redis subscribe error', { error: err.message });
     });
@@ -77,7 +81,10 @@ async function publish(tenantId, event) {
   // subscriber skips the message (it was already broadcast above).
   try {
     const { getClient } = require('../utils/redisClient');
-    await getClient().publish('medibook:sse', JSON.stringify({ tenantId, event, source: INSTANCE_ID }));
+    const client = getClient();
+    if (client) {
+      await client.publish('medibook:sse', JSON.stringify({ tenantId, event, source: INSTANCE_ID }));
+    }
   } catch (_) {}
 }
 

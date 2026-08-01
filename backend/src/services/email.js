@@ -113,10 +113,30 @@ async function handleResendBounce(toEmail, schemaName) {
   } catch (_) {}
 }
 
-// Helper to build tracking pixel HTML
+// Helper to build tracking pixel HTML.
+//
+// The pixel is fetched by the RECIPIENT'S mail client, so the URL must be this
+// API's externally reachable origin — never a localhost default. The previous
+// `API_URL || NEXT_PUBLIC_API_URL || 'http://localhost:3001'` chain referenced
+// two env vars that exist nowhere else in the repo, so in production every
+// email shipped a broken <img> pointing at localhost and open_count was never
+// incremented (making GET /api/track/open dead code).
+//
+// No configured origin now means NO pixel rather than a dead one.
+const PUBLIC_API_ORIGIN = (() => {
+  const raw = (process.env.PUBLIC_API_URL || '').trim();
+  if (!raw) return null;
+  try {
+    return new URL(raw).origin;
+  } catch {
+    logger.warn('PUBLIC_API_URL is not a valid URL — email open tracking disabled', { value: raw });
+    return null;
+  }
+})();
+
 function trackingPixel(contentHash) {
-  const base = process.env.API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-  return `<img src="${base}/api/track/open?h=${encodeURIComponent(contentHash)}" width="1" height="1" alt="" style="display:none">`;
+  if (!PUBLIC_API_ORIGIN) return '';
+  return `<img src="${PUBLIC_API_ORIGIN}/api/track/open?h=${encodeURIComponent(contentHash)}" width="1" height="1" alt="" style="display:none">`;
 }
 
 // Helper to build unsubscribe footer

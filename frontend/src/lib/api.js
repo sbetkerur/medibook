@@ -115,7 +115,11 @@ api.interceptors.response.use(
       }
 
       if (isRefreshing) {
-        // Another refresh is in-flight in this tab — queue this request
+        // Another refresh is in-flight in this tab — queue this request.
+        // Mark it retried BEFORE replaying: without this a queued request whose
+        // replay also 401s re-entered this branch, so it could bounce between
+        // "queue" and "retry" instead of failing once and surfacing the error.
+        originalRequest._retried = true;
         return new Promise((resolve, reject) => {
           failedQueue.push({ resolve, reject });
         }).then((newToken) => {

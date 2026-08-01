@@ -284,6 +284,15 @@ async function processIncomingMessage(msg) {
     const gs = await query(`SELECT * FROM global_bot_sessions WHERE phone=$1`, [phone]).catch(() => null);
     const globalSession = gs?.rows[0] || null;
 
+    // Pre-tenant idempotency. The wa_messages dedup below is the real one, but it
+    // lives in a TENANT schema and so can't run until the clinic is resolved —
+    // meaning a Meta redelivery of a first-contact message re-sent the clinic
+    // prompt. global_bot_sessions.last_wa_message_id covers that window.
+    if (msgId && globalSession?.last_wa_message_id === msgId) {
+      logger.info('Duplicate pre-tenant message skipped', { msgId, phone: maskPhone(phone) });
+      return;
+    }
+
     if (!globalSession || !globalSession.tenant_id || globalSession.state === 'select_tenant') {
       // Load all active tenants
       const tenantsR = await query(
@@ -324,10 +333,11 @@ async function processIncomingMessage(msg) {
         if (selected) {
           // Patient matched a clinic — confirm and route
           await query(
-            `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity)
-             VALUES ($1,$2,'active',NOW())
-             ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active', last_activity=NOW()`,
-            [phone, selected.id]
+            `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id)
+             VALUES ($1,$2,'active',NOW(),$3)
+             ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
+               last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id`,
+            [phone, selected.id, msgId || null]
           );
           await wa.sendText(phone, `✅ Clinic selected: *${selected.name}*`, null, null)
             .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
@@ -335,11 +345,13 @@ async function processIncomingMessage(msg) {
           tenant = r.rows[0] || null;
         } else {
           // No match — show clinic list as plain text and wait for typed reply
+          // Record the message id so a Meta redelivery doesn't re-send this prompt.
           await query(
-            `INSERT INTO global_bot_sessions (phone, state, last_activity)
-             VALUES ($1,'select_tenant',NOW())
-             ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant', last_activity=NOW()`,
-            [phone]
+            `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id)
+             VALUES ($1,'select_tenant',NOW(),$2)
+             ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
+               last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id`,
+            [phone, msgId || null]
           ).catch(() => {});
 
           const isRetry = globalSession?.state === 'select_tenant' && text &&

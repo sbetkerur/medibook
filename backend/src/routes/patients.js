@@ -5,6 +5,7 @@ const { tenantQuery } = require('../db');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { setTenantId } = require('../utils/requestContext');
+const { IST_TODAY_SQL } = require('../utils/dateTz');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -98,7 +99,7 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const upcoming = await tenantQuery(s,
-      `SELECT COUNT(*) FROM appointments WHERE patient_id=$1 AND status='confirmed' AND appointment_date >= CURRENT_DATE`,
+      `SELECT COUNT(*) FROM appointments WHERE patient_id=$1 AND status='confirmed' AND appointment_date >= ${IST_TODAY_SQL}`,
       [req.params.id]);
     if (parseInt(upcoming.rows[0].count) > 0) {
       return res.status(409).json({
@@ -362,7 +363,18 @@ async function importChunkBatched(s, chunk) {
   }
 }
 
-router.post('/patients/import', adminOnly, async (req, res) => {
+// Tighter than patientLimiter: this is the heaviest endpoint in the file (up to
+// 500 rows, a CSV parse and chunked multi-row writes per call) and was the only
+// one with no rate limit at all.
+const importLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many import requests. Try again in an hour.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.post('/patients/import', importLimiter, adminOnly, async (req, res) => {
   try {
     const { csv_data } = req.body; // base64 or raw CSV string
     if (!csv_data) return res.status(400).json({ error: 'csv_data is required (raw CSV or base64)' });

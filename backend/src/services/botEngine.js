@@ -487,8 +487,19 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return;
   }
   if (session.state === STATES.COLLECT_GENDER) {
-      // Check female BEFORE male — 'female' contains 'male' so order matters
-    ctx.patient_gender = /female|btn_1/i.test(choice) ? 'female' : /male|btn_0/i.test(choice) ? 'male' : 'other';
+    // Check female BEFORE male — 'female' contains 'male' so order matters.
+    // Unrecognised replies must RE-PROMPT, not silently fall through to 'other':
+    // a typo or a stale button tap used to write 'other' into the patient record
+    // and advance the flow, unlike every other collection step here.
+    const gender =
+      /\bfemale\b|^btn_1/i.test(choice) ? 'female' :
+      /\bmale\b|^btn_0/i.test(choice)   ? 'male'   :
+      /\bother\b|^btn_2/i.test(choice)  ? 'other'  : null;
+    if (!gender) {
+      await send.buttons('Please choose one of the options below:', ['Male', 'Female', 'Other']);
+      return;
+    }
+    ctx.patient_gender = gender;
     await send.buttons('📧 *Email Address* _(optional)_\n\nShare your email to receive a booking confirmation, or tap Skip to continue:', ['⏭ Skip']);
     await updateSession(schema, phone, STATES.COLLECT_EMAIL, ctx);
     return;

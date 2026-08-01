@@ -19,6 +19,7 @@ const { query, tenantQuery } = require('../db');
 const { validate, schemas } = require('../middleware/validate');
 const { VALID_ROLES, UUID_RE, validateUUID, handleError } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
+const { IST_TODAY_SQL, IST_MONTH_START_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 
 // ── DASHBOARD STATS ───────────────────────────────────────────
@@ -32,7 +33,7 @@ router.get('/dashboard', async (req, res) => {
     try {
       const cacheR = await query(`
         SELECT * FROM tenant_stats_cache
-        WHERE tenant_id=$1 AND stat_date=CURRENT_DATE AND updated_at > NOW() - INTERVAL '15 minutes'
+        WHERE tenant_id=$1 AND stat_date=${IST_TODAY_SQL} AND updated_at > NOW() - INTERVAL '15 minutes'
       `, [tenantId]);
       cached = cacheR.rows[0] || null;
     } catch (_) { /* cache miss */ }
@@ -47,26 +48,28 @@ router.get('/dashboard', async (req, res) => {
       };
     }
 
-    // Always run upcoming (time-sensitive) and today's schedule live
+    // Always run upcoming (time-sensitive) and today's schedule live.
+    // "Today" is the IST calendar day, not CURRENT_DATE (the UTC date, which is
+    // a day behind IST between 00:00 and 05:30 IST — the dashboard used to show
+    // yesterday's queue for the first 5.5 hours of every clinic day).
     const [upcoming, recentAppts, ...liveStats] = await Promise.allSettled([
-      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date>CURRENT_DATE AND status='confirmed'`),
+      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date>${IST_TODAY_SQL} AND status='confirmed'`),
       tenantQuery(s, `
         SELECT a.booking_id, a.appointment_date, a.appointment_time, a.status,
                p.name as patient_name, d.name as doctor_name
         FROM appointments a
         JOIN patients p ON p.id=a.patient_id
         JOIN doctors d ON d.id=a.doctor_id
-        WHERE a.appointment_date=CURRENT_DATE
+        WHERE a.appointment_date=${IST_TODAY_SQL}
         ORDER BY a.appointment_time
         LIMIT 10
       `),
       // Only run heavy queries if cache miss
       ...(cached ? [] : [
-        tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date=CURRENT_DATE AND status='confirmed'`),
-        tenantQuery(s, `SELECT COUNT(*) FROM patients`),
-        tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date>=CURRENT_DATE AND status='available'`),
-        // IST month start — CURRENT_DATE is the UTC date, one day behind IST until 05:30
-        tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')::date AND status IN ('confirmed','completed')`),
+        tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date=${IST_TODAY_SQL} AND status='confirmed'`),
+        tenantQuery(s, `SELECT COUNT(*) FROM patients WHERE deleted_at IS NULL`),
+        tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date>=${IST_TODAY_SQL} AND status='available'`),
+        tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= ${IST_MONTH_START_SQL} AND status IN ('confirmed','completed')`),
       ]),
     ]);
 
@@ -83,7 +86,7 @@ router.get('/dashboard', async (req, res) => {
       // Async update cache (non-blocking)
       query(`
         INSERT INTO tenant_stats_cache (tenant_id, stat_date, appointments_today, appointments_month, patients_total, active_slots, updated_at)
-        VALUES ($1, CURRENT_DATE, $2, $3, $4, $5, NOW())
+        VALUES ($1, ${IST_TODAY_SQL}, $2, $3, $4, $5, NOW())
         ON CONFLICT (tenant_id, stat_date) DO UPDATE SET
           appointments_today=EXCLUDED.appointments_today, appointments_month=EXCLUDED.appointments_month,
           patients_total=EXCLUDED.patients_total, active_slots=EXCLUDED.active_slots, updated_at=NOW()
@@ -187,11 +190,20 @@ router.get('/settings', async (req, res) => {
   try {
     const t = req.tenant;
     const [hospR, planR, usageR, userR] = await Promise.allSettled([
-      tenantQuery(t.schema_name, `SELECT * FROM hospitals LIMIT 1`),
+      // ORDER BY is required for "primary hospital" to mean the same row here as
+      // it does in PATCH /settings — an unordered LIMIT 1 can return either row.
+      tenantQuery(t.schema_name,
+        `SELECT * FROM hospitals WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`),
       query(`SELECT * FROM plans WHERE id=$1`, [t.plan]),
       Promise.all([
         tenantQuery(t.schema_name, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
-        tenantQuery(t.schema_name, `SELECT COUNT(*) FROM appointments WHERE created_at >= date_trunc('month', NOW())`),
+        // Must use the SAME month boundary as bookingCore.checkMonthlyQuota (IST,
+        // not UTC) — otherwise on the 1st of the month this counter and the limit
+        // actually being enforced disagree for 5.5 hours, and the clinic sees
+        // "3/500 used" while bookings are rejected as over quota.
+        tenantQuery(t.schema_name,
+          `SELECT COUNT(*) FROM appointments
+           WHERE created_at >= timezone('Asia/Kolkata', date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata'))`),
       ]),
       tenantQuery(t.schema_name, `SELECT notify_phone FROM users WHERE id=$1`, [req.user.id]),
     ]);
@@ -227,7 +239,7 @@ router.get('/settings', async (req, res) => {
 
 router.patch('/settings', adminOnly, validate(schemas.updateSettings), async (req, res) => {
   try {
-    const { name, notification_prefs, notify_phone } = req.body;
+    const { name, notification_prefs, notify_phone, address, city, phone } = req.body;
     const updates = [];
     const params = [];
     if (name) { params.push(name); updates.push(`name=$${params.length}`); }
@@ -239,6 +251,27 @@ router.patch('/settings', adminOnly, validate(schemas.updateSettings), async (re
       params.push(req.tenant.id);
       await query(`UPDATE tenants SET ${updates.join(',')} WHERE id=$${params.length}`, params);
     }
+
+    // Clinic address/city/phone live on the hospital row, not on tenants.
+    // These were accepted by the Joi schema and reported back by GET /settings
+    // but never written — an admin editing them got a 200 and no change.
+    // Targets the same "primary" hospital GET /settings reads.
+    if (address !== undefined || city !== undefined || phone !== undefined) {
+      const hospUpdates = [];
+      const hospParams = [];
+      if (address !== undefined) { hospParams.push(address || null); hospUpdates.push(`address=$${hospParams.length}`); }
+      if (city !== undefined)    { hospParams.push(city || null);    hospUpdates.push(`city=$${hospParams.length}`); }
+      if (phone !== undefined)   { hospParams.push(phone || null);   hospUpdates.push(`phone=$${hospParams.length}`); }
+      const updated = await tenantQuery(req.tenant.schema_name, `
+        UPDATE hospitals SET ${hospUpdates.join(',')}
+        WHERE id = (SELECT id FROM hospitals WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1)
+        RETURNING id
+      `, hospParams);
+      if (!updated.rows[0]) {
+        return res.status(409).json({ error: 'No clinic record exists yet — add a clinic first.' });
+      }
+    }
+
     if (notify_phone !== undefined) {
       const cleaned = notify_phone ? notify_phone.replace(/[+\s\-()]/g, '') : null;
       await tenantQuery(req.tenant.schema_name,
@@ -321,7 +354,7 @@ router.get('/onboarding/status', async (req, res) => {
     const [hospitalR, doctorR, slotR] = await Promise.all([
       tenantQuery(s, `SELECT COUNT(*) FROM hospitals WHERE is_active=true`),
       tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
-      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= CURRENT_DATE AND status='available'`),
+      tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= ${IST_TODAY_SQL} AND status='available'`),
     ]);
     const hospitals = parseInt(hospitalR.rows[0].count);
     const doctors = parseInt(doctorR.rows[0].count);
@@ -401,6 +434,32 @@ router.post('/messages/send', adminOnly, async (req, res) => {
     }
     const wa = require('../services/whatsapp');
     const normalised = phone.replace(/[+\s]/g, '');
+
+    // The WhatsApp number is SHARED across all tenants, so an unrestricted
+    // "send to any number" endpoint let one clinic's admin message the general
+    // public using platform credentials — and Meta's quality rating (which
+    // governs delivery for EVERY tenant) is a shared resource. Restrict sends to
+    // numbers this tenant already has a relationship with: one of its own
+    // patients, or a staff member's configured notify_phone.
+    const knownR = await tenantQuery(req.tenant.schema_name, `
+      SELECT 1 FROM patients WHERE phone=$1 AND deleted_at IS NULL
+      UNION ALL
+      SELECT 1 FROM users WHERE notify_phone=$1 AND is_active=true
+      LIMIT 1
+    `, [normalised]);
+    if (!knownR.rows[0]) {
+      return res.status(403).json({
+        error: 'That number is not a patient or staff member of this clinic. The WhatsApp number is shared across clinics, so messages can only be sent to your own contacts.',
+      });
+    }
+
+    // Opted-out patients must not be messaged (bot honours this; so must staff).
+    const optedR = await tenantQuery(req.tenant.schema_name,
+      `SELECT 1 FROM patients WHERE phone=$1 AND opted_out=true LIMIT 1`, [normalised]);
+    if (optedR.rows[0]) {
+      return res.status(403).json({ error: 'This patient has opted out of WhatsApp messages.' });
+    }
+
     await wa.sendText(normalised, message, null, null);
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
       'SEND_WA_MESSAGE', 'patient', normalised, null, { message: message.slice(0, 100) }, req.ip);
@@ -481,11 +540,23 @@ router.get('/audit-logs', adminOnly, async (req, res) => {
 // Call this after updating META_ACCESS_TOKEN to immediately unblock sends.
 // (Path fixed: was '/admin/whatsapp/reset-circuit', which resolved to the
 // unreachable /api/admin/admin/whatsapp/reset-circuit.)
+// NOTE: the circuit breaker is keyed by the SHARED META_PHONE_NUMBER_ID, so this
+// is a platform-wide reset triggered from a tenant-scoped route. That's
+// intentional — it's the documented escape hatch after rotating the Meta token,
+// and the failure mode of an unnecessary reset is mild (one extra send attempt).
+// It is audit-logged so a tenant repeatedly resetting a genuinely-open circuit
+// is visible rather than silent.
 router.post('/whatsapp/reset-circuit', adminOnly, async (req, res) => {
   try {
     const wa = require('../services/whatsapp');
     if (typeof wa.resetCircuit === 'function') {
       wa.resetCircuit(process.env.META_PHONE_NUMBER_ID);
+      await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
+        'RESET_WA_CIRCUIT', 'platform', process.env.META_PHONE_NUMBER_ID || null,
+        null, { scope: 'shared_phone_number' }, req.ip);
+      logger.warn('WhatsApp circuit breaker reset by tenant admin (affects all tenants on the shared number)', {
+        tenant: req.tenant.slug, userId: req.user.id,
+      });
       res.json({ success: true, message: 'Circuit breaker reset — bot will send again immediately.' });
     } else {
       res.status(501).json({ error: 'resetCircuit not exported from whatsapp service' });

@@ -442,6 +442,19 @@ async function migrate() {
       }
     });
 
+    // Version 19: dedup key for PRE-TENANT webhook messages.
+    // wa_messages (the normal idempotency store) lives in a tenant schema, so it
+    // can only dedup a message AFTER the patient's clinic is known. First-contact
+    // messages are handled before that point, so a Meta redelivery re-sent the
+    // "type your clinic name" prompt. Recording the last handled wa_message_id on
+    // the global session closes that gap.
+    await runMigration(client, 19, 'global_session_last_wa_message_id', async () => {
+      await client.query(`
+        ALTER TABLE global_bot_sessions
+          ADD COLUMN IF NOT EXISTS last_wa_message_id VARCHAR(255);
+      `);
+    });
+
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
     console.log('✅ Super admin created: admin@medibook.com / SuperAdmin@123');

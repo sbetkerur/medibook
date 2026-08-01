@@ -41,6 +41,9 @@ function sleep(ms) {
  */
 async function acquirePhoneLock(lockKey) {
   const client = getLockRedisClient();
+  // No Redis configured — single-instance, and BullMQ itself can't be running
+  // either (it needs the same Redis), so there is nothing to serialise against.
+  if (!client) return { acquired: false, token: null, notConfigured: true };
   const token = crypto.randomBytes(16).toString('hex');
   const deadline = Date.now() + PHONE_LOCK_MAX_WAIT_MS;
   while (true) {
@@ -58,8 +61,10 @@ async function acquirePhoneLock(lockKey) {
 
 async function releasePhoneLock(lockKey, token) {
   if (!token) return;
+  const client = getLockRedisClient();
+  if (!client) return;
   try {
-    await getLockRedisClient().eval(RELEASE_PHONE_LOCK_SCRIPT, 1, lockKey, token);
+    await client.eval(RELEASE_PHONE_LOCK_SCRIPT, 1, lockKey, token);
   } catch (err) {
     logger.warn('Phone lock release failed (will expire via TTL)', { error: err.message });
   }
@@ -76,7 +81,8 @@ let watchdogStarted = false;
 let shuttingDown = false;
 
 function createConnection() {
-  const conn = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+  // Only reached after initQueue() has confirmed REDIS_URL is set.
+  const conn = new Redis(process.env.REDIS_URL, {
     maxRetriesPerRequest: null, // Required by BullMQ
     enableReadyCheck: false,
     lazyConnect: true,
@@ -100,6 +106,12 @@ function createConnection() {
 async function initQueue() {
   if (process.env.DISABLE_QUEUE === 'true') {
     logger.info('DISABLE_QUEUE=true — skipping BullMQ, using synchronous bot processing');
+    return false;
+  }
+  // No Redis configured — don't burn ~10s of connect timeout on a localhost
+  // endpoint that isn't there. Matches the guard in utils/cronLock.js.
+  if (!process.env.REDIS_URL) {
+    logger.info('REDIS_URL not set — skipping BullMQ, using synchronous bot processing');
     return false;
   }
   try {
@@ -186,8 +198,8 @@ function startBotWorker() {
     // still running, or Redis briefly unreachable), process anyway rather
     // than dropping the patient's message — better a rare race than silence.
     const lockKey = `botlock:${tenantId}:${phone}`;
-    const { acquired, token } = await acquirePhoneLock(lockKey);
-    if (!acquired) {
+    const { acquired, token, notConfigured } = await acquirePhoneLock(lockKey);
+    if (!acquired && !notConfigured) {
       logger.warn('Phone lock not acquired before deadline — processing anyway', { phone, tenantId });
     }
     try {

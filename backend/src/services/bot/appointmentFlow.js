@@ -200,15 +200,23 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
   // holidays, the current date and the old appointment's date; a typed
   // arbitrary date skipped all of those checks (including past dates, whose
   // still-'available' slot rows would let the appointment move into the past).
+  // Fail CLOSED when the offered-dates cache is missing (session resumed after
+  // expiry) — `offeredDates.length && ...` used to accept any well-formed date
+  // in exactly the case where we can't verify it against leaves/holidays.
   const offeredDates = ctx._reschedule_dates || [];
-  if (offeredDates.length && !offeredDates.some(d => d.date === resolvedDate)) {
+  if (!offeredDates.length || !offeredDates.some(d => d.date === resolvedDate)) {
     await send.text('That date is not available. Please pick a date from the list, or reply *Hi* to start over.');
     return;
   }
   ctx.reschedule_new_date = resolvedDate;
+  // Same same-day guard as the booking flow — the offered list starts at
+  // tomorrow, but a stale row tapped after midnight can still resolve to today.
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
+       AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+            OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
      ORDER BY start_time`,
     [ctx.reschedule_doctor_id, resolvedDate]);
   if (!slots.rows.length) {
@@ -278,8 +286,17 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
         [ctx.reschedule_appt_id]
       );
       if (!apptCheck.rows.length) return 'appt_gone';
+      // Re-check the slot hasn't passed, mirroring bookingCore's lock in
+      // completeBooking: the patient can sit on this confirm screen for the
+      // whole 4-hour session window, and without the time predicate they could
+      // move an appointment INTO the past.
       const lock = await client.query(
-        `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available' RETURNING id`,
+        `UPDATE time_slots SET status='booked'
+         WHERE id=$1 AND status='available'
+           AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                    AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
+         RETURNING id`,
         [ctx.reschedule_new_slot_id]
       );
       if (!lock.rows.length) return 'slot_taken';

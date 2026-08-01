@@ -44,6 +44,19 @@ if (!process.env.JWT_SECRET) {
   }
 }
 
+// The IST date logic throughout the app (toZonedTime + date-fns local getters in
+// slotGenerator/botEngine, and the SQL date expressions in utils/dateTz.js)
+// assumes the PROCESS runs in UTC. A non-UTC host timezone shifts slot
+// generation and "today" labels by a day, silently and only for part of each day.
+const _processTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const _tzOffsetMinutes = new Date().getTimezoneOffset();
+if (_tzOffsetMinutes !== 0) {
+  logger.warn(
+    `Process timezone is "${_processTz}" (UTC offset ${-_tzOffsetMinutes} min), not UTC. ` +
+    `Date handling assumes UTC — set TZ=UTC to avoid off-by-one-day slot generation and date labels.`
+  );
+}
+
 // Warn about optional services that are not configured
 if (!process.env.RESEND_API_KEY) {
   logger.warn('RESEND_API_KEY not set — booking confirmation emails will not be sent');
@@ -152,16 +165,51 @@ app.use('/api/v1/webhook', webhookJsonParser);
 app.use(express.json({ limit: '12mb' })); // increased for document base64 uploads (Enhancement 6)
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting
-const globalLimiter = rateLimit({ windowMs: 60 * 1000, max: 500, standardHeaders: true, legacyHeaders: false });
-const webhookLimiter = rateLimit({ windowMs: 60 * 1000, max: 2000 });
+// ── RATE LIMITING ─────────────────────────────────────────────
+// Webhook traffic needs a much higher ceiling than ordinary API traffic: Meta
+// delivers every tenant's inbound messages from a SMALL POOL OF SHARED SOURCE
+// IPs, so a per-IP limit is effectively a platform-wide limit.
+//
+// There used to be two stacked webhook limiters — max:2000 and max:100 — both
+// keyed by IP (express-rate-limit's default key IS req.ip, so the explicit
+// keyGenerator changed nothing). The tighter one always won, silently capping
+// the entire platform at 100 inbound messages/minute and 429-ing Meta; the
+// 2000 was dead config. One limiter now, at the intended ceiling.
+const WEBHOOK_PATHS = ['/api/webhook', '/api/v1/webhook'];
+// NOTE: use originalUrl, not req.path — inside `app.use('/api', globalLimiter)`
+// Express strips the mount point, so req.path is '/webhook/whatsapp' and a
+// '/api/webhook' prefix test would never match.
+const isWebhookPath = (req) => {
+  const path = (req.originalUrl || '').split('?')[0];
+  return WEBHOOK_PATHS.some(p => path === p || path.startsWith(p + '/'));
+};
+
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.WEBHOOK_RATE_LIMIT_PER_MIN || '2000'),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many webhook requests' },
+});
+
+// The global limiter must SKIP webhook paths — mounted on '/api' it also
+// matched /api/webhook, so its max:500 quietly overrode the webhook ceiling.
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 500,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: isWebhookPath,
+});
+
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many login attempts' }, skip: () => process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development' });
 
 app.use('/api/auth', authLimiter);
 app.use('/api/v1/auth', authLimiter); // auth routes are also mounted under /api/v1
-const webhookIpLimiter = rateLimit({ windowMs: 60 * 1000, max: 100, keyGenerator: (req) => req.ip, message: { error: 'Too many requests from this IP' } });
-app.use('/api/webhook', webhookIpLimiter);
+// Both webhook mount points get the limiter — /api/v1/webhook previously had no
+// webhook-specific limit at all, only the generic 500/min global one.
 app.use('/api/webhook', webhookLimiter);
+app.use('/api/v1/webhook', webhookLimiter);
 app.use('/api', globalLimiter);
 
 // ── AUTH + PER-TENANT RATE LIMITING (Enhancement 15) ─────────

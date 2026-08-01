@@ -181,8 +181,14 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
     }, accessToken, phoneNumberId);
   } catch (err) {
     logger.warn('sendList failed, falling back to text', { to, error: err.response?.data || err.message });
-    const lines = sections.flatMap((s, si) =>
-      s.rows.map((r, ri) => `${si * 10 + ri + 1}. ${r.title}${r.description ? ' — ' + r.description : ''}`)
+    // Numbering must be a single running counter across sections. The old
+    // `si * 10 + ri + 1` numbered section 1's rows 11, 12, … while every caller
+    // that parses a typed number (handleSelectSlot, handleSelectDate,
+    // handleSelectHospital) matches against 1..rows.length — so on a
+    // multi-section list the fallback was unusable.
+    let n = 0;
+    const lines = sections.flatMap((s) =>
+      (s.rows || []).map((r) => `${++n}. ${r.title}${r.description ? ' — ' + r.description : ''}`)
     );
     await sendText(to, `${bodyText}\n\n${lines.join('\n')}\n\nReply with the number of your choice.`, accessToken, phoneNumberId);
   }

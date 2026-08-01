@@ -162,6 +162,7 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
               <select value={staffForm.role} onChange={e => setStaffForm(f => ({ ...f, role: e.target.value }))}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
                 <option value="staff">Staff</option>
+                <option value="doctor">Dentist</option>
                 <option value="admin">Admin</option>
               </select>
             </div>

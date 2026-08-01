@@ -15,6 +15,7 @@ const {
   getPatient,
   getPatients,
   updateSession,
+  logMessage,
   notifyAdminWhatsApp,
 } = require('./utils');
 
@@ -347,17 +348,28 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   // leaves and clinic holidays; a typed arbitrary date (or a stale list row
   // tapped after a holiday was declared) skipped those checks entirely and
   // could book a slot on a day the clinic is closed.
-  if (cachedDates.length && !cachedDates.some(d => d.date === resolvedDate)) {
+  //
+  // Fail CLOSED when the cache is missing (session resumed after expiry, or a
+  // context write was lost): `cachedDates.length && ...` used to let any
+  // well-formed YYYY-MM-DD through in exactly the situation where we have no
+  // idea whether that date is open.
+  if (!cachedDates.length || !cachedDates.some(d => d.date === resolvedDate)) {
     await send.text('That date is not available. Please pick a date from the list, or reply *Hi* to start over.');
     return;
   }
   ctx.appointment_date = resolvedDate;
 
+  // Past-slot guard must be a single AND-ed same-day test. The old form
+  //   (slot_date > today OR start_time > now::time)
+  // is true for ANY past date whose start_time happens to be later in the day
+  // than the current clock time, so past slots were offered and then rejected
+  // by completeBooking's lock with a misleading "someone just booked that slot".
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
        AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
-            OR start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time)
+            OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
      ORDER BY start_time`,
     [ctx.doctor_id, resolvedDate]);
 
@@ -724,8 +736,14 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
           bookingId, doctorName: ctx.doctor_name, hospitalName: ctx.hospital_name,
           date: dateLabel, time: (ctx.appointment_time || '').slice(0, 5),
         }, null, null);
+        // Log the template send too. This path bypasses the `send.*` helpers in
+        // botEngine, which are what normally write to wa_messages — so on the
+        // happy path the clinic's message history was missing exactly the
+        // message patients ask about most.
+        await logMessage(schema, phone, 'out', 'template', confirmationText, null);
       } catch {
         // Template not approved or Meta error — fall back to session text message
+        // (send.text logs to wa_messages itself).
         await send.text(confirmationText);
       }
     })(),

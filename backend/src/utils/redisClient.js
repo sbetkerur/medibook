@@ -7,9 +7,26 @@ const logger = require('./logger');
 
 let sharedClient = null;
 
+/** True when a Redis endpoint is actually configured for this deployment. */
+function isRedisConfigured() {
+  return !!process.env.REDIS_URL;
+}
+
+/**
+ * Shared Redis client, or null when REDIS_URL is unset.
+ *
+ * Returning null (rather than falling back to redis://localhost:6379) mirrors
+ * the guard in utils/cronLock.js. Without it, a Redis-less deployment attempted
+ * a doomed localhost connection on EVERY authenticated request (tenantRateLimit),
+ * every feature-flag check and every inbound webhook — all of which fail open,
+ * so it cost latency and log noise for nothing.
+ *
+ * Every caller must handle null. The helpers below already do.
+ */
 function getClient() {
+  if (!isRedisConfigured()) return null;
   if (!sharedClient) {
-    sharedClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    sharedClient = new Redis(process.env.REDIS_URL, {
       lazyConnect: true,
       maxRetriesPerRequest: 1,
       enableReadyCheck: false,
@@ -27,12 +44,23 @@ const INCR_WITH_TTL_SCRIPT = `local c = redis.call('INCR', KEYS[1])
 if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
 return c`;
 
-/** Increment `key`, setting `ttlSeconds` on first increment. Returns the count. */
+/**
+ * Increment `key`, setting `ttlSeconds` on first increment. Returns the count.
+ * Throws REDIS_NOT_CONFIGURED when there is no Redis — callers already treat a
+ * throw as "fall back to the in-process limiter", so this needs no new handling.
+ */
 async function incrWithTTL(key, ttlSeconds) {
-  return getClient().eval(INCR_WITH_TTL_SCRIPT, 1, key, ttlSeconds);
+  const client = getClient();
+  if (!client) {
+    const err = new Error('Redis not configured (REDIS_URL unset)');
+    err.code = 'REDIS_NOT_CONFIGURED';
+    throw err;
+  }
+  return client.eval(INCR_WITH_TTL_SCRIPT, 1, key, ttlSeconds);
 }
 
 async function redisHealthCheck() {
+  if (!isRedisConfigured()) return 'not_configured';
   try {
     const client = getClient();
     const testKey = `health:check:${Date.now()}`;
@@ -52,4 +80,4 @@ function closeClient() {
   }
 }
 
-module.exports = { getClient, incrWithTTL, redisHealthCheck, closeClient };
+module.exports = { getClient, isRedisConfigured, incrWithTTL, redisHealthCheck, closeClient };

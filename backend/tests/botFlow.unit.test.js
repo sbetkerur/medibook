@@ -228,10 +228,22 @@ async function run() {
     assert.strictEqual(state(), 'collect_name');
   });
 
-  await test('Typed name → DOB → gender → email skip → reason → confirmation summary', async () => {
+  await test('REGRESSION: unrecognised gender reply re-prompts instead of silently storing "other"', async () => {
     await send('Asha Verma');
     assert.strictEqual(state(), 'collect_dob');
     await send('15/08/1990');
+    assert.strictEqual(state(), 'collect_gender');
+    // A typo / stale tap used to fall through to 'other' and advance the flow.
+    const r = await send('femle');
+    assert(r.some(m => /choose one of the options/i.test(m.text)),
+      'expected gender re-prompt: ' + JSON.stringify(r));
+    assert.strictEqual(state(), 'collect_gender', 'should stay on gender step');
+    const ctxRaw = db.sessions.get(PHONE).context;
+    const ctx = JSON.parse(require('../src/utils/encryption').decrypt(ctxRaw._enc));
+    assert.strictEqual(ctx.patient_gender, undefined, 'gender must not be set from an unrecognised reply');
+  });
+
+  await test('Typed name → DOB → gender → email skip → reason → confirmation summary', async () => {
     assert.strictEqual(state(), 'collect_gender');
     await send('Female', 'btn_1_1700000000004');
     assert.strictEqual(state(), 'collect_email');

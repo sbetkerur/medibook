@@ -89,10 +89,16 @@ generation, reminders, feedback, digests, session cleanup, webhook retry and
 backups are registered from `index.js`; tasks are returned so SIGTERM can stop
 them.
 
-**Timezone.** Servers run UTC; the product is IST. Use
-`toZonedTime(new Date(), 'Asia/Kolkata')` (via `utils/dateTz.js` shim) for any
-"today" computation, and compare appointment date+time as a
+**Timezone.** Servers run UTC (`TZ=UTC`; startup warns otherwise); the product
+is IST. Use `toZonedTime(new Date(), 'Asia/Kolkata')` (via `utils/dateTz.js`
+shim) for any "today" computation, and compare appointment date+time as a
 `timezone('Asia/Kolkata', ts)` timestamp in SQL — never date-only or time-only.
+In SQL, never write bare `CURRENT_DATE`/`date_trunc('month', NOW())` for a
+clinic-facing "today"/"this month" — it's the UTC date, a day behind IST until
+05:30. Interpolate `IST_TODAY_SQL` / `IST_MONTH_START_SQL` from
+`utils/dateTz.js` instead. Past-slot guards must AND the same-day test
+(`slot_date > today OR (slot_date = today AND start_time > now)`); the
+two-clause `OR start_time > now` form matches past dates.
 DATE columns are returned as strings (type parser in `db/index.js`).
 
 **Slot generation.** `jobs/slotGenerator.js` is the single source of truth
@@ -124,10 +130,15 @@ Required in prod (startup fails or warns otherwise): `DATABASE_URL`,
 `JWT_SECRET` (≥32 chars), `ENCRYPTION_KEY` (≥32 chars, non-default),
 `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_WEBHOOK_VERIFY_TOKEN`,
 `META_APP_SECRET`, `FRONTEND_URL` (locks CORS/CSP). Optional: `REDIS_URL`
-(queues degrade to sync without it), `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`,
-`TWILIO_*`, `OPENAI_API_KEY` (voice transcription), `SENTRY_DSN`,
-`METRICS_SECRET`, `BACKUP_DIR`, `TIMEZONE`. Frontend: `BACKEND_URL`
-(server-side, Railway).
+(queues, cron locks and shared rate-limit counters all degrade to in-process
+fallbacks without it — nothing probes localhost), `RESEND_API_KEY`,
+`PUBLIC_API_URL` (this API's public origin; required for email open-tracking
+pixels to resolve — omit rather than pointing at localhost),
+`RESEND_WEBHOOK_SECRET`, `TWILIO_*`, `OPENAI_API_KEY` (voice transcription),
+`SENTRY_DSN`, `METRICS_SECRET`, `BACKUP_DIR`, `TIMEZONE`,
+`WEBHOOK_RATE_LIMIT_PER_MIN` (default 2000; per-IP, and Meta delivers every
+tenant's traffic from a shared IP pool, so this is effectively platform-wide).
+Frontend: `BACKEND_URL` (server-side, Railway).
 
 ## Testing without WhatsApp credentials
 

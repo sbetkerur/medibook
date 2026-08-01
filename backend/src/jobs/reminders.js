@@ -3,7 +3,7 @@ const { query, tenantQuery } = require('../db');
 const wa = require('../services/whatsapp');
 const { forEachActiveTenantParallel } = require('../utils/tenantUtils');
 const { format, parseISO, subWeeks } = require('date-fns');
-const { toZonedTime } = require('../utils/dateTz');
+const { toZonedTime, IST_TODAY_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
 const { FEEDBACK_BATCH_LIMIT } = require('../utils/errors');
@@ -204,8 +204,8 @@ async function handleReminderConfirmation(schemaName, phone, text) {
       JOIN appointments a ON a.id = rc.appointment_id
       WHERE rc.phone = $1
         AND rc.response IS NULL
-        AND a.appointment_date >= CURRENT_DATE
-        AND a.appointment_date <= CURRENT_DATE + INTERVAL '2 days'
+        AND a.appointment_date >= ${IST_TODAY_SQL}
+        AND a.appointment_date <= ${IST_TODAY_SQL} + INTERVAL '2 days'
         AND a.status = 'confirmed'
       ORDER BY a.appointment_date ASC
       LIMIT 1
@@ -247,7 +247,7 @@ async function sendPostAppointmentFollowup() {
     // reminder above: time-only comparison fails when the 1–2 hour window straddles
     // midnight (e.g. it is 01:30 IST, so 1h-ago = 00:30 and 2h-ago = 23:30).
     const appts = await tenantQuery(tenant.schema_name, `
-      SELECT a.id, a.booking_id, p.phone, p.name as patient_name, d.name as doctor_name
+      SELECT a.id, a.booking_id, a.patient_id, p.phone, p.name as patient_name, d.name as doctor_name
       FROM appointments a
       JOIN patients p ON p.id = a.patient_id
       JOIN doctors d ON d.id = a.doctor_id
@@ -270,13 +270,14 @@ async function sendPostAppointmentFollowup() {
           waToken, waPhoneId);
         await tenantQuery(tenant.schema_name,
           `UPDATE appointments SET follow_up_sent=true WHERE id=$1`, [appt.id]);
-        // Trigger feedback state in bot session
+        // Trigger feedback state in bot session.
+        // Use the appointment's OWN patient_id. This used to re-look-up by phone
+        // (`SELECT id FROM patients WHERE phone=$1`), but patients.phone is
+        // deliberately non-unique for family booking — so a parent booking for a
+        // child filed the feedback against whichever profile Postgres returned
+        // first. sendFeedbackRequests below already carries patient_id correctly.
         const { triggerFeedback } = require('../services/botEngine');
-        const patientR = await tenantQuery(tenant.schema_name,
-          `SELECT id FROM patients WHERE phone=$1`, [appt.phone]);
-        if (patientR.rows[0]) {
-          await triggerFeedback(tenant.schema_name, appt.phone, appt.id, patientR.rows[0].id, appt.doctor_name);
-        }
+        await triggerFeedback(tenant.schema_name, appt.phone, appt.id, appt.patient_id, appt.doctor_name);
         logger.info(`Post-appointment follow-up sent: ${appt.booking_id}`);
       } catch (err) {
         logger.error(`Follow-up failed for ${appt.booking_id}`, { error: err.message });
@@ -302,7 +303,7 @@ async function sendFeedbackRequests() {
       JOIN patients p ON p.id=a.patient_id
       JOIN doctors d ON d.id=a.doctor_id
       WHERE a.status IN ('completed', 'no_show')
-        AND a.appointment_date = CURRENT_DATE - INTERVAL '1 day'
+        AND a.appointment_date = ${IST_TODAY_SQL} - INTERVAL '1 day'
         AND a.follow_up_sent IS NOT TRUE
         AND NOT EXISTS (
           SELECT 1 FROM appointment_feedback af WHERE af.appointment_id=a.id

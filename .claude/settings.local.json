@@ -162,7 +162,14 @@
       "Bash(powershell -Command \"Start-Process 'C:\\\\Program Files\\\\Docker\\\\Docker\\\\Docker Desktop.exe'\")",
       "Bash(docker start *)",
       "Bash(docker stop *)",
-      "Skill(claude-in-chrome)"
+      "Skill(claude-in-chrome)",
+      "Bash(grep -v \"^\\\\S*: *//\")",
+      "Bash(grep -oE \"^\\(DATABASE_URL|REDIS_URL\\)=.{0,45}\" .env)",
+      "Bash(grep -rn '\\\\${IST_TODAY_SQL}\\\\|\\\\${IST_MONTH_START_SQL}' src/)",
+      "Bash(grep -E \"'[^\\\\`]*\\\\\\\\\\\\$\\\\{IST_|\\\\\"[^\\\\`]*\\\\\\\\\\\\$\\\\{IST_\")",
+      "Bash(grep -rn '\\\\${IST_' src/)",
+      "Bash(docker version *)",
+      "WebFetch(domain:www.facebook.com)"
     ]
   }
 }

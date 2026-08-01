@@ -6,6 +6,7 @@ const { validate, schemas } = require('../middleware/validate');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
+const { IST_TODAY_SQL } = require('../utils/dateTz');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -58,7 +59,7 @@ router.get('/doctors', async (req, res) => {
         ) appt_agg ON appt_agg.doctor_id=d.id
         LEFT JOIN (
           SELECT doctor_id, COUNT(*) as available
-          FROM time_slots WHERE slot_date>=CURRENT_DATE AND status='available' GROUP BY doctor_id
+          FROM time_slots WHERE slot_date>=${IST_TODAY_SQL} AND status='available' GROUP BY doctor_id
         ) slot_agg ON slot_agg.doctor_id=d.id
         ${whereClause}
         ORDER BY d.is_active DESC, d.name
@@ -135,7 +136,7 @@ router.get('/doctors/:id', validateUUID(), async (req, res) => {
       LEFT JOIN departments dep ON dep.id=d.department_id
       LEFT JOIN hospitals h ON h.id=d.hospital_id
       LEFT JOIN (SELECT doctor_id, COUNT(*) as total FROM appointments WHERE status='confirmed' GROUP BY doctor_id) appt_agg ON appt_agg.doctor_id=d.id
-      LEFT JOIN (SELECT doctor_id, COUNT(*) as available FROM time_slots WHERE slot_date>=CURRENT_DATE AND status='available' GROUP BY doctor_id) slot_agg ON slot_agg.doctor_id=d.id
+      LEFT JOIN (SELECT doctor_id, COUNT(*) as available FROM time_slots WHERE slot_date>=${IST_TODAY_SQL} AND status='available' GROUP BY doctor_id) slot_agg ON slot_agg.doctor_id=d.id
       WHERE d.id=$1
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
@@ -184,13 +185,13 @@ router.delete('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
       UPDATE doctors SET is_active=false
       WHERE id=$1 AND is_active=true
         AND NOT EXISTS (
-          SELECT 1 FROM appointments WHERE doctor_id=$1 AND status='confirmed' AND appointment_date >= CURRENT_DATE
+          SELECT 1 FROM appointments WHERE doctor_id=$1 AND status='confirmed' AND appointment_date >= ${IST_TODAY_SQL}
         )
       RETURNING id
     `, [req.params.id]);
     if (!r.rows[0]) {
       const exists = await tenantQuery(s,
-        `SELECT id, (SELECT COUNT(*) FROM appointments WHERE doctor_id=$1 AND status='confirmed' AND appointment_date >= CURRENT_DATE) as upcoming FROM doctors WHERE id=$1`,
+        `SELECT id, (SELECT COUNT(*) FROM appointments WHERE doctor_id=$1 AND status='confirmed' AND appointment_date >= ${IST_TODAY_SQL}) as upcoming FROM doctors WHERE id=$1`,
         [req.params.id]);
       if (!exists.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
       const cnt = parseInt(exists.rows[0].upcoming);
