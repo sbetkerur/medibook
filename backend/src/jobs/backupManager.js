@@ -8,14 +8,34 @@ const { query } = require('../db');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
 
+// Defaults to os.tmpdir() only so local dev works without configuration. In a
+// container that is an EPHEMERAL path — every deploy discards the dumps, so the
+// retention logic below silently guards an empty directory. Point BACKUP_DIR at
+// a mounted volume in any deployment whose backups need to survive a restart.
 const BACKUP_DIR = process.env.BACKUP_DIR || os.tmpdir();
 const MAX_BACKUP_FILES = parseInt(process.env.BACKUP_MAX_FILES) || 7;
+
+if (process.env.NODE_ENV === 'production' && !process.env.BACKUP_DIR) {
+  logger.warn(
+    'BACKUP_DIR not set — backups are being written to a temporary directory ' +
+    'and will be lost on the next deploy. Mount a volume and set BACKUP_DIR.'
+  );
+}
 
 async function runBackup() {
   const startedAt = Date.now();
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const fileName = `medibook_backup_${timestamp}.sql`;
   const filePath = path.join(BACKUP_DIR, fileName);
+
+  // A mounted volume starts empty, so a nested BACKUP_DIR (e.g. /data/backups)
+  // will not exist on first run — createWriteStream would ENOENT.
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  } catch (err) {
+    logger.error('Cannot create backup directory', { dir: BACKUP_DIR, error: err.message });
+    throw err;
+  }
 
   let logId = null;
   try {

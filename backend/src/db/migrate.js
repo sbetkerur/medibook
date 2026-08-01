@@ -277,12 +277,27 @@ async function migrate() {
     `);
 
     // ── SEED SUPER ADMIN ──────────────────────────────────────
-    const hash = await bcrypt.hash('SuperAdmin@123', 12);
-    await client.query(`
-      INSERT INTO super_admins (email, password_hash, name)
-      VALUES ('admin@medibook.com', $1, 'Super Admin')
-      ON CONFLICT (email) DO NOTHING;
-    `, [hash]);
+    // ON CONFLICT DO NOTHING, so this only ever fires on a fresh database and
+    // never overwrites an existing password. On a fresh PRODUCTION database
+    // though, a hardcoded default would create a publicly-documented login to
+    // the super admin console, so there it must come from the environment.
+    const superEmail = process.env.SUPER_ADMIN_EMAIL || 'admin@medibook.com';
+    const superPassword = process.env.SUPER_ADMIN_PASSWORD ||
+      (process.env.NODE_ENV === 'production' ? null : 'SuperAdmin@123');
+
+    if (superPassword) {
+      const hash = await bcrypt.hash(superPassword, 12);
+      await client.query(`
+        INSERT INTO super_admins (email, password_hash, name)
+        VALUES ($1, $2, 'Super Admin')
+        ON CONFLICT (email) DO NOTHING;
+      `, [superEmail, hash]);
+    } else {
+      console.warn(
+        '⚠️  No super admin seeded — set SUPER_ADMIN_PASSWORD (and optionally ' +
+        'SUPER_ADMIN_EMAIL) to bootstrap one in production.'
+      );
+    }
 
     // Version 7: Feature flags tables
     await runMigration(client, 7, 'feature_flags', async () => {
@@ -457,7 +472,7 @@ async function migrate() {
 
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
-    console.log('✅ Super admin created: admin@medibook.com / SuperAdmin@123');
+    console.log(`✅ Super admin ensured: ${superEmail}`);
     console.log('✅ audit_logs, cron_jobs, admin_access_logs tables created');
 
     // ── RUN TENANT MIGRATIONS for existing schemas ───────────────

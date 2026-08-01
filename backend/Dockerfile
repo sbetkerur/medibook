@@ -1,7 +1,10 @@
 FROM node:20-alpine
 
-# Install postgresql-client for pg_dump (used by backup cron)
-RUN apk add --no-cache postgresql-client
+# pg_dump for the backup cron. pg_dump can only dump from a server of the same
+# or an older major version, so this client major must keep pace with Railway's
+# Postgres (currently 18) — if backup_log starts showing "server version
+# mismatch", pin the matching postgresqlNN-client rather than removing this.
+RUN apk add --no-cache postgresql-client && pg_dump --version
 
 WORKDIR /app
 

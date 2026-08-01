@@ -3,7 +3,28 @@ const bcrypt = require('bcryptjs');
 const { query, tenantQuery, pool } = require('./index');
 const { createTenantSchema, runTenantMigrations } = require('./tenantMigrate');
 
+// entrypoint.sh runs migrate → seed → start on EVERY Railway boot, and the
+// admin upsert below is `ON CONFLICT DO UPDATE SET password_hash`. That means a
+// hardcoded demo password is re-applied to the live database on every single
+// deploy — changing it in the dashboard silently reverts on the next one. The
+// demo tenant is a sales/dev fixture, so it is opt-in outside development, and
+// when it IS enabled in production the password must come from the environment.
+const IS_PROD = process.env.NODE_ENV === 'production';
+const SEED_DEMO = process.env.SEED_DEMO_DATA === 'true';
+const DEMO_PASSWORD = process.env.DEMO_ADMIN_PASSWORD || (IS_PROD ? null : 'Demo@123456');
+
 async function seed() {
+  if (IS_PROD && !SEED_DEMO) {
+    console.log('Skipping demo seed (production; set SEED_DEMO_DATA=true to enable).');
+    return;
+  }
+  if (!DEMO_PASSWORD) {
+    throw new Error(
+      'SEED_DEMO_DATA=true in production requires DEMO_ADMIN_PASSWORD to be set — ' +
+      'refusing to seed the demo tenant with a hardcoded password.'
+    );
+  }
+
   console.log('Seeding Smile Dental Clinic data...\n');
 
   const slug   = 'demo-clinic';
@@ -28,7 +49,7 @@ async function seed() {
   }
 
   // ── ADMIN USER ────────────────────────────────────────────────
-  const hash = await bcrypt.hash('Demo@123456', 12);
+  const hash = await bcrypt.hash(DEMO_PASSWORD, 12);
   await tenantQuery(schema, `
     INSERT INTO users (email, password_hash, name, role)
     VALUES ('demo@medibook.com', $1, 'Smile Dental Admin', 'admin')
@@ -222,11 +243,18 @@ async function seed() {
   }
   console.log(`✅ ${slotCount} time slots generated (7 days via generateSlotsForDoctor)\n`);
 
-  console.log(`─────────────────────────────────────────
+  // Never echo passwords into production logs — Railway retains them and they
+  // are readable by anyone with project access.
+  console.log(IS_PROD
+    ? `─────────────────────────────────────────
+ Demo tenant seeded (slug: demo-clinic).
+ Credentials come from DEMO_ADMIN_PASSWORD — not printed.
+─────────────────────────────────────────`
+    : `─────────────────────────────────────────
  CREDENTIALS
 ─────────────────────────────────────────
  Super Admin:  admin@medibook.com / SuperAdmin@123
- Clinic Admin: demo@medibook.com  / Demo@123456
+ Clinic Admin: demo@medibook.com  / ${DEMO_PASSWORD}
  Clinic Slug:  demo-clinic
 ─────────────────────────────────────────`);
 

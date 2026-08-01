@@ -169,7 +169,11 @@
       "Bash(grep -E \"'[^\\\\`]*\\\\\\\\\\\\$\\\\{IST_|\\\\\"[^\\\\`]*\\\\\\\\\\\\$\\\\{IST_\")",
       "Bash(grep -rn '\\\\${IST_' src/)",
       "Bash(docker version *)",
-      "WebFetch(domain:www.facebook.com)"
+      "WebFetch(domain:www.facebook.com)",
+      "Bash(docker --version)",
+      "WebFetch(domain:pkgs.alpinelinux.org)",
+      "Bash(MSYS_NO_PATHCONV=1 railway volume add -m /data --json)",
+      "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"BACKUP_DIR=/data/backups\")"
     ]
   }
 }
