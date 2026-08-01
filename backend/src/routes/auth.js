@@ -273,6 +273,15 @@ router.post('/auth/logout', authMiddleware, async (req, res) => {
 });
 
 // ── FORGOT PASSWORD ───────────────────────────────────────────
+// Public, unauthenticated capability probe. /auth/forgot-password deliberately
+// returns success regardless of whether the address exists (to prevent account
+// enumeration) — which means that with no email provider configured it also
+// reports success while delivering nothing. The login page uses this to hide
+// the "Forgot your password?" link rather than send users into that dead end.
+router.get('/auth/capabilities', (req, res) => {
+  res.json({ password_reset_enabled: !!process.env.RESEND_API_KEY });
+});
+
 router.post('/auth/forgot-password', forgotPasswordLimiter, validate(schemas.forgotPassword), async (req, res) => {
   try {
     const { email, tenant_slug } = req.body;

@@ -6,7 +6,7 @@ const { query, tenantQuery, validateSchemaName } = require('../db');
 const { createTenantSchema, runTenantMigrations } = require('../db/tenantMigrate');
 const { authMiddleware, invalidateTenantCache } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const { validateUUID } = require('../utils/errors');
+const { validateUUID, UUID_RE } = require('../utils/errors');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
@@ -725,6 +725,82 @@ router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
       upgrade_prompt: t.upgrade_prompt,
     });
   } catch (err) { handleError(res, err); }
+});
+
+// ── TENANT USERS + PASSWORD RECOVERY ──────────────────────────
+// Self-service reset (/auth/forgot-password) delivers its link by email. When
+// no email provider is configured that flow completes silently and the user
+// never receives anything, leaving a locked-out clinic admin with no recovery
+// path at all — the tenant's own admin can reset staff, but nobody can reset
+// the admin. These two routes are that missing path.
+
+router.get('/tenants/:id/users', validateUUID(), async (req, res) => {
+  try {
+    const tenantR = await query(`SELECT schema_name FROM tenants WHERE id=$1`, [req.params.id]);
+    if (!tenantR.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
+
+    const users = await tenantQuery(tenantR.rows[0].schema_name,
+      `SELECT id, email, name, role, is_active, created_at FROM users ORDER BY role, email`);
+    res.json({ users: users.rows });
+  } catch (err) { handleError(res, err, 'GET /superadmin/tenants/:id/users'); }
+});
+
+// Strict limiter: this hands out working credentials for someone else's clinic.
+const resetTenantPasswordLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many password reset requests. Try again in an hour.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.post('/tenants/:id/users/:userId/reset-password', resetTenantPasswordLimiter, validateUUID(), async (req, res) => {
+  try {
+    const { id: tenantId, userId } = req.params;
+    // validateUUID() only checks :id, so :userId is validated explicitly — it is
+    // interpolated into a tenant-scoped query below.
+    if (!UUID_RE.test(userId)) return res.status(400).json({ error: 'Invalid user id' });
+
+    const tenantR = await query(`SELECT id, name, schema_name FROM tenants WHERE id=$1`, [tenantId]);
+    if (!tenantR.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
+    const tenant = tenantR.rows[0];
+
+    const password = req.body?.password || crypto.randomBytes(9).toString('base64url');
+    if (typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const hash = await bcrypt.hash(password, 12);
+    const upd = await tenantQuery(tenant.schema_name,
+      `UPDATE users SET password_hash=$1 WHERE id=$2 RETURNING id, email, name, role`, [hash, userId]);
+    if (!upd.rows[0]) return res.status(404).json({ error: 'User not found in this clinic' });
+    const user = upd.rows[0];
+
+    // Same rationale as /auth/reset-password: recovery must end any session an
+    // attacker (or the previous holder of the account) still has open.
+    await query(`UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`, [user.id])
+      .catch(e => logger.warn('Refresh-token revocation failed after super admin reset', { error: e.message }));
+
+    try {
+      await query(`
+        INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
+        VALUES ($1,'super_admin','RESET_TENANT_USER_PASSWORD','user',$2,$3,$4)
+      `, [req.user.id, user.id, JSON.stringify({ tenant_id: tenant.id, tenant_name: tenant.name, email: user.email }), req.ip]);
+    } catch (_) {}
+
+    logger.info('Super admin reset a tenant user password', {
+      tenant: tenant.slug || tenant.name, email: user.email, actor: req.user.id,
+    });
+
+    // The generated password is returned ONCE so it can be handed over. It is
+    // deliberately not stored or logged anywhere.
+    res.json({
+      success: true,
+      user: { id: user.id, email: user.email, name: user.name, role: user.role },
+      password,
+      message: 'Password updated. Share it over a secure channel and ask them to change it.',
+    });
+  } catch (err) { handleError(res, err, 'POST /superadmin/tenants/:id/users/:userId/reset-password'); }
 });
 
 module.exports = router;

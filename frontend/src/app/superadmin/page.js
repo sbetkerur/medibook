@@ -28,6 +28,13 @@ export default function SuperAdminPage() {
   const [tenantHealth, setTenantHealth] = useState({}); // { [tenantId]: healthData }
   const [loadingHealth, setLoadingHealth] = useState(null);
 
+  // Password recovery for tenant users. Self-service reset goes out by email, so
+  // with no email provider configured a locked-out clinic admin has no way back
+  // in — this is that path.
+  const [pwModal, setPwModal] = useState(null); // { tenant, users, issued }
+  const [pwLoadingUsers, setPwLoadingUsers] = useState(false);
+  const [pwResettingId, setPwResettingId] = useState(null);
+
   // Billing dashboard state (Enhancement 13)
   const [billing, setBilling] = useState(null);
   const [billingLoading, setBillingLoading] = useState(false);
@@ -87,6 +94,30 @@ export default function SuperAdminPage() {
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to create tenant');
     } finally { setCreating(false); }
+  }
+
+  async function openPasswordModal(tenant) {
+    setPwModal({ tenant, users: [], issued: null });
+    setPwLoadingUsers(true);
+    try {
+      const { data } = await api.get(`/superadmin/tenants/${tenant.id}/users`);
+      setPwModal(m => (m && m.tenant.id === tenant.id ? { ...m, users: data.users || [] } : m));
+    } catch {
+      toast.error('Failed to load clinic users');
+    } finally { setPwLoadingUsers(false); }
+  }
+
+  async function resetUserPassword(tenant, user) {
+    setPwResettingId(user.id);
+    try {
+      const { data } = await api.post(`/superadmin/tenants/${tenant.id}/users/${user.id}/reset-password`, {});
+      // The password is returned exactly once and never stored, so it is held in
+      // component state for the operator to copy before closing the modal.
+      setPwModal(m => (m ? { ...m, issued: { email: data.user.email, password: data.password } } : m));
+      toast.success('Password reset');
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to reset password');
+    } finally { setPwResettingId(null); }
   }
 
   async function toggleStatus(tenant) {
@@ -345,14 +376,20 @@ export default function SuperAdminPage() {
                           {t.created_at ? format(parseISO(t.created_at), 'd MMM yy') : '—'}
                         </td>
                         <td className="px-4 py-3">
-                          <button onClick={() => toggleStatus(t)}
-                            className={`text-xs px-2 py-1 rounded transition ${
-                              t.status === 'active'
-                                ? 'text-red-600 hover:bg-red-50'
-                                : 'text-green-600 hover:bg-green-50'
-                            }`}>
-                            {t.status === 'active' ? 'Suspend' : 'Activate'}
-                          </button>
+                          <div className="flex flex-col items-start gap-1">
+                            <button onClick={() => toggleStatus(t)}
+                              className={`text-xs px-2 py-1 rounded transition ${
+                                t.status === 'active'
+                                  ? 'text-red-600 hover:bg-red-50'
+                                  : 'text-green-600 hover:bg-green-50'
+                              }`}>
+                              {t.status === 'active' ? 'Suspend' : 'Activate'}
+                            </button>
+                            <button onClick={() => openPasswordModal(t)}
+                              className="text-xs px-2 py-1 rounded text-blue-600 hover:bg-blue-50 transition whitespace-nowrap">
+                              🔑 Reset password
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -633,6 +670,68 @@ export default function SuperAdminPage() {
       </div>
 
       {/* Suspension Reason Modal */}
+      {pwModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-lg shadow-2xl max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <h2 className="text-base font-semibold text-gray-900">Reset Password</h2>
+              <button onClick={() => setPwModal(null)} className="text-gray-400 hover:text-gray-600 text-xl">✕</button>
+            </div>
+            <p className="text-xs text-gray-500 mb-4">{pwModal.tenant.name}</p>
+
+            {pwModal.issued ? (
+              <div className="space-y-3">
+                <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                  <p className="text-sm text-green-800 font-medium mb-2">
+                    New password for {pwModal.issued.email}
+                  </p>
+                  <code className="block bg-white border border-green-200 rounded px-3 py-2 font-mono text-sm break-all">
+                    {pwModal.issued.password}
+                  </code>
+                  <p className="text-xs text-green-700 mt-2">
+                    Shown once and not stored anywhere. Copy it now, send it over a secure
+                    channel, and ask them to change it after signing in.
+                  </p>
+                </div>
+                <p className="text-xs text-gray-400">
+                  Any existing sessions for this user have been signed out.
+                </p>
+                <button onClick={() => setPwModal(null)}
+                  className="w-full px-4 py-2 bg-gray-800 text-white rounded-lg text-sm font-medium hover:bg-gray-900 transition">
+                  Done
+                </button>
+              </div>
+            ) : pwLoadingUsers ? (
+              <p className="text-sm text-gray-400 py-8 text-center">Loading users...</p>
+            ) : !pwModal.users.length ? (
+              <p className="text-sm text-gray-400 py-8 text-center">No users found for this clinic.</p>
+            ) : (
+              <div className="divide-y divide-gray-100 border border-gray-100 rounded-lg">
+                {pwModal.users.map(u => (
+                  <div key={u.id} className="p-3 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-gray-900 truncate">{u.name || u.email}</div>
+                      <div className="text-xs text-gray-500 truncate">{u.email}</div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${
+                        u.role === 'admin' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'
+                      }`}>{u.role}</span>
+                      <button
+                        onClick={() => resetUserPassword(pwModal.tenant, u)}
+                        disabled={pwResettingId === u.id}
+                        className="px-3 py-1.5 text-xs border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 disabled:opacity-50 transition whitespace-nowrap">
+                        {pwResettingId === u.id ? 'Resetting...' : 'Reset'}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {suspendModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-2xl">

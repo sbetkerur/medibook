@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import api, { getApiError, resetSessionTimers } from '@/lib/api';
 import toast from 'react-hot-toast';
@@ -13,6 +13,19 @@ export default function LoginPage() {
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotSlug, setForgotSlug] = useState('');
   const [forgotLoading, setForgotLoading] = useState(false);
+  // Self-service reset needs an email provider. Without one the backend still
+  // returns success (to avoid account enumeration) but nothing is delivered, so
+  // offering the link would send users into a silent dead end. Default to hidden
+  // and only show it once the backend confirms it works.
+  const [resetEnabled, setResetEnabled] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.get('/auth/capabilities')
+      .then(({ data }) => { if (!cancelled) setResetEnabled(!!data?.password_reset_enabled); })
+      .catch(() => { /* leave hidden — a probe failure is not a reason to promise recovery */ });
+    return () => { cancelled = true; };
+  }, []);
 
   async function handleLogin(e) {
     e.preventDefault();
@@ -160,15 +173,21 @@ export default function LoginPage() {
             </button>
           </form>
 
-          <div className="text-center mt-4">
-            <button
-              type="button"
-              onClick={() => setShowForgot(true)}
-              className="text-sm text-blue-600 hover:text-blue-800 hover:underline"
-            >
-              Forgot your password?
-            </button>
-          </div>
+          {resetEnabled ? (
+            <div className="text-center mt-4">
+              <button
+                type="button"
+                onClick={() => setShowForgot(true)}
+                className="text-sm text-blue-600 hover:text-blue-800 hover:underline"
+              >
+                Forgot your password?
+              </button>
+            </div>
+          ) : (
+            <p className="text-center mt-4 text-xs text-gray-400">
+              Forgot your password? Contact your clinic administrator.
+            </p>
+          )}
 
           {process.env.NODE_ENV === 'development' && (
             <div className="mt-6 p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
