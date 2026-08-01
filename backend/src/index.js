@@ -86,23 +86,35 @@ const PORT = process.env.PORT || 3001;
 // Validate and resolve FRONTEND_URL early — needed by both helmet CSP and CORS.
 // If not set, fall back to permissive '*' so the first Railway deploy doesn't crash.
 // Set FRONTEND_URL=https://your-frontend.up.railway.app to lock it down.
-const rawFrontendUrl = process.env.FRONTEND_URL || null;
-if (rawFrontendUrl) {
-  let parsedFrontendUrl;
-  try { parsedFrontendUrl = new URL(rawFrontendUrl); } catch {
-    logger.error(`Invalid FRONTEND_URL "${rawFrontendUrl}" — must be a valid URL. Exiting.`);
+// FRONTEND_URL accepts a COMMA-SEPARATED list of origins, which .env.example has
+// always documented but the code did not implement: `new URL()` was called on
+// the whole string, so a second origin threw and hit process.exit(1) below —
+// taking the API down on boot. Multiple origins are needed for real cutovers
+// (custom domain alongside the old *.up.railway.app one) and for staging.
+const frontendOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+for (const origin of frontendOrigins) {
+  let parsed;
+  try { parsed = new URL(origin); } catch {
+    logger.error(`Invalid FRONTEND_URL entry "${origin}" — each comma-separated value must be a valid URL. Exiting.`);
     process.exit(1);
   }
   // In production, reject localhost/loopback origins — a misconfigured FRONTEND_URL would
   // silently open CORS to any local process on the server.
   if (process.env.NODE_ENV === 'production') {
-    const host = parsedFrontendUrl.hostname;
+    const host = parsed.hostname;
     if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
-      logger.error(`FRONTEND_URL "${rawFrontendUrl}" points to localhost — this is not allowed in production. Set it to your actual frontend domain. Exiting.`);
+      logger.error(`FRONTEND_URL entry "${origin}" points to localhost — this is not allowed in production. Set it to your actual frontend domain. Exiting.`);
       process.exit(1);
     }
   }
 }
+
+// Origins are stored without a trailing slash; browsers send the bare origin.
+const rawFrontendUrl = frontendOrigins.length ? frontendOrigins[0] : null;
 
 // Trust Railway/Render/Vercel proxy
 app.set('trust proxy', 1);
@@ -119,7 +131,7 @@ app.use(helmet({
       styleSrc: ["'self'"],
       imgSrc: ["'self'", 'data:', 'https:'],
       // Allow the frontend origin to connect to the API (applies to any HTML served by the API)
-      connectSrc: rawFrontendUrl ? ["'self'", rawFrontendUrl] : ["'self'"],
+      connectSrc: frontendOrigins.length ? ["'self'", ...frontendOrigins] : ["'self'"],
       frameSrc: ["'none'"],
       objectSrc: ["'none'"],
       baseUri: ["'self'"],
@@ -137,8 +149,10 @@ app.use(helmet({
 
 app.use(cors({
   // If FRONTEND_URL is set, restrict to that origin. Otherwise allow all (open during initial deploy).
-  origin: rawFrontendUrl || '*',
-  credentials: !!rawFrontendUrl, // credentials:true requires a specific origin, not '*'
+  // Array form: the cors package matches the request Origin against any entry.
+  // Passing the raw comma-joined string matched literally and rejected both.
+  origin: frontendOrigins.length ? frontendOrigins : '*',
+  credentials: frontendOrigins.length > 0, // credentials:true requires specific origins, not '*'
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 

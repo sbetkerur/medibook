@@ -178,7 +178,11 @@
       "PowerShell($p = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess; if \\($p\\) { Stop-Process -Id $p -Force; \"killed $p\" } else { \"nothing on 3000\" })",
       "Bash(BACKEND_URL=https://backend-production-f66a.up.railway.app npm run dev)",
       "PowerShell($p = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess; if \\($p\\) { Stop-Process -Id $p -Force; \"stopped local dev server \\($p\\)\" } else { \"nothing on 3000\" })",
-      "Bash(grep -v 'IST_\\\\|params.length\\\\|ids.length\\\\|placeholders\\\\|where.join\\\\|updates.join\\\\|sets.join\\\\|hospUpdates.join\\\\|conditions\\\\|VALID_\\\\|he\\(\\\\|statusTxt\\\\|statusBg\\\\|slotPlaceholders\\\\|\\\\${i')"
+      "Bash(grep -v 'IST_\\\\|params.length\\\\|ids.length\\\\|placeholders\\\\|where.join\\\\|updates.join\\\\|sets.join\\\\|hospUpdates.join\\\\|conditions\\\\|VALID_\\\\|he\\(\\\\|statusTxt\\\\|statusBg\\\\|slotPlaceholders\\\\|\\\\${i')",
+      "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"PUBLIC_API_URL=https://api.pragatisolutions.com\")",
+      "Bash(MSYS_NO_PATHCONV=1 railway variables --service frontend --set \"BACKEND_URL=https://api.pragatisolutions.com\")",
+      "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"FRONTEND_URL=https://app.pragatisolutions.com,https://frontend-production-2f2d.up.railway.app\")",
+      "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"FRONTEND_URL=https://app.pragatisolutions.com\")"
     ]
   }
 }
