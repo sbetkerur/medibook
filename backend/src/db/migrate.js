@@ -470,6 +470,19 @@ async function migrate() {
       `);
     });
 
+    // Version 20: shortlist state for the clinic SEARCH entry point.
+    // The patient searches for their clinic instead of being shown every
+    // onboarded tenant; when a search returns several matches we send just
+    // those, numbered. The reply is a bare "2", which carries no way back to
+    // the shortlist it refers to — so the matched tenant ids are parked on the
+    // global session, in the exact order they were rendered.
+    await runMigration(client, 20, 'global_session_search_matches', async () => {
+      await client.query(`
+        ALTER TABLE global_bot_sessions
+          ADD COLUMN IF NOT EXISTS search_matches JSONB;
+      `);
+    });
+
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
     // Only claim this when a super admin was actually seeded — otherwise the

@@ -24,6 +24,7 @@ cd backend && npm run seed      # demo tenant + doctors + slots
 cd frontend && npm run dev      # dashboard on :3000
 cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
+cd backend && node tests/clinicSearch.unit.test.js
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -56,7 +57,12 @@ refresh_tokens, global_bot_sessions, …) use plain `query`.
 
 **Shared WhatsApp number.** All tenants share the global `META_*` credentials.
 Incoming messages are routed to a tenant via `global_bot_sessions` (patient
-picks a clinic by name on first contact; "switch clinic" resets). Pass
+SEARCHES for their clinic on first contact; "switch clinic" resets). The tenant
+roster is never listed — `services/bot/clinicSearch.js` matches the typed query
+and only matches are shown (≥2 as a numbered shortlist parked on
+`global_bot_sessions.search_matches`, >`MAX_SHORTLIST` asks them to narrow it
+down). "Dental"/"clinic" are stripped from both the query and the tenant names,
+so a query of only those words is refused rather than matching everyone. Pass
 `null, null` for token/phoneId to the `whatsapp.js` senders — they fall back to
 env vars. `notifyAdminWhatsApp()` fans out to ALL admins with a `notify_phone`
 — call it once per event, never inside a per-admin loop.

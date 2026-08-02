@@ -9,6 +9,8 @@ const logger = require('../utils/logger');
 const { handleReminderConfirmation } = require('../jobs/reminders');
 const { isEnabled } = require('../utils/featureFlags');
 const { isRealAppSecret } = require('../utils/errors');
+const { parseChoiceNumber } = require('../services/bot/utils');
+const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST } = require('../services/bot/clinicSearch');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -276,7 +278,8 @@ async function processIncomingMessage(msg) {
     const isSwitchClinic = /^(switch|change)\s+(clinic|hospital|branch)$/i.test((text || '').trim());
     if (isSwitchClinic) {
       await query(
-        `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant', last_activity=NOW() WHERE phone=$1`,
+        `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant',
+           search_matches=NULL, last_activity=NOW() WHERE phone=$1`,
         [phone]
       ).catch(() => {});
     }
@@ -310,24 +313,45 @@ async function processIncomingMessage(msg) {
         await query(
           `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity)
            VALUES ($1,$2,'active',NOW())
-           ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active', last_activity=NOW()`,
+           ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
+             search_matches=NULL, last_activity=NOW()`,
           [phone, activeTenants[0].id]
         );
         const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [activeTenants[0].id]);
         tenant = r.rows[0] || null;
       } else {
-        // Multi-tenant: check if patient is selecting a clinic right now
+        // Multi-tenant: the patient SEARCHES for their clinic. The roster is
+        // never listed — only the matches for what they typed, and only when
+        // there is more than one of them.
         let selected = null;
+        const trimmed = (text || '').trim();
+        const isGreeting = /^(hi|hello|hey|start|menu)$/i.test(trimmed);
 
-        // buttonId from list/button reply may be a tenant UUID
+        // 1. Tap on a shortlist row — row id is the tenant UUID.
         if (buttonId) {
-          selected = activeTenants.find(t => t.id === buttonId);
+          selected = activeTenants.find(t => t.id === buttonId) || null;
         }
 
-        if (!selected && text) {
-          // Exact match only (case-insensitive) — patient must type the clinic name as listed
-          const trimmed = text.trim();
-          selected = activeTenants.find(t => t.name.toLowerCase() === trimmed.toLowerCase());
+        // 2. "2" — a pick from the numbered shortlist we last sent this phone.
+        //    Re-checked against activeTenants so a stale reply can't select a
+        //    tenant that has since been deactivated.
+        const shortlist = Array.isArray(globalSession?.search_matches) ? globalSession.search_matches : [];
+        if (!selected && trimmed && shortlist.length) {
+          const n = parseChoiceNumber(trimmed);
+          if (n >= 1 && n <= shortlist.length) {
+            selected = activeTenants.find(t => t.id === shortlist[n - 1]) || null;
+          }
+        }
+
+        // 3. Otherwise treat the message as a search query.
+        let matches = [];
+        let tooGeneric = false;
+        if (!selected && trimmed && !isGreeting) {
+          if (isQueryTooGeneric(trimmed)) tooGeneric = true;
+          else {
+            matches = searchTenants(activeTenants, trimmed);
+            if (matches.length === 1) selected = matches[0];
+          }
         }
 
         if (selected) {
@@ -336,7 +360,8 @@ async function processIncomingMessage(msg) {
             `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id)
              VALUES ($1,$2,'active',NOW(),$3)
              ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
-               last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id`,
+               search_matches=NULL, last_activity=NOW(),
+               last_wa_message_id=EXCLUDED.last_wa_message_id`,
             [phone, selected.id, msgId || null]
           );
           await wa.sendText(phone, `✅ Clinic selected: *${selected.name}*`, null, null)
@@ -344,21 +369,51 @@ async function processIncomingMessage(msg) {
           const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
           tenant = r.rows[0] || null;
         } else {
-          // No match — show clinic list as plain text and wait for typed reply
+          // No single match — re-prompt. Shown matches are stored in render
+          // order so a numbered reply resolves; a search that matched nothing
+          // clears the previous shortlist so an old "2" can't resurface.
+          const shown = matches.length > 1 && matches.length <= MAX_SHORTLIST ? matches : [];
+
           // Record the message id so a Meta redelivery doesn't re-send this prompt.
           await query(
-            `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id)
-             VALUES ($1,'select_tenant',NOW(),$2)
+            `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
+             VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb)
              ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
-               last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id`,
-            [phone, msgId || null]
+               last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
+               search_matches=EXCLUDED.search_matches`,
+            [phone, msgId || null, shown.length ? JSON.stringify(shown.map(t => t.id)) : null]
           ).catch(() => {});
 
-          const isRetry = globalSession?.state === 'select_tenant' && text &&
-            !/^(hi|hello|hey|start|menu)$/i.test(text.trim());
-          const prompt = isRetry
-            ? `❌ No clinic found matching *"${text.trim()}"*.\n\nPlease type your clinic name and try again.`
-            : `👋 Welcome to MediBook!\n\nPlease type the name of your clinic to get started.`;
+          if (shown.length) {
+            const body = `🔍 ${matches.length} clinics match *"${trimmed}"*.\n\nPick yours:`;
+            await wa.sendList(phone, body, 'Select clinic', [{
+              title: 'Matching clinics',
+              rows: shown.map(t => ({
+                id: t.id,
+                title: shortLabel(t.name),
+                description: t.city ? `${t.name} — ${t.city}` : t.name,
+              })),
+            }], null, null).catch(err =>
+              logger.error('Failed to send clinic shortlist', { error: err.message }));
+            return;
+          }
+
+          let prompt;
+          if (tooGeneric) {
+            prompt = `🔍 Almost — nearly every clinic here is a "dental clinic".\n\n` +
+              `Please send the distinctive part of your clinic's name (e.g. *Smile* for "Smile Dental Clinic").`;
+          } else if (matches.length > MAX_SHORTLIST) {
+            prompt = `🔍 *"${trimmed}"* matches ${matches.length} clinics — too many to show.\n\n` +
+              `Please send a bit more of your clinic's name.`;
+          } else if (trimmed && !isGreeting) {
+            prompt = `❌ No clinic found matching *"${trimmed}"*.\n\n` +
+              `Please check the spelling and send your clinic's name again. ` +
+              `You can leave out "dental" and "clinic".`;
+          } else {
+            prompt = `👋 Welcome to MediBook!\n\n` +
+              `🔍 Please send your clinic's name to search for it. ` +
+              `A few letters are enough — you can leave out "dental" and "clinic".`;
+          }
 
           await wa.sendText(phone, prompt, null, null)
             .catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
