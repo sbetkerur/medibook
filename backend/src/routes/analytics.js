@@ -63,18 +63,28 @@ router.get('/analytics/summary', makeAnalyticsLimiter(), async (req, res) => {
     const s = req.tenant.schema_name;
     const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
     const [rev, noShow, total, feedbackAvg] = await Promise.allSettled([
+      // Bounded at BOTH ends. These are "how did the last N days go?" figures —
+      // the dashboard labels them "Revenue (30d)" and "% no-show". Without the
+      // upper bound the window ran from N days ago to the end of the booking
+      // horizon, so every future confirmed appointment (slots are generated 60
+      // days out) counted as revenue already taken, and diluted the no-show rate
+      // with appointments nobody could have missed yet.
       tenantQuery(s, `
         SELECT COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), doc.consultation_fee)), 0) as revenue
         FROM appointments a JOIN doctors doc ON doc.id=a.doctor_id
         WHERE a.status IN ('confirmed','completed')
           AND a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+          AND a.appointment_date <= ${IST_TODAY_SQL}
       `, [d]),
       tenantQuery(s, `
         SELECT COUNT(*) FILTER (WHERE status='no_show') as no_show_count, COUNT(*) as total_count
         FROM appointments WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+          AND appointment_date <= ${IST_TODAY_SQL}
           AND status != 'cancelled'
       `, [d]),
-      tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL AND status != 'cancelled'`, [d]),
+      tenantQuery(s, `SELECT COUNT(*) FROM appointments
+         WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+           AND appointment_date <= ${IST_TODAY_SQL} AND status != 'cancelled'`, [d]),
       tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg FROM appointment_feedback WHERE created_at >= NOW() - ($1::text || ' days')::INTERVAL`, [d]),
     ]);
     const safeVal = (r, fn) => r.status === 'fulfilled' ? fn(r.value.rows[0]) : null;

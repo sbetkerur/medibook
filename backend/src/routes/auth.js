@@ -330,7 +330,10 @@ router.post('/auth/forgot-password', forgotPasswordLimiter, validate(schemas.for
         [foundEmail, tenantId, hashToken(token), expiresAt]
       );
 
-      const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${token}`;
+      // frontendBaseUrl(), not the raw env var: FRONTEND_URL may list several
+      // origins, and interpolating the whole list produces a reset link nobody
+      // can open — which locks every user out of password recovery.
+      const resetUrl = `${require('../utils/appUrls').frontendBaseUrl()}/reset-password?token=${token}`;
       await emailService.sendPasswordReset(foundEmail, resetUrl);
     } catch (err) {
       logger.error('Forgot password background error', { error: err.message });

@@ -249,7 +249,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
         email: owner_email,
         password: effectivePassword,
         tenant_slug: slug,
-        login_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login`,
+        login_url: `${require('../utils/appUrls').frontendBaseUrl()}/login`,
       },
       message: 'Tenant created successfully'
     });

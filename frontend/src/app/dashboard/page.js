@@ -296,6 +296,14 @@ export default function Dashboard() {
       es.onmessage = (e) => {
         try {
           const { type, payload } = JSON.parse(e.data);
+          // The server closes the stream when the connecting token expires. Left
+          // alone, EventSource reconnects on its own — with the same expired
+          // token in the URL — and retries every few seconds forever. Close it
+          // and wait: the refresh below reconnects with a fresh token.
+          if (type === 'token_expired') {
+            if (es) { es.close(); es = null; }
+            return;
+          }
           if (type === 'new_booking') {
             toast.success(`New booking: ${payload?.patientName || 'Patient'} → Dr. ${payload?.doctorName || ''}`, {
               duration: 5000, icon: '📅',

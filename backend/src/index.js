@@ -91,10 +91,10 @@ const PORT = process.env.PORT || 3001;
 // the whole string, so a second origin threw and hit process.exit(1) below —
 // taking the API down on boot. Multiple origins are needed for real cutovers
 // (custom domain alongside the old *.up.railway.app one) and for staging.
-const frontendOrigins = (process.env.FRONTEND_URL || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+// Parsed in utils/appUrls.js so the CORS allowlist and the link builders
+// (password reset, unsubscribe, tenant login_url) can never disagree about what
+// this variable means.
+const frontendOrigins = require('./utils/appUrls').frontendOrigins();
 
 for (const origin of frontendOrigins) {
   let parsed;
@@ -112,9 +112,6 @@ for (const origin of frontendOrigins) {
     }
   }
 }
-
-// Origins are stored without a trailing slash; browsers send the bare origin.
-const rawFrontendUrl = frontendOrigins.length ? frontendOrigins[0] : null;
 
 // Trust Railway/Render/Vercel proxy
 app.set('trust proxy', 1);

@@ -83,7 +83,8 @@ async function generateUnsubscribeUrl(schemaName, patientId) {
         `INSERT INTO email_unsubscribes (patient_id, token) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
         [patientId, token]);
     }
-    const base = process.env.FRONTEND_URL || 'http://localhost:3000';
+    // One origin, not the raw comma-separated list (see utils/appUrls.js).
+    const base = require('../utils/appUrls').frontendBaseUrl();
     return `${base}/unsubscribe?token=${token}`;
   } catch (_) {
     return null;
