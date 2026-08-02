@@ -62,7 +62,10 @@ roster is never listed — `services/bot/clinicSearch.js` matches the typed quer
 and only matches are shown (≥2 as a numbered shortlist parked on
 `global_bot_sessions.search_matches`, >`MAX_SHORTLIST` asks them to narrow it
 down). "Dental"/"clinic" are stripped from both the query and the tenant names,
-so a query of only those words is refused rather than matching everyone. Pass
+so a query of only those words is refused rather than matching everyone. The
+search runs even when exactly ONE tenant is active — there is deliberately no
+auto-assign shortcut, so the entry step doesn't change shape as clinics are
+onboarded. Pass
 `null, null` for token/phoneId to the `whatsapp.js` senders — they fall back to
 env vars. `notifyAdminWhatsApp()` fans out to ALL admins with a `notify_phone`
 — call it once per event, never inside a per-admin loop.

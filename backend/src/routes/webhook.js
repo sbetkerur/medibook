@@ -308,117 +308,107 @@ async function processIncomingMessage(msg) {
         return;
       }
 
-      if (activeTenants.length === 1) {
-        // Auto-assign single tenant — no selection needed
+      // The patient SEARCHES for their clinic. The roster is never listed —
+      // only the matches for what they typed, and only when there is more than
+      // one of them. This runs even when a single tenant is onboarded: the
+      // entry step must not change shape as clinics are added, and a patient
+      // messaging the shared number should never be silently attached to a
+      // clinic they did not name.
+      let selected = null;
+      const trimmed = (text || '').trim();
+      const isGreeting = /^(hi|hello|hey|start|menu)$/i.test(trimmed);
+
+      // 1. Tap on a shortlist row — row id is the tenant UUID.
+      if (buttonId) {
+        selected = activeTenants.find(t => t.id === buttonId) || null;
+      }
+
+      // 2. "2" — a pick from the numbered shortlist we last sent this phone.
+      //    Re-checked against activeTenants so a stale reply can't select a
+      //    tenant that has since been deactivated.
+      const shortlist = Array.isArray(globalSession?.search_matches) ? globalSession.search_matches : [];
+      if (!selected && trimmed && shortlist.length) {
+        const n = parseChoiceNumber(trimmed);
+        if (n >= 1 && n <= shortlist.length) {
+          selected = activeTenants.find(t => t.id === shortlist[n - 1]) || null;
+        }
+      }
+
+      // 3. Otherwise treat the message as a search query.
+      let matches = [];
+      let tooGeneric = false;
+      if (!selected && trimmed && !isGreeting) {
+        if (isQueryTooGeneric(trimmed)) tooGeneric = true;
+        else {
+          matches = searchTenants(activeTenants, trimmed);
+          if (matches.length === 1) selected = matches[0];
+        }
+      }
+
+      if (selected) {
+        // Patient matched a clinic — confirm and route
         await query(
-          `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity)
-           VALUES ($1,$2,'active',NOW())
+          `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id)
+           VALUES ($1,$2,'active',NOW(),$3)
            ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
-             search_matches=NULL, last_activity=NOW()`,
-          [phone, activeTenants[0].id]
+             search_matches=NULL, last_activity=NOW(),
+             last_wa_message_id=EXCLUDED.last_wa_message_id`,
+          [phone, selected.id, msgId || null]
         );
-        const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [activeTenants[0].id]);
+        await wa.sendText(phone, `✅ Clinic selected: *${selected.name}*`, null, null)
+          .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
+        const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
         tenant = r.rows[0] || null;
       } else {
-        // Multi-tenant: the patient SEARCHES for their clinic. The roster is
-        // never listed — only the matches for what they typed, and only when
-        // there is more than one of them.
-        let selected = null;
-        const trimmed = (text || '').trim();
-        const isGreeting = /^(hi|hello|hey|start|menu)$/i.test(trimmed);
+        // No single match — re-prompt. Shown matches are stored in render
+        // order so a numbered reply resolves; a search that matched nothing
+        // clears the previous shortlist so an old "2" can't resurface.
+        const shown = matches.length > 1 && matches.length <= MAX_SHORTLIST ? matches : [];
 
-        // 1. Tap on a shortlist row — row id is the tenant UUID.
-        if (buttonId) {
-          selected = activeTenants.find(t => t.id === buttonId) || null;
-        }
+        // Record the message id so a Meta redelivery doesn't re-send this prompt.
+        await query(
+          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
+           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb)
+           ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
+             last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
+             search_matches=EXCLUDED.search_matches`,
+          [phone, msgId || null, shown.length ? JSON.stringify(shown.map(t => t.id)) : null]
+        ).catch(() => {});
 
-        // 2. "2" — a pick from the numbered shortlist we last sent this phone.
-        //    Re-checked against activeTenants so a stale reply can't select a
-        //    tenant that has since been deactivated.
-        const shortlist = Array.isArray(globalSession?.search_matches) ? globalSession.search_matches : [];
-        if (!selected && trimmed && shortlist.length) {
-          const n = parseChoiceNumber(trimmed);
-          if (n >= 1 && n <= shortlist.length) {
-            selected = activeTenants.find(t => t.id === shortlist[n - 1]) || null;
-          }
-        }
-
-        // 3. Otherwise treat the message as a search query.
-        let matches = [];
-        let tooGeneric = false;
-        if (!selected && trimmed && !isGreeting) {
-          if (isQueryTooGeneric(trimmed)) tooGeneric = true;
-          else {
-            matches = searchTenants(activeTenants, trimmed);
-            if (matches.length === 1) selected = matches[0];
-          }
-        }
-
-        if (selected) {
-          // Patient matched a clinic — confirm and route
-          await query(
-            `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id)
-             VALUES ($1,$2,'active',NOW(),$3)
-             ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
-               search_matches=NULL, last_activity=NOW(),
-               last_wa_message_id=EXCLUDED.last_wa_message_id`,
-            [phone, selected.id, msgId || null]
-          );
-          await wa.sendText(phone, `✅ Clinic selected: *${selected.name}*`, null, null)
-            .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
-          const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
-          tenant = r.rows[0] || null;
-        } else {
-          // No single match — re-prompt. Shown matches are stored in render
-          // order so a numbered reply resolves; a search that matched nothing
-          // clears the previous shortlist so an old "2" can't resurface.
-          const shown = matches.length > 1 && matches.length <= MAX_SHORTLIST ? matches : [];
-
-          // Record the message id so a Meta redelivery doesn't re-send this prompt.
-          await query(
-            `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
-             VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb)
-             ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
-               last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
-               search_matches=EXCLUDED.search_matches`,
-            [phone, msgId || null, shown.length ? JSON.stringify(shown.map(t => t.id)) : null]
-          ).catch(() => {});
-
-          if (shown.length) {
-            const body = `🔍 ${matches.length} clinics match *"${trimmed}"*.\n\nPick yours:`;
-            await wa.sendList(phone, body, 'Select clinic', [{
-              title: 'Matching clinics',
-              rows: shown.map(t => ({
-                id: t.id,
-                title: shortLabel(t.name),
-                description: t.city ? `${t.name} — ${t.city}` : t.name,
-              })),
-            }], null, null).catch(err =>
-              logger.error('Failed to send clinic shortlist', { error: err.message }));
-            return;
-          }
-
-          let prompt;
-          if (tooGeneric) {
-            prompt = `🔍 Almost — nearly every clinic here is a "dental clinic".\n\n` +
-              `Please send the distinctive part of your clinic's name (e.g. *Smile* for "Smile Dental Clinic").`;
-          } else if (matches.length > MAX_SHORTLIST) {
-            prompt = `🔍 *"${trimmed}"* matches ${matches.length} clinics — too many to show.\n\n` +
-              `Please send a bit more of your clinic's name.`;
-          } else if (trimmed && !isGreeting) {
-            prompt = `❌ No clinic found matching *"${trimmed}"*.\n\n` +
-              `Please check the spelling and send your clinic's name again. ` +
-              `You can leave out "dental" and "clinic".`;
-          } else {
-            prompt = `👋 Welcome to MediBook!\n\n` +
-              `🔍 Please send your clinic's name to search for it. ` +
-              `A few letters are enough — you can leave out "dental" and "clinic".`;
-          }
-
-          await wa.sendText(phone, prompt, null, null)
-            .catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
+        if (shown.length) {
+          const body = `🔍 ${matches.length} clinics match *"${trimmed}"*.\n\nPick yours:`;
+          await wa.sendList(phone, body, 'Select clinic', [{
+            title: 'Matching clinics',
+            rows: shown.map(t => ({
+              id: t.id,
+              title: shortLabel(t.name),
+              description: t.city ? `${t.name} — ${t.city}` : t.name,
+            })),
+          }], null, null).catch(err =>
+            logger.error('Failed to send clinic shortlist', { error: err.message }));
           return;
         }
+
+        let prompt;
+        if (tooGeneric) {
+          prompt = `🔍 Almost — nearly every clinic here is a "dental clinic".\n\n` +
+            `Please send the distinctive part of your clinic's name (e.g. *Smile* for "Smile Dental Clinic").`;
+        } else if (matches.length > MAX_SHORTLIST) {
+          prompt = `🔍 *"${trimmed}"* matches ${matches.length} clinics — too many to show.\n\n` +
+            `Please send a bit more of your clinic's name.`;
+        } else if (trimmed && !isGreeting) {
+          prompt = `❌ No clinic found matching *"${trimmed}"*.\n\n` +
+            `Please check the spelling and send your clinic's name again. ` +
+            `You can leave out "dental" and "clinic".`;
+        } else {
+          prompt = `👋 Welcome to MediBook!\n\n` +
+            `🔍 Please send your clinic's name to search for it. ` +
+            `A few letters are enough — you can leave out "dental" and "clinic".`;
+        }
+
+        await wa.sendText(phone, prompt, null, null)
+          .catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
+        return;
       }
     } else {
       // Patient already assigned to a tenant
