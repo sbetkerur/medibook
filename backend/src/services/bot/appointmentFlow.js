@@ -23,7 +23,7 @@ async function showMyAppointments(phone, schema, tenant, send) {
   // booked for other family members were invisible in this view.
   const patients = await getPatients(schema, phone);
   if (!patients.length) {
-    await send.text('We don\'t have any appointments linked to this number.\n\nReply *Hi* and tap *Book Appointment* to schedule your first one! 😊');
+    await send.text('We don\'t have any appointments linked to this number.\n\nReply *Menu* and tap *Book Appointment* to schedule your first one! 😊');
     return;
   }
 
@@ -58,7 +58,7 @@ async function showMyAppointments(phone, schema, tenant, send) {
   ]);
 
   if (!upcomingR.rows.length && !pastR.rows.length) {
-    await send.text('You have no appointments yet.\n\nReply *Hi* and tap *Book Appointment* to get started! 📅');
+    await send.text('You have no appointments yet.\n\nReply *Menu* and tap *Book Appointment* to get started! 📅');
     return;
   }
 
@@ -107,7 +107,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
      WHERE a.booking_id=$1 AND a.status='confirmed' AND p.phone=$2`,
     [input.toUpperCase(), phone]);
   if (!appt.rows[0]) {
-    await send.text('Booking ID not found or already cancelled. Please try again.\n\nReply *Hi* to go back.');
+    await send.text('Booking ID not found or already cancelled. Please try again.\n\nReply *Menu* to go back.');
     return;
   }
   const a = appt.rows[0];
@@ -120,7 +120,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
     const apptDateTimeR = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
     const hoursUntilR = (apptDateTimeR - nowDateR) / (1000 * 60 * 60);
     if (!isNaN(hoursUntilR) && hoursUntilR < 2 && hoursUntilR >= 0) {
-      await send.text(`⚠️ Rescheduling must be done at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
+      await send.text(`⚠️ Rescheduling must be done at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Menu* to return to main menu.`);
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -156,7 +156,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
     slots: parseInt(r.slots),
   }));
   if (!dates.length) {
-    await send.text(`No available slots for Dr. ${a.doctor_name} in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nReply *Hi* to go back.`);
+    await send.text(`No available slots for Dr. ${a.doctor_name} in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nReply *Menu* to go back.`);
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
@@ -206,7 +206,7 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
   // in exactly the case where we can't verify it against leaves/holidays.
   const offeredDates = ctx._reschedule_dates || [];
   if (!offeredDates.length || !offeredDates.some(d => d.date === resolvedDate)) {
-    await send.text('That date is not available. Please pick a date from the list, or reply *Hi* to start over.');
+    await send.text('That date is not available. Please pick a date from the list, or reply *Menu* to start over.');
     return;
   }
   ctx.reschedule_new_date = resolvedDate;
@@ -221,7 +221,7 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
      ORDER BY start_time`,
     [ctx.reschedule_doctor_id, resolvedDate]);
   if (!slots.rows.length) {
-    await send.text('No slots available for that date. Please pick another.\n\nReply *Hi* to start over.');
+    await send.text('No slots available for that date. Please pick another.\n\nReply *Menu* to start over.');
     return;
   }
   // Cap at 10 rows — WhatsApp list messages reject more than 10 rows per section.
@@ -320,12 +320,12 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       return 'ok';
     });
     if (rescheduled === 'appt_gone') {
-      await send.text('⚠️ This appointment is no longer active — it may have been cancelled or updated by the clinic. Reply *Hi* to check your appointments.');
+      await send.text('⚠️ This appointment is no longer active — it may have been cancelled or updated by the clinic. Reply *Menu* to check your appointments.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
     if (rescheduled !== 'ok') {
-      await send.text('⚠️ That slot was just taken! Reply *Hi* to pick another time.');
+      await send.text('⚠️ That slot was just taken! Reply *Menu* to pick another time.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -356,7 +356,7 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       );
     })().catch(() => {});
   } else {
-    await send.text('No changes made — your original appointment is kept. ✅\n\nReply *Hi* for the main menu.');
+    await send.text('No changes made — your original appointment is kept. ✅\n\nReply *Menu* for the main menu.');
   }
   await updateSession(schema, phone, STATES.IDLE, {});
 }
@@ -370,7 +370,7 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
      WHERE a.booking_id=$1 AND a.status='confirmed' AND p.phone=$2`,
     [input.toUpperCase(), phone]);
   if (!appt.rows[0]) {
-    await send.text('Booking ID not found or already cancelled. Please try again.\n\nReply *Hi* to go back.');
+    await send.text('Booking ID not found or already cancelled. Please try again.\n\nReply *Menu* to go back.');
     return;
   }
   const a = appt.rows[0];
@@ -383,7 +383,7 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
     const apptDateTime = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
     const hoursUntilAppt = (apptDateTime - nowDate) / (1000 * 60 * 60);
     if (!isNaN(hoursUntilAppt) && hoursUntilAppt < 2 && hoursUntilAppt >= 0) {
-      await send.text(`⚠️ Cancellations must be made at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Hi* to return to main menu.`);
+      await send.text(`⚠️ Cancellations must be made at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Menu* to return to main menu.`);
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -448,14 +448,14 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
       return false;
     });
     if (!cancelled) {
-      await send.text('⚠️ This appointment has already been cancelled or modified. Reply *Hi* to check your appointments.');
+      await send.text('⚠️ This appointment has already been cancelled or modified. Reply *Menu* to check your appointments.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
     await send.text(
       '✅ *Appointment Cancelled*\n\n' +
       'Your appointment has been cancelled and the slot released.\n\n' +
-      'We hope everything is okay. Whenever you\'re ready, reply *Hi* to book again. 🙏'
+      'We hope everything is okay. Whenever you\'re ready, reply *Menu* to book again. 🙏'
     );
     // Notify clinic admin via WhatsApp
     (async () => {
@@ -471,7 +471,7 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
       );
     })().catch(() => {});
   } else {
-    await send.text('No worries, your appointment is still on! ✅\n\nReply *Hi* for the main menu.');
+    await send.text('No worries, your appointment is still on! ✅\n\nReply *Menu* for the main menu.');
   }
   await updateSession(schema, phone, STATES.IDLE, {});
 }

@@ -122,7 +122,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     // the 4-hour session expiry catches abandoned flows.
     try {
       await wa.sendText(phone,
-        'Sorry, something went wrong — retrying. If nothing happens, reply *Hi* to start over.',
+        'Sorry, something went wrong — retrying. If nothing happens, reply *Menu* to start over.',
         waToken, waPhoneId);
     } catch (_) { /* ignore — circuit might be open */ }
     try { require('../utils/metrics').increment('bot_errors_total'); } catch (_) {}
@@ -224,7 +224,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
         // so the bot doesn't stay stuck in a broken mid-flow state with empty context.
         logger.warn('Session context decryption failed, resetting to idle', { phone });
         await updateSession(schema, phone, STATES.IDLE, {});
-        await send.text('Sorry, something went wrong. Let\'s start over — reply *Hi* to continue.');
+        await send.text('Sorry, something went wrong. Let\'s start over — reply *Menu* to continue.');
         return;
       }
       ctx = JSON.parse(decrypted);
@@ -239,7 +239,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   } catch (err) {
     logger.warn(`Malformed session context, resetting to idle`, { error: err.message });
     await updateSession(schema, phone, STATES.IDLE, {});
-    await send.text('Sorry, something went wrong. Let\'s start over — reply *Hi* to continue.');
+    await send.text('Sorry, something went wrong. Let\'s start over — reply *Menu* to continue.');
     return;
   }
 
@@ -275,7 +275,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   if (atRestingState && /^reschedule$/i.test(input) && !isGreeting) {
     const patient = await getPatient(schema, phone);
     if (!patient) {
-      await send.text('No appointments found. Reply *Hi* to book your first appointment.');
+      await send.text('No appointments found. Reply *Menu* to book your first appointment.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -286,7 +286,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   if (atRestingState && /^cancel appointment$/i.test(input) && !isGreeting) {
     const patient = await getPatient(schema, phone);
     if (!patient) {
-      await send.text('No appointments found. Reply *Hi* to book your first appointment.');
+      await send.text('No appointments found. Reply *Menu* to book your first appointment.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -300,7 +300,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     await send.text(
       `🚨 *Dental Emergency*\n\n` +
       `We'll get you seen as soon as possible!\n\n` +
-      `Please reply *Hi* and tap *Book Appointment* to find the earliest available slot.\n\n` +
+      `Please reply *Menu* and tap *Book Appointment* to find the earliest available slot.\n\n` +
       `If you need immediate assistance, please call the clinic directly.`
     );
     await updateSession(schema, phone, STATES.IDLE, {});
@@ -342,12 +342,13 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
         `• Reply *Book* — Book an appointment\n` +
         `• Reply *Status* — Check appointment status\n` +
         `• Reply *My* — View your appointments\n` +
-        `• Reply *Hi* — Return to main menu\n\n` +
+        `• Reply *Menu* — Return to main menu\n` +
+        `• Reply *Hi* — Start over / choose a different clinic\n\n` +
         `For emergencies, please call the clinic directly.`
       );
       return;
     }
-    await send.text('Please choose an option from the menu. Reply *Hi* to see the menu again.');
+    await send.text('Please choose an option from the menu. Reply *Menu* to see the menu again.');
     return;
   }
 
@@ -364,7 +365,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
        WHERE a.booking_id=$1 AND p.phone=$2`,
       [bookingId, phone]);
     if (!apptR.rows[0]) {
-      await send.text('Booking ID not found. Please check and try again.\n\nReply *Hi* to go back.');
+      await send.text('Booking ID not found. Please check and try again.\n\nReply *Menu* to go back.');
       return;
     }
     const a = apptR.rows[0];
@@ -379,7 +380,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       `👨‍⚕️ Dr. ${a.doctor_name}\n` +
       `🦷 ${a.hospital_name}\n` +
       `📅 ${dt} at ${(a.appointment_time || '').slice(0, 5)}\n\n` +
-      `Reply *Hi* for the main menu.`
+      `Reply *Menu* for the main menu.`
     );
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
@@ -527,7 +528,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     // handleRescheduleConfirm/handleCancelConfirm in appointmentFlow.js.
     const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bcancel\b|\bnahi\b|btn_1|^2$/i.test(choice);
     if (isNegative) {
-      await send.text('Booking cancelled. Reply *Hi* to start over anytime. 👋');
+      await send.text('Booking cancelled. Reply *Menu* to start over anytime. 👋');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -594,10 +595,11 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   await send.text(
     `I didn't quite get that. 🤔\n\n` +
     `Here's what you can do:\n` +
-    `• Reply *Hi* — Main menu\n` +
+    `• Reply *Menu* — Main menu\n` +
     `• Reply *Book* — Book an appointment\n` +
     `• Reply *Status* — Check appointment status\n` +
-    `• Reply *Cancel Appointment* — Cancel a booking`
+    `• Reply *Cancel Appointment* — Cancel a booking\n` +
+    `• Reply *Hi* — Start over / choose a different clinic`
   );
   await updateSession(schema, phone, STATES.IDLE, {});
 }
@@ -616,7 +618,7 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
     } catch (_) {}
   }
   if (/^skip$/i.test((input || '').trim())) {
-    await send.text('No problem! Reply *Hi* for the main menu.');
+    await send.text('No problem! Reply *Menu* for the main menu.');
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
@@ -656,7 +658,7 @@ async function handleFeedbackComment(phone, schema, send, ctx, input) {
         [ctx.feedback_appointment_id, ctx.feedback_patient_id, ctx.feedback_rating, comment]);
     }
   } catch (_) {}
-  await send.text('✅ *Thank you for your feedback!*\n\nIt genuinely helps the clinic improve. We appreciate you taking the time. 🙏\n\nReply *Hi* for the main menu.');
+  await send.text('✅ *Thank you for your feedback!*\n\nIt genuinely helps the clinic improve. We appreciate you taking the time. 🙏\n\nReply *Menu* for the main menu.');
   await updateSession(schema, phone, STATES.IDLE, {});
 }
 
@@ -737,7 +739,7 @@ async function handleVoiceMessage({ phone, audioId, tenant }) {
   } catch (err) {
     logger.warn('Voice transcription failed', { phone, error: err.message });
     await wa.sendText(phone,
-      'Sorry, I couldn\'t process your audio. Please type *Hi* to start.',
+      'Sorry, I couldn\'t process your audio. Please type *Menu* to start.',
       waToken, waPhoneId).catch(() => {});
   }
 }

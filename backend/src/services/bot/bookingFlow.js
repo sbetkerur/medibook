@@ -135,7 +135,7 @@ async function showDepartments(phone, schema, tenant, send, ctx) {
      ORDER BY d.name`, [ctx.hospital_id]);
 
   if (!depts.rows.length) {
-    await send.text('No treatments available right now. Please contact the clinic directly.\n\nReply *Hi* to start over.');
+    await send.text('No treatments available right now. Please contact the clinic directly.\n\nReply *Menu* to start over.');
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
@@ -206,7 +206,7 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
     [dept.id, ctx.hospital_id]);
 
   if (!doctors.rows.length) {
-    await send.text(`No dentists available for ${dept.name}.\n\nReply *Hi* to choose another treatment.`);
+    await send.text(`No dentists available for ${dept.name}.\n\nReply *Menu* to choose another treatment.`);
     return;
   }
 
@@ -334,7 +334,7 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       // No other doctors in this department — guide user back to menu
       const deptLabel = ctx.department_name || 'this specialty';
       await send.text(
-        `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days, and there are no other dentists available for ${deptLabel} right now.\n\nPlease try again later or contact the clinic directly.\n\nReply *Hi* to go back to the main menu.`
+        `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days, and there are no other dentists available for ${deptLabel} right now.\n\nPlease try again later or contact the clinic directly.\n\nReply *Menu* to go back to the main menu.`
       );
       await updateSession(schema, phone, STATES.IDLE, {});
     }
@@ -396,7 +396,7 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   // well-formed YYYY-MM-DD through in exactly the situation where we have no
   // idea whether that date is open.
   if (!cachedDates.length || !cachedDates.some(d => d.date === resolvedDate)) {
-    await send.text('That date is not available. Please pick a date from the list, or reply *Hi* to start over.');
+    await send.text('That date is not available. Please pick a date from the list, or reply *Menu* to start over.');
     return;
   }
   ctx.appointment_date = resolvedDate;
@@ -440,9 +440,9 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
         try { label = format(parseISO(r.date), 'EEE, d MMM'); } catch {}
         return `• ${label} (${r.slots} slots)`;
       }).join('\n');
-      await send.text(`No slots available on that date.\n\n📅 *Next available dates for Dr. ${ctx.doctor_name}:*\n${suggestions}\n\nReply *Hi* to go back and choose a date.`);
+      await send.text(`No slots available on that date.\n\n📅 *Next available dates for Dr. ${ctx.doctor_name}:*\n${suggestions}\n\nReply *Menu* to go back and choose a date.`);
     } else {
-      await send.text('No slots left for that date. Please select another date.\n\nReply *Hi* to start over.');
+      await send.text('No slots left for that date. Please select another date.\n\nReply *Menu* to start over.');
     }
     return;
   }
@@ -608,7 +608,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
   // uses pool.connect() directly for a custom transaction, we must check here too.
   if (!schema || !/^tenant_[a-z0-9_]+$/.test(schema)) {
     logger.error(`completeBooking: invalid schema name "${schema}", aborting booking`);
-    await send.text('Something went wrong with your booking. Please try again.\n\nReply *Hi* to start over.');
+    await send.text('Something went wrong with your booking. Please try again.\n\nReply *Menu* to start over.');
     return;
   }
 
@@ -620,7 +620,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
        WHERE p.phone=$1 AND a.status='confirmed' AND a.created_at >= NOW() - INTERVAL '1 hour'`,
       [phone]);
     if (parseInt(recentR.rows[0].count) >= LIMITS.MAX_BOOKINGS_PER_HOUR) {
-      await send.text(`⚠️ You've made ${LIMITS.MAX_BOOKINGS_PER_HOUR} bookings in the last hour. Please wait before booking again.\n\nReply *Hi* for the main menu.`);
+      await send.text(`⚠️ You've made ${LIMITS.MAX_BOOKINGS_PER_HOUR} bookings in the last hour. Please wait before booking again.\n\nReply *Menu* for the main menu.`);
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -636,7 +636,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       '⚠️ *Online booking temporarily unavailable*\n\n' +
       'This clinic cannot accept more online bookings right now. ' +
       'Please call the clinic directly to book your appointment.\n\n' +
-      'Reply *Hi* for the main menu.'
+      'Reply *Menu* for the main menu.'
     );
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
@@ -686,7 +686,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
           `✅ *Booking Already Confirmed*\n\n` +
           `Looks like this appointment is already booked — no action needed!\n\n` +
           `🪪 Booking ID: *${existing.rows[0].booking_id}*\n\n` +
-          `Reply *Hi* for the main menu, or *My Appointments* to view details.`
+          `Reply *Menu* for the main menu, or *My Appointments* to view details.`
         );
         await updateSession(schema, phone, STATES.IDLE, {});
         return;
@@ -694,7 +694,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       await send.text(
         '⚠️ *Slot no longer available*\n\n' +
         'Someone just booked that slot. Please choose a different time.\n\n' +
-        'Reply *Hi* to go back to the menu.'
+        'Reply *Menu* to go back to the menu.'
       );
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
@@ -734,7 +734,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       '⚠️ *Something went wrong*\n\n' +
       'We were unable to complete your booking. Please try again.\n\n' +
       'If this keeps happening, contact the clinic directly.\n\n' +
-      'Reply *Hi* to try again.'
+      'Reply *Menu* to try again.'
     );
     await updateSession(schema, phone, STATES.IDLE, {});
     return;

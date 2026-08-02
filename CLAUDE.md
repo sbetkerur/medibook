@@ -90,8 +90,14 @@ no row for delivery receipts to attach to.
 **Bot engine.** `services/botEngine.js` is a state machine over
 `bot_sessions.state` with context stored ENCRYPTED (`{_enc: ...}`, AES-256-GCM
 via `utils/encryption.js`). Always read/write context through
-`getSession`/`updateSession` in `services/bot/utils.js`. "Hi" must always reset
-to the main menu from any state. Handlers live in `services/bot/bookingFlow.js`
+`getSession`/`updateSession` in `services/bot/utils.js`. **"Hi" restarts the
+whole conversation** — `routes/webhook.js` intercepts it before the engine,
+clears the clinic and re-runs the search; selecting a clinic then hands the
+engine a synthesised "Hi" so it lands on that clinic's main menu with a clean
+session. "Menu" is the one-step reset to the CURRENT clinic's menu and is what
+patient-facing copy must point at (`Reply *Menu*`); `*Hi*` in copy means start
+over / change clinic. Inside the engine, a greeting still always resets to the
+main menu from any state. Handlers live in `services/bot/bookingFlow.js`
 and `appointmentFlow.js`. In confirm steps, check negative intent ("no",
 "don't", "keep") BEFORE positive keywords. `fuzzyFind` (`bot/utils.js`)
 returns null when input is under 3 chars or matches more than one item — it

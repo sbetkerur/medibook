@@ -337,7 +337,7 @@ async function sendFeedbackRequests() {
         // would be tone-deaf. Nudge them to rebook instead.
         const message = appt.status === 'no_show'
           ? `🦷 Hi ${firstName}, we missed you at your appointment with Dr. ${appt.doctor_name} yesterday.\n\n` +
-            `No worries — these things happen! Reply *Hi* to book a new appointment whenever you're ready. 😊`
+            `No worries — these things happen! Reply *Menu* to book a new appointment whenever you're ready. 😊`
           : `⭐ *How was your dental visit, ${firstName}?*\n\n` +
             `We hope Dr. ${appt.doctor_name} took great care of your smile! 🦷\n\n` +
             `Rate your experience:\n` +

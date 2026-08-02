@@ -230,6 +230,16 @@ router.post('/webhook/whatsapp', async (req, res) => {
   }
 });
 
+// A greeting restarts the whole conversation, clinic choice included.
+// "menu" is excluded on purpose — botEngine treats it as a main-menu trigger,
+// so it remains the one-step way back to the current clinic's menu (which is
+// what the bot's own "reply for the main menu" prompts promise).
+const RESTART_GREETING_RE = /^(hi|hello|hey|start|restart|helo|hy|hai)$/i;
+
+// Inputs that are a request to begin, not search text. Superset of the above:
+// in the clinic-search state "menu" is no more a clinic name than "hi" is.
+const GREETING_RE = /^(hi|hello|hey|start|restart|menu|main menu|helo|hy|hai)$/i;
+
 // A bare "yes" or "4" is only meaningful as an answer to something. These are
 // the two questions a CLINIC asks unprompted, via the reminder and feedback
 // crons — the only cases where the sender, not the patient, decides which
@@ -361,6 +371,11 @@ async function processIncomingMessage(msg) {
 
     if (!text && !buttonId && !unsupportedType) return;
 
+    // What the patient ACTUALLY sent, captured before routing may rewrite
+    // `text` (see the clinic-selection branch). The message history must show
+    // the clinic name they typed, not the greeting we synthesised from it.
+    const inboundContent = (text || buttonId || '').slice(0, 500);
+
     // ── GLOBAL SESSION ROUTING (shared WhatsApp number) ──────────
     // All tenants share one phone number. Route each patient to their chosen clinic
     // via the global_bot_sessions table. New patients see a clinic selector first.
@@ -369,7 +384,23 @@ async function processIncomingMessage(msg) {
     // Noun is REQUIRED — a bare "change" mid-booking ("change the date") must
     // not silently reset the patient's clinic selection.
     const isSwitchClinic = /^(switch|change)\s+(clinic|hospital|branch)$/i.test((text || '').trim());
-    if (isSwitchClinic) {
+    // "Hi" means START OVER, and the start of a conversation on a shared number
+    // is the clinic search — not the menu of whichever clinic happens to still
+    // be attached to the session. So a greeting drops the clinic too, and the
+    // patient is asked who they want. ("menu" deliberately does NOT: it is what
+    // the bot's own "reply for the main menu" prompts point at, and it should
+    // stay a one-step trip back to the CURRENT clinic's menu.)
+    const isRestartGreeting = RESTART_GREETING_RE.test((text || '').trim());
+    // Which clinic they are leaving, if any — read BEFORE the reset clears it,
+    // so the prompt can say what just happened instead of greeting a patient
+    // mid-booking as though they had never been here.
+    let leavingClinic = null;
+    if (isSwitchClinic || isRestartGreeting) {
+      const prev = await query(
+        `SELECT t.name FROM global_bot_sessions gs
+         JOIN tenants t ON t.id = gs.tenant_id WHERE gs.phone=$1`, [phone]
+      ).catch(() => null);
+      leavingClinic = prev?.rows[0]?.name || null;
       await query(
         `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant',
            search_matches=NULL, last_activity=NOW() WHERE phone=$1`,
@@ -409,7 +440,7 @@ async function processIncomingMessage(msg) {
       // clinic they did not name.
       let selected = null;
       const trimmed = (text || '').trim();
-      const isGreeting = /^(hi|hello|hey|start|menu)$/i.test(trimmed);
+      const isGreeting = GREETING_RE.test(trimmed);
 
       // 1. Tap on a shortlist row — row id is the tenant UUID.
       if (buttonId) {
@@ -452,6 +483,15 @@ async function processIncomingMessage(msg) {
           .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
         const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
         tenant = r.rows[0] || null;
+
+        // Picking a clinic is the first step of a fresh conversation, so hand
+        // the engine a greeting rather than the clinic name the patient just
+        // typed. Two reasons: the name is not a valid answer to whatever step
+        // their old session was on (a half-finished booking would try to read
+        // "smile" as a date), and a greeting is what resets that session and
+        // shows the clinic's main menu — which is where "start over" ends.
+        text = 'Hi';
+        buttonId = null;
       } else {
         // No single match — re-prompt. Shown matches are stored in render
         // order so a numbered reply resolves; a search that matched nothing
@@ -493,6 +533,13 @@ async function processIncomingMessage(msg) {
           prompt = `❌ No clinic found matching *"${trimmed}"*.\n\n` +
             `Please check the spelling and send your clinic's name again. ` +
             `You can leave out "dental" and "clinic".`;
+        } else if (leavingClinic) {
+          // They were with a clinic and asked to start over. Say so — a plain
+          // "welcome" to someone who was three steps into a booking reads as
+          // though the bot forgot them.
+          prompt = `🔄 Starting over — you've left *${leavingClinic}*.\n\n` +
+            `🔍 Send a clinic's name to continue. ` +
+            `A few letters are enough — you can leave out "dental" and "clinic".`;
         } else {
           prompt = `👋 Welcome to MediBook!\n\n` +
             `🔍 Please send your clinic's name to search for it. ` +
@@ -554,7 +601,7 @@ async function processIncomingMessage(msg) {
            VALUES ($1,'in',$2,$3,$4)
            ON CONFLICT (wa_message_id) WHERE wa_message_id IS NOT NULL DO NOTHING
            RETURNING id`,
-          [phone, msg.type, (text || buttonId || '').slice(0, 500), msgId]
+          [phone, msg.type, inboundContent, msgId]
         );
         if (!inserted.rows[0]) {
           logger.info('Duplicate message skipped', { msgId, phone });
@@ -595,7 +642,7 @@ async function processIncomingMessage(msg) {
     if (unsupportedType) {
       logger.info('Unsupported message type received', { phone, type: unsupportedType, tenant: tenant.slug });
       wa.sendText(phone,
-        `Sorry, I can only process text messages. Please type *Hi* to start booking an appointment. 😊`,
+        `Sorry, I can only process text messages. Please type *Menu* to start booking an appointment. 😊`,
         null, null
       ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone, type: unsupportedType, error: err.message }));
       return;
@@ -646,7 +693,7 @@ async function processIncomingMessage(msg) {
             ).catch(() => {});
           } else {
             wa.sendText(phone,
-              `Got it! Reply *Cancel Appointment* to cancel your booking, or *Reschedule* to pick a new time. 🙏\n\nReply *Hi* for the main menu.`,
+              `Got it! Reply *Cancel Appointment* to cancel your booking, or *Reschedule* to pick a new time. 🙏\n\nReply *Menu* for the main menu.`,
               null, null
             ).catch(() => {});
           }
