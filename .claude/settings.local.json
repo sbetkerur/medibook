@@ -182,7 +182,20 @@
       "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"PUBLIC_API_URL=https://api.pragatisolutions.com\")",
       "Bash(MSYS_NO_PATHCONV=1 railway variables --service frontend --set \"BACKEND_URL=https://api.pragatisolutions.com\")",
       "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"FRONTEND_URL=https://app.pragatisolutions.com,https://frontend-production-2f2d.up.railway.app\")",
-      "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"FRONTEND_URL=https://app.pragatisolutions.com\")"
+      "Bash(MSYS_NO_PATHCONV=1 railway variables --service backend --set \"FRONTEND_URL=https://app.pragatisolutions.com\")",
+      "PowerShell(\\(Invoke-WebRequest -Uri \"https://backend-production-f66a.up.railway.app/health\" -UseBasicParsing\\).Content)",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; $v = railway variables -s Postgres --json | ConvertFrom-Json; $v.PSObject.Properties.Name)",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; $env:PGURL = \\(railway variables -s Postgres --json | ConvertFrom-Json\\).DATABASE_PUBLIC_URL; node \"C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\b3858837-65ae-4bea-83df-a5797484eb87\\\\scratchpad\\\\inspect.js\")",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; $env:NODE_PATH = \"C:\\\\claude_projects\\\\medibook\\\\backend\\\\node_modules\"; $env:PGURL = \\(railway variables -s Postgres --json | ConvertFrom-Json\\).DATABASE_PUBLIC_URL; node \"C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\b3858837-65ae-4bea-83df-a5797484eb87\\\\scratchpad\\\\inspect.js\")",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; \\(railway deployment list --service backend --json | ConvertFrom-Json\\)[0] | Select-Object id, status, createdAt)",
+      "PowerShell(Start-Sleep -Seconds 15; \\(Invoke-WebRequest -Uri \"https://backend-production-f66a.up.railway.app/health\" -UseBasicParsing\\).Content)",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; $env:NODE_PATH = \"C:\\\\claude_projects\\\\medibook\\\\backend\\\\node_modules\"; $env:PGURL = \\(railway variables -s Postgres --json | ConvertFrom-Json\\).DATABASE_PUBLIC_URL; node \"C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\b3858837-65ae-4bea-83df-a5797484eb87\\\\scratchpad\\\\inspect2.js\")",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; $env:NODE_PATH = \"C:\\\\claude_projects\\\\medibook\\\\backend\\\\node_modules\"; $env:PGURL = \\(railway variables -s Postgres --json | ConvertFrom-Json\\).DATABASE_PUBLIC_URL; node \"C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\b3858837-65ae-4bea-83df-a5797484eb87\\\\scratchpad\\\\reset.js\")",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; foreach \\($f in @\\('src/routes/webhook.js','src/jobs/reminders.js','src/services/pendingReply.js','src/jobs/slotGenerator.js','src/db/migrate.js'\\)\\) { node --check $f; if \\(-not $?\\) { \"FAILED: $f\"; break } }; if \\($?\\) { \"all syntax OK\" })",
+      "PowerShell(git checkout *)",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; \\(Get-Content frontend/src/app/dashboard/page.js | Measure-Object -Line\\).Lines; git diff --stat; \"--- encoding spot-check ---\"; Select-String -Path frontend/src/app/dashboard/page.js -Pattern '📤|── DOCTORS ──|₹' | Select-Object -First 3 | ForEach-Object { $_.Line.Trim\\(\\) })",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; foreach \\($t in @\\('clinicSearch','slotPlanner','fuzzyFind','botFlow'\\)\\) { $r = node \"tests/$t.unit.test.js\" 2>&1 | Select-String 'Results:'; \"$t -> $r\" })",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; \\(Select-String -Path backend/src/services/botEngine.js -Pattern '🦷|✅|👨‍⚕️' | Measure-Object\\).Count; \"---\"; git diff backend/src/services/botEngine.js | Select-String '^[+-]' | Select-String -NotMatch '^\\(\\\\+\\\\+\\\\+|---\\)' | Select-Object -First 8 | ForEach-Object { $_.Line.Trim\\(\\) })"
     ]
   }
 }
