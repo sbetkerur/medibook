@@ -459,7 +459,6 @@ router.post('/messages/send', adminOnly, async (req, res) => {
     if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
       return res.status(400).json({ error: 'WhatsApp not configured (META_PHONE_NUMBER_ID / META_ACCESS_TOKEN missing in env)' });
     }
-    const wa = require('../services/whatsapp');
     const normalised = phone.replace(/[+\s]/g, '');
 
     // The WhatsApp number is SHARED across all tenants, so an unrestricted
@@ -487,7 +486,11 @@ router.post('/messages/send', adminOnly, async (req, res) => {
       return res.status(403).json({ error: 'This patient has opted out of WhatsApp messages.' });
     }
 
-    await wa.sendText(normalised, message, null, null);
+    // Recorded in wa_messages: a message a staff member sent by hand is part of
+    // the patient's conversation, and it used to be the one outbound message
+    // that left no trace anywhere except the audit log.
+    const { sendPatientText } = require('../services/outbound');
+    await sendPatientText(req.tenant.schema_name, normalised, message);
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
       'SEND_WA_MESSAGE', 'patient', normalised, null, { message: message.slice(0, 100) }, req.ip);
     res.json({ success: true, phone: normalised });

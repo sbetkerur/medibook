@@ -697,6 +697,12 @@ router.post('/doctors/:id/locations', adminOnly, validateUUID(), async (req, res
 
 router.delete('/doctors/:id/locations/:hospitalId', adminOnly, validateUUID(), async (req, res) => {
   try {
+    // validateUUID() only checks :id. Without this, a malformed :hospitalId
+    // reaches Postgres and comes back as a 500 ("invalid input syntax for type
+    // uuid") instead of a 400 — same guard as the other two-param routes.
+    if (!UUID_RE.test(req.params.hospitalId)) {
+      return res.status(400).json({ error: 'Invalid hospital ID' });
+    }
     const s = req.tenant.schema_name;
     await tenantQuery(s, `
       DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND hospital_id=$2

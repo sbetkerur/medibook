@@ -176,9 +176,9 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       .catch(err => logger.warn('Opt-out patient update failed', { phone, error: err.message }));
     await resetSessionToIdle(schema, phone)
       .catch(err => logger.warn('Opt-out session reset failed', { phone, error: err.message }));
-    await wa.sendText(phone,
-      `You have been unsubscribed from ${tenant.name} WhatsApp notifications.\n\nTo re-subscribe, reply *START*.`,
-      waToken, waPhoneId).catch(err => logger.warn('Opt-out reply failed to send', { phone, error: err.message }));
+    await send.text(
+      `You have been unsubscribed from ${tenant.name} WhatsApp notifications.\n\nTo re-subscribe, reply *START*.`
+    ).catch(err => logger.warn('Opt-out reply failed to send', { phone, error: err.message }));
     logger.info(`Patient ${phone} opted out from ${tenant.name}`);
     return;
   }
@@ -694,10 +694,13 @@ async function handleVoiceMessage({ phone, audioId, tenant }) {
   const waToken = null;
   const waPhoneId = null;
 
+  // Voice replies go through the logging wrapper for the same reason the bot's
+  // own send.* helpers do: a patient who only ever sends voice notes would
+  // otherwise have a conversation history containing none of the bot's answers.
+  const { sendPatientText } = require('./outbound');
+
   if (!process.env.OPENAI_API_KEY) {
-    await wa.sendText(phone,
-      'Sorry, I can only process text messages. Please type your request.',
-      waToken, waPhoneId);
+    await sendPatientText(schema, phone, 'Sorry, I can only process text messages. Please type your request.');
     return;
   }
 
@@ -729,7 +732,7 @@ async function handleVoiceMessage({ phone, audioId, tenant }) {
 
     const transcribed = whisperRes.data?.text?.trim();
     if (!transcribed) {
-      await wa.sendText(phone, 'Sorry, I couldn\'t understand the audio. Please type your message.', waToken, waPhoneId);
+      await sendPatientText(schema, phone, 'Sorry, I couldn\'t understand the audio. Please type your message.');
       return;
     }
 
@@ -738,9 +741,8 @@ async function handleVoiceMessage({ phone, audioId, tenant }) {
     await handle({ phone, text: transcribed, buttonId: null, tenant });
   } catch (err) {
     logger.warn('Voice transcription failed', { phone, error: err.message });
-    await wa.sendText(phone,
-      'Sorry, I couldn\'t process your audio. Please type *Menu* to start.',
-      waToken, waPhoneId).catch(() => {});
+    await sendPatientText(schema, phone, 'Sorry, I couldn\'t process your audio. Please type *Menu* to start.')
+      .catch(() => {});
   }
 }
 

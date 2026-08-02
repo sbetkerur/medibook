@@ -26,6 +26,7 @@ cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
 cd backend && node tests/clinicSearch.unit.test.js
 cd backend && node tests/slotPlanner.unit.test.js
+cd backend && node tests/restartGreeting.unit.test.js
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -96,7 +97,9 @@ clears the clinic and re-runs the search; selecting a clinic then hands the
 engine a synthesised "Hi" so it lands on that clinic's main menu with a clean
 session. "Menu" is the one-step reset to the CURRENT clinic's menu and is what
 patient-facing copy must point at (`Reply *Menu*`); `*Hi*` in copy means start
-over / change clinic. Inside the engine, a greeting still always resets to the
+over / change clinic. "Start" is NOT a restart word — it is the re-subscribe
+keyword and must reach the engine with the clinic attached, or an opted-out
+patient can never opt back in (`tests/restartGreeting.unit.test.js`). Inside the engine, a greeting still always resets to the
 main menu from any state. Handlers live in `services/bot/bookingFlow.js`
 and `appointmentFlow.js`. In confirm steps, check negative intent ("no",
 "don't", "keep") BEFORE positive keywords. `fuzzyFind` (`bot/utils.js`)

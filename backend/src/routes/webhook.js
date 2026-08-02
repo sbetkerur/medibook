@@ -13,6 +13,7 @@ const { parseChoiceNumber } = require('../services/bot/utils');
 const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
+const { sendPatientText } = require('../services/outbound');
 const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST } = require('../services/bot/clinicSearch');
 
 const testEndpointLimiter = rateLimit({
@@ -231,10 +232,16 @@ router.post('/webhook/whatsapp', async (req, res) => {
 });
 
 // A greeting restarts the whole conversation, clinic choice included.
-// "menu" is excluded on purpose — botEngine treats it as a main-menu trigger,
-// so it remains the one-step way back to the current clinic's menu (which is
-// what the bot's own "reply for the main menu" prompts promise).
-const RESTART_GREETING_RE = /^(hi|hello|hey|start|restart|helo|hy|hai)$/i;
+//
+// Two words botEngine also treats as greetings are deliberately NOT here:
+//   "menu"  — it stays the one-step way back to the CURRENT clinic's menu,
+//             which is what the bot's own prompts promise.
+//   "start" — it is the RE-SUBSCRIBE keyword. The opt-out reply tells patients
+//             "to re-subscribe, reply START", and that only clears opted_out if
+//             the message reaches the engine with their clinic still attached.
+//             Restarting on it would drop the clinic first, so the patient would
+//             re-pick a clinic and stay opted out for good.
+const RESTART_GREETING_RE = /^(hi|hello|hey|restart|helo|hy|hai)$/i;
 
 // Inputs that are a request to begin, not search text. Superset of the above:
 // in the clinic-search state "menu" is no more a clinic name than "hi" is.
@@ -641,9 +648,8 @@ async function processIncomingMessage(msg) {
     // If message type is unsupported (image, document, sticker, etc.), send a helpful reply
     if (unsupportedType) {
       logger.info('Unsupported message type received', { phone, type: unsupportedType, tenant: tenant.slug });
-      wa.sendText(phone,
-        `Sorry, I can only process text messages. Please type *Menu* to start booking an appointment. 😊`,
-        null, null
+      sendPatientText(tenant.schema_name, phone,
+        `Sorry, I can only process text messages. Please type *Menu* to start booking an appointment. 😊`
       ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone, type: unsupportedType, error: err.message }));
       return;
     }
@@ -686,17 +692,10 @@ async function processIncomingMessage(msg) {
           // session leaves collect_feedback_rating, which is what
           // resolveAskingTenant verifies, and the row expires on its own.)
           await clearPendingReply(phone, tenant.id, KINDS.CONFIRMATION);
-          if (confirmResult === 'yes') {
-            wa.sendText(phone,
-              `✅ Thank you for confirming! We'll see you at your appointment. 😊\n\nIf plans change, reply *Reschedule* or *Cancel Appointment*.`,
-              null, null
-            ).catch(() => {});
-          } else {
-            wa.sendText(phone,
-              `Got it! Reply *Cancel Appointment* to cancel your booking, or *Reschedule* to pick a new time. 🙏\n\nReply *Menu* for the main menu.`,
-              null, null
-            ).catch(() => {});
-          }
+          const ack = confirmResult === 'yes'
+            ? `✅ Thank you for confirming! We'll see you at your appointment. 😊\n\nIf plans change, reply *Reschedule* or *Cancel Appointment*.`
+            : `Got it! Reply *Cancel Appointment* to cancel your booking, or *Reschedule* to pick a new time. 🙏\n\nReply *Menu* for the main menu.`;
+          sendPatientText(tenant.schema_name, phone, ack).catch(() => {});
           return;
         }
       }
@@ -800,3 +799,7 @@ if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT ==
 }
 
 module.exports = router;
+// Exported for tests: which words restart the conversation is a decision with a
+// sharp edge — "start" belongs to the re-subscribe flow, not to this one.
+module.exports.RESTART_GREETING_RE = RESTART_GREETING_RE;
+module.exports.GREETING_RE = GREETING_RE;
