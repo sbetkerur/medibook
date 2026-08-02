@@ -54,6 +54,49 @@ function computeDaySlotTimes(startTime, endTime, duration, lunchStartTime = null
   return slots;
 }
 
+/**
+ * Plan every slot a doctor should have over the lookahead window.
+ *
+ * SINGLE SOURCE OF TRUTH for the day loop. The nightly tenant sweep and the
+ * per-doctor regeneration used to carry their own copies of this loop, which
+ * is exactly how the per-doctor path ended up ignoring clinic holidays.
+ *
+ * Day 0 (TODAY) is included, with only the slots still ahead of the current IST
+ * time. Starting at day 1 meant a dentist added — or a schedule extended — this
+ * morning had no bookable slots at all until the 23:30 cron ran, so same-day
+ * booking, the case a patient in pain actually needs, silently failed.
+ *
+ * @param {object}   doc          - { hospital_id, duration, schedules[] }
+ * @param {Date}     today        - IST "now"
+ * @param {number}   days         - how many days PAST today to plan
+ * @param {Function} isBlockedDay - (dateStr) => boolean; leave/holiday check
+ * @returns {Array<{dateStr: string, st: string, et: string}>}
+ */
+function planDoctorSlots(doc, today, days, isBlockedDay) {
+  // "HH:MM" strings compare correctly lexicographically, which is why the slot
+  // times computed below can be filtered against it directly.
+  const nowHHMM = format(today, 'HH:mm');
+  const planned = [];
+
+  for (let i = 0; i <= days; i++) {
+    const date = addDays(today, i);
+    const sched = doc.schedules.find(s => s.dow === date.getDay());
+    if (!sched) continue;
+
+    const dateStr = format(date, 'yyyy-MM-dd');
+    if (isBlockedDay(dateStr)) continue;
+
+    for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
+      // Today only: skip slots whose start time has already passed. Booking
+      // rejects them anyway (see completeBooking's time predicate), so
+      // generating them would just show patients times they cannot take.
+      if (i === 0 && st <= nowHHMM) continue;
+      planned.push({ dateStr, st, et });
+    }
+  }
+  return planned;
+}
+
 /** Wrap a promise with a hard timeout */
 function withTimeout(promise, ms, label) {
   return Promise.race([
@@ -79,6 +122,23 @@ async function flushSlots(schema, batch) {
     VALUES ${values.join(',')}
     ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING
   `, params);
+}
+
+/**
+ * Insert planned slots in BATCH_SIZE chunks. Returns the number planned.
+ * Shared by both generation paths so batching/flushing can't drift either.
+ */
+async function flushPlanned(schema, planned, docId, hospitalId) {
+  let batch = [];
+  for (const { dateStr, st, et } of planned) {
+    batch.push({ docId, hospitalId, dateStr, st, et, maxCapacity: 1 });
+    if (batch.length >= BATCH_SIZE) {
+      await flushSlots(schema, batch);
+      batch = [];
+    }
+  }
+  if (batch.length) await flushSlots(schema, batch);
+  return planned.length;
 }
 
 // Cache Indian public holidays for a year (TTL: 24h in Redis)
@@ -229,32 +289,16 @@ async function generateSlotsForTenant(schema) {
 
   /** Generate slots for a single doctor and flush them. Returns slot count. */
   async function generateForDoctor(docId, doc) {
-    let localBatch = [];
-    let localCount = 0;
+    // Same planner the per-doctor path uses; only the blocked-day lookup differs,
+    // because this sweep prefetches leaves/holidays for every doctor at once.
+    const planned = planDoctorSlots(doc, today, CRON_LOOKAHEAD_DAYS, (dateStr) =>
+      holidaySet.has(`${doc.hospital_id}:${dateStr}`) ||  // hospital-specific holiday
+      clinicWideHolidays.has(dateStr) ||                  // clinic-wide holiday
+      publicHolidaySet.has(dateStr) ||                    // Indian public holiday
+      leaveSet.has(`${docId}:${dateStr}`)                 // doctor-specific leave
+    );
 
-    for (let i = 1; i <= CRON_LOOKAHEAD_DAYS; i++) {
-      const date = addDays(today, i);
-      const dow = date.getDay();
-      const sched = doc.schedules.find(s => s.dow === dow);
-      if (!sched) continue;
-
-      const dateStr = format(date, 'yyyy-MM-dd');
-      if (holidaySet.has(`${doc.hospital_id}:${dateStr}`) || clinicWideHolidays.has(dateStr)) continue; // hospital-specific or clinic-wide holiday
-      if (publicHolidaySet.has(dateStr)) continue;      // Indian public holiday
-      if (leaveSet.has(`${docId}:${dateStr}`)) continue; // doctor-specific leave
-
-      for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
-        localBatch.push({ docId, hospitalId: doc.hospital_id, dateStr, st, et, maxCapacity: 1 });
-        localCount++;
-        if (localBatch.length >= BATCH_SIZE) {
-          await flushSlots(schema, localBatch);
-          localBatch = [];
-        }
-      }
-    }
-
-    if (localBatch.length) await flushSlots(schema, localBatch);
-    return localCount;
+    return flushPlanned(schema, planned, docId, doc.hospital_id);
   }
 
   // Process doctors in parallel batches (PARALLEL_DOCTORS at a time)
@@ -344,6 +388,11 @@ async function cleanupTokenBlacklist() {
   try {
     // Remove used or expired refresh tokens older than 7 days
     await query(`DELETE FROM refresh_tokens WHERE used=true OR expires_at < NOW() - INTERVAL '7 days'`);
+  } catch (_) { /* non-fatal */ }
+  try {
+    // Expired "this clinic is waiting for a reply" hints (services/pendingReply.js).
+    // They are consulted only while unexpired, so old rows are pure noise.
+    await query(`DELETE FROM global_pending_replies WHERE expires_at < NOW()`);
   } catch (_) { /* non-fatal */ }
   try {
     // Prune email log after 30 days. Dedup only needs EMAIL_DEDUP_WINDOW_HOURS,
@@ -559,53 +608,19 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
   const isBlockedDay = (dateStr) =>
     leaveSet.has(dateStr) || holidaySet.has(dateStr) || publicHolidaySet.has(dateStr);
 
-  // Dry-run: collect slots into an array without inserting
+  // One plan, used by both the preview and the insert — a dry run that walked
+  // its own loop could report slots the real run would not create.
+  const planned = planDoctorSlots(doc, today, days, isBlockedDay);
+
   if (dryRun) {
-    const previewSlots = [];
-    let count = 0;
-
-    for (let i = 1; i <= days; i++) {
-      const date = addDays(today, i);
-      const dow = date.getDay();
-      const sched = doc.schedules.find(s => s.dow === dow);
-      if (!sched) continue;
-      const dateStr = format(date, 'yyyy-MM-dd');
-      if (isBlockedDay(dateStr)) continue;
-
-      for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
-        if (previewSlots.length < 10) {
-          previewSlots.push({ date: dateStr, start_time: st, end_time: et });
-        }
-        count++;
-      }
-    }
-
-    return { dry_run: true, would_generate: count, preview: previewSlots };
+    return {
+      dry_run: true,
+      would_generate: planned.length,
+      preview: planned.slice(0, 10).map(p => ({ date: p.dateStr, start_time: p.st, end_time: p.et })),
+    };
   }
 
-  // Normal (non-dry-run) path
-  let localBatch = [];
-  let count = 0;
-
-  for (let i = 1; i <= days; i++) {
-    const date = addDays(today, i);
-    const dow = date.getDay();
-    const sched = doc.schedules.find(s => s.dow === dow);
-    if (!sched) continue;
-    const dateStr = format(date, 'yyyy-MM-dd');
-    if (isBlockedDay(dateStr)) continue;
-
-    for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
-      localBatch.push({ docId: doctorId, hospitalId: doc.hospital_id, dateStr, st, et, maxCapacity: 1 });
-      count++;
-      if (localBatch.length >= BATCH_SIZE) {
-        await flushSlots(schema, localBatch);
-        localBatch = [];
-      }
-    }
-  }
-  if (localBatch.length) await flushSlots(schema, localBatch);
-  return count;
+  return flushPlanned(schema, planned, doctorId, doc.hospital_id);
 }
 
 module.exports = {
@@ -613,6 +628,7 @@ module.exports = {
   generateSlotsForTenant,
   generateSlotsForDoctor,
   computeDaySlotTimes,
+  planDoctorSlots,
   updateNoShowScores,
   cleanupExpiredSlots,
 };

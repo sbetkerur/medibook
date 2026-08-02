@@ -18,19 +18,27 @@ const slotsGenerateLimiter = rateLimit({
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
-// Deletes future (IST) time_slots for a doctor that aren't referenced by an
-// appointment — a cancelled appointment keeps its slot_id, so deleting a
-// referenced slot would violate the appointments FK. Uses IST date, not UTC
-// CURRENT_DATE: between 00:00 and 05:30 IST the UTC date is a day behind, so
-// '> CURRENT_DATE' would delete IST-today's remaining slots while the
-// generator (which starts at IST-tomorrow) never recreates them.
+// Deletes still-upcoming (IST) time_slots for a doctor that aren't referenced by
+// an appointment — a cancelled appointment keeps its slot_id, so deleting a
+// referenced slot would violate the appointments FK.
+//
+// "Upcoming" is the two-clause IST test, not a date-only one: the generator now
+// creates TODAY's remaining slots too, so a date-only '> today' would leave the
+// old schedule's afternoon grid in place while the regenerated one is added
+// alongside it — two overlapping sets of bookable times for the same dentist.
+// Slots whose start time has already passed are left alone; they are history.
+// (The UTC date is a day behind IST until 05:30, hence timezone(...) rather
+// than CURRENT_DATE.)
+//
 // `statuses` controls which slot statuses are eligible for deletion — schedule
 // updates only touch 'available' slots, while a manual "clear" regen also
 // releases slots an admin had manually 'blocked'.
 async function deleteFutureUnreferencedSlots(schema, doctorId, statuses = ['available']) {
   return tenantQuery(schema,
     `DELETE FROM time_slots WHERE doctor_id=$1 AND status = ANY($2::text[])
-       AND slot_date > (timezone('Asia/Kolkata', NOW()))::date
+       AND (slot_date > (timezone('Asia/Kolkata', NOW()))::date
+            OR (slot_date = (timezone('Asia/Kolkata', NOW()))::date
+                AND start_time > (timezone('Asia/Kolkata', NOW()))::time))
        AND id NOT IN (SELECT slot_id FROM appointments WHERE slot_id IS NOT NULL)`,
     [doctorId, statuses]);
 }
@@ -446,11 +454,11 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
     const s = req.tenant.schema_name;
     const safeDays = Math.min(Math.max(parseInt(days) || 7, 1), 365);
     if (clear) {
-      // Future-only in IST ('>=' + UTC CURRENT_DATE wiped IST-today's remaining
-      // availability, which the generator never recreates), and never rows still
-      // referenced by an appointment (FK violation — cancelled appointments keep
-      // their slot_id). Also releases manually 'blocked' slots — unlike the
-      // schedule-update regen above, a manual "clear" is meant to reset everything.
+      // Upcoming-only in IST (past slots are history and are never regenerated),
+      // and never rows still referenced by an appointment (FK violation —
+      // cancelled appointments keep their slot_id). Also releases manually
+      // 'blocked' slots — unlike the schedule-update regen above, a manual
+      // "clear" is meant to reset everything.
       await deleteFutureUnreferencedSlots(s, doctor_id, ['available', 'blocked']);
     }
     const docR = await tenantQuery(s, `SELECT id FROM doctors WHERE id=$1`, [doctor_id]);

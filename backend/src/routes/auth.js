@@ -115,7 +115,10 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
     res.json({
       token,
       refresh_token: refreshToken,
-      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug }
+      // normalizedSlug, not the raw body value — the client stores this and
+      // sends it back on subsequent logins, so returning an untrimmed copy
+      // would hand back a slug that no longer matches the one we looked up.
+      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug: normalizedSlug }
     });
   } catch (err) {
     handleError(res, err);

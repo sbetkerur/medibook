@@ -1,74 +1,14 @@
 const Redis = require('ioredis');
-const crypto = require('crypto');
 const { Queue, Worker } = require('bullmq');
 const botEngine = require('../services/botEngine');
 const { query } = require('../db');
 const logger = require('../utils/logger');
-const { getClient: getLockRedisClient } = require('../utils/redisClient');
-
-// ── Per-phone job lock ────────────────────────────────────────────
-// Worker concurrency is 5: two rapid messages from the same phone can be
-// picked up by two slots at once, both calling getSession/updateSession on
-// the same row — a classic lost-update race (second writer's stale context
-// clobbers the first writer's progress). A short Redis lock keyed by
-// tenant+phone serializes processing per phone without affecting throughput
-// across different phones.
-const PHONE_LOCK_TTL_MS = 15000;       // safety net if a holder crashes before releasing
-const PHONE_LOCK_MAX_WAIT_MS = 12000;  // give the current holder time to finish its turn
-const PHONE_LOCK_POLL_MS = 250;
-
-// Atomic release: only DEL if our token still owns the lock (mirrors
-// utils/cronLock.js) — otherwise a slow job could delete a lock that has since
-// expired and been re-acquired by someone else.
-const RELEASE_PHONE_LOCK_SCRIPT = `
-  if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-  else
-    return 0
-  end
-`;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Acquire a short-lived per-phone lock, polling for up to PHONE_LOCK_MAX_WAIT_MS
- * if another job currently holds it. Fails OPEN (returns as if acquired) on
- * Redis errors so a Redis blip never blocks bot replies entirely — the queue's
- * own Redis connection already governs whether jobs run at all.
- * @returns {Promise<{acquired: boolean, token: string|null}>}
- */
-async function acquirePhoneLock(lockKey) {
-  const client = getLockRedisClient();
-  // No Redis configured — single-instance, and BullMQ itself can't be running
-  // either (it needs the same Redis), so there is nothing to serialise against.
-  if (!client) return { acquired: false, token: null, notConfigured: true };
-  const token = crypto.randomBytes(16).toString('hex');
-  const deadline = Date.now() + PHONE_LOCK_MAX_WAIT_MS;
-  while (true) {
-    try {
-      const result = await client.set(lockKey, token, 'NX', 'PX', PHONE_LOCK_TTL_MS);
-      if (result === 'OK') return { acquired: true, token };
-    } catch (err) {
-      logger.warn('Phone lock acquire failed, processing without lock', { error: err.message });
-      return { acquired: false, token: null, redisError: true };
-    }
-    if (Date.now() >= deadline) return { acquired: false, token: null };
-    await sleep(PHONE_LOCK_POLL_MS);
-  }
-}
-
-async function releasePhoneLock(lockKey, token) {
-  if (!token) return;
-  const client = getLockRedisClient();
-  if (!client) return;
-  try {
-    await client.eval(RELEASE_PHONE_LOCK_SCRIPT, 1, lockKey, token);
-  } catch (err) {
-    logger.warn('Phone lock release failed (will expire via TTL)', { error: err.message });
-  }
-}
+// Worker concurrency is 5: two rapid messages from the same phone can be picked
+// up by two slots at once, both calling getSession/updateSession on the same row
+// — a classic lost-update race. The lock (shared with the webhook's pre-tenant
+// path, hence utils/) serialises per phone without affecting throughput across
+// different phones.
+const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 
 let botQueue = null;
 let dlQueue = null;  // dead-letter queue for failed jobs

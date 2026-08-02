@@ -764,7 +764,9 @@ router.post('/tenants/:id/users/:userId/reset-password', resetTenantPasswordLimi
     // interpolated into a tenant-scoped query below.
     if (!UUID_RE.test(userId)) return res.status(400).json({ error: 'Invalid user id' });
 
-    const tenantR = await query(`SELECT id, name, schema_name FROM tenants WHERE id=$1`, [tenantId]);
+    // slug is selected because the log line below prefers it — without it the
+    // message always silently fell back to the tenant name.
+    const tenantR = await query(`SELECT id, name, slug, schema_name FROM tenants WHERE id=$1`, [tenantId]);
     if (!tenantR.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
     const tenant = tenantR.rows[0];
 

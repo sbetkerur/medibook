@@ -10,6 +10,9 @@ const { handleReminderConfirmation } = require('../jobs/reminders');
 const { isEnabled } = require('../utils/featureFlags');
 const { isRealAppSecret } = require('../utils/errors');
 const { parseChoiceNumber } = require('../services/bot/utils');
+const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
+const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
+const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST } = require('../services/bot/clinicSearch');
 
 const testEndpointLimiter = rateLimit({
@@ -212,7 +215,7 @@ router.post('/webhook/whatsapp', async (req, res) => {
         // A value can carry both statuses and messages — process both.
         for (const msg of value.messages || []) {
           try {
-            await processIncomingMessage(msg);
+            await processIncomingMessageSerialized(msg);
           } catch (msgErr) {
             logger.error('Webhook message processing failed', { msgId: msg?.id, error: msgErr.message });
           }
@@ -226,6 +229,96 @@ router.post('/webhook/whatsapp', async (req, res) => {
     });
   }
 });
+
+// A bare "yes" or "4" is only meaningful as an answer to something. These are
+// the two questions a CLINIC asks unprompted, via the reminder and feedback
+// crons — the only cases where the sender, not the patient, decides which
+// clinic the message belongs to.
+const CONFIRMATION_REPLY_RE = /^(yes|no|confirm|haan|nahi|ha|ok|sure|nope)\b/i;
+const RATING_REPLY_RE = /^[1-5]$/;
+
+/**
+ * If this message is an answer to a question a DIFFERENT clinic asked, return
+ * that clinic. Otherwise null (the overwhelmingly common case).
+ *
+ * Both ends are verified before redirecting, because "1".."5" and "yes" are
+ * also ordinary bot input — a patient mid-booking replying "2" to pick a date
+ * must never be dragged into another clinic:
+ *   - the CURRENT clinic must have nothing in flight (session idle), and
+ *   - the OTHER clinic must actually be waiting for exactly this answer.
+ * Any failure returns null and processing continues unchanged.
+ */
+async function resolveAskingTenant(phone, text, currentTenant) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return null;
+
+  const kind = RATING_REPLY_RE.test(trimmed) ? KINDS.FEEDBACK
+    : CONFIRMATION_REPLY_RE.test(trimmed) ? KINDS.CONFIRMATION
+    : null;
+  if (!kind) return null;
+
+  try {
+    const askingTenantId = await findPendingReplyTenant(phone, kind);
+    if (!askingTenantId || askingTenantId === currentTenant.id) return null;
+
+    // The patient is mid-conversation with their selected clinic — that
+    // conversation owns the message, whatever it looks like.
+    const cur = await tenantQuery(currentTenant.schema_name,
+      `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
+    const curState = cur.rows[0]?.state || 'idle';
+    if (curState !== 'idle' && curState !== 'main_menu') return null;
+
+    const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [askingTenantId]);
+    const asking = r.rows[0];
+    if (!asking) return null;
+
+    // Confirm the other clinic is genuinely still waiting. The pending row is a
+    // hint with a TTL; this is the authoritative check.
+    if (kind === KINDS.FEEDBACK) {
+      const s = await tenantQuery(asking.schema_name,
+        `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
+      if (s.rows[0]?.state !== 'collect_feedback_rating') return null;
+    } else {
+      const c = await tenantQuery(asking.schema_name, `
+        SELECT 1 FROM reminder_confirmations rc
+        JOIN appointments a ON a.id = rc.appointment_id
+        WHERE rc.phone=$1 AND rc.response IS NULL AND a.status='confirmed'
+          AND a.appointment_date >= ${IST_TODAY_SQL}
+        LIMIT 1`, [phone]);
+      if (!c.rows.length) return null;
+    }
+    return asking;
+  } catch (err) {
+    logger.warn('Asking-tenant lookup failed — using the selected clinic', { error: err.message });
+    return null;
+  }
+}
+
+// Per-phone serialisation for the PRE-TENANT stretch of processing.
+//
+// botWorker's lock only starts once a clinic is known, so everything before it
+// — the global-session read, the clinic search, the shortlist write, the
+// wa_messages dedup insert — ran unserialised. Two messages arriving together
+// from a new patient therefore both searched, both wrote the session, and could
+// both send the prompt. The window is short, so the wait is short too: on
+// timeout we process anyway rather than delay the rest of Meta's batch.
+//
+// Note the lock covers the ENQUEUE, not the bot's own handling of the message —
+// the sync fallback deliberately runs fire-and-forget, exactly as before.
+const PRE_TENANT_LOCK = { ttlMs: 10000, maxWaitMs: 4000 };
+
+async function processIncomingMessageSerialized(msg) {
+  const phone = (msg?.from || '').replace(/^\+/, '');
+  if (!phone) return processIncomingMessage(msg);
+
+  const lockKey = `waphone:${phone}`;
+  const { acquired, token } = await acquirePhoneLock(lockKey, PRE_TENANT_LOCK);
+  try {
+    return await processIncomingMessage(msg);
+  } finally {
+    if (acquired) await releasePhoneLock(lockKey, token);
+  }
+}
 
 // One incoming patient message end-to-end: parse → tenant routing → dedup →
 // rate limits → enqueue/sync. Extracted so the POST handler can iterate over
@@ -416,9 +509,13 @@ async function processIncomingMessage(msg) {
       tenant = r.rows[0] || null;
 
       if (!tenant) {
-        // Tenant was deactivated — reset and re-run selection on next message
+        // Tenant was deactivated — reset and re-run selection on next message.
+        // search_matches is cleared too: a shortlist from an earlier search is
+        // no longer on the patient's screen, and leaving it would let a stray
+        // "2" pick a clinic they were never shown.
         await query(
-          `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant', last_activity=NOW() WHERE phone=$1`,
+          `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant',
+             search_matches=NULL, last_activity=NOW() WHERE phone=$1`,
           [phone]
         ).catch(() => {});
         logger.warn('Tenant deactivated — global session reset', { phone: maskPhone(phone) });
@@ -429,6 +526,20 @@ async function processIncomingMessage(msg) {
     if (!tenant) {
       logger.warn('Could not resolve tenant for phone', { phone: maskPhone(phone) });
       return;
+    }
+
+    // ── ANSWERS GO BACK TO WHOEVER ASKED ─────────────────────────
+    // Everything above routes by the clinic the PATIENT chose. Reminders and
+    // feedback requests are asked by a CLINIC, and the answer ("yes", "4")
+    // names nobody — so for a patient who has since switched clinics it landed
+    // in the wrong schema and was silently dropped. Hand it back to the asker
+    // for this message only; the patient's selected clinic is left alone.
+    const redirect = await resolveAskingTenant(phone, text, tenant);
+    if (redirect) {
+      logger.info('Reply redirected to the clinic that asked', {
+        phone: maskPhone(phone), from: tenant.slug, to: redirect.slug,
+      });
+      tenant = redirect;
     }
 
     // Idempotency — atomic INSERT dedup using the unique partial index on
@@ -505,7 +616,9 @@ async function processIncomingMessage(msg) {
     // intercepted here even when a pending confirmation exists. The reminder
     // confirmation handler only accepts pure yes/no-style replies.
     if (text) {
-      const isConfirmReply = /^(yes|no|confirm|haan|nahi|ha|ok|sure|nope)\b/i.test(text.trim());
+      // Same pattern resolveAskingTenant classifies on — one definition, so the
+      // "is this a confirmation?" question can't be answered two ways.
+      const isConfirmReply = CONFIRMATION_REPLY_RE.test(text.trim());
       // Only treat a yes/no as a reminder confirmation when the patient is NOT in
       // the middle of a bot conversation. Otherwise an "ok"/"yes" that's really a
       // booking step (e.g. confirming a slot) would be hijacked and consumed here.
@@ -521,6 +634,11 @@ async function processIncomingMessage(msg) {
       if (isConfirmReply && botSessionState === 'idle') {
         const confirmResult = await handleReminderConfirmation(tenant.schema_name, phone, text).catch(() => false);
         if (confirmResult) {
+          // Answered — stop treating this clinic as waiting. (The feedback
+          // equivalent needs no explicit clear: once the rating is recorded the
+          // session leaves collect_feedback_rating, which is what
+          // resolveAskingTenant verifies, and the row expires on its own.)
+          await clearPendingReply(phone, tenant.id, KINDS.CONFIRMATION);
           if (confirmResult === 'yes') {
             wa.sendText(phone,
               `✅ Thank you for confirming! We'll see you at your appointment. 😊\n\nIf plans change, reply *Reschedule* or *Cancel Appointment*.`,

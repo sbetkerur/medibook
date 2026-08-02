@@ -228,8 +228,13 @@ async function seed() {
   // - exclude slots referenced by appointments: a cancelled appointment keeps
   //   its slot_id while the slot returns to 'available', so deleting the slot
   //   violates the appointments.slot_id FK and aborts the seed
-  // - future-only in IST: regeneration starts at IST-tomorrow, so deleting
-  //   today's rows would wipe same-day availability on every deploy
+  // - future-only in IST: the seed runs on EVERY boot, and deleting today's
+  //   rows would drop same-day availability mid-deploy, including out from
+  //   under a patient part-way through booking. The generator does now produce
+  //   today's remaining slots (see planDoctorSlots), and re-inserting them is
+  //   harmless — ON CONFLICT (doctor_id, slot_date, start_time) DO NOTHING.
+  //   The admin regen path in routes/doctors.js deliberately DOES clear today,
+  //   because there a schedule actually changed and the old grid must go.
   const { generateSlotsForDoctor } = require('../jobs/slotGenerator');
   let slotCount = 0;
   for (const doc of doctorIds) {

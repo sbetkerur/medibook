@@ -25,6 +25,7 @@ cd frontend && npm run dev      # dashboard on :3000
 cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
 cd backend && node tests/clinicSearch.unit.test.js
+cd backend && node tests/slotPlanner.unit.test.js
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -70,6 +71,22 @@ onboarded. Pass
 env vars. `notifyAdminWhatsApp()` fans out to ALL admins with a `notify_phone`
 — call it once per event, never inside a per-admin loop.
 
+**Answers go back to whoever asked.** Inbound routing follows the patient's
+SELECTED clinic, which is wrong for anything a clinic asked unprompted: a
+reminder's "yes" or a feedback "4" from a patient who has since switched
+clinics used to be looked up in the wrong schema and silently dropped. Crons
+that ask a question record it via `services/pendingReply.js`
+(`global_pending_replies`); `resolveAskingTenant` in `routes/webhook.js`
+redirects just that message back to the asker, only when the current clinic's
+session is idle AND the asking clinic is verifiably still waiting. Any new
+clinic-initiated question needs the same `recordPendingReply` call.
+
+**Cron sends must be logged.** Patient-facing messages sent outside botEngine
+go through `services/outbound.js` (`sendPatientText` / `sendPatientTemplate`),
+which writes to `wa_messages`. `wa.sendText`/`sendTemplate` on their own record
+nothing, so anything using them directly is invisible in clinic history and has
+no row for delivery receipts to attach to.
+
 **Bot engine.** `services/botEngine.js` is a state machine over
 `bot_sessions.state` with context stored ENCRYPTED (`{_enc: ...}`, AES-256-GCM
 via `utils/encryption.js`). Always read/write context through
@@ -94,7 +111,10 @@ Appointment status changes must respect `APPOINTMENT_TRANSITIONS`
 the `x-hub-signature-256` HMAC against the RAW body, dedups by `wa_message_id`
 (partial unique index), then enqueues to BullMQ. Every sync fallback must go
 through `processSyncWithRetryFallback` so failures land in `failed_webhooks`
-for the retry cron.
+for the retry cron. Processing is serialised per phone by `utils/phoneLock.js`
+— once before tenant routing (the clinic search and session writes) and again
+in `jobs/botWorker.js` once the clinic is known. Both fail OPEN: a Redis blip
+must never silence the bot.
 
 **Crons.** All crons wrap in `withCronLock(lockName, ttlSeconds, fn)` — the
 TTL argument is REQUIRED (omitting it silently breaks the cron). Slot
@@ -118,9 +138,15 @@ two-clause `OR start_time > now` form matches past dates.
 DATE columns are returned as strings (type parser in `db/index.js`).
 
 **Slot generation.** `jobs/slotGenerator.js` is the single source of truth
-(`computeDaySlotTimes`, `generateSlotsForDoctor`). Any path that creates slots
-must skip doctor leaves, clinic holidays and (feature-flagged) public
-holidays — delegate to `generateSlotsForDoctor`, don't re-implement the loop.
+(`computeDaySlotTimes`, `planDoctorSlots`, `generateSlotsForDoctor`). Any path
+that creates slots must skip doctor leaves, clinic holidays and
+(feature-flagged) public holidays — delegate to `planDoctorSlots`, don't
+re-implement the day loop; the nightly sweep and the per-doctor regen both use
+it. The window starts at TODAY, keeping only slots later than the current IST
+time (`tests/slotPlanner.unit.test.js`) — starting at tomorrow meant a dentist
+added this morning had no same-day availability. Any path that clears slots
+before regenerating must therefore clear today's REMAINING slots too, or the
+old grid survives alongside the new one.
 Slots blocked by a doctor leave carry `blocked_by_leave=true`; removing a leave
 only releases those.
 

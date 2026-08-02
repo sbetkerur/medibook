@@ -1,6 +1,5 @@
 const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
-const wa = require('../services/whatsapp');
 const { forEachActiveTenantParallel } = require('../utils/tenantUtils');
 const { format, parseISO, subWeeks } = require('date-fns');
 const { toZonedTime, IST_TODAY_SQL } = require('../utils/dateTz');
@@ -8,6 +7,13 @@ const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
 const { FEEDBACK_BATCH_LIMIT } = require('../utils/errors');
 const emailService = require('../services/email');
+// Cron sends go through these so they land in the tenant's message history —
+// wa.sendText/sendTemplate on their own do not record anything.
+const { sendPatientText, sendPatientTemplate } = require('../services/outbound');
+// Every message below asks the patient a question. On a shared WhatsApp number
+// the answer routes to whichever clinic the patient last selected, so record
+// who is actually waiting for it (see services/pendingReply.js).
+const { KINDS, recordPendingReply } = require('../services/pendingReply');
 
 // Allow timezone override via env var so multi-region deployments work without code changes
 const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
@@ -16,10 +22,6 @@ const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
 
 async function sendReminders() {
   await forEachActiveTenantParallel('sendReminders', async (tenant) => {
-    // Shared phone — use global META_* env vars
-    const waToken = null;
-    const waPhoneId = null;
-
     // ── CONFIGURABLE REMINDER TIMING ────────────────────────────
     const settings = tenant.settings || {};
     const reminder24hEnabled = settings.reminder_24h_enabled !== false; // default true
@@ -69,8 +71,18 @@ async function sendReminders() {
             ? `\n\n📋 *Checklist for your visit:*\n${appt.pre_visit_checklist}`
             : '';
 
+          const reminderText =
+            `🔔 *Dental Appointment Reminder*\n\nYou have an appointment tomorrow!\n\n` +
+            `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
+            `📅 ${dt} at ${(appt.appointment_time || '').slice(0, 5)}\n` +
+            `🦷 ${appt.hospital_name}` +
+            `\n\n📋 *Before your visit:*\n• Arrive 10 minutes early\n• Bring any previous dental X-rays or records\n• Inform us of any medications or allergies\n• Avoid eating 1 hour before your appointment` +
+            `${departmentChecklist}\n\n` +
+            `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`;
+
           try {
-            await wa.sendTemplate(
+            await sendPatientTemplate(
+              tenant.schema_name,
               appt.phone,
               'appointment_reminder_24h',
               [{
@@ -82,20 +94,10 @@ async function sendReminders() {
                   { type: 'text', text: appt.hospital_name },
                 ]
               }],
-              waToken, waPhoneId
+              reminderText
             );
           } catch (_templateErr) {
-            await wa.sendText(
-              appt.phone,
-              `🔔 *Dental Appointment Reminder*\n\nYou have an appointment tomorrow!\n\n` +
-              `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
-              `📅 ${dt} at ${(appt.appointment_time || '').slice(0, 5)}\n` +
-              `🦷 ${appt.hospital_name}` +
-              `\n\n📋 *Before your visit:*\n• Arrive 10 minutes early\n• Bring any previous dental X-rays or records\n• Inform us of any medications or allergies\n• Avoid eating 1 hour before your appointment` +
-              `${departmentChecklist}\n\n` +
-              `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`,
-              waToken, waPhoneId
-            );
+            await sendPatientText(tenant.schema_name, appt.phone, reminderText);
           }
           await tenantQuery(tenant.schema_name,
             `UPDATE appointments SET reminder_24h_sent=true WHERE id=$1`, [appt.id]);
@@ -107,6 +109,11 @@ async function sendReminders() {
             VALUES ($1, $2)
             ON CONFLICT (appointment_id) DO NOTHING
           `, [appt.id, appt.phone]).catch(e => logger.warn('Failed to insert reminder confirmation record', { appointment_id: appt.id, error: e.message }));
+
+          // The reply ("yes"/"no") must come back to THIS clinic even if the
+          // patient's shared-number session now points at another one. 48h
+          // covers the appointment itself plus a late answer.
+          await recordPendingReply(appt.phone, tenant.id, KINDS.CONFIRMATION, 48);
         } catch (err) {
           logger.error(`24h reminder failed for ${appt.booking_id}`, { error: err.message });
         }
@@ -142,9 +149,24 @@ async function sendReminders() {
       for (const appt of r2.rows) {
         const dayLabel = appt.appointment_date === todayIST ? 'Today' : 'Tomorrow';
         try {
+          // Use checklist already fetched via LEFT JOIN in the main query (no extra DB round-trip)
+          const departmentChecklist = appt.pre_visit_checklist
+            ? `\n\n📋 *Checklist for your visit:*\n${appt.pre_visit_checklist}`
+            : '';
+          // The hourly cron fires this anywhere within the next ${hours2}h window,
+          // so state the exact time rather than an imprecise "in N hours".
+          const reminderText =
+            `⏰ *Reminder: your dental appointment is coming up!*\n\n` +
+            `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
+            `🕐 ${dayLabel} at ${(appt.appointment_time || '').slice(0, 5)}\n\n` +
+            `🦷 *Quick reminders:*\n• Please arrive 10 minutes early\n• Bring any dental X-rays or records\n• Avoid eating 1 hour before your appointment` +
+            `${departmentChecklist}\n\n` +
+            `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`;
+
           // Try template first, fall back to plain text with pre-visit checklist
           try {
-            await wa.sendTemplate(
+            await sendPatientTemplate(
+              tenant.schema_name,
               appt.phone,
               'appointment_reminder_2h',
               [{
@@ -154,26 +176,10 @@ async function sendReminders() {
                   { type: 'text', text: (appt.appointment_time || '').slice(0, 5) },
                 ]
               }],
-              waToken, waPhoneId
+              reminderText
             );
           } catch (_templateErr) {
-            // Use checklist already fetched via LEFT JOIN in the main query (no extra DB round-trip)
-            const departmentChecklist = appt.pre_visit_checklist
-              ? `\n\n📋 *Checklist for your visit:*\n${appt.pre_visit_checklist}`
-              : '';
-
-            await wa.sendText(
-              appt.phone,
-              // The hourly cron fires this anywhere within the next ${hours2}h window,
-              // so state the exact time rather than an imprecise "in N hours".
-              `⏰ *Reminder: your dental appointment is coming up!*\n\n` +
-              `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
-              `🕐 ${dayLabel} at ${(appt.appointment_time || '').slice(0, 5)}\n\n` +
-              `🦷 *Quick reminders:*\n• Please arrive 10 minutes early\n• Bring any dental X-rays or records\n• Avoid eating 1 hour before your appointment` +
-              `${departmentChecklist}\n\n` +
-              `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`,
-              waToken, waPhoneId
-            );
+            await sendPatientText(tenant.schema_name, appt.phone, reminderText);
           }
           await tenantQuery(tenant.schema_name,
             `UPDATE appointments SET reminder_2h_sent=true WHERE id=$1`, [appt.id]);
@@ -193,7 +199,11 @@ async function sendReminders() {
  */
 async function handleReminderConfirmation(schemaName, phone, text) {
   const isYes = /^(yes|confirm|ok|sure|haan|ha|attending)$/i.test(text.trim());
-  const isNo  = /^(no|cancel|nahi|won'?t|not attending)$/i.test(text.trim());
+  // "cancel" is deliberately NOT here: it is a standalone bot command (cancel
+  // appointment), and routes/webhook.js excludes it from the replies it hands
+  // to this function. Accepting it would only ever be dead code — or, if that
+  // filter were relaxed, would swallow a cancellation request as a decline.
+  const isNo  = /^(no|nahi|won'?t|not attending)$/i.test(text.trim());
   if (!isYes && !isNo) return false;
 
   try {
@@ -239,10 +249,6 @@ async function sendPostAppointmentFollowup() {
       return;
     }
 
-    // Shared phone — use global META_* env vars
-    const waToken = null;
-    const waPhoneId = null;
-
     // Use timezone-aware comparison for the same midnight-crossing reason as the 2h
     // reminder above: time-only comparison fails when the 1–2 hour window straddles
     // midnight (e.g. it is 01:30 IST, so 1h-ago = 00:30 and 2h-ago = 23:30).
@@ -262,12 +268,11 @@ async function sendPostAppointmentFollowup() {
     for (const appt of appts.rows) {
       try {
         const firstName = appt.patient_name ? appt.patient_name.split(' ')[0] : 'there';
-        await wa.sendText(appt.phone,
+        await sendPatientText(tenant.schema_name, appt.phone,
           `😊 Hi ${firstName}! How did your visit with Dr. ${appt.doctor_name} go?\n\n` +
           `We'd love your feedback! Rate your experience:\n` +
           `⭐ 1 — Poor\n⭐⭐ 2 — Below Average\n⭐⭐⭐ 3 — Average\n⭐⭐⭐⭐ 4 — Good\n⭐⭐⭐⭐⭐ 5 — Excellent\n\n` +
-          `Just reply with a number 1–5!`,
-          waToken, waPhoneId);
+          `Just reply with a number 1–5!`);
         await tenantQuery(tenant.schema_name,
           `UPDATE appointments SET follow_up_sent=true WHERE id=$1`, [appt.id]);
         // Trigger feedback state in bot session.
@@ -278,6 +283,10 @@ async function sendPostAppointmentFollowup() {
         // first. sendFeedbackRequests below already carries patient_id correctly.
         const { triggerFeedback } = require('../services/botEngine');
         await triggerFeedback(tenant.schema_name, appt.phone, appt.id, appt.patient_id, appt.doctor_name);
+        // The rating flow was armed in THIS tenant's bot session — make sure a
+        // bare "4" finds its way back here (24h; a rating older than that is
+        // not worth hijacking a message for).
+        await recordPendingReply(appt.phone, tenant.id, KINDS.FEEDBACK, 24);
         logger.info(`Post-appointment follow-up sent: ${appt.booking_id}`);
       } catch (err) {
         logger.error(`Follow-up failed for ${appt.booking_id}`, { error: err.message });
@@ -291,10 +300,6 @@ async function sendFeedbackRequests() {
   const { triggerFeedback } = require('../services/botEngine');
 
   await forEachActiveTenantParallel('sendFeedbackRequests', async (tenant) => {
-    // Shared phone — use global META_* env vars
-    const waToken = null;
-    const waPhoneId = null;
-
     // Skip appointments that already received the 2-hour post-appointment
     // follow-up (follow_up_sent) so patients aren't asked for feedback twice.
     const appts = await tenantQuery(tenant.schema_name, `
@@ -342,7 +347,7 @@ async function sendFeedbackRequests() {
             `4 ⭐⭐⭐⭐ — Good\n` +
             `5 ⭐⭐⭐⭐⭐ — Excellent\n\n` +
             `Just reply with a number *1–5*. Takes 5 seconds! 🙏`;
-        await wa.sendText(appt.phone, message, waToken, waPhoneId);
+        await sendPatientText(tenant.schema_name, appt.phone, message);
         // Only arm the rating flow for completed visits — no_show patients got
         // a rebook nudge, not a rating request.
         if (appt.status !== 'no_show') {
@@ -353,6 +358,10 @@ async function sendFeedbackRequests() {
             appt.patient_id,
             appt.doctor_name
           );
+          // Same reason as the follow-up above: the rating must come back to
+          // the clinic whose session is armed for it. no_show patients got a
+          // rebook nudge, not a question, so nothing to wait for.
+          await recordPendingReply(appt.phone, tenant.id, KINDS.FEEDBACK, 24);
         }
         // Mark AFTER a successful send so a failed send is retried on the next
         // run rather than silently consumed (same policy as reminder_*_sent).

@@ -212,6 +212,9 @@ async function notifyAdminWhatsApp(schema, tenant, message) {
     for (const admin of adminUsers.rows) {
       try {
         await wa.sendText(admin.notify_phone, message, null, null);
+        // Recorded like any other outbound message, but under its own type so a
+        // conversation view can keep staff alerts out of patient threads.
+        await logMessage(schema, admin.notify_phone, 'out', 'admin_alert', message, null);
       } catch (err) {
         logger.warn('Admin WhatsApp alert failed', { error: err.message });
       }

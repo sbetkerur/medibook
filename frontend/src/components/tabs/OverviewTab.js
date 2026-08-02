@@ -1,0 +1,131 @@
+'use client';
+import api from '@/lib/api';
+import toast from 'react-hot-toast';
+import StatCard from '@/components/ui/StatCard';
+import Badge from '@/components/ui/Badge';
+
+/**
+ * Dashboard landing tab: the stat row, today's schedule and quick actions.
+ * Extracted from dashboard/page.js verbatim — behaviour unchanged.
+ */
+export default function OverviewTab({
+  loading,
+  stats,
+  statsLastUpdated,
+  statsRefreshing,
+  fetchStats,
+  analyticsSummary,
+  setTab,
+  exportCSV,
+}) {
+  return (
+    <div className="space-y-6">
+      {loading ? (
+        <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 md:gap-4">
+          {[1,2,3,4,5].map(i => (
+            <div key={i} className="bg-white rounded-xl p-5 border-l-4 border-gray-200 shadow-sm animate-pulse">
+              <div className="flex items-center justify-between">
+                <div className="space-y-2">
+                  <div className="h-3 w-20 bg-gray-200 rounded" />
+                  <div className="h-8 w-12 bg-gray-200 rounded" />
+                </div>
+                <div className="h-8 w-8 bg-gray-200 rounded-full" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <>
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs text-gray-400">
+            {statsLastUpdated ? `Updated ${statsLastUpdated.toLocaleTimeString()}` : ''}
+            {statsRefreshing && <span className="ml-2 text-blue-500 animate-pulse">↻ Refreshing...</span>}
+          </span>
+          <button onClick={() => fetchStats(true)} disabled={statsRefreshing}
+            className="text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50 transition">
+            ↻ Refresh
+          </button>
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 md:gap-4">
+          <StatCard label="Today" value={stats?.today_appointments} icon="📅" color="border-blue-500" />
+          <StatCard label="Upcoming" value={stats?.upcoming_appointments} icon="🗓" color="border-green-500" />
+          <StatCard label="Patients" value={stats?.total_patients} icon="👥" color="border-purple-500" />
+          <StatCard label="Open Slots" value={stats?.available_slots} icon="⏰" color="border-orange-500" />
+          <StatCard
+            label="Revenue (30d)"
+            value={analyticsSummary ? `₹${Number(analyticsSummary.revenue_30d || 0).toLocaleString('en-IN')}` : '—'}
+            icon="💰"
+            color="border-yellow-500"
+            sub={analyticsSummary ? `${analyticsSummary.no_show_rate || 0}% no-show` : undefined}
+          />
+        </div>
+        </>
+      )}
+
+      {/* Today's schedule skeleton */}
+      {loading && (
+        <div className="bg-white rounded-xl shadow-sm overflow-hidden animate-pulse">
+          <div className="px-5 py-4 border-b border-gray-100">
+            <div className="h-4 w-32 bg-gray-200 rounded" />
+          </div>
+          <div className="divide-y divide-gray-50">
+            {[1,2,3].map(i => (
+              <div key={i} className="px-5 py-3 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="h-4 w-10 bg-gray-200 rounded" />
+                  <div className="space-y-1.5">
+                    <div className="h-3 w-28 bg-gray-200 rounded" />
+                    <div className="h-2.5 w-20 bg-gray-100 rounded" />
+                  </div>
+                </div>
+                <div className="h-5 w-16 bg-gray-200 rounded-full" />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Today's schedule */}
+      {!loading && stats?.todays_schedule?.length > 0 && (
+        <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100">
+            <h2 className="font-semibold text-gray-800">Today's Schedule</h2>
+          </div>
+          <div className="divide-y divide-gray-50">
+            {stats.todays_schedule.map((a, i) => (
+              <div key={i} className="px-5 py-3 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="text-sm font-medium text-blue-600 w-12">{a.appointment_time?.slice(0,5)}</div>
+                  <div>
+                    <div className="text-sm font-medium text-gray-900">{a.patient_name}</div>
+                    <div className="text-xs text-gray-500">Dr. {a.doctor_name}</div>
+                  </div>
+                </div>
+                <Badge status={a.status} />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl p-5 shadow-sm">
+        <h3 className="font-semibold text-gray-800 mb-3">Quick Actions</h3>
+        <div className="flex flex-wrap gap-3">
+          <button onClick={() => setTab('appointments')} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">View All Appointments</button>
+          <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Dentists</button>
+          <button onClick={() => setTab('test')} className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700 transition">Test WhatsApp Bot</button>
+          <button onClick={async () => {
+            // Fetch fresh rows instead of racing the appointments tab's
+            // state via setTimeout — the old approach exported whatever
+            // stale (usually empty) list was in memory.
+            setTab('appointments');
+            try {
+              const { data } = await api.get('/admin/appointments?limit=100&page=1');
+              exportCSV(data.appointments || []);
+            } catch { toast.error('Failed to export'); }
+          }} className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">Export CSV</button>
+        </div>
+      </div>
+    </div>
+  );
+}

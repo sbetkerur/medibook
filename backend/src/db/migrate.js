@@ -483,6 +483,30 @@ async function migrate() {
       `);
     });
 
+    // Version 21: which clinic is waiting for a reply from this phone.
+    // Inbound messages are routed by the patient's CURRENTLY SELECTED clinic
+    // (global_bot_sessions). But reminders and feedback requests are sent per
+    // tenant by the crons and expect an answer — so a patient who books at
+    // clinic A, switches to clinic B, then replies "yes" to A's reminder had
+    // that confirmation looked up in B's schema, found nothing, and silently
+    // lost. This table lets the webhook hand such a reply back to the clinic
+    // that actually asked. Rows are short-lived and best-effort.
+    await runMigration(client, 21, 'global_pending_replies', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS global_pending_replies (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          phone VARCHAR(20) NOT NULL,
+          tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          kind VARCHAR(20) NOT NULL,
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          UNIQUE (phone, tenant_id, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_replies_lookup
+          ON global_pending_replies(phone, kind, expires_at);
+      `);
+    });
+
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
     // Only claim this when a super admin was actually seeded — otherwise the
