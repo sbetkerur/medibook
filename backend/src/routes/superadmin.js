@@ -241,7 +241,7 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
 // ── CREATE TENANT ─────────────────────────────────────────────
 router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), async (req, res) => {
   try {
-    const { name, slug, owner_email, owner_password, owner_name, plan } = req.body;
+    const { name, slug, owner_email, owner_password, owner_name, plan, city } = req.body;
 
     const schema = 'tenant_' + slug.replace(/-/g, '_').toLowerCase();
 
@@ -251,9 +251,9 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
 
     // Phase 1: insert tenant record (WA credentials are now global — no per-tenant fields)
     const r = await query(`
-      INSERT INTO tenants (name, slug, schema_name, owner_email, plan)
-      VALUES ($1,$2,$3,$4,$5) RETURNING *
-    `, [name, slug, schema, owner_email, plan || 'starter']);
+      INSERT INTO tenants (name, slug, schema_name, owner_email, plan, city)
+      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *
+    `, [name, slug, schema, owner_email, plan || 'starter', city?.trim() || null]);
     const tenant = r.rows[0];
 
     // Phase 2 & 3: create schema + admin user — rollback both if either fails
@@ -315,7 +315,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
 // ── UPDATE TENANT ─────────────────────────────────────────────
 router.patch('/tenants/:id', validateUUID(), async (req, res) => {
   try {
-    const { status, plan, name, suspension_reason } = req.body;
+    const { status, plan, name, suspension_reason, city } = req.body;
 
     const VALID_STATUSES = ['active', 'suspended', 'inactive'];
     if (status && !VALID_STATUSES.includes(status)) {
@@ -341,6 +341,13 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
       return res.status(400).json({ error: `Invalid plan. Must be one of: ${VALID_PLANS.join(', ')}` });
     }
     if (plan) { params.push(plan); updates.push(`plan=$${params.length}`); }
+    // `!== undefined`, not truthiness like the fields above: a wrong city must be
+    // removable, and '' / null are the only ways to say "unset". The bot filters
+    // on a non-null city, so it is stored as NULL rather than an empty string.
+    if (city !== undefined) {
+      params.push(typeof city === 'string' ? (city.trim() || null) : null);
+      updates.push(`city=$${params.length}`);
+    }
 
     if (!updates.length) return res.json({ message: 'Nothing to update' });
 

@@ -141,13 +141,67 @@ function shortLabel(name) {
   return kept.length >= 5 ? kept : full;
 }
 
+/**
+ * City names are compared on their own normalizer, not `normalize()` above:
+ * that one strips "dental"/"clinic" as noise, which is right for a clinic name
+ * and wrong for a place name.
+ */
+function normalizeCity(value) {
+  return String(value == null ? '' : value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+// Cities are short ("Pune", "Goa"), so the 3-char floor that protects the
+// clinic search would reject real answers. Two is the shortest that is still
+// evidence of intent.
+const MIN_CITY_QUERY_LEN = 2;
+
+/**
+ * Resolve what a patient typed against the cities that actually have active
+ * clinics.
+ *
+ * Deliberately stricter than `searchTenants`: the candidate set is small and
+ * controlled, so exact-then-prefix is enough, and typo tolerance here would be
+ * actively harmful — "Mysore"/"Mysuru" style near-misses would silently send a
+ * patient the wrong city's clinics. Returns null when nothing matches OR when
+ * more than one city does, so the caller re-asks rather than guessing. Same
+ * rule as `fuzzyFind`: ambiguity is never resolved by list order.
+ */
+function matchCity(cities, input) {
+  const q = normalizeCity(input);
+  if (q.length < MIN_CITY_QUERY_LEN) return null;
+  const list = (Array.isArray(cities) ? cities : []).filter(Boolean);
+
+  // Compared with spaces collapsed as well as kept, the same trick searchTenants
+  // uses: multi-word cities are written both ways in practice, so "newdelhi"
+  // has to reach "New Delhi". This is still exact matching — it widens what
+  // counts as the SAME string, it does not tolerate a typo.
+  const collapse = s => s.replace(/\s+/g, '');
+  const qJoined = collapse(q);
+  const indexed = list.map(city => {
+    const n = normalizeCity(city);
+    return { city, n, joined: collapse(n) };
+  });
+
+  const exact = indexed.filter(e => e.n === q || e.joined === qJoined);
+  if (exact.length) return exact.length === 1 ? exact[0].city : null;
+
+  const prefix = indexed.filter(e => e.n.startsWith(q) || e.joined.startsWith(qJoined));
+  return prefix.length === 1 ? prefix[0].city : null;
+}
+
 module.exports = {
   IGNORED_WORDS,
   shortLabel,
   MIN_QUERY_LEN,
+  MIN_CITY_QUERY_LEN,
   MAX_SHORTLIST,
   tokenize,
   normalize,
+  normalizeCity,
   isQueryTooGeneric,
   searchTenants,
+  matchCity,
 };

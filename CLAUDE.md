@@ -25,6 +25,9 @@ cd frontend && npm run dev      # dashboard on :3000
 cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
 cd backend && node tests/clinicSearch.unit.test.js
+cd backend && node tests/clinicNearby.unit.test.js   # "clinics near me" entry
+cd backend && node tests/clinicNearbyFlow.test.js    # entry routing e2e (needs DB;
+                                                     # seeds + drops its own tenants)
 cd backend && node tests/slotPlanner.unit.test.js
 cd backend && node tests/restartGreeting.unit.test.js
 ```
@@ -67,7 +70,23 @@ down). "Dental"/"clinic" are stripped from both the query and the tenant names,
 so a query of only those words is refused rather than matching everyone. The
 search runs even when exactly ONE tenant is active — there is deliberately no
 auto-assign shortcut, so the entry step doesn't change shape as clinics are
-onboarded. Pass
+onboarded.
+
+**"Clinics near me" is the second entry, never the first.** The name search
+stays the primary path; the entry prompt merely ALSO offers a location button
+(`NEARBY_RE` in `routes/webhook.js`), and only when some tenant actually has a
+city — otherwise the button would dead-end. Tapping it parks the session in
+`select_city` and asks for a city; picking one lists just that city's clinics
+(≤10, WhatsApp's row cap) into the same `search_matches` shortlist the name
+search uses, so a numbered reply resolves identically. Two rules carry over
+unchanged: a city with exactly ONE clinic is still shown as a list rather than
+auto-attached (choosing a city is not naming a clinic), and the full roster is
+still never listed. The trigger is matched on message TEXT, not the interactive
+reply id — `wa.sendButtons` mints its own opaque ids — and deliberately does NOT
+accept a bare "city"/"near", which would shadow real searches like "City Dental
+Care". Clinic city lives in `tenants.city` (public schema, indexed on
+`lower(city)`); it was previously read from `settings->>'city'`, which nothing
+ever wrote. A clinic with no city is invisible to this path. Pass
 `null, null` for token/phoneId to the `whatsapp.js` senders — they fall back to
 env vars. `notifyAdminWhatsApp()` fans out to ALL admins with a `notify_phone`
 — call it once per event, never inside a per-admin loop.

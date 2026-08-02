@@ -105,6 +105,20 @@ async function migrate() {
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT false;
     `);
 
+    // ── TENANTS: city ─────────────────────────────────────────
+    // A real column, not settings->>'city': the bot looks clinics up by city at
+    // first contact, and a JSONB key can't be indexed case-insensitively without
+    // an expression index over the extracted text anyway. The UPDATE is a
+    // one-time backfill of any hand-written settings.city so the column becomes
+    // the single source of truth rather than orphaning that value; it is scoped
+    // to `city IS NULL` so re-running migrate on every boot never overwrites an
+    // edit made through the super admin API.
+    await client.query(`
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS city VARCHAR(100);
+      CREATE INDEX IF NOT EXISTS idx_tenants_city ON tenants(lower(city));
+      UPDATE tenants SET city = settings->>'city' WHERE city IS NULL AND settings->>'city' IS NOT NULL;
+    `);
+
     // ── ADMIN ACCESS LOGS ─────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS admin_access_logs (

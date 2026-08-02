@@ -40,8 +40,8 @@ async function seed() {
   let tenant = (await query(`SELECT * FROM tenants WHERE slug=$1`, [slug])).rows[0];
   if (!tenant) {
     const r = await query(`
-      INSERT INTO tenants (name, slug, schema_name, owner_email, plan, status)
-      VALUES ('Smile Dental Clinic', $1, $2, 'demo@medibook.com', 'growth', 'active')
+      INSERT INTO tenants (name, slug, schema_name, owner_email, plan, status, city)
+      VALUES ('Smile Dental Clinic', $1, $2, 'demo@medibook.com', 'growth', 'active', 'Bengaluru')
       RETURNING *
     `, [slug, schema]);
     tenant = r.rows[0];
@@ -61,6 +61,11 @@ async function seed() {
     } else {
       console.log(`✅ Tenant exists: ${tenant.name} (name left as-is; SEED_DEMO_RESET=true restores demo defaults)`);
     }
+    // Fill the city only when unset: a demo tenant seeded before the city column
+    // existed would otherwise stay NULL forever and be invisible to the bot's
+    // city lookup. Scoped to `city IS NULL` so, unlike the name above, it can
+    // never revert a value an operator set — no SEED_DEMO_RESET gate needed.
+    await query(`UPDATE tenants SET city='Bengaluru' WHERE slug=$1 AND city IS NULL`, [slug]);
     await runTenantMigrations(schema);
   }
 

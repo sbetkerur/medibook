@@ -25,7 +25,7 @@ export default function NewTenantPage() {
   const [createdTenant, setCreatedTenant] = useState(null);
   const [showPassword, setShowPassword] = useState(false);
   const [form, setForm] = useState({
-    name: '', slug: '', owner_email: '', owner_name: '', owner_password: '',
+    name: '', slug: '', city: '', owner_email: '', owner_name: '', owner_password: '',
     plan: 'starter',
   });
 
@@ -53,6 +53,9 @@ export default function NewTenantPage() {
       if (!/^[a-z0-9-]+$/.test(form.slug)) { toast.error('Slug must be lowercase letters, numbers, and hyphens only'); return false; }
       if (!form.owner_email.trim()) { toast.error('Owner email is required'); return false; }
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.owner_email)) { toast.error('Invalid email address'); return false; }
+      // City is optional and never blocks creation — only normalised, so the
+      // review step and the create payload agree on what was actually typed.
+      if (form.city !== form.city.trim()) setForm(f => ({ ...f, city: f.city.trim() }));
     }
     if (step === 2) {
       if (!form.plan) { toast.error('Select a plan'); return false; }
@@ -72,6 +75,7 @@ export default function NewTenantPage() {
       const { data } = await api.post('/superadmin/tenants', {
         name: form.name.trim(),
         slug: form.slug.trim(),
+        city: form.city.trim() || undefined,
         owner_email: form.owner_email.trim(),
         owner_name: form.owner_name.trim() || form.name.trim() + ' Admin',
         owner_password: form.owner_password.trim() || undefined,
@@ -93,28 +97,31 @@ export default function NewTenantPage() {
   if (step === 5 && createdTenant) {
     const creds = createdTenant.credentials;
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
-        <div className="bg-white rounded-2xl shadow-xl p-8 w-full max-w-lg">
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4 sm:p-6">
+        <div className="bg-white rounded-2xl shadow-xl p-5 sm:p-8 w-full max-w-lg">
           <div className="text-center mb-6">
             <div className="text-5xl mb-3">🎉</div>
             <h1 className="text-2xl font-bold text-gray-900">Clinic Created!</h1>
-            <p className="text-gray-500 text-sm mt-1">{createdTenant.tenant.name} is ready to use</p>
+            <p className="text-gray-500 text-sm mt-1 break-words">{createdTenant.tenant.name} is ready to use</p>
           </div>
 
+          {/* break-all on every value: generated passwords and clinic emails are
+              single unbreakable tokens and would otherwise push this card wider
+              than a 320px viewport. */}
           <div className="bg-gray-50 rounded-xl p-4 mb-5 font-mono text-sm space-y-2">
             <p className="text-xs font-semibold text-gray-500 uppercase mb-3">Login Credentials</p>
-            <div className="flex justify-between"><span className="text-gray-500">Email:</span><span className="font-medium">{creds.email}</span></div>
-            <div className="flex justify-between items-center gap-2">
-              <span className="text-gray-500">Password:</span>
-              <div className="flex items-center gap-2">
-                <span className="font-medium">{showPassword ? creds.password : '••••••••••••'}</span>
+            <div className="flex justify-between gap-3"><span className="text-gray-500 shrink-0">Email:</span><span className="font-medium break-all text-right">{creds.email}</span></div>
+            <div className="flex justify-between items-start gap-2">
+              <span className="text-gray-500 shrink-0">Password:</span>
+              <div className="flex items-start gap-2 min-w-0">
+                <span className="font-medium break-all text-right">{showPassword ? creds.password : '••••••••••••'}</span>
                 <button type="button" onClick={() => setShowPassword(v => !v)}
                   className="text-xs text-blue-500 hover:text-blue-700 underline shrink-0">
                   {showPassword ? 'Hide' : 'Show'}
                 </button>
               </div>
             </div>
-            <div className="flex justify-between"><span className="text-gray-500">Clinic Slug:</span><span className="font-medium text-blue-600">{creds.tenant_slug}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-gray-500 shrink-0">Clinic Slug:</span><span className="font-medium text-blue-600 break-all text-right">{creds.tenant_slug}</span></div>
           </div>
 
           <div className="bg-blue-50 rounded-xl p-4 mb-6">
@@ -122,14 +129,16 @@ export default function NewTenantPage() {
             <ol className="text-sm text-blue-800 space-y-2">
               <li>1. Save the credentials above — the password cannot be recovered</li>
               <li>2. Configure WhatsApp in Meta Developer Console if not done</li>
-              <li>3. Set webhook URL: <code className="bg-blue-100 px-1 rounded">/api/webhook/whatsapp</code></li>
+              <li>3. Set webhook URL: <code className="bg-blue-100 px-1 rounded break-all">/api/webhook/whatsapp</code></li>
               <li>4. Log in as clinic admin and add doctors &amp; schedules</li>
               <li>5. Generate appointment slots from the Slots tab</li>
               <li>6. Test the bot via the Bot Tester tab</li>
             </ol>
           </div>
 
-          <div className="flex gap-3">
+          {/* Stacked below sm: these buttons carry no horizontal padding, so side
+              by side their labels alone are wider than a 320px card. */}
+          <div className="flex flex-col sm:flex-row gap-3">
             <button
               onClick={() => { navigator.clipboard.writeText(`Email: ${creds.email}\nPassword: ${creds.password}\nSlug: ${creds.tenant_slug}`); toast.success('Copied!'); }}
               className="flex-1 border border-gray-300 text-gray-700 py-2.5 rounded-lg text-sm font-medium hover:bg-gray-50 transition">
@@ -148,11 +157,11 @@ export default function NewTenantPage() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      <nav className="bg-white border-b border-gray-200 px-6 py-4 flex items-center gap-4">
-        <button onClick={() => router.push('/superadmin')} className="text-gray-400 hover:text-gray-600 text-xl">←</button>
-        <div>
-          <h1 className="font-semibold text-gray-900">New Clinic Onboarding</h1>
-          <p className="text-xs text-gray-500">Step {step} of 4 — {STEPS[step - 1]}</p>
+      <nav className="bg-white border-b border-gray-200 px-4 sm:px-6 py-4 flex items-center gap-3 sm:gap-4">
+        <button onClick={() => router.push('/superadmin')} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">←</button>
+        <div className="min-w-0">
+          <h1 className="font-semibold text-gray-900 truncate">New Clinic Onboarding</h1>
+          <p className="text-xs text-gray-500 truncate">Step {step} of 4 — {STEPS[step - 1]}</p>
         </div>
       </nav>
 
@@ -161,12 +170,15 @@ export default function NewTenantPage() {
         <div className="h-full bg-blue-600 transition-all duration-300" style={{ width: `${(step / 4) * 100}%` }} />
       </div>
 
-      <div className="max-w-2xl mx-auto p-6">
-        {/* Step indicators */}
+      <div className="max-w-2xl mx-auto p-4 sm:p-6">
+        {/* Step indicators. Below sm the labels are hidden, so only the four
+            32px circles and the connectors have to fit: at 320px the original
+            w-8 + mx-2 connectors summed to exactly the available width with no
+            slack, hence the narrower mobile connector. */}
         <div className="flex items-center justify-between mb-8">
           {STEPS.map((label, i) => (
             <div key={i} className="flex items-center">
-              <div className={`flex items-center justify-center w-8 h-8 rounded-full text-sm font-medium transition-colors ${
+              <div className={`flex items-center justify-center w-8 h-8 shrink-0 rounded-full text-sm font-medium transition-colors ${
                 i + 1 < step ? 'bg-green-500 text-white' :
                 i + 1 === step ? 'bg-blue-600 text-white' :
                 'bg-gray-200 text-gray-500'
@@ -176,12 +188,12 @@ export default function NewTenantPage() {
               <span className={`ml-2 text-xs hidden sm:block ${i + 1 === step ? 'font-medium text-gray-900' : 'text-gray-400'}`}>
                 {label}
               </span>
-              {i < STEPS.length - 1 && <div className="w-8 sm:w-12 h-px bg-gray-200 mx-2" />}
+              {i < STEPS.length - 1 && <div className="w-4 sm:w-12 h-px bg-gray-200 mx-1 sm:mx-2" />}
             </div>
           ))}
         </div>
 
-        <div className="bg-white rounded-2xl shadow-sm p-6">
+        <div className="bg-white rounded-2xl shadow-sm p-4 sm:p-6">
           {/* STEP 1: Clinic Info */}
           {step === 1 && (
             <div className="space-y-4">
@@ -203,6 +215,17 @@ export default function NewTenantPage() {
                     placeholder="smile-dental"
                     className="flex-1 px-3 py-2 text-sm focus:outline-none" />
                 </div>
+              </div>
+              {/* City sits with the clinic fields, not the admin ones: it describes
+                  where the clinic IS, and is what the bot matches on for
+                  "clinics near me". Optional — a clinic without one still works,
+                  it just never surfaces in a near-me search. */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">City <span className="text-gray-400 font-normal">(used for &quot;clinics near me&quot; search)</span></label>
+                <input value={form.city} onChange={e => set('city', e.target.value)}
+                  maxLength={100}
+                  placeholder="e.g. Bengaluru"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Admin Name</label>
@@ -285,14 +308,18 @@ export default function NewTenantPage() {
                 {[
                   { label: 'Clinic Name', value: form.name },
                   { label: 'Slug', value: form.slug, mono: true },
+                  // Shown even when blank: a missing city silently keeps the clinic
+                  // out of the bot's "near me" results, so its absence has to be
+                  // visible here rather than discovered later.
+                  { label: 'City', value: form.city.trim() || '— not set —' },
                   { label: 'Admin Email', value: form.owner_email },
                   { label: 'Admin Name', value: form.owner_name || `${form.name} Admin` },
                   { label: 'Plan', value: selectedPlan ? `${selectedPlan.name} (${selectedPlan.price_monthly === 0 ? 'Free' : '₹' + selectedPlan.price_monthly + '/mo'})` : form.plan },
                   { label: 'WhatsApp', value: 'Shared global number' },
                 ].map(({ label, value, mono }) => (
-                  <div key={label} className="flex justify-between items-center px-4 py-3 text-sm">
-                    <span className="text-gray-500">{label}</span>
-                    <span className={`font-medium text-gray-900 ${mono ? 'font-mono text-blue-600' : ''}`}>{value}</span>
+                  <div key={label} className="flex justify-between items-start gap-3 px-4 py-3 text-sm">
+                    <span className="text-gray-500 shrink-0">{label}</span>
+                    <span className={`font-medium text-gray-900 min-w-0 text-right break-words ${mono ? 'font-mono text-blue-600 break-all' : ''}`}>{value}</span>
                   </div>
                 ))}
               </div>
@@ -303,19 +330,19 @@ export default function NewTenantPage() {
           )}
 
           {/* Navigation */}
-          <div className="flex items-center justify-between mt-6 pt-5 border-t border-gray-100">
+          <div className="flex flex-wrap items-center justify-between gap-3 mt-6 pt-5 border-t border-gray-100">
             <button onClick={() => step === 1 ? router.push('/superadmin') : setStep(s => s - 1)}
-              className="px-5 py-2.5 text-sm text-gray-600 hover:text-gray-900 border border-gray-300 rounded-lg transition hover:bg-gray-50">
+              className="px-4 sm:px-5 py-2.5 text-sm text-gray-600 hover:text-gray-900 border border-gray-300 rounded-lg transition hover:bg-gray-50 whitespace-nowrap">
               {step === 1 ? 'Cancel' : '← Back'}
             </button>
             {step < 4 ? (
               <button onClick={next}
-                className="px-5 py-2.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium">
+                className="px-4 sm:px-5 py-2.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium whitespace-nowrap">
                 Next →
               </button>
             ) : (
               <button onClick={create} disabled={creating}
-                className="px-6 py-2.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium disabled:opacity-50 flex items-center gap-2">
+                className="px-4 sm:px-6 py-2.5 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium disabled:opacity-50 flex items-center gap-2 whitespace-nowrap">
                 {creating ? (
                   <><span className="animate-spin">⏳</span> Creating...</>
                 ) : (
