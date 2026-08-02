@@ -72,7 +72,7 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
 
   return (
     <div className="max-w-2xl space-y-6">
-      <div className="bg-white rounded-xl p-6 shadow-sm">
+      <div className="bg-white rounded-xl p-4 sm:p-6 shadow-sm">
         <h2 className="font-semibold text-gray-800 mb-5">Clinic Settings</h2>
         {settings === null ? (
           <div className="text-gray-400 py-8 text-center">Loading settings...</div>
@@ -123,7 +123,7 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
             <div className="pt-4">
               {isAdmin ? (
                 <button type="submit" disabled={settingsSaving}
-                  className="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
+                  className="w-full sm:w-auto px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
                   {settingsSaving ? 'Saving...' : '💾 Save Settings'}
                 </button>
               ) : (
@@ -189,7 +189,9 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
             </div>
           )}
           {/* Account info */}
-          <div className="bg-gray-50 rounded-xl p-4 border border-gray-200 text-xs text-gray-500 space-y-1.5">
+          {/* break-words: the owner email and slug are single unbreakable tokens
+              that would otherwise push this card past a 320px viewport. */}
+          <div className="bg-gray-50 rounded-xl p-4 border border-gray-200 text-xs text-gray-500 space-y-1.5 break-words">
             <p><strong className="text-gray-700">Tenant slug:</strong> {settings.slug}</p>
             <p><strong className="text-gray-700">Plan:</strong> {settings.plan}</p>
             <p><strong className="text-gray-700">Owner:</strong> {settings.owner_email}</p>
@@ -199,7 +201,7 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
       )}
 
       {/* Change Password */}
-      <div className="bg-white rounded-xl p-6 shadow-sm">
+      <div className="bg-white rounded-xl p-4 sm:p-6 shadow-sm">
         <h2 className="font-semibold text-gray-800 mb-1">Change Password</h2>
         <p className="text-xs text-gray-400 mb-5">Update your account password. Must be 8+ chars with uppercase, lowercase and a digit.</p>
         <form onSubmit={changePassword} className="space-y-3">
@@ -234,7 +236,7 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
           )}
           <div className="pt-2">
             <button type="submit" disabled={changingPwd || (changePwdForm.confirm_password && changePwdForm.new_password !== changePwdForm.confirm_password)}
-              className="px-6 py-2.5 bg-gray-800 text-white rounded-lg text-sm font-medium hover:bg-gray-900 disabled:opacity-50 transition">
+              className="w-full sm:w-auto px-6 py-2.5 bg-gray-800 text-white rounded-lg text-sm font-medium hover:bg-gray-900 disabled:opacity-50 transition">
               {changingPwd ? 'Changing...' : '🔒 Change Password'}
             </button>
           </div>

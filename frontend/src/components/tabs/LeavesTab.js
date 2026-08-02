@@ -111,15 +111,18 @@ export default function LeavesTab({ isAdmin, setConfirmModal }) {
               {isAdmin && (
               <div className="bg-white rounded-xl p-5 shadow-sm">
                 <h3 className="font-semibold text-gray-800 mb-4">Add Leave — Dr. {leavesDoctor.name}</h3>
+                {/* Fields go full width below sm and only sit side by side once
+                    there is room — a date input's intrinsic width is browser
+                    dependent and can crowd the row on a narrow phone. */}
                 <div className="flex flex-wrap gap-3 items-end">
-                  <div>
+                  <div className="w-full sm:w-auto">
                     <label className="block text-xs font-medium text-gray-700 mb-1">Leave Date *</label>
                     <input type="date" value={leaveDate}
                       onChange={e => setLeaveDate(e.target.value)}
                       min={todayIST()}
-                      className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                      className="w-full sm:w-auto border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
                   </div>
-                  <div className="flex-1 min-w-[160px]">
+                  <div className="w-full sm:flex-1 sm:w-auto sm:min-w-[160px]">
                     <label className="block text-xs font-medium text-gray-700 mb-1">Reason (optional)</label>
                     <input value={leaveReason}
                       onChange={e => setLeaveReason(e.target.value)}
@@ -127,7 +130,7 @@ export default function LeavesTab({ isAdmin, setConfirmModal }) {
                       className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
                   </div>
                   <button onClick={addLeave} disabled={leaveSaving || !leaveDate}
-                    className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition whitespace-nowrap">
+                    className="w-full sm:w-auto px-4 py-2.5 sm:py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition whitespace-nowrap">
                     {leaveSaving ? 'Adding...' : '+ Add Leave'}
                   </button>
                 </div>
@@ -139,7 +142,7 @@ export default function LeavesTab({ isAdmin, setConfirmModal }) {
 
               {/* Existing leaves */}
               <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+                <div className="px-4 sm:px-5 py-3 border-b border-gray-100 flex items-center justify-between gap-2">
                   <h3 className="font-medium text-gray-800">Scheduled Leaves</h3>
                   <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">
                     {leaves.length} date{leaves.length !== 1 ? 's' : ''}
@@ -156,16 +159,16 @@ export default function LeavesTab({ isAdmin, setConfirmModal }) {
                 ) : (
                   <div className="divide-y divide-gray-50">
                     {leaves.map(l => (
-                      <div key={l.id} className="px-5 py-3 flex items-center justify-between">
-                        <div>
+                      <div key={l.id} className="px-4 sm:px-5 py-3 flex items-center justify-between gap-3">
+                        <div className="min-w-0">
                           <div className="text-sm font-medium text-gray-900">
                             {(() => { try { return format(parseISO(l.leave_date), 'EEEE, d MMMM yyyy'); } catch { return l.leave_date; } })()}
                           </div>
-                          {l.reason && <div className="text-xs text-gray-400 mt-0.5">{l.reason}</div>}
+                          {l.reason && <div className="text-xs text-gray-400 mt-0.5 break-words">{l.reason}</div>}
                         </div>
                         {isAdmin && (
                         <button onClick={() => removeLeave(leavesDoctor.id, l.leave_date)}
-                          className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition">
+                          className="px-3 py-2 sm:px-2 sm:py-1 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition shrink-0">
                           Remove
                         </button>
                         )}

@@ -50,8 +50,11 @@ export default function HospitalsTab({
             const depts = deptsByHospital[h.id] || [];
             return (
               <div key={h.id} className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                <div className="px-5 py-4 flex items-start justify-between border-b border-gray-50">
-                  <div>
+                {/* The three action buttons are ~190px wide and must not shrink,
+                    which leaves too little for the hospital name on a phone —
+                    stack them under it below sm. */}
+                <div className="px-5 py-4 flex flex-col sm:flex-row items-start justify-between gap-3 border-b border-gray-50">
+                  <div className="min-w-0">
                     <h3 className="font-semibold text-gray-900 text-base">{h.name}</h3>
                     <div className="flex flex-wrap gap-3 mt-1 text-sm text-gray-500">
                       {h.city && <span>📍 {h.city}</span>}
@@ -60,7 +63,7 @@ export default function HospitalsTab({
                     </div>
                   </div>
                   {isAdmin && (
-                  <div className="flex items-center gap-2 shrink-0 ml-3">
+                  <div className="flex items-center gap-2 shrink-0 sm:ml-3">
                     <button onClick={() => openEditHospital(h)}
                       className="px-3 py-1.5 text-xs font-medium bg-gray-50 text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-100 transition">
                       ✏️ Edit
@@ -90,11 +93,14 @@ export default function HospitalsTab({
                           className="flex items-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-700 text-sm rounded-lg border border-blue-100 group">
                           <span>{d.name}</span>
                           {d.description && <span className="text-blue-400 ml-1 text-xs">— {d.description}</span>}
+                          {/* Reveal-on-hover only from md up: a touch device never
+                              fires hover, so on a phone these were permanently
+                              invisible and departments could not be edited at all. */}
                           {isAdmin && (<>
                           <button onClick={() => openEditDept(d, h)}
-                            className="ml-1 text-blue-400 hover:text-blue-600 opacity-0 group-hover:opacity-100 transition text-xs">✏️</button>
+                            className="ml-1 text-blue-400 hover:text-blue-600 px-2 py-1 md:px-0 md:py-0 md:opacity-0 md:group-hover:opacity-100 transition-opacity text-xs">✏️</button>
                           <button onClick={() => deleteDept(d, h)}
-                            className="text-red-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition text-xs">✕</button>
+                            className="text-red-400 hover:text-red-600 px-2 py-1 md:px-0 md:py-0 md:opacity-0 md:group-hover:opacity-100 transition-opacity text-xs">✕</button>
                           </>)}
                         </div>
                       ))}

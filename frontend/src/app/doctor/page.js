@@ -139,14 +139,17 @@ export default function DoctorPage() {
   const selectedDoctor = doctors.find(d => d.id === selectedDoctorId);
   const headerName = selectedDoctor ? `Dr. ${selectedDoctor.name}` : (user?.name || 'Doctor');
 
+  // 100vh on a mobile browser excludes the collapsing address bar, and both
+  // panels below are their own scrollers — so the overflow was unreachable
+  // rather than merely off-screen. Prefer 100dvh, falling back to 100vh.
   return (
-    <div className="flex flex-col md:flex-row h-screen bg-gray-50">
+    <div className="flex flex-col md:flex-row h-screen supports-[height:100dvh]:h-[100dvh] bg-gray-50">
       {/* Left Column */}
       <div className="w-full md:w-96 shrink-0 max-h-[45vh] md:max-h-none bg-white border-b md:border-b-0 md:border-r border-gray-200 flex flex-col">
         <div className="p-5 border-b border-gray-100">
-          <div className="flex items-center justify-between mb-1">
-            <h1 className="text-lg font-bold text-gray-900">{headerName}</h1>
-            <a href="/dashboard" className="text-xs text-blue-500 hover:underline">Dashboard</a>
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <h1 className="text-lg font-bold text-gray-900 min-w-0 truncate">{headerName}</h1>
+            <a href="/dashboard" className="shrink-0 text-xs text-blue-500 hover:underline">Dashboard</a>
           </div>
           <p className="text-sm text-gray-500">Today&apos;s Schedule — {todayDisplay}</p>
 
@@ -222,11 +225,13 @@ export default function DoctorPage() {
         ) : (
           <div className="p-4 sm:p-8 max-w-2xl">
             <div className="flex flex-wrap items-center justify-between gap-2 mb-6">
-              <div>
-                <h2 className="text-2xl font-bold text-gray-900">{selectedAppt.patient_name || '—'}</h2>
-                <p className="text-gray-500 mt-1">Booking: <span className="font-mono font-semibold text-gray-700">{selectedAppt.booking_id}</span></p>
+              {/* min-w-0 + break-words: a flex item defaults to min-width:auto, so
+                  a long patient name would push past the panel instead of wrapping. */}
+              <div className="min-w-0">
+                <h2 className="text-2xl font-bold text-gray-900 break-words">{selectedAppt.patient_name || '—'}</h2>
+                <p className="text-gray-500 mt-1 break-words">Booking: <span className="font-mono font-semibold text-gray-700">{selectedAppt.booking_id}</span></p>
               </div>
-              <span className={`px-3 py-1.5 rounded-full text-sm font-semibold capitalize ${statusBadge(selectedAppt.status)}`}>
+              <span className={`shrink-0 px-3 py-1.5 rounded-full text-sm font-semibold capitalize ${statusBadge(selectedAppt.status)}`}>
                 {(selectedAppt.status || '').replace('_', ' ')}
               </span>
             </div>
@@ -234,10 +239,12 @@ export default function DoctorPage() {
             {/* Patient Details */}
             <div className="bg-white rounded-xl border border-gray-200 p-5 mb-5">
               <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Patient Details</h3>
-              <div className="grid grid-cols-2 gap-3 text-sm">
-                <div>
+              {/* One column below sm: at 320px a two-column split leaves ~118px per
+                  cell, which a phone number or a department name overflows. */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                <div className="min-w-0">
                   <span className="text-gray-500">Phone</span>
-                  <p className="font-medium text-gray-900 mt-0.5">{selectedAppt.patient_phone || '—'}</p>
+                  <p className="font-medium text-gray-900 mt-0.5 break-words">{selectedAppt.patient_phone || '—'}</p>
                 </div>
                 <div>
                   <span className="text-gray-500">Gender</span>
@@ -261,14 +268,14 @@ export default function DoctorPage() {
             {/* Appointment Details */}
             <div className="bg-white rounded-xl border border-gray-200 p-5 mb-5">
               <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Appointment Details</h3>
-              <div className="grid grid-cols-2 gap-3 text-sm">
-                <div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                <div className="min-w-0">
                   <span className="text-gray-500">Doctor</span>
-                  <p className="font-medium text-gray-900 mt-0.5">Dr. {selectedAppt.doctor_name}</p>
+                  <p className="font-medium text-gray-900 mt-0.5 break-words">Dr. {selectedAppt.doctor_name}</p>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <span className="text-gray-500">Department</span>
-                  <p className="font-medium text-gray-900 mt-0.5">{selectedAppt.department_name || '—'}</p>
+                  <p className="font-medium text-gray-900 mt-0.5 break-words">{selectedAppt.department_name || '—'}</p>
                 </div>
                 <div>
                   <span className="text-gray-500">Time</span>
@@ -283,9 +290,9 @@ export default function DoctorPage() {
                   </p>
                 </div>
                 {selectedAppt.hospital_name && (
-                  <div>
+                  <div className="min-w-0">
                     <span className="text-gray-500">Hospital</span>
-                    <p className="font-medium text-gray-900 mt-0.5">{selectedAppt.hospital_name}</p>
+                    <p className="font-medium text-gray-900 mt-0.5 break-words">{selectedAppt.hospital_name}</p>
                   </div>
                 )}
               </div>
@@ -304,7 +311,7 @@ export default function DoctorPage() {
               <button
                 onClick={saveNotes}
                 disabled={saving}
-                className="mt-3 px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-lg text-sm font-medium transition disabled:opacity-50"
+                className="mt-3 w-full sm:w-auto px-4 py-3 sm:py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-lg text-sm font-medium transition disabled:opacity-50"
               >
                 {saving ? 'Saving...' : 'Save Notes'}
               </button>
@@ -317,7 +324,7 @@ export default function DoctorPage() {
                 <button
                   onClick={markComplete}
                   disabled={completing}
-                  className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition disabled:opacity-50"
+                  className="w-full sm:w-auto px-6 py-3 sm:py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition disabled:opacity-50"
                 >
                   {completing ? 'Updating...' : 'Mark as Completed'}
                 </button>

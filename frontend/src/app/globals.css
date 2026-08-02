@@ -8,4 +8,28 @@
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* iOS inflates text in landscape without this, which breaks the width
+     assumptions every responsive breakpoint below is built on. */
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Every form control in the app is `text-sm` (14px). iOS Safari auto-zooms the
+   viewport whenever a focused control's font-size is under 16px, and it does
+   not zoom back out — the dashboard ends up scrolled sideways and stuck there
+   after a single tap into a search box. Force 16px on phone-width screens;
+   desktop keeps the tighter type. `!important` is required because a Tailwind
+   `.text-sm` class selector otherwise outranks these element selectors.
+
+   The cutoff is Tailwind's `sm` (640px), NOT `md`. Several dense multi-column
+   layouts switch on at `sm:` — the schedule modal's
+   grid-cols-[90px_60px_1fr_1fr_70px_1fr_1fr] row of <input type="time"> being
+   the tightest — and a grid `1fr` track cannot shrink below its item's
+   min-content width, so widening those inputs to 16px in the 640-767px band
+   would overflow the modal. Every phone in portrait is under 640px anyway. */
+@media (max-width: 639px) {
+  input:not([type='checkbox']):not([type='radio']),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
 }

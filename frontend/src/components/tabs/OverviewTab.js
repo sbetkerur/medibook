@@ -23,7 +23,7 @@ export default function OverviewTab({
       {loading ? (
         <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 md:gap-4">
           {[1,2,3,4,5].map(i => (
-            <div key={i} className="bg-white rounded-xl p-5 border-l-4 border-gray-200 shadow-sm animate-pulse">
+            <div key={i} className="bg-white rounded-xl p-3 md:p-5 border-l-4 border-gray-200 shadow-sm animate-pulse">
               <div className="flex items-center justify-between">
                 <div className="space-y-2">
                   <div className="h-3 w-20 bg-gray-200 rounded" />
@@ -93,12 +93,12 @@ export default function OverviewTab({
           </div>
           <div className="divide-y divide-gray-50">
             {stats.todays_schedule.map((a, i) => (
-              <div key={i} className="px-5 py-3 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="text-sm font-medium text-blue-600 w-12">{a.appointment_time?.slice(0,5)}</div>
-                  <div>
-                    <div className="text-sm font-medium text-gray-900">{a.patient_name}</div>
-                    <div className="text-xs text-gray-500">Dr. {a.doctor_name}</div>
+              <div key={i} className="px-4 md:px-5 py-3 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="text-sm font-medium text-blue-600 w-12 shrink-0">{a.appointment_time?.slice(0,5)}</div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-gray-900 truncate">{a.patient_name}</div>
+                    <div className="text-xs text-gray-500 truncate">Dr. {a.doctor_name}</div>
                   </div>
                 </div>
                 <Badge status={a.status} />

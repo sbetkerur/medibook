@@ -167,13 +167,17 @@ export default function AnalyticsTab() {
                     const maxRev = revenueData.by_doctor[0]?.revenue || 1;
                     const pct = Math.round((d.revenue / maxRev) * 100);
                     return (
-                      <div key={d.name} className="flex items-center gap-3">
+                      // The fixed name + amount columns add up to more than a
+                      // 320px card is wide, leaving the bar negative space, so
+                      // both narrow on phones. The amount stays nowrap because
+                      // ₹1,50,000 has no break opportunity.
+                      <div key={d.name} className="flex items-center gap-2 sm:gap-3">
                         <span className="text-xs font-bold text-gray-400 w-4">#{i + 1}</span>
-                        <span className="text-sm text-gray-700 w-28 truncate">Dr. {d.name}</span>
-                        <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
+                        <span className="text-sm text-gray-700 w-20 sm:w-28 truncate">Dr. {d.name}</span>
+                        <div className="flex-1 min-w-0 h-2 bg-gray-100 rounded-full overflow-hidden">
                           <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${pct}%` }} />
                         </div>
-                        <span className="text-sm font-semibold text-gray-800 w-24 text-right">₹{parseInt(d.revenue).toLocaleString('en-IN')}</span>
+                        <span className="text-sm font-semibold text-gray-800 w-20 sm:w-24 text-right whitespace-nowrap">₹{parseInt(d.revenue).toLocaleString('en-IN')}</span>
                       </div>
                     );
                   })}

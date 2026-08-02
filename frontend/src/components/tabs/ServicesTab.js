@@ -142,7 +142,9 @@ export default function ServicesTab({ hospitals, isAdmin, setConfirmModal }) {
                 rows={2} placeholder="Brief description of the treatment"
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" />
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            {/* Two form controls side by side cannot shrink past their intrinsic
+                widths, so they overflow the modal on a phone — stack them below sm. */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-medium text-gray-700 mb-1">Duration (minutes)</label>
                 <select value={serviceForm.duration_minutes} onChange={e => setServiceForm(f => ({ ...f, duration_minutes: e.target.value }))}
