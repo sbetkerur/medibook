@@ -10,6 +10,9 @@ const IST = 'Asia/Kolkata';
 const {
   STATES,
   parseChoiceNumber,
+  maskPhone,
+  sendConfirmButtons,
+  confirmButtonIndex,
   getPatient,
   getPatients,
   updateSession,
@@ -94,7 +97,13 @@ async function showMyAppointments(phone, schema, tenant, send) {
     ? ['🔄 Reschedule', '❌ Cancel Appointment', '🏠 Main Menu']
     : ['🏠 Main Menu'];
   await send.buttons(bodyText, buttons);
-  await updateSession(schema, phone, STATES.MY_APPOINTMENTS, { _appts: upcomingR.rows });
+  // Store only the booking ids, not the joined rows. The single consumer
+  // (botEngine's MY_APPOINTMENTS branch) asks whether the list is non-empty, and
+  // ctx is size-capped: five rows of doctor/hospital/patient names and dates is
+  // several hundred bytes of the budget that a large clinic's _hospitals /
+  // _depts / _doctors / _dates / _slots caches later need.
+  await updateSession(schema, phone, STATES.MY_APPOINTMENTS,
+    { _appts: upcomingR.rows.map(a => a.booking_id) });
 }
 
 async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
@@ -212,12 +221,18 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
   ctx.reschedule_new_date = resolvedDate;
   // Same same-day guard as the booking flow — the offered list starts at
   // tomorrow, but a stale row tapped after midnight can still resolve to today.
+  //
+  // SLOT_DAY_OPEN_SQL re-checks leaves and holidays too. The list above filtered
+  // them when it was BUILT; a holiday declared after that does not edit the rows
+  // cached in `_reschedule_dates`, and sessions can sit for days.
+  const { SLOT_DAY_OPEN_SQL } = require('../bookingCore');
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
        AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
             OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                 AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
+       AND ${SLOT_DAY_OPEN_SQL}
      ORDER BY start_time`,
     [ctx.reschedule_doctor_id, resolvedDate]);
   if (!slots.rows.length) {
@@ -260,7 +275,10 @@ async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, in
   try { oldDate = format(parseISO(oldDate), 'EEE, d MMM'); } catch {}
   try { newDate = format(parseISO(newDate), 'EEE, d MMM'); } catch {}
 
-  await send.buttons(
+  // sendConfirmButtons, not send.buttons: this prompt moves a real appointment,
+  // so the reply must be provably a tap on THESE buttons and not on any of the
+  // ones still sitting in the patient's chat history (see bot/utils.js).
+  await sendConfirmButtons(send, ctx,
     `🔄 *Confirm Reschedule*\n\n` +
     `Dr. ${ctx.reschedule_doctor_name}\n\n` +
     `❌ Old: ${oldDate} at ${(ctx.reschedule_old_time || '').slice(0, 5)}\n` +
@@ -272,10 +290,24 @@ async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, in
 }
 
 async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice) {
+  // A positional button reply we cannot attribute to the prompt above is a tap
+  // on an OLD message — most often the "🔄 Reschedule" button of the My
+  // Appointments card, which is also btn_0. Re-ask instead of reading it as
+  // either answer; a re-render is cheap, a silently moved appointment is not.
+  const btnIdx = confirmButtonIndex(ctx, choice);
+  if (btnIdx === -1) {
+    await sendConfirmButtons(send, ctx,
+      `🔄 That looks like a tap on an older message.\n\nConfirm the change to your appointment?`,
+      ['✅ Yes, Reschedule', '❌ No, Keep Original']
+    );
+    await updateSession(schema, phone, STATES.RESCHEDULE_CONFIRM, ctx);
+    return;
+  }
   // Check negative intent FIRST — replies like "no, don't reschedule" contain the
   // word "reschedule" and would otherwise match the positive pattern below.
-  const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|btn_1|^2$/i.test(choice);
-  if (!isNegative && /yes|reschedule|confirm|btn_0|^1$/.test(choice)) {
+  // btn_1/btn_0 are matched by index now, not as substrings of the raw id.
+  const isNegative = btnIdx === 1 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^2$/i.test(choice);
+  if (!isNegative && (btnIdx === 0 || /yes|reschedule|confirm|^1$/.test(choice))) {
     // Atomic: lock appointment row + lock new slot + release old slot + update appointment
     const rescheduled = await tenantTransaction(schema, async (client) => {
       // Lock the appointment and re-check it is still confirmed — an admin may have
@@ -290,13 +322,17 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       // Re-check the slot hasn't passed, mirroring bookingCore's lock in
       // completeBooking: the patient can sit on this confirm screen for the
       // whole 4-hour session window, and without the time predicate they could
-      // move an appointment INTO the past.
+      // move an appointment INTO the past. SLOT_DAY_OPEN_SQL is there for the
+      // same reason and for the same window — a holiday or leave declared while
+      // this screen was open would otherwise move them onto a closed day.
+      const { SLOT_DAY_OPEN_SQL } = require('../bookingCore');
       const lock = await client.query(
         `UPDATE time_slots SET status='booked'
          WHERE id=$1 AND status='available'
            AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                 OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                     AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
+           AND ${SLOT_DAY_OPEN_SQL}
          RETURNING id`,
         [ctx.reschedule_new_slot_id]
       );
@@ -341,7 +377,9 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       `⏰ ${(ctx.reschedule_new_time || '').slice(0, 5)}\n\n` +
       `We'll send you a fresh reminder 24 hours before. See you then! 😊`
     );
-    logger.info(`Rescheduled: ${ctx.reschedule_booking_id}`, { phone, tenant: tenant.name });
+    // Masked: logs/combined.log is persistent, and the booking id already
+    // identifies the appointment for anyone who needs to look it up.
+    logger.info(`Rescheduled: ${ctx.reschedule_booking_id}`, { phone: maskPhone(phone), tenant: tenant.name });
     // Notify clinic admin via WhatsApp
     (async () => {
       let oldDateLabel = ctx.reschedule_old_date || '';
@@ -415,7 +453,9 @@ async function handleCancelReason(phone, schema, tenant, send, ctx, input, butto
   ctx.cancel_reason = (matchedKey ? reasonMap[matchedKey] : null) || input || 'Not specified';
   let confirmDateLabel = ctx.cancel_date;
   try { confirmDateLabel = format(parseISO(ctx.cancel_date), 'EEE, d MMM'); } catch {}
-  await send.buttons(
+  // sendConfirmButtons, not send.buttons — "this cannot be undone" must only be
+  // answerable by the buttons on THIS message (see bot/utils.js).
+  await sendConfirmButtons(send, ctx,
     `❌ *Confirm Cancellation*\n\n` +
     `Booking: *${ctx.cancel_booking_id}*\n` +
     `👨‍⚕️ Dr. ${ctx.cancel_doctor_name}\n` +
@@ -428,11 +468,26 @@ async function handleCancelReason(phone, schema, tenant, send, ctx, input, butto
 }
 
 async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
+  // A positional button reply that does not belong to the confirm prompt is a
+  // stale tap — e.g. the still-live "🔄 Reschedule" (btn_0) from the My
+  // Appointments card three steps back, which used to be read as "Yes, Cancel
+  // It" and destroyed the booking without the patient ever answering.
+  const btnIdx = confirmButtonIndex(ctx, choice);
+  if (btnIdx === -1) {
+    await sendConfirmButtons(send, ctx,
+      `❌ That looks like a tap on an older message.\n\n` +
+      `Booking: *${ctx.cancel_booking_id}*\n\nThis cannot be undone. Are you sure?`,
+      ['Yes, Cancel It', 'No, Keep It']
+    );
+    await updateSession(schema, phone, STATES.CANCEL_CONFIRM, ctx);
+    return;
+  }
   // Check negative intent FIRST — replies like "no, don't cancel" contain the
   // word "cancel" and would otherwise match the positive pattern and cancel
-  // the appointment the patient explicitly asked to keep.
-  const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|btn_1|^2$/i.test(choice);
-  if (!isNegative && /yes|cancel|btn_0|^1$/.test(choice)) {
+  // the appointment the patient explicitly asked to keep. btn_0/btn_1 are now
+  // matched by verified index rather than as substrings of the raw id.
+  const isNegative = btnIdx === 1 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^2$/i.test(choice);
+  if (!isNegative && (btnIdx === 0 || /yes|cancel|^1$/.test(choice))) {
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(
         `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,

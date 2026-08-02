@@ -196,6 +196,23 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     const { status, notes, note_category, cancellation_reason } = req.body;
     const s = req.tenant.schema_name;
     const VALID_NOTE_CATEGORIES = ['general', 'vip', 'allergy', 'followup', 'special'];
+
+    // Per-capability gate rather than a blanket adminOnly on the route: marking
+    // an appointment completed/no_show is normal front-desk work and must keep
+    // working for staff. Only cancelling is withheld — it releases the slot back
+    // to the pool and fires a WhatsApp alert to every admin, so a non-admin
+    // could quietly empty a day's book one appointment at a time, which is
+    // exactly what adminOnly on PATCH /appointments/bulk exists to stop.
+    //
+    // `notes` is deliberately NOT gated. An appointment note is reception's
+    // scratchpad ("called, running late", "bringing old X-rays") — the people
+    // who need to write it are precisely the non-admins. It is not the clinical
+    // record: that is patients.dental_history, which has its own admin-only
+    // route. Gating this field would break the front desk to protect a free-text
+    // box its own staff are meant to fill in.
+    if (req.user?.role !== 'admin' && status === 'cancelled') {
+      return res.status(403).json({ error: 'Admin access required to cancel an appointment' });
+    }
     if (status && !VALID_APPOINTMENT_STATUSES.includes(status)) {
       return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_APPOINTMENT_STATUSES.join(', ')}` });
     }
@@ -473,6 +490,15 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
           // its date/time actually match the requested appointment_date/time —
           // otherwise the appointment record (used by reminders and the dashboard)
           // could disagree with the slot that was locked.
+          //
+          // Deliberately NOT carrying the bot flow's SLOT_DAY_OPEN_SQL guard.
+          // Declaring a holiday now flips its slots to status='blocked'
+          // (services.js POST /holidays), so the status='available' predicate
+          // already 409s this route on a closed day. Beyond that, this is an
+          // adminOnly route: staff opening the clinic for one emergency patient
+          // on a holiday is a legitimate action, and they take it by unblocking
+          // that specific slot — a hard NOT EXISTS would make it impossible.
+          // The bot has no such override, which is why it carries the guard.
           const slotR = await client.query(
             `UPDATE time_slots SET status='booked'
              WHERE id=$1 AND status='available' AND doctor_id=$2 AND hospital_id=$3

@@ -56,6 +56,19 @@ const changePasswordLimiter = rateLimit({
   skip: skipInDev,
 });
 
+// Unsubscribe is unauthenticated AND its handler walks every active tenant
+// schema, so an unthrottled caller could turn one HTTP request into N database
+// round-trips across the whole platform. Kept deliberately tighter than the
+// global 500/min limiter; a real recipient clicks the link once.
+const unsubscribeLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 20,
+  message: { error: 'Too many unsubscribe attempts. Try again in an hour.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipInDev,
+});
+
 // ── SUPER ADMIN LOGIN ─────────────────────────────────────────
 router.post('/auth/superadmin/login', loginLimiter, validate(schemas.loginStrict), async (req, res) => {
   try {
@@ -455,6 +468,62 @@ router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.reset
     }
 
     res.json({ success: true, message: 'Password updated successfully' });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// ── EMAIL UNSUBSCRIBE ─────────────────────────────────────────
+// Public and unauthenticated: the only thing the caller holds is the token
+// embedded in the footer of a booking-confirmation / reminder email
+// (services/email.js → generateUnsubscribeUrl).
+//
+// `email_unsubscribes` is a PER-TENANT table and there is no tenant context on
+// an emailed link — no cookie, no JWT, no slug — so the token has to be looked
+// up by sweeping the active tenants, the same shape as the Resend bounce
+// handler in index.js. Every schema name is re-validated before use and all
+// tenant SQL goes through tenantQuery; a schema name is never interpolated.
+const UNSUB_TOKEN_RE = /^[a-f0-9]{64}$/;      // crypto.randomBytes(32).toString('hex')
+const UNSUB_SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
+
+router.post('/unsubscribe', unsubscribeLimiter, async (req, res) => {
+  try {
+    const token = typeof req.body?.token === 'string' ? req.body.token.trim().toLowerCase() : '';
+    // Shape check first: without it every stray querystring value would trigger
+    // a full sweep of every tenant schema, which is the expensive path.
+    if (!UNSUB_TOKEN_RE.test(token)) {
+      return res.status(400).json({ error: 'This unsubscribe link is invalid or incomplete.' });
+    }
+
+    const tenants = await query(`SELECT id, schema_name FROM tenants WHERE status='active'`);
+    for (const t of tenants.rows) {
+      if (!UNSUB_SCHEMA_RE.test(t.schema_name)) continue; // never touch an unvalidated schema name
+      try {
+        // COALESCE, not a bare NOW(): a second click (mail clients and security
+        // scanners routinely re-fetch links) must stay idempotent and keep the
+        // ORIGINAL opt-out timestamp rather than sliding it forward.
+        const upd = await tenantQuery(t.schema_name,
+          `UPDATE email_unsubscribes
+              SET unsubscribed_at = COALESCE(unsubscribed_at, NOW())
+            WHERE token = $1
+            RETURNING id`,
+          [token]);
+        if (upd.rows[0]) {
+          logger.info('Email unsubscribe recorded', { tenant_id: t.id });
+          break; // tokens are globally unique — first match is the only match
+        }
+      } catch (err) {
+        // One tenant schema failing (older schema without the table, a lock
+        // timeout) must not abort the sweep and strand the recipient's opt-out
+        // in a schema further down the list.
+        logger.warn('Unsubscribe lookup failed for a tenant schema', { tenant_id: t.id, error: err.message });
+      }
+    }
+
+    // Identical response whether or not the token matched — a "not found" here
+    // would make this endpoint an oracle for guessing valid unsubscribe tokens,
+    // each of which identifies a real patient at a real clinic.
+    res.json({ success: true, message: 'You have been unsubscribed from these emails.' });
   } catch (err) {
     handleError(res, err);
   }

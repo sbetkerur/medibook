@@ -114,14 +114,26 @@ async function _send(payload, accessToken, phoneNumberId) {
 
 // ── PUBLIC API ────────────────────────────────────────────────────────────────
 
+/**
+ * Meta's send response is `{ messages: [{ id: "wamid...." }], ... }`. Every
+ * sender must hand that id back: it is the ONLY key delivery receipts arrive
+ * with, and `updateMessageStatus()` matches on `wa_messages.wa_message_id`.
+ * While the senders returned undefined, every outbound row was written with a
+ * NULL id and no sent/delivered/read callback could ever match a row.
+ */
+function _messageId(res) {
+  return res?.data?.messages?.[0]?.id || null;
+}
+
 async function sendText(to, text, accessToken, phoneNumberId) {
   try {
-    await _send({
+    const res = await _send({
       recipient_type: 'individual',
       to,
       type: 'text',
       text: { preview_url: false, body: String(text).slice(0, 4096) },
     }, accessToken, phoneNumberId);
+    return _messageId(res);
   } catch (err) {
     logger.error('sendText failed', { to, error: err.response?.data || err.message });
     throw err;
@@ -131,7 +143,7 @@ async function sendText(to, text, accessToken, phoneNumberId) {
 async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId) {
   const btns = buttons.slice(0, 3);
   try {
-    await _send({
+    const res = await _send({
       recipient_type: 'individual',
       to,
       type: 'interactive',
@@ -146,10 +158,13 @@ async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId) {
         },
       },
     }, accessToken, phoneNumberId);
+    return _messageId(res);
   } catch (err) {
-    // Fallback to numbered text list
+    // Fallback to numbered text list. Return the FALLBACK's id — that plain text
+    // is the message the patient actually received, so it is the one whose
+    // delivery receipts must find a row.
     const numbered = buttons.map((b, i) => `${i + 1}. ${b}`).join('\n');
-    await sendText(to, `${bodyText}\n\n${numbered}\n\nReply with number to choose.`, accessToken, phoneNumberId);
+    return await sendText(to, `${bodyText}\n\n${numbered}\n\nReply with number to choose.`, accessToken, phoneNumberId);
   }
 }
 
@@ -169,7 +184,7 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
     return { title: String(s.title || '').slice(0, 24), rows };
   }).filter(s => s.rows.length > 0);
   try {
-    await _send({
+    const res = await _send({
       recipient_type: 'individual',
       to,
       type: 'interactive',
@@ -179,6 +194,7 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
         action: { button: String(buttonLabel).slice(0, 20), sections: sanitizedSections },
       },
     }, accessToken, phoneNumberId);
+    return _messageId(res);
   } catch (err) {
     logger.warn('sendList failed, falling back to text', { to, error: err.response?.data || err.message });
     // Numbering must be a single running counter across sections. The old
@@ -190,17 +206,20 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
     const lines = sections.flatMap((s) =>
       (s.rows || []).map((r) => `${++n}. ${r.title}${r.description ? ' — ' + r.description : ''}`)
     );
-    await sendText(to, `${bodyText}\n\n${lines.join('\n')}\n\nReply with the number of your choice.`, accessToken, phoneNumberId);
+    // As in sendButtons: the fallback text is what was really delivered, so its
+    // id is the one the caller must record.
+    return await sendText(to, `${bodyText}\n\n${lines.join('\n')}\n\nReply with the number of your choice.`, accessToken, phoneNumberId);
   }
 }
 
 async function sendTemplate(to, templateName, components = [], accessToken, phoneNumberId) {
   try {
-    await _send({
+    const res = await _send({
       to,
       type: 'template',
       template: { name: templateName, language: { code: 'en' }, components },
     }, accessToken, phoneNumberId);
+    return _messageId(res);
   } catch (err) {
     logger.error('sendTemplate failed', { to, templateName, error: err.response?.data || err.message });
     throw err;
@@ -209,12 +228,13 @@ async function sendTemplate(to, templateName, components = [], accessToken, phon
 
 async function sendImage(to, imageUrl, caption, accessToken, phoneNumberId) {
   try {
-    await _send({
+    const res = await _send({
       recipient_type: 'individual',
       to,
       type: 'image',
       image: { link: imageUrl, caption: caption ? String(caption).slice(0, 1024) : '' },
     }, accessToken, phoneNumberId);
+    return _messageId(res);
   } catch (err) {
     logger.error('sendImage failed', { to, error: err.response?.data || err.message });
     throw err;
@@ -236,12 +256,13 @@ async function sendReaction(to, messageId, emoji, accessToken, phoneNumberId) {
 
 async function sendDocument(to, documentUrl, filename, caption, accessToken, phoneNumberId) {
   try {
-    await _send({
+    const res = await _send({
       recipient_type: 'individual',
       to,
       type: 'document',
       document: { link: documentUrl, filename: filename || 'document', caption: caption || '' },
     }, accessToken, phoneNumberId);
+    return _messageId(res);
   } catch (err) {
     logger.error('sendDocument failed', { to, error: err.response?.data || err.message });
     throw err;
@@ -276,7 +297,7 @@ async function updateMessageStatus(schemaName, waMessageId, status) {
 
 // ── Template convenience wrappers ─────────────────────────────────────────────
 async function sendBookingConfirmationTemplate(to, { bookingId, doctorName, hospitalName, date, time }, accessToken, phoneNumberId) {
-  await sendTemplate(to, 'appointment_confirmed', [{
+  return await sendTemplate(to, 'appointment_confirmed', [{
     type: 'body',
     parameters: [
       { type: 'text', text: String(bookingId) },
@@ -291,7 +312,7 @@ async function sendBookingConfirmationTemplate(to, { bookingId, doctorName, hosp
 // Parameter order MUST match jobs/reminders.js (the live sender for this
 // template): {{1}} doctor, {{2}} date, {{3}} time, {{4}} hospital.
 async function sendReminderTemplate(to, { doctorName, hospitalName, date, time }, accessToken, phoneNumberId) {
-  await sendTemplate(to, 'appointment_reminder_24h', [{
+  return await sendTemplate(to, 'appointment_reminder_24h', [{
     type: 'body',
     parameters: [
       { type: 'text', text: String(doctorName) },

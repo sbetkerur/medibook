@@ -19,18 +19,22 @@ export default function AnalyticsTab() {
     } catch { toast.error('Failed to load analytics'); }
   }, []);
 
-  const fetchRevenue = useCallback(async (months) => {
-    try {
-      const m = months || revenueMonths;
-      const { data } = await api.get(`/admin/analytics/revenue?months=${m}`);
-      setRevenueData(data);
-    } catch { /* silent — revenue section shows no-data state */ }
-  }, [revenueMonths]);
-
   useEffect(() => {
     fetchAnalytics();
-    fetchRevenue();
-  }, [fetchAnalytics, fetchRevenue]);
+  }, [fetchAnalytics]);
+
+  // `revenueMonths` is the only trigger for a revenue fetch. The dropdown used
+  // to also call fetchRevenue() itself, and because that callback closed over
+  // revenueMonths its identity changed too — re-running the mount effect for a
+  // second /analytics/revenue plus a pointless /analytics. Three requests per
+  // dropdown change against a 5/min per-user limit meant real users got 429s.
+  useEffect(() => {
+    let cancelled = false;
+    api.get(`/admin/analytics/revenue?months=${revenueMonths}`)
+      .then(({ data }) => { if (!cancelled) setRevenueData(data); })
+      .catch(() => { /* silent — revenue section shows no-data state */ });
+    return () => { cancelled = true; };
+  }, [revenueMonths]);
 
   return (
     <div className="space-y-4">
@@ -116,7 +120,7 @@ export default function AnalyticsTab() {
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-semibold text-gray-800">💰 Revenue Analytics</h3>
           <select value={revenueMonths}
-            onChange={e => { const m = Number(e.target.value); setRevenueMonths(m); fetchRevenue(m); }}
+            onChange={e => setRevenueMonths(Number(e.target.value))}
             className="border border-gray-300 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
             {[3, 6, 12, 24].map(m => <option key={m} value={m}>Last {m} months</option>)}
           </select>
@@ -126,7 +130,7 @@ export default function AnalyticsTab() {
             {/* KPI cards */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
               <div className="bg-green-50 rounded-lg p-4 text-center">
-                <div className="text-2xl font-bold text-green-700">₹{(revenueData.total_revenue || 0).toLocaleString('en-IN')}</div>
+                <div className="text-2xl font-bold text-green-700">₹{(parseInt(revenueData.total_revenue) || 0).toLocaleString('en-IN')}</div>
                 <div className="text-xs text-green-600 mt-1">Total Revenue ({revenueMonths}m)</div>
               </div>
               <div className="bg-blue-50 rounded-lg p-4 text-center">
@@ -135,7 +139,7 @@ export default function AnalyticsTab() {
               </div>
               <div className="bg-purple-50 rounded-lg p-4 text-center">
                 <div className="text-2xl font-bold text-purple-700">
-                  ₹{revenueData.monthly?.length ? Math.round((revenueData.total_revenue || 0) / revenueData.monthly.length).toLocaleString('en-IN') : 0}
+                  ₹{revenueData.monthly?.length ? Math.round((parseInt(revenueData.total_revenue) || 0) / revenueData.monthly.length).toLocaleString('en-IN') : 0}
                 </div>
                 <div className="text-xs text-purple-600 mt-1">Avg Monthly</div>
               </div>

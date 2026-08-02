@@ -9,7 +9,41 @@
 
 const { genBookingId } = require('./bot/utils');
 const { query, tenantQuery } = require('../db');
+const { IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
+
+/**
+ * "This slot's day is actually open" — a correlated guard for any query over
+ * `time_slots` that runs AFTER a date has been chosen.
+ *
+ * The date-LIST queries have always excluded doctor leaves and clinic holidays,
+ * but everything downstream of them trusted the chosen date. That trust was
+ * misplaced: `_dates` is cached in the bot session, `getSession` has no TTL and
+ * the cleanup cron only purges non-idle sessions after 7 days, so a patient can
+ * tap a date row that was offered before the clinic declared a holiday on it.
+ * Blocking the slots at declaration time (services.js POST /holidays) covers the
+ * slots that existed then; this guard covers everything else, including any slot
+ * created by a path that forgets to consult planDoctorSlots.
+ *
+ * Correlated on the slot's OWN doctor_id/hospital_id/slot_date rather than on
+ * bound parameters: the reschedule flow never carried a hospital_id in its
+ * session context, and a guard that silently degrades when the caller's context
+ * is stale is exactly the failure this exists to prevent. Holidays are per
+ * hospital OR clinic-wide (hospital_id IS NULL) — both must block.
+ *
+ * Interpolate into the WHERE clause; it binds no parameters. The table must be
+ * referenced as `time_slots` (unaliased), which is how every call site spells it.
+ */
+const SLOT_DAY_OPEN_SQL = `
+  NOT EXISTS (
+    SELECT 1 FROM doctor_leaves dl
+    WHERE dl.doctor_id = time_slots.doctor_id AND dl.leave_date = time_slots.slot_date
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM clinic_holidays ch
+    WHERE ch.holiday_date = time_slots.slot_date
+      AND (ch.hospital_id IS NULL OR ch.hospital_id = time_slots.hospital_id)
+  )`;
 
 /**
  * Insert an appointment inside an existing transaction, retrying up to 3 times
@@ -77,9 +111,12 @@ async function checkMonthlyQuota(tenant) {
 
     // Month boundary in IST (the product timezone), not UTC — with plain
     // date_trunc('month', NOW()) the quota would reset 5.5 hours late on the 1st.
+    // Via the shared constant, not a hand-rolled copy: this is the number the
+    // whole product agrees on (GET /settings' usage bar, the super admin's
+    // quota panel and platform stats all report it), and three independent
+    // transcriptions of the same expression is how they drift apart.
     const usedR = await tenantQuery(tenant.schema_name,
-      `SELECT COUNT(*) FROM appointments
-       WHERE created_at >= timezone('Asia/Kolkata', date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata'))`);
+      `SELECT COUNT(*) FROM appointments WHERE created_at >= ${IST_MONTH_START_TS_SQL}`);
     const used = parseInt(usedR.rows[0].count);
     return { allowed: used < limit, used, limit };
   } catch (err) {
@@ -88,4 +125,4 @@ async function checkMonthlyQuota(tenant) {
   }
 }
 
-module.exports = { insertAppointmentWithRetry, checkMonthlyQuota };
+module.exports = { insertAppointmentWithRetry, checkMonthlyQuota, SLOT_DAY_OPEN_SQL };

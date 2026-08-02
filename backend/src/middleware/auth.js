@@ -15,7 +15,12 @@ async function authMiddleware(req, res, next) {
   // The query-param form exists ONLY for EventSource (SSE), which can't set
   // headers — accepting it everywhere would let tokens leak into proxy access
   // logs, browser history and Referer headers on any admin call.
-  const isSSE = req.path.endsWith('/events');
+  // Exact match, not endsWith: this middleware is mounted on /api/admin and
+  // /api/v1/admin, so req.path is router-relative and the SSE route is exactly
+  // '/events'. endsWith admitted the query-param token on ANY path ending in
+  // those characters — no current route abuses it, but the comment above states
+  // the header-only intent and that surface grows with every route added.
+  const isSSE = req.path === '/events';
   const headerToken = (req.headers.authorization || '').replace('Bearer ', '');
   const token = (headerToken || (isSSE ? req.query.token : '') || '').trim();
   if (!token) return res.status(401).json({ error: ERRORS.NO_TOKEN });

@@ -91,6 +91,53 @@ async function generateUnsubscribeUrl(schemaName, patientId) {
   }
 }
 
+// Should we mail this patient at all? ONE gate, covering both reasons not to:
+//
+//   - they used the footer link to opt out (email_unsubscribes), and
+//   - the address hard-bounced or drew a spam complaint (patients.email_status),
+//     recorded by the Resend webhook in index.js.
+//
+// The bounce half in particular was write-only: email_status was set by the
+// webhook and read by NOTHING, so a confirmed-dead address kept receiving every
+// confirmation and reminder — burning sender reputation on mail that cannot be
+// delivered. Both reasons are answered here so a new send path can't honour one
+// and forget the other.
+//
+// Fails OPEN (returns false → send anyway) on a DB error, matching how the
+// other optional lookups in this file degrade: a PG blip must not swallow a
+// booking confirmation. It does NOT fail open when the lookup succeeds and
+// reports a suppression — that is a deliberate answer, not an outage.
+async function isSuppressed(schemaName, patientId, toEmail) {
+  if (!schemaName) return false;
+  try {
+    const { tenantQuery } = require('../db');
+    if (patientId) {
+      const r = await tenantQuery(schemaName,
+        `SELECT 1 FROM email_unsubscribes WHERE patient_id=$1 AND unsubscribed_at IS NOT NULL LIMIT 1`,
+        [patientId]);
+      if (r.rows[0]) return 'unsubscribed';
+    }
+    if (toEmail) {
+      // lower(email), matching the webhook writer: addresses are stored verbatim
+      // by the admin patient edit and the CSV import, so a case-sensitive compare
+      // would miss exactly the rows an operator entered by hand.
+      const b = await tenantQuery(schemaName,
+        `SELECT 1 FROM patients WHERE lower(email)=lower($1) AND email_status='bounced' LIMIT 1`,
+        [toEmail]);
+      if (b.rows[0]) return 'bounced';
+    }
+    return false;
+  } catch (err) {
+    logger.warn('Email suppression check failed — sending anyway', { error: err.message });
+    return false;
+  }
+}
+
+// Back-compat alias: `isUnsubscribed` was the narrower predecessor of the gate
+// above and is still the name that reads best at a call site asking only about
+// the opt-out link.
+const isUnsubscribed = (schemaName, patientId) => isSuppressed(schemaName, patientId, null);
+
 // ── OPEN TRACKING ─────────────────────────────────────────────
 async function trackEmailOpen(contentHash) {
   try {
@@ -102,17 +149,13 @@ async function trackEmailOpen(contentHash) {
   } catch (_) {}
 }
 
-// ── BOUNCE HANDLER (called by Resend webhook route) ───────────
-async function handleResendBounce(toEmail, schemaName) {
-  if (!toEmail || !schemaName) return;
-  try {
-    const { tenantQuery } = require('../db');
-    await tenantQuery(schemaName,
-      `UPDATE patients SET email_status='bounced', updated_at=NOW() WHERE email=$1`,
-      [toEmail.toLowerCase()]);
-    logger.info(`Email bounced — marked patient email invalid: ${toEmail}`);
-  } catch (_) {}
-}
+// NOTE: the bounce handler that used to live here was removed. It was exported
+// and called by nothing — index.js's Resend webhook route carries the only live
+// implementation — and the two had already drifted apart on the one detail that
+// matters (this copy compared `email = $1`, which misses the mixed-case rows the
+// admin patient edit and the CSV import store verbatim). Two copies of a
+// cross-tenant write, one of them dead and wrong, is a trap for whoever edits
+// next; the reader side is `isSuppressed()` above.
 
 // Helper to build tracking pixel HTML.
 //
@@ -193,6 +236,15 @@ async function sendBookingConfirmation(toEmail, data, opts = {}) {
   const { bookingId, patientName, doctorName, date, time, hospitalName, visitType, patientId, schemaName } = data;
   if (!toEmail) { logger.info(`Booking ${bookingId} has no patient email — skipping confirmation`); return; }
 
+  // Checked BEFORE the dedup claim below: claiming the hash and then bailing
+  // would burn the dedup slot for a send that never happened, so a later
+  // re-subscribe within the window would be silently deduped away.
+  const bookingSuppression = await isSuppressed(schemaName, patientId, toEmail);
+  if (bookingSuppression) {
+    logger.info(`Booking confirmation skipped (${bookingSuppression}): ${bookingId}`);
+    return;
+  }
+
   // Deduplication: skip if same booking confirmation sent within the window
   const dedupHash = crypto.createHash('sha256')
     .update(`booking_confirmation:${toEmail}:${bookingId}`).digest('hex');
@@ -247,6 +299,13 @@ async function sendReminderEmail(toEmail, data, opts = {}) {
   const resend = getResend();
   if (!resend || !toEmail) return;
   const { bookingId, patientName, doctorName, date, time, hoursUntil, patientId, schemaName } = data;
+
+  // Before the dedup claim — same reason as sendBookingConfirmation.
+  const reminderSuppression = await isSuppressed(schemaName, patientId, toEmail);
+  if (reminderSuppression) {
+    logger.info(`Reminder email skipped (${reminderSuppression}): ${bookingId}`);
+    return;
+  }
 
   // Deduplication: skip if same reminder sent within the window
   const dedupHash = crypto.createHash('sha256')
@@ -406,5 +465,5 @@ async function sendWeeklyDigest(toEmail, tenantName, stats) {
 module.exports = {
   sendBookingConfirmation, sendReminderEmail, sendAdminBookingAlert,
   sendPasswordReset, sendWeeklyDigest, setEmailQueue, queueEmail,
-  getTemplate, generateUnsubscribeUrl, trackEmailOpen, handleResendBounce,
+  getTemplate, generateUnsubscribeUrl, isSuppressed, isUnsubscribed, trackEmailOpen,
 };

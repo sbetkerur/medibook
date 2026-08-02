@@ -12,8 +12,22 @@ const { handleError } = require('../utils/errors');
 const { IST_TODAY_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const { getClient: getRedisClient } = require('../utils/redisClient');
 
-const STATS_CACHE_KEY = 'superadmin:stats:v1';
+// v2: the meaning of total_appointments_30d / appointments_this_month changed
+// (see GET /stats below). A v1 payload written by the previous deploy would be
+// served for up to 60s with the OLD definitions under the NEW field names, so
+// the key is bumped rather than reused.
+const STATS_CACHE_KEY = 'superadmin:stats:v2';
 const STATS_CACHE_TTL_S = 60; // 1 minute
+
+// tenant_stats_cache freshness window for the platform dashboard.
+// routes/admin.js uses 15 minutes because a clinic watching its own queue needs
+// near-live numbers and refreshes the row itself on every miss. Here the row is
+// normally written once a night by the slotGenerator cron, so 15 minutes would
+// be a permanent miss; a full-day window is the opposite bug — it serves the
+// 00:05 IST row at 22:00 IST, when patients_total is ~22 hours stale. 60 minutes
+// lets a genuinely recent roll-up (cron, or a tenant dashboard refresh) save the
+// heaviest query on this endpoint, and falls through to a live count otherwise.
+const STATS_CACHE_FRESH_MINUTES = 60;
 
 // Strict limiter for tenant creation — each call provisions a full DB schema
 const createTenantLimiter = rateLimit({
@@ -51,88 +65,124 @@ router.get('/stats', async (req, res) => {
     ]);
     const mrr = parseInt(mrrR.rows[0].mrr) || 0;
 
-    // Use stats cache for cross-tenant aggregates (populated nightly by slotGenerator cron)
-    let cachedStats = { appointments_today: 0, appointments_month: 0, patients_total: 0 };
+    const activeTenants = parseInt(active.rows[0].count);
+
+    // ── Cross-tenant aggregates ───────────────────────────────
+    // Every field below has exactly ONE definition whether or not the roll-up
+    // cache is warm. Previously total_appointments_30d was served from
+    // tenant_stats_cache.appointments_month on a hit and from a live
+    // created_at >= NOW() - 30 days count on a miss — two different questions
+    // (scheduled month-to-date vs created in the last 30 days) under one name,
+    // so on the 2nd of the month the number silently dropped by ~90% depending
+    // on whether the nightly cron had written a row.
+    //
+    // The cache can only honestly answer two of these:
+    //   appointments_today  — appointment_date = IST today AND status='confirmed'
+    //   patients_total      — patients WHERE deleted_at IS NULL
+    // Its appointments_month column is appointment_date-based and status-filtered,
+    // which is NOT the quota definition, so it is never read here.
+    let totalPatients = null;
     let cacheHit = false;
     try {
+      // Partial coverage must NOT be treated as a hit: SUM over whichever rows
+      // happen to be fresh would silently omit every tenant whose row is stale
+      // or missing, under-reporting the platform total with no error. Require a
+      // fresh row for every active tenant, or compute the whole thing live.
       const cached = await query(`
-        SELECT
-          SUM(appointments_today) as appointments_today,
-          SUM(appointments_month) as appointments_month,
-          SUM(patients_total) as patients_total
-        FROM tenant_stats_cache
-        WHERE stat_date = ${IST_TODAY_SQL}
+        SELECT COUNT(*)::int AS fresh_tenants,
+               COALESCE(SUM(c.patients_total), 0) AS patients_total
+        FROM tenant_stats_cache c
+        JOIN tenants t ON t.id = c.tenant_id AND t.status = 'active'
+        WHERE c.stat_date = ${IST_TODAY_SQL}
+          AND c.updated_at > NOW() - INTERVAL '${STATS_CACHE_FRESH_MINUTES} minutes'
       `);
-      if (cached.rows[0] && cached.rows[0].appointments_today !== null) {
-        cachedStats = {
-          appointments_today: parseInt(cached.rows[0].appointments_today || 0),
-          appointments_month: parseInt(cached.rows[0].appointments_month || 0),
-          patients_total: parseInt(cached.rows[0].patients_total || 0),
-        };
+      const row = cached.rows[0];
+      if (activeTenants > 0 && row && row.fresh_tenants >= activeTenants) {
+        totalPatients = parseInt(row.patients_total) || 0;
         cacheHit = true;
       }
     } catch (_) {}
 
-    // Fall back to UNION ALL if cache is empty (first run before nightly cron)
-    let totalAppointments = cachedStats.appointments_month;
-    let totalPatients = cachedStats.patients_total;
-    if (!cacheHit) {
-      const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
-      const tenantSchemas = await query(`SELECT schema_name FROM tenants WHERE status='active'`);
-      const validSchemas = tenantSchemas.rows.filter(t => SCHEMA_RE.test(t.schema_name));
-      const invalidCount = tenantSchemas.rows.length - validSchemas.length;
-      if (invalidCount > 0) {
-        logger.warn(`Cross-tenant stats: skipping ${invalidCount} tenant(s) with a schema_name that failed validation`, { invalidCount });
-      }
+    const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
+    const tenantSchemas = await query(`SELECT schema_name FROM tenants WHERE status='active'`);
+    const validSchemas = tenantSchemas.rows.filter(t => SCHEMA_RE.test(t.schema_name));
+    const invalidCount = tenantSchemas.rows.length - validSchemas.length;
+    if (invalidCount > 0) {
+      logger.warn(`Cross-tenant stats: skipping ${invalidCount} tenant(s) with a schema_name that failed validation`, { invalidCount });
+    }
 
-      // Process ALL active tenants in fixed-size batches (rather than capping at
-      // an arbitrary 100) so platform totals never silently undercount once there
-      // are more tenants than a single UNION ALL query should reasonably hold.
-      const BATCH_SIZE = 100;
-      let apptTotal = 0;
-      let patientTotal = 0;
-      for (let i = 0; i < validSchemas.length; i += BATCH_SIZE) {
-        const batch = validSchemas.slice(i, i + BATCH_SIZE);
-        try {
-          const apptParts = batch.map(t =>
-            `SELECT COUNT(*) AS cnt FROM "${t.schema_name}".appointments WHERE created_at >= NOW() - INTERVAL '30 days'`
-          );
-          const apptR = await query(
-            `SELECT SUM(cnt)::bigint AS total FROM (${apptParts.join(' UNION ALL ')}) x`
-          );
-          apptTotal += parseInt(apptR.rows[0].total) || 0;
-        } catch (err) {
-          logger.warn('Cross-tenant appointment count failed for a batch', { error: err.message, batchStart: i, batchSize: batch.length });
-        }
-        try {
-          const patientParts = batch.map(t =>
-            `SELECT COUNT(*) AS cnt FROM "${t.schema_name}".patients`
-          );
-          const patientR = await query(
-            `SELECT SUM(cnt)::bigint AS total FROM (${patientParts.join(' UNION ALL ')}) x`
-          );
-          patientTotal += parseInt(patientR.rows[0].total) || 0;
-        } catch (err) {
-          logger.warn('Cross-tenant patient count failed for a batch', { error: err.message, batchStart: i, batchSize: batch.length });
-        }
+    // Process ALL active tenants in fixed-size batches (rather than capping at
+    // an arbitrary 100) so platform totals never silently undercount once there
+    // are more tenants than a single UNION ALL query should reasonably hold.
+    const BATCH_SIZE = 100;
+    let appts30d = 0;
+    let apptsMonth = 0;
+    let apptsToday = 0;
+    let patientTotal = 0;
+    for (let i = 0; i < validSchemas.length; i += BATCH_SIZE) {
+      const batch = validSchemas.slice(i, i + BATCH_SIZE);
+      try {
+        // All three appointment metrics come from ONE scan per tenant schema, so
+        // computing the fast-moving ones live costs nothing beyond the 30-day
+        // count this loop already ran.
+        // - c_month uses IST_MONTH_START_TS_SQL against created_at with ALL
+        //   statuses: it must equal the sum of the per-tenant quota panels
+        //   (/tenants/:id/quota) and bookingCore.checkMonthlyQuota, which is the
+        //   limit actually enforced at booking time. A cancelled appointment
+        //   still consumed quota, so status must not be filtered.
+        // - c_today matches the slotGenerator roll-up's definition exactly.
+        const apptParts = batch.map(t => `
+          SELECT
+            COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') AS c_30d,
+            COUNT(*) FILTER (WHERE created_at >= ${IST_MONTH_START_TS_SQL}) AS c_month,
+            COUNT(*) FILTER (WHERE appointment_date = ${IST_TODAY_SQL} AND status = 'confirmed') AS c_today
+          FROM "${t.schema_name}".appointments`);
+        const apptR = await query(
+          `SELECT SUM(c_30d)::bigint AS t_30d, SUM(c_month)::bigint AS t_month, SUM(c_today)::bigint AS t_today
+           FROM (${apptParts.join(' UNION ALL ')}) x`
+        );
+        appts30d += parseInt(apptR.rows[0].t_30d) || 0;
+        apptsMonth += parseInt(apptR.rows[0].t_month) || 0;
+        apptsToday += parseInt(apptR.rows[0].t_today) || 0;
+      } catch (err) {
+        logger.warn('Cross-tenant appointment count failed for a batch', { error: err.message, batchStart: i, batchSize: batch.length });
       }
-      if (validSchemas.length > 0) {
-        totalAppointments = apptTotal;
-        totalPatients = patientTotal;
+      if (cacheHit) continue; // patients_total already served from the roll-up
+      try {
+        // deleted_at IS NULL mirrors the cache writers (slotGenerator /
+        // routes/admin.js); a bare COUNT(*) here made total_patients jump
+        // upwards on a cache miss by counting soft-deleted patients.
+        const patientParts = batch.map(t =>
+          `SELECT COUNT(*) AS cnt FROM "${t.schema_name}".patients WHERE deleted_at IS NULL`
+        );
+        const patientR = await query(
+          `SELECT SUM(cnt)::bigint AS total FROM (${patientParts.join(' UNION ALL ')}) x`
+        );
+        patientTotal += parseInt(patientR.rows[0].total) || 0;
+      } catch (err) {
+        logger.warn('Cross-tenant patient count failed for a batch', { error: err.message, batchStart: i, batchSize: batch.length });
       }
     }
+    if (!cacheHit) totalPatients = patientTotal;
 
     const result = {
       total_tenants: parseInt(total.rows[0].count),
-      active_tenants: parseInt(active.rows[0].count),
+      active_tenants: activeTenants,
       new_tenants_this_month: parseInt(newMonth.rows[0].count),
       monthly_growth: parseInt(monthly.rows[0].new_tenants),
       by_plan: plans.rows,
-      total_appointments_30d: totalAppointments,
+      // Appointments CREATED in the trailing 30 days, all statuses, active tenants.
+      total_appointments_30d: appts30d,
+      // Active-tenant patients with deleted_at IS NULL.
       total_patients: totalPatients,
-      appointments_today: cachedStats.appointments_today,
-      appointments_this_month: cachedStats.appointments_month,
+      // Appointments SCHEDULED for the IST calendar day today, status='confirmed'.
+      appointments_today: apptsToday,
+      // Appointments CREATED since the IST month start, all statuses — the quota
+      // definition (bookingCore.checkMonthlyQuota), not a scheduled-in-month count.
+      appointments_this_month: apptsMonth,
       mrr,
+      // Honest: true only when total_patients came from a fresh, complete
+      // tenant_stats_cache roll-up. Every other field above is always live.
       stats_cache_hit: cacheHit,
     };
 

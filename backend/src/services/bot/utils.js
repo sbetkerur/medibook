@@ -70,6 +70,66 @@ function parseChoiceNumber(input) {
   return /^\d+$/.test(s) ? parseInt(s, 10) : NaN;
 }
 
+/**
+ * Mask a phone number for logging — last 4 digits only.
+ *
+ * utils/logger.js writes logs/combined.log in production, so an unmasked number
+ * is a patient identifier persisted to disk (and shipped to whatever tails it).
+ * Lives here rather than in routes/webhook.js, where it started, because the
+ * webhook, the bot engine, the booking flow and the reminder cron all log the
+ * same value and were each masking it (or not) on their own.
+ */
+function maskPhone(phone) {
+  const s = String(phone == null ? '' : phone);
+  if (s.length < 4) return '****';
+  return '*'.repeat(Math.min(s.length - 4, 8)) + s.slice(-4);
+}
+
+// ── DESTRUCTIVE-CONFIRM BUTTON BINDING ────────────────────────
+//
+// whatsapp.js mints reply ids positionally — `btn_${i}_${Date.now()}` — and
+// WhatsApp keeps every button it has ever delivered tappable forever. So a bare
+// "btn_0" means "the first button of SOME message we once sent this phone", not
+// "the button on the question you are answering". Matching it as a substring in
+// a cancel/reschedule confirm step meant a patient scrolling up and tapping the
+// old "🔄 Reschedule" button (btn_0 of the My Appointments card) answered "yes"
+// to "This cannot be undone. Are you sure?" — appointment cancelled, slot
+// released, admin alerted, with no confirmation from the patient at all.
+//
+// The fix binds the answer to the question: the confirm prompt records WHEN its
+// buttons were minted, and only an id whose timestamp falls inside that window
+// can act as a positional answer. Typed "yes"/"no"/"1"/"2" are unaffected —
+// they carry their own intent and are matched by the callers' text patterns.
+
+/** Send a confirm prompt and remember which buttons it minted. */
+async function sendConfirmButtons(send, ctx, bodyText, buttons) {
+  const from = Date.now();
+  await send.buttons(bodyText, buttons);
+  // Same process, same clock as whatsapp.js's Date.now() — the ids this send
+  // just created are exactly those with a timestamp in [from, to].
+  ctx._confirm_btns = { from, to: Date.now() };
+}
+
+/**
+ * Classify a reply against the buttons the current confirm prompt rendered.
+ *
+ * @returns {number|null} null — not a positional button reply at all (typed
+ *   text, or a list-row id); -1 — a positional button reply that does NOT
+ *   belong to this prompt (a stale tap: re-ask, never act on it); otherwise the
+ *   0-based index of the button on the prompt we just sent.
+ */
+function confirmButtonIndex(ctx, choice) {
+  const m = /^btn_(\d+)_(\d+)$/.exec(String(choice == null ? '' : choice));
+  if (!m) return null;
+  const w = ctx && ctx._confirm_btns;
+  const ts = Number(m[2]);
+  // No window recorded (context write lost, or a prompt that predates this
+  // binding) — fail CLOSED. An unverifiable tap on a destructive question is
+  // exactly the case this exists for.
+  if (!w || !(ts >= w.from && ts <= w.to)) return -1;
+  return Number(m[1]);
+}
+
 // Substring matching below this length is not evidence of intent — it is a
 // coin flip. "a" is a substring of most names, so a one-character reply used to
 // resolve to whichever doctor happened to be first in the list.
@@ -135,9 +195,25 @@ async function updateSession(schemaName, phone, state, context) {
   const plainJson = JSON.stringify(context || {});
   const byteLen = Buffer.byteLength(plainJson, 'utf8');
   if (byteLen > LIMITS.SESSION_CONTEXT_MAX_BYTES) {
-    logger.warn(`Session context too large (${byteLen} bytes), resetting to idle`);
+    logger.warn(`Session context too large (${byteLen} bytes), resetting to idle`, { phone: maskPhone(phone) });
     await tenantQuery(schemaName,
       `UPDATE bot_sessions SET state='idle', context='{}', last_activity=NOW() WHERE phone=$1`, [phone]);
+    // The reset is deliberate; the SILENCE was not. The caller has already sent
+    // the next prompt ("Who is this appointment for?"), so without this the
+    // patient answers a question whose session no longer exists and gets the
+    // main menu back with no explanation — and it happens exactly at the end of
+    // a long booking (a multi-branch clinic's ctx carries _hospitals + _depts +
+    // _doctors + _dates + _slots + _patients of 36-char UUIDs, which crosses the
+    // limit around the patient-selection step).
+    // Lazy require: services/outbound.js requires THIS module for logMessage.
+    try {
+      const { sendPatientText } = require('../outbound');
+      await sendPatientText(schemaName, phone,
+        '⚠️ Sorry — this conversation grew too long for me to keep track of and I had to reset it.\n\n' +
+        'Nothing was booked. Reply *Menu* to start again.');
+    } catch (err) {
+      logger.warn('Session-reset notice failed to send', { phone: maskPhone(phone), error: err.message });
+    }
     return;
   }
   // Encrypt context before storage to protect PII (patient names, DOB, selected options)
@@ -175,6 +251,33 @@ async function resetSessionToIdle(schemaName, phone) {
   return updateSession(schemaName, phone, STATES.IDLE, {});
 }
 
+/**
+ * Has this patient opted out of this clinic's WhatsApp messages?
+ *
+ * botEngine enforces opt-out at the top of _handleInner, but several sends
+ * never reach it: the webhook's unsupported-type reply (fires on every image),
+ * the clinic-selection confirmation, and the voice path (which used to pay for
+ * a Meta media download and a Whisper call before handle() dropped the
+ * message). They all need the same answer, so they all ask here.
+ *
+ * Non-fatal: an unreadable patients table returns false, i.e. behave exactly as
+ * before rather than going silent on every patient.
+ *
+ * "Any profile" rather than "the first profile": a phone can carry several
+ * family profiles, and both the opt-out and the re-subscribe writes set the
+ * flag on ALL rows for the phone, so the two readings agree — but this one does
+ * not depend on which row an unordered SELECT happens to return first.
+ */
+async function isOptedOut(schemaName, phone) {
+  try {
+    const r = await tenantQuery(schemaName,
+      `SELECT opted_out FROM patients WHERE phone=$1 AND opted_out=true LIMIT 1`, [phone]);
+    return r.rows.length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function getPatient(schemaName, phone) {
   const r = await tenantQuery(schemaName,
     `SELECT id, phone, name, email, date_of_birth, gender, visit_count FROM patients WHERE phone=$1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, [phone]);
@@ -189,12 +292,22 @@ async function getPatients(schemaName, phone) {
 
 async function logMessage(schemaName, phone, direction, type, content, waMessageId) {
   try {
+    // Only a real Meta id (a "wamid...." string) belongs in this column. The
+    // /api/webhook/test endpoint and the bot tests monkey-patch the senders with
+    // stubs that return whatever their body evaluates to (undefined, an array
+    // length, …); writing those would poison the unique index with junk ids.
+    const msgId = typeof waMessageId === 'string' && waMessageId ? waMessageId : null;
+    // wa_message_id carries a UNIQUE partial index (idx_wa_messages_msg_id).
+    // Inbound and outbound ids are separate Meta namespaces so a clash is a
+    // freak event — but an unguarded INSERT would turn one into a thrown error
+    // in the middle of a booking, losing the patient's reply over a history row.
     await tenantQuery(schemaName,
       `INSERT INTO wa_messages (phone, direction, message_type, content, wa_message_id)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [phone, direction, type, content, waMessageId || null]);
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (wa_message_id) WHERE wa_message_id IS NOT NULL DO NOTHING`,
+      [phone, direction, type, content, msgId]);
   } catch (err) {
-    logger.warn('logMessage failed', { phone, direction, error: err.message });
+    logger.warn('logMessage failed', { phone: maskPhone(phone), direction, error: err.message });
   }
 }
 
@@ -211,10 +324,12 @@ async function notifyAdminWhatsApp(schema, tenant, message) {
     const wa = require('../whatsapp');
     for (const admin of adminUsers.rows) {
       try {
-        await wa.sendText(admin.notify_phone, message, null, null);
+        const waMessageId = await wa.sendText(admin.notify_phone, message, null, null);
         // Recorded like any other outbound message, but under its own type so a
-        // conversation view can keep staff alerts out of patient threads.
-        await logMessage(schema, admin.notify_phone, 'out', 'admin_alert', message, null);
+        // conversation view can keep staff alerts out of patient threads. The
+        // Meta id is what delivery receipts key on — without it the row can
+        // never move past status NULL.
+        await logMessage(schema, admin.notify_phone, 'out', 'admin_alert', message, waMessageId);
       } catch (err) {
         logger.warn('Admin WhatsApp alert failed', { error: err.message });
       }
@@ -230,9 +345,13 @@ module.exports = {
   levenshtein,
   fuzzyFind,
   parseChoiceNumber,
+  maskPhone,
+  sendConfirmButtons,
+  confirmButtonIndex,
   getSession,
   updateSession,
   resetSessionToIdle,
+  isOptedOut,
   getPatient,
   getPatients,
   logMessage,

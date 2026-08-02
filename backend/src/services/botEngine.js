@@ -13,8 +13,13 @@ const {
   getSession,
   updateSession,
   resetSessionToIdle,
+  isOptedOut,
   getPatient,
   logMessage,
+  maskPhone,
+  parseChoiceNumber,
+  sendConfirmButtons,
+  confirmButtonIndex,
 } = require('./bot/utils');
 
 const {
@@ -110,7 +115,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId }) {
     // reset the session to idle and tell the user to try again. This prevents the bot
     // from silently dying and leaving the user stuck with no response.
     logger.error('Bot handle() uncaught error', {
-      phone, tenant: tenant.slug, error: err.message,
+      phone: maskPhone(phone), tenant: tenant.slug, error: err.message,
       stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
     });
     // Deliberately do NOT reset the session here. The rethrow below feeds the
@@ -136,18 +141,29 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   // Inbound message is already logged by the webhook handler for idempotency dedup.
   // Only log outgoing messages here to avoid a double-insert in wa_messages.
 
+  // Send FIRST, then log with the id Meta returned. Logging first meant every
+  // outbound row was written with wa_message_id NULL, so the sent/delivered/read
+  // callbacks in routes/webhook.js could never match a row and the status column
+  // stayed NULL forever. Consequence of the swap: a send that THROWS is no longer
+  // written to history — the same policy services/outbound.js already documents
+  // (history must record what actually went out). The throw still propagates to
+  // handle()'s top-level catch exactly as before, which is what feeds the
+  // BullMQ/failed_webhooks retry path.
   const send = {
     text: async (t) => {
-      await logMessage(schema, phone, 'out', 'text', t, null);
-      return wa.sendText(phone, t, waToken, waPhoneId);
+      const id = await wa.sendText(phone, t, waToken, waPhoneId);
+      await logMessage(schema, phone, 'out', 'text', t, id);
+      return id;
     },
     buttons: async (t, btns) => {
-      await logMessage(schema, phone, 'out', 'buttons', t, null);
-      return wa.sendButtons(phone, t, btns, waToken, waPhoneId);
+      const id = await wa.sendButtons(phone, t, btns, waToken, waPhoneId);
+      await logMessage(schema, phone, 'out', 'buttons', t, id);
+      return id;
     },
     list: async (t, label, sections) => {
-      await logMessage(schema, phone, 'out', 'list', t, null);
-      return wa.sendList(phone, t, label, sections, waToken, waPhoneId);
+      const id = await wa.sendList(phone, t, label, sections, waToken, waPhoneId);
+      await logMessage(schema, phone, 'out', 'list', t, id);
+      return id;
     },
   };
 
@@ -158,28 +174,27 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   // ── OPTED-OUT check — silently drop all messages from opted-out patients ──
   // We check opted_out before any state handling so opted-out patients can
   // still send STOP/START but get no other bot responses.
+  // isOptedOut (bot/utils) is the single definition — the webhook's
+  // unsupported-type reply, the clinic-selection confirmation and the voice
+  // path all sit OUTSIDE this function and have to ask the same question.
   if (!/^(stop|unsubscribe|opt.?out|block|start)$/i.test(input)) {
-    try {
-      const optedR = await tenantQuery(schema,
-        `SELECT opted_out FROM patients WHERE phone=$1`, [phone]);
-      if (optedR.rows[0]?.opted_out === true) {
-        logger.info(`Dropped message from opted-out patient`, { phone });
-        return;
-      }
-    } catch (_) {} // non-fatal — proceed if table or column missing
+    if (await isOptedOut(schema, phone)) {
+      logger.info(`Dropped message from opted-out patient`, { phone: maskPhone(phone) });
+      return;
+    }
   }
 
   // ── OPT-OUT handler ─────────────────────────────────────────
   if (/^(stop|unsubscribe|opt.?out|block)$/i.test(input)) {
     await tenantQuery(schema,
       `UPDATE patients SET opted_out=true, updated_at=NOW() WHERE phone=$1`, [phone])
-      .catch(err => logger.warn('Opt-out patient update failed', { phone, error: err.message }));
+      .catch(err => logger.warn('Opt-out patient update failed', { phone: maskPhone(phone), error: err.message }));
     await resetSessionToIdle(schema, phone)
-      .catch(err => logger.warn('Opt-out session reset failed', { phone, error: err.message }));
+      .catch(err => logger.warn('Opt-out session reset failed', { phone: maskPhone(phone), error: err.message }));
     await send.text(
       `You have been unsubscribed from ${tenant.name} WhatsApp notifications.\n\nTo re-subscribe, reply *START*.`
-    ).catch(err => logger.warn('Opt-out reply failed to send', { phone, error: err.message }));
-    logger.info(`Patient ${phone} opted out from ${tenant.name}`);
+    ).catch(err => logger.warn('Opt-out reply failed to send', { phone: maskPhone(phone), error: err.message }));
+    logger.info(`Patient ${maskPhone(phone)} opted out from ${tenant.name}`);
     return;
   }
 
@@ -222,7 +237,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       if (!decrypted) {
         // Decryption failed (key rotation or corrupted data) — reset session entirely
         // so the bot doesn't stay stuck in a broken mid-flow state with empty context.
-        logger.warn('Session context decryption failed, resetting to idle', { phone });
+        logger.warn('Session context decryption failed, resetting to idle', { phone: maskPhone(phone) });
         await updateSession(schema, phone, STATES.IDLE, {});
         await send.text('Sorry, something went wrong. Let\'s start over — reply *Menu* to continue.');
         return;
@@ -232,7 +247,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       // Legacy unencrypted session — accept for backwards compat but log so
       // operators know these exist. They'll be re-encrypted on next updateSession.
       if (raw && Object.keys(raw).length > 0) {
-        logger.warn('Unencrypted bot session context found — will be encrypted on next write', { phone });
+        logger.warn('Unencrypted bot session context found — will be encrypted on next write', { phone: maskPhone(phone) });
       }
       ctx = raw;
     }
@@ -522,20 +537,29 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSession);
   }
   if (session.state === STATES.CONFIRM_BOOKING) {
+    // Which button, if any, the patient actually tapped on the summary above.
+    // A bare positional id ("btn_0" from ANY older message — WhatsApp keeps them
+    // all tappable) is not consent to book; -1 means "stale tap" and falls
+    // through to the re-prompt at the bottom of this branch.
+    const btnIdx = confirmButtonIndex(ctx, choice);
     // Check negative intent FIRST — replies like "no, don't confirm" contain
     // words ("confirm") that would otherwise match the positive pattern below
     // and book an appointment the patient just declined. Mirrors
     // handleRescheduleConfirm/handleCancelConfirm in appointmentFlow.js.
-    const isNegative = /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bcancel\b|\bnahi\b|btn_1|^2$/i.test(choice);
+    const isNegative = btnIdx === 1 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bcancel\b|\bnahi\b|^2$/i.test(choice);
     if (isNegative) {
       await send.text('Booking cancelled. Reply *Menu* to start over anytime. 👋');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
-    if (/^(yes|confirm|ok|sure|haan)$|^btn_0|^1$/.test(choice)) {
+    if (btnIdx === 0 || /^(yes|confirm|ok|sure|haan)$|^1$/.test(choice)) {
       return completeBooking(phone, schema, tenant, send, ctx);
     }
-    await send.buttons('Please confirm your booking:', ['✅ Confirm', '❌ Cancel']);
+    // Re-prompt — and re-bind, because these are freshly minted buttons; the
+    // window recorded for the previous prompt no longer describes what is on
+    // the patient's screen. The session write persists the new binding.
+    await sendConfirmButtons(send, ctx, 'Please confirm your booking:', ['✅ Confirm', '❌ Cancel']);
+    await updateSession(schema, phone, STATES.CONFIRM_BOOKING, ctx);
     return;
   }
 
@@ -627,7 +651,10 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
   // so we match by prefix rather than exact key.
   const ratingMap = { btn_0: 1, btn_1: 3, btn_2: 5 };
   const matchedKey = Object.keys(ratingMap).find(k => (choice || '').startsWith(k + '_') || choice === k);
-  let rating = matchedKey ? ratingMap[matchedKey] : parseInt(input, 10);
+  // parseChoiceNumber, not parseInt: parseInt pulls a leading digit run out of
+  // anything, so "3rd visit, staff were lovely" was filed as a 3-star rating and
+  // the compliment thrown away. A whole-string number or nothing.
+  let rating = matchedKey ? ratingMap[matchedKey] : parseChoiceNumber(input);
   if (!rating || rating < 1 || rating > 5) {
     await send.buttons(
       `Please reply with a number from *1 to 5*:\n\n1 ⭐ — Poor\n3 ⭐⭐⭐ — Average\n5 ⭐⭐⭐⭐⭐ — Excellent`,
@@ -669,7 +696,7 @@ async function triggerFeedback(schemaName, phone, appointmentId, patientId, doct
     // feedback state when the patient is idle or at the main menu.
     const session = await getSession(schemaName, phone);
     if (session && session.state !== STATES.IDLE && session.state !== STATES.MAIN_MENU) {
-      logger.info(`Skipping feedback for ${phone} — active session state: ${session.state}`);
+      logger.info(`Skipping feedback for ${maskPhone(phone)} — active session state: ${session.state}`);
       return;
     }
     // Use updateSession() so the context is encrypted (protects appointment/patient IDs)
@@ -680,7 +707,7 @@ async function triggerFeedback(schemaName, phone, appointmentId, patientId, doct
       doctor_name: doctorName,
     });
   } catch (err) {
-    logger.warn('triggerFeedback failed', { phone, error: err.message });
+    logger.warn('triggerFeedback failed', { phone: maskPhone(phone), error: err.message });
   }
 }
 
@@ -698,6 +725,17 @@ async function handleVoiceMessage({ phone, audioId, tenant }) {
   // own send.* helpers do: a patient who only ever sends voice notes would
   // otherwise have a conversation history containing none of the bot's answers.
   const { sendPatientText } = require('./outbound');
+
+  // Opt-out is enforced inside _handleInner, which this function only reaches
+  // AFTER a Meta media download and a paid Whisper call — and both replies
+  // below are sent before it is consulted at all, so an opted-out patient got
+  // an answer from a clinic they unsubscribed from. Check first: silence, and
+  // no spend. (Re-subscribing stays a typed *START*; a transcript is not a
+  // reliable enough signal to reopen a channel the patient closed.)
+  if (await isOptedOut(schema, phone)) {
+    logger.info('Dropped voice message from opted-out patient', { phone: maskPhone(phone) });
+    return;
+  }
 
   if (!process.env.OPENAI_API_KEY) {
     await sendPatientText(schema, phone, 'Sorry, I can only process text messages. Please type your request.');
@@ -736,11 +774,11 @@ async function handleVoiceMessage({ phone, audioId, tenant }) {
       return;
     }
 
-    logger.info('Audio transcribed', { phone, length: transcribed.length });
+    logger.info('Audio transcribed', { phone: maskPhone(phone), length: transcribed.length });
     // Process transcribed text through bot engine
     await handle({ phone, text: transcribed, buttonId: null, tenant });
   } catch (err) {
-    logger.warn('Voice transcription failed', { phone, error: err.message });
+    logger.warn('Voice transcription failed', { phone: maskPhone(phone), error: err.message });
     await sendPatientText(schema, phone, 'Sorry, I couldn\'t process your audio. Please type *Menu* to start.')
       .catch(() => {});
   }

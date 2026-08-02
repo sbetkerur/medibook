@@ -402,6 +402,14 @@ export default function Dashboard() {
     } catch { toast.error('Failed to load appointments'); }
   }, [filterDate, filterStatus, apptPage]);
 
+  // The 60s auto-refresh interval below must not depend on `fetchAppointments`
+  // directly: its identity changes with the filters and the page, so the timer
+  // was cleared and restarted on every filter tweak and never survived the full
+  // minute for anyone actually using the tab. The interval reads the latest
+  // fetcher from this ref instead, so it stays mounted without going stale.
+  const fetchAppointmentsRef = useRef(fetchAppointments);
+  useEffect(() => { fetchAppointmentsRef.current = fetchAppointments; }, [fetchAppointments]);
+
   const fetchDoctors = useCallback(async () => {
     try {
       const url = showInactive ? '/admin/doctors?include_inactive=true' : '/admin/doctors';
@@ -483,7 +491,11 @@ export default function Dashboard() {
     try {
       const { data } = await api.get('/admin/onboarding/status');
       setOnboarding(data);
-      if (!data.all_done && !data.onboarding_completed) setShowOnboarding(true);
+      // Show while the tenant has not been marked complete — including once
+      // every step is ticked, which is the only state that offers the
+      // "Mark setup complete" button. Hiding it on all_done left
+      // `onboarding_completed` false forever.
+      if (!data.onboarding_completed) setShowOnboarding(true);
     } catch { /* silent */ }
   }, []);
 
@@ -940,10 +952,10 @@ export default function Dashboard() {
       if (tab === 'overview') fetchStats(true);
     }, 60000);
     const apptInterval = setInterval(() => {
-      if (tab === 'appointments') fetchAppointments();
+      if (tab === 'appointments') fetchAppointmentsRef.current();
     }, 60000);
     return () => { clearInterval(statsInterval); clearInterval(apptInterval); };
-  }, [tab, fetchStats, fetchAppointments]);
+  }, [tab, fetchStats]);
 
   useEffect(() => {
     if (tab === 'appointments') { setApptPage(1); fetchAppointments(1); }
@@ -1181,8 +1193,11 @@ export default function Dashboard() {
           <button className="md:hidden text-gray-400 hover:text-gray-600 p-1" onClick={() => setSidebarOpen(false)}>✕</button>
         </div>
         <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
-          {/* Audit logs endpoint is admin-only (403 for staff) — hide the tab */}
-          {NAV.filter(item => isAdmin || item.id !== 'audit').map(item => (
+          {/* Hide the tabs whose backing endpoint is adminOnly, rather than
+              letting a non-admin open a tab that can only ever show a "Failed
+              to load" toast. GET /admin/audit-logs and GET /admin/staff both
+              403 for staff/doctor. */}
+          {NAV.filter(item => isAdmin || (item.id !== 'audit' && item.id !== 'staff')).map(item => (
             <button key={item.id} onClick={() => { setTab(item.id); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                 tab === item.id ? 'bg-blue-50 text-blue-600' : 'text-gray-600 hover:bg-gray-50'
@@ -1296,12 +1311,18 @@ export default function Dashboard() {
           )}
 
           {/* ── ONBOARDING BANNER ── */}
-          {showOnboarding && onboarding && !onboarding.all_done && (
+          {showOnboarding && onboarding && (
             <div className="mb-4 bg-blue-50 border border-blue-200 rounded-xl p-4">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <h3 className="font-semibold text-blue-900 text-sm">🎉 Welcome! Complete your setup</h3>
-                  <p className="text-xs text-blue-600 mt-0.5">Finish these steps to activate your WhatsApp bot</p>
+                  <h3 className="font-semibold text-blue-900 text-sm">
+                    {onboarding.all_done ? '🎉 Setup complete!' : '🎉 Welcome! Complete your setup'}
+                  </h3>
+                  <p className="text-xs text-blue-600 mt-0.5">
+                    {onboarding.all_done
+                      ? 'Your WhatsApp bot is live — dismiss this for good below'
+                      : 'Finish these steps to activate your WhatsApp bot'}
+                  </p>
                 </div>
                 <button onClick={() => setShowOnboarding(false)} className="text-blue-400 hover:text-blue-600 text-lg">✕</button>
               </div>
@@ -1314,7 +1335,16 @@ export default function Dashboard() {
                 ))}
               </div>
               {onboarding.all_done && (
-                <button onClick={async () => { await api.post('/admin/onboarding/complete'); setShowOnboarding(false); }}
+                <button onClick={async () => {
+                    try {
+                      await api.post('/admin/onboarding/complete');
+                      setOnboarding(o => (o ? { ...o, onboarding_completed: true } : o));
+                      setShowOnboarding(false);
+                      toast.success('Setup marked complete');
+                    } catch (err) {
+                      toast.error(err.response?.data?.error || 'Failed to mark setup complete');
+                    }
+                  }}
                   className="mt-3 px-4 py-1.5 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
                   Mark setup complete ✓
                 </button>
@@ -1456,7 +1486,10 @@ export default function Dashboard() {
           )}
 
           {/* ── STAFF ── */}
-          {tab === 'staff' && !tabLoading && (
+          {/* isAdmin guard mirrors the AUDIT LOGS tab below: hiding it in NAV is
+              not enough, because the tab can also be reached by a keyboard
+              shortcut or a stale `tab` value. */}
+          {tab === 'staff' && isAdmin && !tabLoading && (
             <StaffTab
               isAdmin={isAdmin}
               setConfirmModal={setConfirmModal}
@@ -1491,8 +1524,11 @@ export default function Dashboard() {
           )}
 
           {/* ── SLOTS ── */}
+          {/* The grid itself is readable by any role; only block/unblock is
+              admin-gated server-side (PATCH /admin/slots/:id), so pass isAdmin
+              rather than hiding the whole tab. */}
           {tab === 'slots' && !tabLoading && (
-            <SlotsTab doctors={doctors} />
+            <SlotsTab doctors={doctors} isAdmin={isAdmin} />
           )}
 
           {/* ── BOT TESTER ── */}
@@ -1882,6 +1918,12 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="flex gap-2 flex-shrink-0">
+                      {/* The blob fetch is adminOnly server-side (it is the only
+                          route that returns file_data — a full scan or X-ray),
+                          so a non-admin's click could only ever 403. The list
+                          above stays visible to every role: front desk needs to
+                          know a document exists. */}
+                      {isAdmin && (
                       <button
                         onClick={async () => {
                           try {
@@ -1889,10 +1931,16 @@ export default function Dashboard() {
                             const a = document.createElement('a');
                             a.href = `data:${doc.file_type || 'application/octet-stream'};base64,${data.document.file_data}`;
                             a.download = doc.file_name;
+                            // Firefox ignores .click() on an anchor that is not
+                            // in the document, so the download silently did
+                            // nothing there (see printReceipt above).
+                            document.body.appendChild(a);
                             a.click();
+                            a.remove();
                           } catch { toast.error('Download failed'); }
                         }}
                         className="text-xs text-blue-600 hover:underline px-2 py-1">Download</button>
+                      )}
                       {isAdmin && (
                       <button
                         onClick={async () => {

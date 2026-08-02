@@ -9,8 +9,14 @@ const { createTenantSchema, runTenantMigrations } = require('./tenantMigrate');
 // deploy — changing it in the dashboard silently reverts on the next one. The
 // demo tenant is a sales/dev fixture, so it is opt-in outside development, and
 // when it IS enabled in production the password must come from the environment.
+// The same "runs on every boot" property applies to every OTHER field this file
+// overwrites, not just the password: the tenant name and the admin user's name
+// are both editable in the dashboard, so re-applying the seed's values on each
+// deploy silently reverts real edits. Those writes are now opt-in behind this
+// flag, which means "put the demo fixture back to factory settings".
 const IS_PROD = process.env.NODE_ENV === 'production';
 const SEED_DEMO = process.env.SEED_DEMO_DATA === 'true';
+const SEED_DEMO_RESET = process.env.SEED_DEMO_RESET === 'true';
 const DEMO_PASSWORD = process.env.DEMO_ADMIN_PASSWORD || (IS_PROD ? null : 'Demo@123456');
 
 async function seed() {
@@ -43,18 +49,42 @@ async function seed() {
     await runTenantMigrations(schema);
     console.log('✅ Tenant created: Smile Dental Clinic');
   } else {
-    await query(`UPDATE tenants SET name='Smile Dental Clinic' WHERE slug=$1`, [slug]);
+    // This UPDATE used to be unconditional. entrypoint.sh runs the seed on every
+    // Railway boot, so renaming the clinic in the Settings tab reverted on the
+    // next deploy — and because services/bot/clinicSearch.js matches a patient's
+    // typed search against the tenant NAME, patients who had learned the new name
+    // stopped finding the clinic at all. The rename was a one-time migration off
+    // the old non-dental demo fixture, so it is opt-in now.
+    if (SEED_DEMO_RESET) {
+      await query(`UPDATE tenants SET name='Smile Dental Clinic' WHERE slug=$1`, [slug]);
+      console.log('✅ Tenant name reset to: Smile Dental Clinic (SEED_DEMO_RESET)');
+    } else {
+      console.log(`✅ Tenant exists: ${tenant.name} (name left as-is; SEED_DEMO_RESET=true restores demo defaults)`);
+    }
     await runTenantMigrations(schema);
-    console.log('✅ Tenant name updated to: Smile Dental Clinic');
   }
 
   // ── ADMIN USER ────────────────────────────────────────────────
+  // Insert-only by default. `ON CONFLICT DO UPDATE SET name, password_hash` here
+  // re-applied the seed's display name AND DEMO_ADMIN_PASSWORD on every boot, so
+  // an admin who changed either in the dashboard was reverted by the next deploy.
+  // The gate at the top of this file only kept a HARDCODED password out of
+  // production — it did not stop the revert.
   const hash = await bcrypt.hash(DEMO_PASSWORD, 12);
-  await tenantQuery(schema, `
+  const adminUpsert = await tenantQuery(schema, SEED_DEMO_RESET ? `
     INSERT INTO users (email, password_hash, name, role)
     VALUES ('demo@medibook.com', $1, 'Smile Dental Admin', 'admin')
     ON CONFLICT (email) DO UPDATE SET name='Smile Dental Admin', password_hash=EXCLUDED.password_hash
+  ` : `
+    INSERT INTO users (email, password_hash, name, role)
+    VALUES ('demo@medibook.com', $1, 'Smile Dental Admin', 'admin')
+    ON CONFLICT (email) DO NOTHING
   `, [hash]);
+  console.log(adminUpsert.rowCount > 0
+    ? (SEED_DEMO_RESET
+        ? '✅ Admin user reset to demo defaults: demo@medibook.com (SEED_DEMO_RESET)'
+        : '✅ Admin user created: demo@medibook.com')
+    : '✅ Admin user exists: demo@medibook.com (name/password left as-is)');
 
   // ── CLINICS (multi-branch dental chain) ──────────────────────
   // Branch 1: Banjara Hills (main)
@@ -142,15 +172,6 @@ async function seed() {
   console.log(`✅ ${deptList.length} dental treatment categories — Branch 1`);
   console.log(`✅ ${deptList2.length} dental treatment categories — Branch 2 (KPHB)`);
 
-  // ── DEACTIVATE OLD NON-DENTAL DOCTORS ────────────────────────
-  const oldNames = [
-    'Shashidhar','Suvarna','Sanjay','Sandeep','Sunita','Manjula','Akanksha','Gautam',
-    'Priya Sharma','Rajesh Kumar','Anita Reddy','Suresh Mehta',
-  ];
-  for (const name of oldNames) {
-    await tenantQuery(schema, `UPDATE doctors SET is_active=false WHERE name=$1`, [name]);
-  }
-
   // ── DENTISTS ──────────────────────────────────────────────────
   // branch: 1 = Banjara Hills, 2 = KPHB
   const doctorDefs = [
@@ -166,6 +187,49 @@ async function seed() {
     { name: 'Suresh Babu',     spec: 'Endodontist',                  qual: 'BDS, MDS (Endodontics)',        dept: 'Root Canal Treatment',    fee: 650,  duration: 60, branch: 2 },
     { name: 'Anjali Verma',    spec: 'Cosmetic Dentist',             qual: 'BDS, MDS (Prosthodontics)',     dept: 'Cosmetic Dentistry',      fee: 500,  duration: 45, branch: 2 },
   ];
+
+  // ── ONE-TIME CLEANUP: leftovers of the pre-dental seed ───────
+  // This was `for (const name of oldNames) UPDATE doctors SET is_active=false
+  // WHERE name=$1` running on EVERY boot — unscoped to hospital and to the
+  // seeded doctor set. A clinic admin who added a real dentist called "Sanjay"
+  // or "Priya Sharma" (the literal placeholder text in the dashboard's
+  // Add-Doctor modal) had them silently deactivated by the next deploy, with no
+  // audit-log entry, and they vanished from the WhatsApp bot.
+  // It is a one-shot historical fixup now, narrowed four ways:
+  //   1. recorded in seed_markers (table created by tenantMigrate.js) so it can
+  //      never sweep a schema a second time — after this, no deploy can ever
+  //      deactivate a hand-added doctor, whatever they are called;
+  //   2. scoped to the two branches this seed owns, so a doctor at a branch the
+  //      clinic added itself is out of range;
+  //   3. names no current doctorDef uses;
+  //   4. skips any doctor with appointments against their name. The one
+  //      remaining historical run is the only chance this code ever gets to hit
+  //      a real dentist, and a dentist the clinic actually books is exactly the
+  //      one that must survive it. Leftovers of the pre-dental seed have no
+  //      appointments in a live clinic's schema.
+  const LEGACY_DOCTOR_MARKER = 'deactivate_legacy_doctors_v1';
+  const markerDone = (await tenantQuery(schema,
+    `SELECT 1 FROM seed_markers WHERE key=$1`, [LEGACY_DOCTOR_MARKER])).rowCount > 0;
+  if (markerDone) {
+    console.log('✅ Legacy doctor cleanup already applied — skipped');
+  } else {
+    const currentNames = doctorDefs.map(d => d.name);
+    const legacyNames = [
+      'Shashidhar','Suvarna','Sanjay','Sandeep','Sunita','Manjula','Akanksha','Gautam',
+      'Priya Sharma','Rajesh Kumar','Anita Reddy','Suresh Mehta',
+    ].filter(n => !currentNames.includes(n));
+    const cleanup = await tenantQuery(schema, `
+      UPDATE doctors d SET is_active=false
+      WHERE d.name = ANY($1::text[])
+        AND d.hospital_id IN ($2,$3)
+        AND d.is_active=true
+        AND NOT EXISTS (SELECT 1 FROM appointments a WHERE a.doctor_id = d.id)
+    `, [legacyNames, hospital.id, hospital2.id]);
+    await tenantQuery(schema,
+      `INSERT INTO seed_markers (key) VALUES ($1) ON CONFLICT (key) DO NOTHING`,
+      [LEGACY_DOCTOR_MARKER]);
+    console.log(`✅ Legacy doctor cleanup (one-time): ${cleanup.rowCount} doctor(s) deactivated`);
+  }
 
   const doctorIds = [];
   for (const d of doctorDefs) {

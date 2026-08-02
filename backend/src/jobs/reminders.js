@@ -14,6 +14,9 @@ const { sendPatientText, sendPatientTemplate } = require('../services/outbound')
 // the answer routes to whichever clinic the patient last selected, so record
 // who is actually waiting for it (see services/pendingReply.js).
 const { KINDS, recordPendingReply } = require('../services/pendingReply');
+// Persistent logs (logs/combined.log in production) must not carry full patient
+// numbers — same helper the webhook and bot engine use.
+const { maskPhone } = require('../services/bot/utils');
 
 // Allow timezone override via env var so multi-region deployments work without code changes
 const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
@@ -229,7 +232,7 @@ async function handleReminderConfirmation(schemaName, phone, text) {
 
     return isYes ? 'yes' : 'no'; // consumed — caller uses this to send the appropriate response
   } catch (err) {
-    logger.warn('handleReminderConfirmation DB error', { phone, schemaName, error: err.message });
+    logger.warn('handleReminderConfirmation DB error', { phone: maskPhone(phone), schemaName, error: err.message });
     return false;
   }
 }
@@ -273,8 +276,6 @@ async function sendPostAppointmentFollowup() {
           `We'd love your feedback! Rate your experience:\n` +
           `⭐ 1 — Poor\n⭐⭐ 2 — Below Average\n⭐⭐⭐ 3 — Average\n⭐⭐⭐⭐ 4 — Good\n⭐⭐⭐⭐⭐ 5 — Excellent\n\n` +
           `Just reply with a number 1–5!`);
-        await tenantQuery(tenant.schema_name,
-          `UPDATE appointments SET follow_up_sent=true WHERE id=$1`, [appt.id]);
         // Trigger feedback state in bot session.
         // Use the appointment's OWN patient_id. This used to re-look-up by phone
         // (`SELECT id FROM patients WHERE phone=$1`), but patients.phone is
@@ -287,6 +288,15 @@ async function sendPostAppointmentFollowup() {
         // bare "4" finds its way back here (24h; a rating older than that is
         // not worth hijacking a message for).
         await recordPendingReply(appt.phone, tenant.id, KINDS.FEEDBACK, 24);
+        // Mark LAST, once the reply is actually routable — same policy as
+        // sendFeedbackRequests below and as reminder_*_sent. recordPendingReply
+        // writes to the PUBLIC schema, a different failure domain from this
+        // tenant-schema flag: setting the flag first meant a throw in there
+        // consumed the appointment with nothing recorded, no retry on the next
+        // run, and the patient's bare "4" landing in whichever clinic their
+        // shared-number session happened to point at.
+        await tenantQuery(tenant.schema_name,
+          `UPDATE appointments SET follow_up_sent=true WHERE id=$1`, [appt.id]);
         logger.info(`Post-appointment follow-up sent: ${appt.booking_id}`);
       } catch (err) {
         logger.error(`Follow-up failed for ${appt.booking_id}`, { error: err.message });
@@ -303,16 +313,34 @@ async function sendFeedbackRequests() {
     // Skip appointments that already received the 2-hour post-appointment
     // follow-up (follow_up_sent) so patients aren't asked for feedback twice.
     const appts = await tenantQuery(tenant.schema_name, `
-      SELECT a.id, a.status, p.phone, p.id as patient_id, p.name as patient_name, d.name as doctor_name
+      SELECT a.id, a.status, a.appointment_date::text AS appointment_date,
+             p.phone, p.id as patient_id, p.name as patient_name, d.name as doctor_name
       FROM appointments a
       JOIN patients p ON p.id=a.patient_id
       JOIN doctors d ON d.id=a.doctor_id
       WHERE a.status IN ('completed', 'no_show')
+        -- Key the window off when the appointment became ELIGIBLE, not off the
+        -- visit date. 'completed'/'no_show' is a status the clinic sets by hand,
+        -- and a practice that reconciles the week on Monday marks Tue–Fri all at
+        -- once: with a visit-date window, Tue/Wed/Thu were already outside it and
+        -- never got a request, ever. updated_at moves with the status change
+        -- (every status route sets updated_at=NOW()), so all four are picked up.
+        --
         -- Window is a RANGE, not exactly "yesterday". With a hard LIMIT and a
         -- single-day window, every patient past the limit was dropped forever,
-        -- because that date is never "yesterday" again. Combined with
+        -- because that day is never "yesterday" again. Combined with
         -- feedback_request_sent below, the backlog now drains over later runs.
-        AND a.appointment_date BETWEEN ${IST_TODAY_SQL} - INTERVAL '3 days'
+        --
+        -- Rolling NOW() interval, not an IST_TODAY_SQL date: updated_at is a
+        -- TIMESTAMPTZ, and comparing one to a ::date coerces at the server
+        -- timezone (UTC) and reintroduces the 5.5-hour skew.
+        AND a.updated_at >= NOW() - INTERVAL '3 days'
+        -- Independent sanity bound on the visit itself. Without it, a clinic
+        -- finally tidying up months-old records would blast "how was your visit?"
+        -- at patients who came in last spring. 30 days is the outer edge of a
+        -- rating a patient can still meaningfully give; the '1 day' end leaves
+        -- same-day visits to the 2-hour follow-up above.
+        AND a.appointment_date BETWEEN ${IST_TODAY_SQL} - INTERVAL '30 days'
                                    AND ${IST_TODAY_SQL} - INTERVAL '1 day'
         AND a.follow_up_sent IS NOT TRUE
         AND a.feedback_request_sent IS NOT TRUE
@@ -333,10 +361,15 @@ async function sendFeedbackRequests() {
     for (const appt of appts.rows) {
       try {
         const firstName = appt.patient_name ? appt.patient_name.split(' ')[0] : 'there';
+        // Name the actual date rather than saying "yesterday": now that the
+        // window keys off updated_at, a visit marked no_show during a weekly
+        // reconciliation can be several days back.
+        let visitLabel = 'recently';
+        try { visitLabel = 'on ' + format(parseISO(appt.appointment_date), 'EEE, d MMM'); } catch {}
         // no_show patients didn't have a visit — a "how was your visit?" message
         // would be tone-deaf. Nudge them to rebook instead.
         const message = appt.status === 'no_show'
-          ? `🦷 Hi ${firstName}, we missed you at your appointment with Dr. ${appt.doctor_name} yesterday.\n\n` +
+          ? `🦷 Hi ${firstName}, we missed you at your appointment with Dr. ${appt.doctor_name} ${visitLabel}.\n\n` +
             `No worries — these things happen! Reply *Menu* to book a new appointment whenever you're ready. 😊`
           : `⭐ *How was your dental visit, ${firstName}?*\n\n` +
             `We hope Dr. ${appt.doctor_name} took great care of your smile! 🦷\n\n` +

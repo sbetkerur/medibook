@@ -203,7 +203,13 @@
       "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; foreach \\($f in @\\('src/index.js','src/routes/auth.js','src/services/email.js','src/routes/superadmin.js','src/routes/analytics.js','src/utils/appUrls.js'\\)\\) { node --check $f; if \\(-not $?\\) { \"FAILED $f\" } }; $env:FRONTEND_URL='https://app.example.com , https://old.up.railway.app/'; node -e \"const u=require\\('./src/utils/appUrls'\\);console.log\\('origins:',JSON.stringify\\(u.frontendOrigins\\(\\)\\)\\);console.log\\('base:',u.frontendBaseUrl\\(\\)\\)\")",
       "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; node -e \"require\\('./src/routes/analytics'\\);require\\('./src/routes/auth'\\);require\\('./src/services/email'\\);require\\('./src/routes/superadmin'\\);require\\('./src/utils/appUrls'\\);console.log\\('LOADS OK'\\)\" 2>&1 | Select-String 'LOADS OK'; foreach \\($t in @\\('clinicSearch','slotPlanner','fuzzyFind','botFlow','restartGreeting'\\)\\) { $r = node \"tests/$t.unit.test.js\" 2>&1 | Select-String 'Results:'; \"$t -> $r\" })",
       "PowerShell(cd C:\\\\claude_projects\\\\medibook; $n=0; do { Start-Sleep -Seconds 15; $n++; $b = \\(railway deployment list --service backend --json | ConvertFrom-Json\\)[0].status; $f = \\(railway deployment list --service frontend --json | ConvertFrom-Json\\)[0].status } while \\(\\(\\($b -in @\\('BUILDING','DEPLOYING','INITIALIZING','QUEUED'\\)\\) -or \\($f -in @\\('BUILDING','DEPLOYING','INITIALIZING','QUEUED'\\)\\)\\) -and $n -lt 30\\); \"backend=$b frontend=$f\"; Start-Sleep -Seconds 10; \\(\\(Invoke-WebRequest -Uri \"https://backend-production-f66a.up.railway.app/health\" -UseBasicParsing\\).Content | ConvertFrom-Json\\) | Select-Object status, uptime_seconds, @{n='db';e={$_.db.status}}, redis | Format-List)",
-      "PowerShell(cd C:\\\\claude_projects\\\\medibook; foreach \\($svc in @\\('backend','frontend'\\)\\) { $d = \\(railway deployment list --service $svc --json | ConvertFrom-Json\\)[0]; \"$svc : $\\($d.status\\)  $\\($d.createdAt\\)  id=$\\($d.id.Substring\\(0,8\\)\\)\" })"
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook; foreach \\($svc in @\\('backend','frontend'\\)\\) { $d = \\(railway deployment list --service $svc --json | ConvertFrom-Json\\)[0]; \"$svc : $\\($d.status\\)  $\\($d.createdAt\\)  id=$\\($d.id.Substring\\(0,8\\)\\)\" })",
+      "Bash(echo \"SYNTAX_OK exit=$?\")",
+      "Bash(docker info *)",
+      "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; foreach \\($f in @\\('src/routes/doctors.js','src/routes/appointments.js','src/routes/patients.js','src/routes/admin.js','src/routes/services.js','src/routes/events.js','src/middleware/auth.js'\\)\\) { node --check $f; if \\($?\\) { Write-Output \"check ok: $f\" } })",
+      "Bash(SEED_DEMO_RESET=true npm run seed)",
+      "Bash(echo \"=== exit: $?\")",
+      "Bash(docker exec *)"
     ]
   }
 }

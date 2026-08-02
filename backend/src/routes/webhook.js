@@ -9,7 +9,9 @@ const logger = require('../utils/logger');
 const { handleReminderConfirmation } = require('../jobs/reminders');
 const { isEnabled } = require('../utils/featureFlags');
 const { isRealAppSecret } = require('../utils/errors');
-const { parseChoiceNumber } = require('../services/bot/utils');
+// maskPhone moved to services/bot/utils.js — the bot engine, the booking flow
+// and the reminder cron log the same value and each needed it too.
+const { parseChoiceNumber, maskPhone, isOptedOut } = require('../services/bot/utils');
 const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
@@ -93,12 +95,6 @@ const _rlCleanupInterval = setInterval(() => {
   }
 }, 5 * 60 * 1000);
 _rlCleanupInterval.unref(); // don't block process exit
-
-// Mask phone for logging: show only last 4 digits
-function maskPhone(phone) {
-  if (!phone || phone.length < 4) return '****';
-  return '*'.repeat(Math.min(phone.length - 4, 8)) + phone.slice(-4);
-}
 
 // Process a bot message synchronously (fire-and-forget). On failure, persist to
 // failed_webhooks so the retry cron replays it — used by ALL sync fallback paths
@@ -196,17 +192,33 @@ router.post('/webhook/whatsapp', async (req, res) => {
         // ── STATUS UPDATES (delivery receipts) ───────────────────
         // Route each status by ITS recipient — a batch can span patients whose
         // sessions point at different tenants.
-        for (const status of value.statuses || []) {
-          if (!status?.id || !status.recipient_id) continue;
-          const gs = await query(`SELECT tenant_id FROM global_bot_sessions WHERE phone=$1`, [status.recipient_id]).catch(() => null);
-          if (!gs?.rows[0]?.tenant_id) continue;
-          const tr = await query(`SELECT schema_name FROM tenants WHERE id=$1`, [gs.rows[0].tenant_id]).catch(() => null);
-          if (tr?.rows[0]) {
-            wa.updateMessageStatus(tr.rows[0].schema_name, status.id, status.status).catch(err => {
+        //
+        // Meta emits sent + delivered + read for EVERY outbound message, so this
+        // is the highest-volume path in the webhook. It used to run two
+        // sequential public-schema round-trips (global_bot_sessions, then
+        // tenants) per status; resolving the whole batch's distinct recipients
+        // with one joined query collapses that to a single query per POST.
+        const statuses = (value.statuses || []).filter(s => s?.id && s.recipient_id);
+        if (statuses.length) {
+          const recipients = [...new Set(statuses.map(s => s.recipient_id))];
+          const sr = await query(
+            `SELECT g.phone, t.schema_name
+               FROM global_bot_sessions g
+               JOIN tenants t ON t.id = g.tenant_id
+              WHERE g.phone = ANY($1::text[])`,
+            [recipients]).catch(() => null);
+          // A failed lookup drops the receipts rather than the whole POST — the
+          // messages in this same value still have to be processed.
+          const schemaByPhone = new Map((sr?.rows || []).map(r => [r.phone, r.schema_name]));
+
+          for (const status of statuses) {
+            const schemaName = schemaByPhone.get(status.recipient_id);
+            if (!schemaName) continue;
+            wa.updateMessageStatus(schemaName, status.id, status.status).catch(err => {
               logger.error('Failed to persist WhatsApp delivery status update', {
                 waMessageId: status.id,
                 status: status.status,
-                tenantSchema: tr.rows[0].schema_name,
+                tenantSchema: schemaName,
                 error: err.message,
               });
             });
@@ -284,18 +296,38 @@ async function resolveAskingTenant(phone, text, currentTenant) {
       `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
     const curState = cur.rows[0]?.state || 'idle';
     if (curState !== 'idle' && curState !== 'main_menu') return null;
+    // At main_menu the digits ARE the menu: botEngine reads '1' as Book, '2' as
+    // My Appointments, '3' as Check Status — and RATING_REPLY_RE matches all
+    // three. A patient who picked a new clinic, landed on its menu and typed
+    // '1' to book had that '1' filed as a 1-star review against the clinic they
+    // left, and never got the booking they asked for. A rating and a menu pick
+    // are indistinguishable here, so the clinic the patient is looking at keeps
+    // it. ("yes"/"no" are not menu options, so those still redirect.)
+    if (curState === 'main_menu' && kind === KINDS.FEEDBACK) return null;
 
     const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [askingTenantId]);
     const asking = r.rows[0];
     if (!asking) return null;
 
-    // Confirm the other clinic is genuinely still waiting. The pending row is a
-    // hint with a TTL; this is the authoritative check.
+    // Confirm the other clinic is genuinely still waiting, AND that it can
+    // actually receive the answer. Redirecting into a clinic that is mid-flow
+    // does not deliver the answer — it feeds it to that clinic's state machine:
+    // a "yes" handed to an abandoned booking's select_date step came back as
+    // "❌ Booking cancelled." from a clinic the patient wasn't even talking to.
+    // The pending row is a hint with a TTL; these are the authoritative checks.
     if (kind === KINDS.FEEDBACK) {
       const s = await tenantQuery(asking.schema_name,
         `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
       if (s.rows[0]?.state !== 'collect_feedback_rating') return null;
     } else {
+      // Mirror the reminder intercept further down, which only consumes a
+      // confirmation when the session is idle and otherwise falls through into
+      // the state machine. Both consumers of this question must agree on when
+      // an answer is deliverable, or the redirect hands it somewhere the
+      // intercept will refuse to take it.
+      const s = await tenantQuery(asking.schema_name,
+        `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
+      if ((s.rows[0]?.state || 'idle') !== 'idle') return null;
       const c = await tenantQuery(asking.schema_name, `
         SELECT 1 FROM reminder_confirmations rc
         JOIN appointments a ON a.id = rc.appointment_id
@@ -486,10 +518,22 @@ async function processIncomingMessage(msg) {
              last_wa_message_id=EXCLUDED.last_wa_message_id`,
           [phone, selected.id, msgId || null]
         );
-        await wa.sendText(phone, `✅ Clinic selected: *${selected.name}*`, null, null)
-          .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
+        // Resolve the tenant BEFORE confirming, for two reasons the old order
+        // made impossible: the confirmation is a patient-facing message sent
+        // outside botEngine and so must go through services/outbound.js (a raw
+        // wa.sendText writes no wa_messages row — invisible in clinic history,
+        // and nothing for the delivery receipts the status handler will try to
+        // attach), and we need the schema to ask whether this patient opted out
+        // of this clinic. If they did, stay silent: the synthesised "Hi" below
+        // is dropped by the engine's opt-out check anyway, so sending this line
+        // meant one message from a clinic they unsubscribed from and then
+        // nothing.
         const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
         tenant = r.rows[0] || null;
+        if (tenant && !(await isOptedOut(tenant.schema_name, phone))) {
+          await sendPatientText(tenant.schema_name, phone, `✅ Clinic selected: *${selected.name}*`)
+            .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
+        }
 
         // Picking a clinic is the first step of a fresh conversation, so hand
         // the engine a greeting rather than the clinic name the patient just
@@ -611,7 +655,7 @@ async function processIncomingMessage(msg) {
           [phone, msg.type, inboundContent, msgId]
         );
         if (!inserted.rows[0]) {
-          logger.info('Duplicate message skipped', { msgId, phone });
+          logger.info('Duplicate message skipped', { msgId, phone: maskPhone(phone) });
           return;
         }
       } catch (dupErr) {
@@ -636,7 +680,7 @@ async function processIncomingMessage(msg) {
     if (unsupportedType === 'audio' && audioId) {
       const voiceEnabled = await isEnabled(tenant.id, 'voice_transcription_enabled').catch(() => false);
       if (voiceEnabled) {
-        logger.info('Audio message → dispatching to Whisper transcription', { phone, audioId, tenant: tenant.slug });
+        logger.info('Audio message → dispatching to Whisper transcription', { phone: maskPhone(phone), audioId, tenant: tenant.slug });
         botEngine.handleVoiceMessage({ phone, audioId, tenant }).catch(err => {
           logger.error('Voice transcription failed', { error: err.message });
         });
@@ -647,10 +691,15 @@ async function processIncomingMessage(msg) {
 
     // If message type is unsupported (image, document, sticker, etc.), send a helpful reply
     if (unsupportedType) {
-      logger.info('Unsupported message type received', { phone, type: unsupportedType, tenant: tenant.slug });
-      sendPatientText(tenant.schema_name, phone,
-        `Sorry, I can only process text messages. Please type *Menu* to start booking an appointment. 😊`
-      ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone, type: unsupportedType, error: err.message }));
+      logger.info('Unsupported message type received', { phone: maskPhone(phone), type: unsupportedType, tenant: tenant.slug });
+      // This reply is sent outside botEngine, so it never met the engine's
+      // opt-out check — an unsubscribed patient sending a photo got an answer
+      // from the clinic, and this line fires on EVERY image.
+      if (!await isOptedOut(tenant.schema_name, phone)) {
+        sendPatientText(tenant.schema_name, phone,
+          `Sorry, I can only process text messages. Please type *Menu* to start booking an appointment. 😊`
+        ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone: maskPhone(phone), type: unsupportedType, error: err.message }));
+      }
       return;
     }
 
@@ -803,3 +852,8 @@ module.exports = router;
 // sharp edge — "start" belongs to the re-subscribe flow, not to this one.
 module.exports.RESTART_GREETING_RE = RESTART_GREETING_RE;
 module.exports.GREETING_RE = GREETING_RE;
+// Exported for tests: when a reply belongs to the clinic that ASKED rather than
+// the one the patient selected is a decision with two sharp edges — a menu pick
+// must never be read as a star rating, and an answer must never be handed to a
+// clinic whose session cannot receive it (see tests/askingTenant.unit.test.js).
+module.exports.resolveAskingTenant = resolveAskingTenant;

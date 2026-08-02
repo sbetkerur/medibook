@@ -156,7 +156,15 @@ require.cache[dbPath] = { id: dbPath, filename: dbPath, loaded: true, exports: m
 const wa = require('../src/services/whatsapp');
 const sent = [];
 wa.sendText = async (to, text) => { sent.push({ type: 'text', text }); };
-wa.sendButtons = async (to, text, buttons) => { sent.push({ type: 'buttons', text, buttons }); };
+// Mint reply ids exactly as the real sendButtons does (`btn_${i}_${Date.now()}`)
+// and hand them back on the recorded message. Confirm steps now verify that a
+// positional btn_N belongs to the prompt they just sent (see bot/utils.js
+// confirmButtonIndex), so a test tapping a hardcoded id is no longer tapping
+// the button the bot rendered — it is tapping a stale one, which is the whole
+// point of that check.
+wa.sendButtons = async (to, text, buttons) => {
+  sent.push({ type: 'buttons', text, buttons, ids: buttons.map((_, i) => `btn_${i}_${Date.now()}`) });
+};
 wa.sendList = async (to, text, label, sections) => { sent.push({ type: 'list', text, sections }); };
 wa.sendBookingConfirmationTemplate = async () => { throw new Error('template not approved (test)'); };
 
@@ -243,6 +251,10 @@ async function run() {
     assert.strictEqual(ctx.patient_gender, undefined, 'gender must not be set from an unrecognised reply');
   });
 
+  // Set by the confirmation-summary test below: the id of the "✅ Confirm"
+  // button the summary actually minted.
+  let confirmBtnId = null;
+
   await test('Typed name → DOB → gender → email skip → reason → confirmation summary', async () => {
     assert.strictEqual(state(), 'collect_gender');
     await send('Female', 'btn_1_1700000000004');
@@ -250,12 +262,26 @@ async function run() {
     await send('⏭ Skip', 'btn_0_1700000000005');
     assert.strictEqual(state(), 'collect_chief_complaint');
     const r = await send('🔍 Checkup / Cleaning', 'btn_1_1700000000006');
-    assert(r.some(m => /review your booking/.test(m.text)), 'confirmation summary not shown: ' + JSON.stringify(r));
+    const summary = r.find(m => /review your booking/.test(m.text));
+    assert(summary, 'confirmation summary not shown: ' + JSON.stringify(r));
+    confirmBtnId = summary.ids[0];
     assert.strictEqual(state(), 'confirm_booking');
   });
 
+  await test('STALE btn_0 at confirm_booking does not book — it re-asks', async () => {
+    // btn_0 of some older message (WhatsApp keeps every button tappable). It is
+    // not consent to book, so nothing may be written.
+    const r = await send('✅ Confirm', 'btn_0_1700000000099');
+    assert(r.some(m => /Please confirm your booking/.test(m.text)),
+      'expected a re-prompt for the stale tap: ' + JSON.stringify(r));
+    assert.strictEqual(db.appointments.length, 0, 'a stale tap booked an appointment');
+    assert.strictEqual(state(), 'confirm_booking');
+    // The re-prompt minted fresh buttons — tap those instead.
+    confirmBtnId = r.find(m => /Please confirm your booking/.test(m.text)).ids[0];
+  });
+
   await test('REGRESSION: tapping ✅ Confirm completes the booking (not main-menu reset)', async () => {
-    const r = await send('✅ Confirm', 'btn_0_1700000000007');
+    const r = await send('✅ Confirm', confirmBtnId);
     assert(!r.some(m => /How can I help you today/.test(m.text)),
       'confirm tap was reset to main menu — stale-button bug is back');
     assert(r.some(m => /Appointment Confirmed/.test(m.text)), 'confirmation not sent: ' + JSON.stringify(r));

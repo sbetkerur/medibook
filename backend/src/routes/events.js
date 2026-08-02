@@ -121,28 +121,79 @@ router.get('/events', (req, res) => {
   // Send initial heartbeat so the browser doesn't wait for data
   res.write(`data: ${JSON.stringify({ type: 'connected', tenantId })}\n\n`);
 
-  // Heartbeat every 30 seconds to keep the connection alive through proxies
+  // Tear the stream down, telling the client why in the ONE shape it handles:
+  // dashboard/page.js closes the EventSource on type === 'token_expired' and
+  // waits for 'medibook:token-refreshed' to reconnect. Any other type would be
+  // ignored and the browser would reconnect forever with the same dead token.
+  let closed = false;
+  const endStream = (reason) => {
+    if (closed) return;
+    closed = true;
+    logger.info('SSE stream ended by server', { tenantId, reason });
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'token_expired' })}\n\n`);
+      res.end();
+    } catch (_) {}
+  };
+
+  // Heartbeat every 30 seconds to keep the connection alive through proxies —
+  // and, on the same tick, re-authorise the stream.
+  //
+  // The stream outlives the request that authenticated it: auth runs once at
+  // connect, and the only other teardown is the expiry timer below, up to 60
+  // minutes out. So an EventSource opened before a clinic deactivated a fired
+  // staff member — or before a super admin suspended the tenant — kept
+  // receiving every publish(), i.e. new bookings with patient names and phone
+  // numbers, for the rest of the hour. Both of those correctly block new
+  // requests within 5s, and POST /auth/logout blacklists the jti and burns the
+  // refresh tokens, yet none of it touched the live socket.
+  //
+  // One round-trip covers both conditions. Transient DB errors do NOT kill the
+  // stream on the first failure: a blip would otherwise close every dashboard's
+  // feed and, because the client then waits for a token refresh that may be
+  // ~an hour away, leave it stale far longer than the outage. Two consecutive
+  // failures is treated as "cannot authorise" and closes — the exposure stays
+  // bounded by the expiry timer either way.
+  let consecutiveCheckFailures = 0;
+  const revalidate = async () => {
+    if (closed) return;
+    try {
+      const { query } = require('../db');
+      const r = await query(
+        `SELECT (SELECT status FROM tenants WHERE id=$1) AS tenant_status,
+                EXISTS(SELECT 1 FROM token_blacklist WHERE jti=$2 AND expires_at > NOW()) AS revoked`,
+        [tenantId, req.user?.jti || null]
+      );
+      consecutiveCheckFailures = 0;
+      const row = r.rows[0] || {};
+      if (row.revoked) return endStream('token_revoked');
+      if (row.tenant_status !== 'active') return endStream('tenant_inactive');
+    } catch (err) {
+      // Table absent on a first deploy is not a revocation — same carve-out as
+      // middleware/auth.js's blacklist check.
+      if (err.code === '42P01') return;
+      consecutiveCheckFailures++;
+      logger.warn('SSE revalidation failed', { tenantId, error: err.message, consecutiveCheckFailures });
+      if (consecutiveCheckFailures >= 2) endStream('revalidation_unavailable');
+    }
+  };
+
   const heartbeat = setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch (_) {}
+    revalidate();
   }, 30 * 1000);
 
-  // Close the stream when the connecting token expires. Auth ran once at
-  // connect; without this a revoked/expired session (e.g. fired staff) keeps
-  // receiving live patient data for as long as the socket stays open. The
-  // frontend reconnects with a fresh token on 'medibook:token-refreshed'.
+  // Close the stream when the connecting token expires. The frontend
+  // reconnects with a fresh token on 'medibook:token-refreshed'.
   let expiryTimer = null;
   if (req.user?.exp) {
     const msUntilExpiry = req.user.exp * 1000 - Date.now();
-    expiryTimer = setTimeout(() => {
-      try {
-        res.write(`data: ${JSON.stringify({ type: 'token_expired' })}\n\n`);
-        res.end();
-      } catch (_) {}
-    }, Math.max(msUntilExpiry, 0));
+    expiryTimer = setTimeout(() => endStream('token_expired'), Math.max(msUntilExpiry, 0));
   }
 
   // Cleanup on disconnect
   req.on('close', () => {
+    closed = true; // stops any in-flight revalidate from writing to a dead socket
     clearInterval(heartbeat);
     if (expiryTimer) clearTimeout(expiryTimer);
     clientSet.delete(res);

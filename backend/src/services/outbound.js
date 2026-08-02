@@ -20,8 +20,10 @@ const { logMessage } = require('./bot/utils');
 
 /** Send a plain text message and record it. Shared phone → global META_* env. */
 async function sendPatientText(schema, phone, text) {
-  await wa.sendText(phone, text, null, null);
-  await logMessage(schema, phone, 'out', 'text', text, null);
+  // Record the id Meta returns: it is the join key delivery receipts arrive
+  // with, so a row logged without it can never leave status NULL.
+  const waMessageId = await wa.sendText(phone, text, null, null);
+  await logMessage(schema, phone, 'out', 'text', text, waMessageId);
 }
 
 /**
@@ -30,8 +32,8 @@ async function sendPatientText(schema, phone, text) {
  *   entry; the raw parameter array would be meaningless to clinic staff.
  */
 async function sendPatientTemplate(schema, phone, templateName, components, logText) {
-  await wa.sendTemplate(phone, templateName, components, null, null);
-  await logMessage(schema, phone, 'out', 'template', logText || `[template: ${templateName}]`, null);
+  const waMessageId = await wa.sendTemplate(phone, templateName, components, null, null);
+  await logMessage(schema, phone, 'out', 'template', logText || `[template: ${templateName}]`, waMessageId);
 }
 
 module.exports = { sendPatientText, sendPatientTemplate };

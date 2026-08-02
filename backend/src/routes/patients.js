@@ -6,6 +6,7 @@ const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { setTenantId } = require('../utils/requestContext');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
+const logger = require('../utils/logger');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -125,11 +126,31 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
 });
 
 // ── MEDICAL HISTORY ───────────────────────────────────────────
+// Deliberately NOT adminOnly, unlike the PATCH below. Two reasons:
+//   1. `adminOnly` excludes the 'doctor' role, and blood type / allergies /
+//      current medications are precisely what a dentist and a front-desk
+//      check-in need to see. Hiding them from clinicians is a patient-safety
+//      problem, not a privacy win.
+//   2. It would be theatre anyway — GET /patients/:id and
+//      GET /appointments/:id both return the same dental_history blob to every
+//      role. Locking one of three doors protects nothing.
+// What we DO add is the same access audit trail routes/appointments.js already
+// writes, so a bulk walk of every patient's history is attributable after the
+// fact. Raw uploaded files are a different matter — see the documents routes.
 router.get('/patients/:id/medical-history', validateUUID(), async (req, res) => {
   try {
-    const r = await tenantQuery(req.tenant.schema_name,
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s,
       `SELECT id, name, phone, dental_history as medical_history FROM patients WHERE id=$1 AND deleted_at IS NULL`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
+    // Fire-and-forget, and only when there is actually something to read.
+    // Masked patient id (first 8 chars) matches appointments.js so the audit
+    // log itself doesn't become a second copy of the identifiers.
+    if (r.rows[0].medical_history && Object.keys(r.rows[0].medical_history).length > 0) {
+      writeAuditLog(s, req.user.id, req.user.role, 'ACCESS_DENTAL_HISTORY', 'patient',
+        String(req.params.id).slice(0, 8) + '…', null, null, req.ip)
+        .catch(e => logger.warn('Medical history audit log failed', { error: e.message }));
+    }
     res.json({ patient: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
@@ -154,6 +175,9 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
 // ── PATIENT DOCUMENTS (Enhancement 6) ────────────────────────
 const MAX_FILE_BASE64_LEN = 14 * 1024 * 1024; // ~10 MB after base64 overhead
 
+// Metadata only — no file_data. Left open to every role on purpose: front-desk
+// staff need to see THAT a scan or prescription exists (and its name/date) to
+// do check-in, and the dashboard's patient modal fetches this for all roles.
 router.get('/patients/:id/documents', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
@@ -164,13 +188,42 @@ router.get('/patients/:id/documents', validateUUID(), async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-router.get('/patients/:id/documents/:docId', validateUUID(), async (req, res) => {
+// The only route in this file that returns file_data — the full base64 blob of
+// a scan/X-ray/prescription, up to 10 MB. It had neither a role gate nor a rate
+// limit, so a 'staff' login could walk GET /patients for every UUID, list each
+// patient's documents and then pull every raw file: a complete exfiltration of
+// the clinic's uploaded medical records by a non-admin. Same reasoning that put
+// adminOnly on GET /analytics/export (a bulk PHI extract reachable by any
+// 'staff' or 'doctor' login), and it matches POST/DELETE on this same
+// collection, which have always been admin-only.
+// The limiter is the second half of the fix: adminOnly stops the non-admin
+// walk, docLimiter bounds how fast a compromised ADMIN token can drain the
+// archive. patientLimiter was only ever applied to the list route.
+const docLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: { error: 'Too many document requests. Slow down and retry shortly.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.get('/patients/:id/documents/:docId', adminOnly, docLimiter, validateUUID(), async (req, res) => {
   try {
     if (!UUID_RE.test(req.params.docId)) return res.status(400).json({ error: 'Invalid document ID' });
-    const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT * FROM documents WHERE id=$1 AND patient_id=$2`,
+    const s = req.tenant.schema_name;
+    // Explicit column list rather than SELECT *: this response carries PHI, so
+    // any column added to `documents` later must be opted in deliberately.
+    const r = await tenantQuery(s,
+      `SELECT id, patient_id, appointment_id, file_name, file_type, file_data,
+              file_size_bytes, notes, uploaded_by_user_id, created_at
+       FROM documents WHERE id=$1 AND patient_id=$2`,
       [req.params.docId, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Document not found' });
+    // Upload and delete are audited; reading the actual file was not, so a bulk
+    // drain left no trace at all. Fire-and-forget so it can't stall the download.
+    writeAuditLog(s, req.user.id, req.user.role, 'ACCESS_DOCUMENT', 'patient',
+      String(req.params.id).slice(0, 8) + '…', null, { file_name: r.rows[0].file_name }, req.ip)
+      .catch(e => logger.warn('Document access audit log failed', { error: e.message }));
     res.json({ document: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
@@ -374,7 +427,12 @@ const importLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-router.post('/patients/import', importLimiter, adminOnly, async (req, res) => {
+// adminOnly BEFORE importLimiter (same order as POST /slots/generate). The
+// limiter counts per IP, and a whole clinic sits behind one NAT'd address, so
+// with the limiter first a 'staff' user whose requests are rejected anyway
+// still burns the hour's budget of 10 — ten clicks and the actual admin can't
+// import until the window rolls over.
+router.post('/patients/import', adminOnly, importLimiter, async (req, res) => {
   try {
     const { csv_data } = req.body; // base64 or raw CSV string
     if (!csv_data) return res.status(400).json({ error: 'csv_data is required (raw CSV or base64)' });

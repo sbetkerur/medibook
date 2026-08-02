@@ -287,7 +287,7 @@ export default function NewTenantPage() {
                   { label: 'Slug', value: form.slug, mono: true },
                   { label: 'Admin Email', value: form.owner_email },
                   { label: 'Admin Name', value: form.owner_name || `${form.name} Admin` },
-                  { label: 'Plan', value: selectedPlan ? `${selectedPlan.name} (₹${selectedPlan.price_monthly === 0 ? 'Free' : selectedPlan.price_monthly + '/mo'})` : form.plan },
+                  { label: 'Plan', value: selectedPlan ? `${selectedPlan.name} (${selectedPlan.price_monthly === 0 ? 'Free' : '₹' + selectedPlan.price_monthly + '/mo'})` : form.plan },
                   { label: 'WhatsApp', value: 'Shared global number' },
                 ].map(({ label, value, mono }) => (
                   <div key={label} className="flex justify-between items-center px-4 py-3 text-sm">

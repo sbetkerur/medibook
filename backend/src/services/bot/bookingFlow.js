@@ -13,6 +13,8 @@ const {
   STATES,
   fuzzyFind,
   parseChoiceNumber,
+  maskPhone,
+  sendConfirmButtons,
   getPatient,
   getPatients,
   updateSession,
@@ -371,6 +373,30 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
 }
 
+// Re-render the offered dates after an answer we could not resolve.
+//
+// Unrecognised input at this step used to send "❌ Booking cancelled." and wipe
+// the context — so typing "tomorrow" at the date list cost the patient the whole
+// booking. handleSelectDept and handleSelectDoctor already made the opposite
+// call ("should re-ask, not discard the booking"); this matches them.
+async function _repromptDates(phone, schema, send, ctx, lead) {
+  const cachedDates = ctx._dates || [];
+  if (cachedDates.length) {
+    await send.list(
+      `${lead}\n\nPlease pick a date from the list:`,
+      'Choose Date',
+      [{ title: 'Available Dates', rows: cachedDates.map(d => ({
+        id: d.date, title: d.label, description: `${d.slots} slots available`,
+      })) }]
+    );
+  } else {
+    // No cache to re-offer (session resumed after expiry, or a context write was
+    // lost). Still don't cancel — "Menu" restarts the picker from the top.
+    await send.text(`${lead}\n\nI've lost track of the dates I offered. Reply *Menu* to start again.`);
+  }
+  await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
+}
+
 async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   const cachedDates = ctx._dates || [];
   let resolvedDate = choice;
@@ -380,24 +406,26 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
     if (n >= 1 && n <= cachedDates.length) {
       resolvedDate = cachedDates[n - 1].date;
     } else {
-      await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
-        ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
-      await updateSession(schema, phone, STATES.MAIN_MENU, {});
-      return;
+      return _repromptDates(phone, schema, send, ctx,
+        `❓ I couldn't tell which date you meant.`);
     }
   }
   // Only accept dates from the offered list. The list query excludes doctor
-  // leaves and clinic holidays; a typed arbitrary date (or a stale list row
-  // tapped after a holiday was declared) skipped those checks entirely and
-  // could book a slot on a day the clinic is closed.
+  // leaves and clinic holidays, so a typed arbitrary date skipped those checks
+  // entirely and could book a slot on a day the clinic is closed.
+  //
+  // This check does NOT cover a stale list row tapped after a holiday was
+  // declared — the row was legitimately offered, so it is in `_dates` and passes
+  // here. Sessions have no TTL and the cleanup cron only purges non-idle ones
+  // after 7 days, so that list can be a week old. The re-check on the slot query
+  // below (and again on completeBooking's lock) is what closes that hole.
   //
   // Fail CLOSED when the cache is missing (session resumed after expiry, or a
   // context write was lost): `cachedDates.length && ...` used to let any
   // well-formed YYYY-MM-DD through in exactly the situation where we have no
   // idea whether that date is open.
   if (!cachedDates.length || !cachedDates.some(d => d.date === resolvedDate)) {
-    await send.text('That date is not available. Please pick a date from the list, or reply *Menu* to start over.');
-    return;
+    return _repromptDates(phone, schema, send, ctx, 'That date is not available.');
   }
   ctx.appointment_date = resolvedDate;
 
@@ -406,12 +434,18 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   // is true for ANY past date whose start_time happens to be later in the day
   // than the current clock time, so past slots were offered and then rejected
   // by completeBooking's lock with a misleading "someone just booked that slot".
+  //
+  // SLOT_DAY_OPEN_SQL re-checks leaves and holidays against the date the patient
+  // actually chose. The date list this came from was filtered when it was BUILT;
+  // a holiday declared since then does not retroactively edit the cached rows.
+  const { SLOT_DAY_OPEN_SQL } = require('../bookingCore');
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
        AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
             OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                 AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
+       AND ${SLOT_DAY_OPEN_SQL}
      ORDER BY start_time`,
     [ctx.doctor_id, resolvedDate]);
 
@@ -474,9 +508,25 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
     || slots.find(s => s.start_time.slice(0, 5) === choice || s.start_time.slice(0, 5) === input) // time match (typed or button title)
     || (!isNaN(num) && num >= 1 && num <= slots.length ? slots[num - 1] : null); // typed number
   if (!slot) {
-    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
-    await updateSession(schema, phone, STATES.MAIN_MENU, {});
+    // Re-ask, don't discard. "10 am" or "morning" typed at the time list used to
+    // send "❌ Booking cancelled." and wipe the context — six steps of work lost
+    // to one unrecognised word, unlike every other picker in this flow.
+    let dateLabel = ctx.appointment_date;
+    try { dateLabel = format(parseISO(ctx.appointment_date), 'EEE, d MMM'); } catch {}
+    if (slots.length) {
+      await send.list(
+        `❓ I couldn't tell which time you meant.\n\nPlease pick a slot on ${dateLabel}:`,
+        'Choose Time',
+        [{ title: `Slots on ${dateLabel}`.slice(0, 24), rows: slots.map(s => ({
+          id: s.id, title: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`,
+        })) }]
+      );
+    } else {
+      // Nothing cached to re-offer (session resumed after expiry, or a lost
+      // context write) — still not a reason to throw the booking away.
+      await send.text(`❓ I've lost track of the times I offered. Reply *Menu* to pick a slot again.`);
+    }
+    await updateSession(schema, phone, STATES.SELECT_SLOT, ctx);
     return;
   }
 
@@ -595,13 +645,16 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
     `\n👤 *Patient:* ${ctx.patient_name}\n\n` +
     `Tap *Confirm* to book your appointment.`;
 
-  await send.buttons(summary, ['✅ Confirm', '❌ Cancel']);
+  // sendConfirmButtons binds btn_0/btn_1 to THIS message: a stale "✅ Confirm"
+  // tap from an abandoned earlier booking must not book this one (botEngine's
+  // CONFIRM_BOOKING branch checks the binding).
+  await sendConfirmButtons(send, ctx, summary, ['✅ Confirm', '❌ Cancel']);
   await updateSessionFn(schema, phone, STATES.CONFIRM_BOOKING, ctx);
 }
 
 async function completeBooking(phone, schema, tenant, send, ctx) {
   const { LIMITS } = require('../../utils/errors');
-  const { insertAppointmentWithRetry, checkMonthlyQuota } = require('../bookingCore');
+  const { insertAppointmentWithRetry, checkMonthlyQuota, SLOT_DAY_OPEN_SQL } = require('../bookingCore');
 
   // Guard: validate schema name before using it in a raw SET LOCAL command.
   // tenantQuery/tenantTransaction enforce this internally; since completeBooking
@@ -642,7 +695,8 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     return;
   }
 
-  // Single transaction: slot lock + patient upsert + appointment insert
+  // Single transaction: patient upsert + slot lock + appointment insert (that
+  // order is load-bearing — see the lock-ordering note inside).
   const client = await pool.connect();
   let bookingId;
   let patientId = ctx.patient_id;
@@ -651,15 +705,51 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     await client.query('BEGIN');
     await client.query(`SET LOCAL search_path TO "${schema}", public`);
 
+    // Patient row FIRST, slot SECOND — and it must stay that order.
+    //
+    // The admin walk-in route (POST /appointments) has always taken the patient
+    // row before the slot. This function used to take them the other way round,
+    // so a bot booking and a walk-in racing on the same patient + same slot each
+    // held the lock the other was waiting on: Postgres aborted one with 40P01
+    // and the patient saw "Something went wrong with your booking". Both paths
+    // now go patients → time_slots → appointments; the appointments-last leg was
+    // already consistent everywhere.
+    //
+    // Nothing leaks if the slot lock below then fails: this INSERT/UPDATE is in
+    // the same transaction, and every failure path from here on ROLLBACKs before
+    // returning, so the patient row and the visit_count bump are undone together.
+    // (`patientId` is left pointing at a row that no longer exists after such a
+    // rollback — every one of those paths returns immediately and never uses it.)
+    //
+    // Insert new patient or increment visit count for existing one.
+    // Phone is no longer unique (family booking) so we use a plain INSERT for new profiles.
+    if (!patientId) {
+      const pr = await client.query(
+        `INSERT INTO patients (phone, name, date_of_birth, gender, email, visit_count)
+         VALUES ($1,$2,$3,$4,$5,1)
+         RETURNING id`,
+        [phone, ctx.patient_name, ctx.patient_dob || null, ctx.patient_gender || null, ctx.patient_email || null]);
+      patientId = pr.rows[0].id;
+    } else {
+      await client.query(
+        `UPDATE patients SET visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`, [patientId]);
+    }
+
     // Atomic slot lock. The time predicate re-checks that the slot hasn't
     // passed — a patient can sit on the confirm screen for hours (4h session
     // window) and previously could confirm a slot whose start time had gone by.
+    //
+    // SLOT_DAY_OPEN_SQL is the last line of defence for a day the clinic closed
+    // mid-flow: the date list, the slot list and this confirm screen can all
+    // predate the holiday/leave being declared. Failing here costs the patient a
+    // re-pick; not failing here books them into a locked clinic.
     const slotUpdate = await client.query(
       `UPDATE time_slots SET status='booked'
        WHERE id=$1 AND status='available'
          AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
               OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                   AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
+         AND ${SLOT_DAY_OPEN_SQL}
        RETURNING id`,
       [ctx.slot_id]);
 
@@ -680,6 +770,14 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
          ORDER BY a.created_at DESC LIMIT 1`,
         [ctx.slot_id, phone]
       );
+      // Why the lock failed changes what we should say. A holiday/leave declared
+      // while the patient sat on the confirm screen is not a race — telling them
+      // "someone just booked that slot" sends them back to pick another time on
+      // a day that no longer has any. Checked after the idempotency lookup: an
+      // already-committed booking stands regardless of a later closure.
+      const dayClosed = existing.rows.length ? { rows: [] } : await client.query(
+        `SELECT 1 FROM time_slots WHERE id=$1 AND NOT (${SLOT_DAY_OPEN_SQL}) LIMIT 1`,
+        [ctx.slot_id]);
       await client.query('ROLLBACK');
       if (existing.rows.length) {
         await send.text(
@@ -691,27 +789,16 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
         await updateSession(schema, phone, STATES.IDLE, {});
         return;
       }
-      await send.text(
-        '⚠️ *Slot no longer available*\n\n' +
-        'Someone just booked that slot. Please choose a different time.\n\n' +
-        'Reply *Menu* to go back to the menu.'
+      await send.text(dayClosed.rows.length
+        ? '⚠️ *That day is no longer open*\n\n' +
+          'The clinic has since closed that date. Please pick another day.\n\n' +
+          'Reply *Menu* to go back to the menu.'
+        : '⚠️ *Slot no longer available*\n\n' +
+          'Someone just booked that slot. Please choose a different time.\n\n' +
+          'Reply *Menu* to go back to the menu.'
       );
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
-    }
-
-    // Insert new patient or increment visit count for existing one.
-    // Phone is no longer unique (family booking) so we use a plain INSERT for new profiles.
-    if (!patientId) {
-      const pr = await client.query(
-        `INSERT INTO patients (phone, name, date_of_birth, gender, email, visit_count)
-         VALUES ($1,$2,$3,$4,$5,1)
-         RETURNING id`,
-        [phone, ctx.patient_name, ctx.patient_dob || null, ctx.patient_gender || null, ctx.patient_email || null]);
-      patientId = pr.rows[0].id;
-    } else {
-      await client.query(
-        `UPDATE patients SET visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`, [patientId]);
     }
 
     // Insert with booking-ID collision retry (shared with walk-in/follow-up routes)
@@ -780,15 +867,16 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     (async () => {
       // Shared phone — use global META_* env vars (null → fallback)
       try {
-        await wa.sendBookingConfirmationTemplate(phone, {
+        const waMessageId = await wa.sendBookingConfirmationTemplate(phone, {
           bookingId, doctorName: ctx.doctor_name, hospitalName: ctx.hospital_name,
           date: dateLabel, time: (ctx.appointment_time || '').slice(0, 5),
         }, null, null);
         // Log the template send too. This path bypasses the `send.*` helpers in
         // botEngine, which are what normally write to wa_messages — so on the
         // happy path the clinic's message history was missing exactly the
-        // message patients ask about most.
-        await logMessage(schema, phone, 'out', 'template', confirmationText, null);
+        // message patients ask about most. Carry Meta's id so its delivery
+        // receipts have a row to attach to.
+        await logMessage(schema, phone, 'out', 'template', confirmationText, waMessageId);
       } catch {
         // Template not approved or Meta error — fall back to session text message
         // (send.text logs to wa_messages itself).
@@ -878,7 +966,9 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
   ]);
 
   // Session was already reset to IDLE immediately after commit, above.
-  logger.info(`✅ Booking confirmed: ${bookingId}`, { phone, tenant: tenant.name });
+  // Masked — logs/combined.log is persistent in production, and the booking id
+  // is the identifier anyone reading this line actually needs.
+  logger.info(`✅ Booking confirmed: ${bookingId}`, { phone: maskPhone(phone), tenant: tenant.name });
   try { require('../../utils/metrics').increment('appointments_booked_total'); } catch (_) {}
 
   // Publish SSE event so dashboard updates in real-time without polling

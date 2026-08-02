@@ -5,10 +5,19 @@ import { todayIST } from '@/lib/dateIST';
 import { format, parseISO } from 'date-fns';
 import Badge from '@/components/ui/Badge';
 
+// The month cursor is derived from the IST date, never `new Date()` — on a
+// device set to UTC, "now" is still on the previous day (and, on the 1st, the
+// previous month) until 05:30 IST, so the calendar opened on the wrong month
+// while isToday() below correctly highlighted nothing.
+function istMonthStart() {
+  const [y, m] = todayIST().split('-').map(Number);
+  return new Date(y, m - 1, 1);
+}
+
 // Self-contained. Fetches the current month on mount; the prev/next/today
 // buttons refetch directly.
 export default function CalendarTab() {
-  const [calendarDate, setCalendarDate] = useState(new Date());
+  const [calendarDate, setCalendarDate] = useState(istMonthStart);
   const [calendarAppts, setCalendarAppts] = useState([]);
   const [selectedCalDay, setSelectedCalDay] = useState(null);
   const [calDayAppts, setCalDayAppts] = useState([]);
@@ -80,8 +89,7 @@ export default function CalendarTab() {
           className="p-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition text-gray-600">Next →</button>
         <button
           onClick={() => {
-            const d = new Date();
-            const first = new Date(d.getFullYear(), d.getMonth(), 1);
+            const first = istMonthStart();
             setCalendarDate(first); setSelectedCalDay(null);
             fetchCalendarAppts(first.getFullYear(), first.getMonth());
           }}

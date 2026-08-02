@@ -19,7 +19,11 @@ export default function FeedbackTab() {
       setFeedbackPage(page);
       setFeedbackHasMore(data.has_more || false);
       setFeedbackAvgRating(data.avg_rating);
-      setFeedbackTotal(data.total || 0);
+      // total_all, not total: this number sits beside the clinic-wide average and
+      // is the denominator for the distribution bars below, both of which are
+      // unfiltered. `total` is the FILTERED count (it drives has_more), so using
+      // it here would make the bars add up to more than 100% under a filter.
+      setFeedbackTotal(data.total_all ?? data.total ?? 0);
       setFeedbackDistribution(data.distribution || []);
     } catch { toast.error('Failed to load feedback'); }
   }, []);

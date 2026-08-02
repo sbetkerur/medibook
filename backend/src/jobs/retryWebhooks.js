@@ -3,6 +3,22 @@ const { query } = require('../db');
 const botEngine = require('../services/botEngine');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
+// Same lock the BullMQ worker takes, and deliberately the same key format: a
+// replay must serialise against a LIVE message from the same patient, not just
+// against other replays. Without it this cron ran botEngine.handle concurrently
+// with the worker on one bot_sessions row — the exact lost update the lock
+// exists to prevent, and the replayed message is by definition one the patient
+// already sent, so their current step is what gets clobbered.
+const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
+const { maskPhone } = require('../services/bot/utils');
+
+// KNOWN LIMITATION: a replay goes straight to botEngine, so it also bypasses the
+// greeting interception in routes/webhook.js — a replayed "Hi" resets to the
+// CURRENT clinic's main menu instead of restarting the clinic search. Fixing it
+// here means re-running the global-session reset + clinic search, which lives
+// inline in the webhook's message handler; duplicating that (rather than
+// extracting it) would give the platform a second, drifting copy of the entry
+// step. Left as-is deliberately: the failure is one extra "Hi" from the patient.
 
 async function retryFailedWebhooks() {
   // Recover rows orphaned in 'processing' — a crash/redeploy between the claim
@@ -50,19 +66,33 @@ async function retryFailedWebhooks() {
         status: row.tenant_status,
       };
 
-      await botEngine.handle({
-        phone: row.phone,
-        text: row.text || '',
-        buttonId: row.button_id || null,
-        tenant,
-      });
+      // FAIL OPEN, as in jobs/botWorker.js and the webhook's pre-tenant lock: a
+      // Redis blip must never mean the patient's message is dropped for good —
+      // this is its last retry path.
+      const lockKey = `botlock:${row.tenant_id}:${row.phone}`;
+      const { acquired, token, notConfigured } = await acquirePhoneLock(lockKey);
+      if (!acquired && !notConfigured) {
+        logger.warn('Phone lock not acquired before deadline — replaying anyway', {
+          phone: maskPhone(row.phone), tenantId: row.tenant_id,
+        });
+      }
+      try {
+        await botEngine.handle({
+          phone: row.phone,
+          text: row.text || '',
+          buttonId: row.button_id || null,
+          tenant,
+        });
+      } finally {
+        if (acquired) await releasePhoneLock(lockKey, token);
+      }
 
       // Success — mark as succeeded
       await query(
         `UPDATE failed_webhooks SET status='succeeded' WHERE id=$1`,
         [row.id]
       );
-      logger.info(`Webhook retry succeeded for phone ${row.phone.slice(-4).padStart(row.phone.length, '*')}`);
+      logger.info(`Webhook retry succeeded for phone ${maskPhone(row.phone)}`);
     } catch (err) {
       logger.warn(`Webhook retry attempt failed`, { id: row.id, error: err.message });
 

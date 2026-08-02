@@ -33,14 +33,29 @@ const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 // `statuses` controls which slot statuses are eligible for deletion — schedule
 // updates only touch 'available' slots, while a manual "clear" regen also
 // releases slots an admin had manually 'blocked'.
-async function deleteFutureUnreferencedSlots(schema, doctorId, statuses = ['available']) {
+//
+// `throughDays` bounds the DELETE to the window the caller is about to
+// REGENERATE. Without it this deleted every future slot out to the full 60-day
+// CRON_LOOKAHEAD_DAYS horizon while POST /slots/generate re-created only
+// `days` (default 7) — so one "clear and regenerate" wiped ~53 days of
+// availability and restored a week, leaving the bot's 14-day date picker
+// half-empty until the 23:30 IST cron refilled it. Null means "no upper bound",
+// which is correct for the schedule-update path: it regenerates the whole cron
+// window, so clearing the whole cron window is the matching span.
+async function deleteFutureUnreferencedSlots(schema, doctorId, statuses = ['available'], throughDays = null) {
+  const upperBound = throughDays === null
+    ? ''
+    : `AND slot_date <= (timezone('Asia/Kolkata', NOW()))::date + ($3::int * INTERVAL '1 day')`;
+  const params = [doctorId, statuses];
+  if (throughDays !== null) params.push(throughDays);
   return tenantQuery(schema,
     `DELETE FROM time_slots WHERE doctor_id=$1 AND status = ANY($2::text[])
        AND (slot_date > (timezone('Asia/Kolkata', NOW()))::date
             OR (slot_date = (timezone('Asia/Kolkata', NOW()))::date
                 AND start_time > (timezone('Asia/Kolkata', NOW()))::time))
+       ${upperBound}
        AND id NOT IN (SELECT slot_id FROM appointments WHERE slot_id IS NOT NULL)`,
-    [doctorId, statuses]);
+    params);
 }
 
 // ── DOCTORS ───────────────────────────────────────────────────
@@ -316,22 +331,29 @@ router.post('/doctors/:id/leaves', adminOnly, validateUUID(), async (req, res) =
     const validDates = dates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d) && d >= todayIST);
     let skipped = dates.length - validDates.length;
     if (validDates.length) {
-      const ins = await tenantQuery(s, `
-        INSERT INTO doctor_leaves (doctor_id, leave_date, reason, created_by_user_id)
-        SELECT $1, d, $2, $3 FROM unnest($4::date[]) AS d
-        ON CONFLICT (doctor_id, leave_date) DO NOTHING
-        RETURNING id
-      `, [req.params.id, reason || null, req.user.id, validDates]);
-      // Only count rows actually inserted — ON CONFLICT DO NOTHING returns no row
-      // for dates that were already on leave.
-      added = ins.rows.length;
+      // ONE transaction for the INSERT and the block. As two separate statements
+      // a failure in between (connection drop, pool timeout) committed the leave
+      // and left its slots 'available' — the dentist is recorded as away while
+      // the bot keeps booking them, and nothing ever reconciles the two. That is
+      // the same "recorded but not enforced" hole clinic holidays had.
+      added = await tenantTransaction(s, async (client) => {
+        const ins = await client.query(`
+          INSERT INTO doctor_leaves (doctor_id, leave_date, reason, created_by_user_id)
+          SELECT $1, d, $2, $3 FROM unnest($4::date[]) AS d
+          ON CONFLICT (doctor_id, leave_date) DO NOTHING
+          RETURNING id
+        `, [req.params.id, reason || null, req.user.id, validDates]);
+        // Mark blocked_by_leave so removing the leave later only releases these
+        // slots — never slots an admin blocked manually for another reason.
+        await client.query(
+          `UPDATE time_slots SET status='blocked', blocked_by_leave=true
+           WHERE doctor_id=$1 AND slot_date = ANY($2::date[]) AND status='available'`,
+          [req.params.id, validDates]);
+        // Only count rows actually inserted — ON CONFLICT DO NOTHING returns no
+        // row for dates that were already on leave.
+        return ins.rows.length;
+      });
       skipped += validDates.length - added;
-      // Mark blocked_by_leave so removing the leave later only releases these
-      // slots — never slots an admin blocked manually for another reason.
-      await tenantQuery(s,
-        `UPDATE time_slots SET status='blocked', blocked_by_leave=true
-         WHERE doctor_id=$1 AND slot_date = ANY($2::date[]) AND status='available'`,
-        [req.params.id, validDates]);
     }
 
     // Surface already-booked appointments on the leave dates: blocking only
@@ -375,18 +397,34 @@ router.delete('/doctors/:id/leaves/:date', adminOnly, validateUUID(), async (req
     if (!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date)) {
       return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
     }
-    const r = await tenantQuery(s,
-      `DELETE FROM doctor_leaves WHERE doctor_id=$1 AND leave_date=$2 RETURNING id`,
-      [req.params.id, req.params.date]);
-    if (!r.rows[0]) return res.status(404).json({ error: 'Leave record not found' });
-    // Only release slots that THIS leave blocked (blocked_by_leave) — a blanket
-    // unblock previously also re-opened slots an admin had blocked manually.
-    await tenantQuery(s,
-      `UPDATE time_slots SET status='available', blocked_by_leave=false
-       WHERE doctor_id=$1 AND slot_date=$2 AND status='blocked' AND blocked_by_leave=true`,
-      [req.params.id, req.params.date]);
+    // DELETE + release in one transaction — the mirror of the create path above.
+    const released = await tenantTransaction(s, async (client) => {
+      const del = await client.query(
+        `DELETE FROM doctor_leaves WHERE doctor_id=$1 AND leave_date=$2 RETURNING id`,
+        [req.params.id, req.params.date]);
+      if (!del.rows[0]) return null;
+      // Only release slots that THIS leave blocked (blocked_by_leave) — a blanket
+      // unblock previously also re-opened slots an admin had blocked manually.
+      // The clinic_holidays check is the same guard the holiday delete carries in
+      // the other direction: a holiday declared AFTER the leave could not block
+      // the already-'blocked' slots, so without it ending a leave re-opens a day
+      // the whole clinic is shut.
+      const rel = await client.query(
+        `UPDATE time_slots SET status='available', blocked_by_leave=false
+         WHERE doctor_id=$1 AND slot_date=$2 AND status='blocked' AND blocked_by_leave=true
+           AND blocked_by_holiday IS NOT TRUE
+           AND NOT EXISTS (
+             SELECT 1 FROM clinic_holidays ch
+             WHERE ch.holiday_date = time_slots.slot_date
+               AND (ch.hospital_id IS NULL OR ch.hospital_id = time_slots.hospital_id)
+           )
+         RETURNING id`,
+        [req.params.id, req.params.date]);
+      return rel.rows.length;
+    });
+    if (released === null) return res.status(404).json({ error: 'Leave record not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'REMOVE_DOCTOR_LEAVE', 'doctor', req.params.id,
-      null, { date: req.params.date }, req.ip);
+      null, { date: req.params.date, slots_released: released }, req.ip);
     res.json({ success: true });
   } catch (err) { handleError(res, err); }
 });
@@ -412,7 +450,12 @@ router.get('/slots', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-router.patch('/slots/:id', validateUUID(), async (req, res) => {
+// adminOnly: blocking/unblocking a slot is a schedule mutation, exactly like
+// POST /slots/block-range below — which does the same thing in one call and has
+// always been admin-gated. Without it a 'staff' login could enumerate ids via
+// GET /slots?doctor_id=…&date=… and loop PATCH {"action":"block"} to take a
+// dentist's entire bookable calendar offline one slot at a time.
+router.patch('/slots/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     const { status, action } = req.body;
     const s = req.tenant.schema_name;
@@ -431,12 +474,14 @@ router.patch('/slots/:id', validateUUID(), async (req, res) => {
     if (existing.rows[0].status === 'booked' && newStatus === 'blocked') {
       return res.status(409).json({ error: 'Cannot block a booked slot' });
     }
-    // Clear blocked_by_leave on any manual block/unblock: the flag marks slots
-    // blocked BY A LEAVE so that removing the leave releases only those. Once an
-    // admin manually changes a slot's status, the slot is under manual control —
-    // a stale flag would let a later leave removal re-open a manually blocked slot.
+    // Clear blocked_by_leave / blocked_by_holiday on any manual block/unblock:
+    // the flags mark slots blocked BY A LEAVE or BY A HOLIDAY so that removing
+    // that leave/holiday releases only those. Once an admin manually changes a
+    // slot's status, the slot is under manual control — a stale flag would let a
+    // later leave/holiday removal re-open a manually blocked slot.
     const r = await tenantQuery(s,
-      `UPDATE time_slots SET status=$1, blocked_by_leave=false WHERE id=$2 AND status != 'booked' RETURNING *`,
+      `UPDATE time_slots SET status=$1, blocked_by_leave=false, blocked_by_holiday=false
+       WHERE id=$2 AND status != 'booked' RETURNING *`,
       [newStatus, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Slot not found or is already booked' });
     await writeAuditLog(s, req.user.id, req.user.role, `slot_${newStatus === 'blocked' ? 'block' : 'unblock'}`, 'time_slot', req.params.id, null, null, req.ip);
@@ -458,8 +503,10 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
       // and never rows still referenced by an appointment (FK violation —
       // cancelled appointments keep their slot_id). Also releases manually
       // 'blocked' slots — unlike the schedule-update regen above, a manual
-      // "clear" is meant to reset everything.
-      await deleteFutureUnreferencedSlots(s, doctor_id, ['available', 'blocked']);
+      // "clear" is meant to reset everything. Bounded to safeDays: this route
+      // regenerates only that far, so clearing further would delete days it is
+      // not going to rebuild.
+      await deleteFutureUnreferencedSlots(s, doctor_id, ['available', 'blocked'], safeDays);
     }
     const docR = await tenantQuery(s, `SELECT id FROM doctors WHERE id=$1`, [doctor_id]);
     if (!docR.rows[0]) return res.status(404).json({ error: 'Doctor not found' });

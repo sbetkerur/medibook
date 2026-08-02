@@ -19,7 +19,7 @@ const { query, tenantQuery } = require('../db');
 const { validate, schemas } = require('../middleware/validate');
 const { VALID_ROLES, UUID_RE, validateUUID, handleError } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
-const { IST_TODAY_SQL, IST_MONTH_START_SQL } = require('../utils/dateTz');
+const { IST_TODAY_SQL, IST_MONTH_START_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 
 // ── DASHBOARD STATS ───────────────────────────────────────────
@@ -112,7 +112,15 @@ router.get('/dashboard', async (req, res) => {
 });
 
 // ── STAFF ─────────────────────────────────────────────────────
-router.get('/staff', async (req, res) => {
+// adminOnly, matching every mutating sibling below. This is a user-management
+// view, not a directory: it hands out the email address, role and active flag
+// of every account in the clinic, which is exactly the input for a targeted
+// phish at whoever holds 'admin'. A non-admin who reaches this tab can do
+// nothing with the result — StaffTab renders no actions unless isAdmin.
+// NOTE: the dashboard's NAV does not yet hide the Staff tab from non-admins
+// (it only filters 'audit'), so until it does, a staff/doctor login opening
+// that tab sees a "Failed to load staff" toast instead of a list.
+router.get('/staff', adminOnly, async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
       `SELECT id, email, name, role, is_active, created_at FROM users ORDER BY created_at DESC`);
@@ -213,6 +221,37 @@ router.delete('/staff/:id', adminOnly, validateUUID(), async (req, res) => {
 });
 
 // ── SETTINGS ──────────────────────────────────────────────────
+// tenants.settings is a mixed jsonb blob: tenant-editable notification prefs
+// sit alongside SERVER-controlled keys. PATCH /settings deliberately allowlists
+// notification_prefs (see schemas.updateSettings) "so a tenant admin can never
+// inject rate_limits or alert_webhook_url" — but the read side used to hand the
+// whole blob to any role. alert_webhook_url is the URL the platform POSTs
+// rate-limit alerts to (middleware/tenantRateLimit.js) and can carry a bearer
+// token in its query string, so it must not leave the server at all; rate_limits
+// is the per-tenant throttle configuration, useful only for probing where the
+// ceilings are. Both are stripped for EVERY role, including admins, who have no
+// way to set them and no UI that reads them.
+const PLATFORM_ONLY_SETTINGS_KEYS = ['rate_limits', 'alert_webhook_url'];
+// Non-admins get only what the dashboard actually consumes:
+// frontend/src/components/tabs/SettingsTab.js reads exactly these three from
+// `settings.settings` and nothing else (the toggles are admin-write anyway).
+const NON_ADMIN_SETTINGS_KEYS = ['email_on_booking', 'reminder_24h_enabled', 'reminder_2h_enabled'];
+
+function visibleSettings(rawSettings, role) {
+  const src = rawSettings || {};
+  const out = {};
+  if (role === 'admin') {
+    for (const [k, v] of Object.entries(src)) {
+      if (!PLATFORM_ONLY_SETTINGS_KEYS.includes(k)) out[k] = v;
+    }
+    return out;
+  }
+  for (const k of NON_ADMIN_SETTINGS_KEYS) {
+    if (src[k] !== undefined) out[k] = src[k];
+  }
+  return out;
+}
+
 router.get('/settings', async (req, res) => {
   try {
     const t = req.tenant;
@@ -230,7 +269,7 @@ router.get('/settings', async (req, res) => {
         // "3/500 used" while bookings are rejected as over quota.
         tenantQuery(t.schema_name,
           `SELECT COUNT(*) FROM appointments
-           WHERE created_at >= timezone('Asia/Kolkata', date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata'))`),
+           WHERE created_at >= ${IST_MONTH_START_TS_SQL}`),
       ]),
       tenantQuery(t.schema_name, `SELECT notify_phone FROM users WHERE id=$1`, [req.user.id]),
     ]);
@@ -244,7 +283,7 @@ router.get('/settings', async (req, res) => {
       plan: t.plan,
       wa_configured: !!(process.env.META_PHONE_NUMBER_ID && process.env.META_ACCESS_TOKEN),
       notify_phone: notifyPhone,
-      settings: t.settings || {},
+      settings: visibleSettings(t.settings, req.user?.role),
       hospital: {
         address: hosp.address || '',
         city: hosp.city || '',
@@ -359,16 +398,31 @@ router.get('/feedback', async (req, res) => {
       ORDER BY af.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
-    const [avgR, distR] = await Promise.all([
+    // The count must carry the SAME filters as the page query. It used to be an
+    // unfiltered COUNT(*) over appointment_feedback, so filtering by doctor or
+    // rating left `total` and `has_more` describing a different result set: the
+    // "Load more" button stayed live past the last row and then paged into
+    // nothing. avg_rating/distribution stay clinic-wide on purpose — they are
+    // the headline numbers, not a property of the current filter.
+    const countParams = params.slice(0, params.length - 2);
+    const [filteredCountR, avgR, distR] = await Promise.all([
+      tenantQuery(s, `
+        SELECT COUNT(*) as total
+        FROM appointment_feedback af
+        JOIN appointments a ON a.id=af.appointment_id
+        WHERE ${where.join(' AND ')}
+      `, countParams),
       tenantQuery(s, `SELECT ROUND(AVG(rating),1) as avg_rating, COUNT(*) as total FROM appointment_feedback`),
       tenantQuery(s, `SELECT rating, COUNT(*) as count FROM appointment_feedback GROUP BY rating ORDER BY rating DESC`),
     ]);
+    const total = parseInt(filteredCountR.rows[0]?.total || 0);
     res.json({
       feedback: r.rows,
       page: parseInt(page),
-      has_more: offset + r.rows.length < parseInt(avgR.rows[0]?.total || 0),
+      has_more: offset + r.rows.length < total,
       avg_rating: avgR.rows[0]?.avg_rating ? parseFloat(avgR.rows[0].avg_rating) : null,
-      total: parseInt(avgR.rows[0]?.total || 0),
+      total,
+      total_all: parseInt(avgR.rows[0]?.total || 0),
       distribution: distR.rows,
     });
   } catch (err) { handleError(res, err); }

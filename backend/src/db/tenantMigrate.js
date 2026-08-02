@@ -217,6 +217,15 @@ async function createTenantSchema(schemaName) {
       );
       CREATE INDEX IF NOT EXISTS idx_documents_patient ON documents(patient_id, created_at DESC);
 
+      -- One-shot data fixups run by db/seed.js record themselves here. entrypoint.sh
+      -- re-runs the seed on EVERY boot, so anything that mutates rows an admin can
+      -- also edit (deactivating doctors, resetting names) must be gated on a marker
+      -- instead of sweeping the tenant again on every deploy.
+      CREATE TABLE IF NOT EXISTS seed_markers (
+        key VARCHAR(100) PRIMARY KEY,
+        applied_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       -- Core indexes
       CREATE INDEX IF NOT EXISTS idx_slots_date_status ON time_slots(slot_date, status);
       CREATE INDEX IF NOT EXISTS idx_slots_doctor ON time_slots(doctor_id);
@@ -309,6 +318,15 @@ async function runTenantMigrations(schemaName) {
     await client.query("SET lock_timeout TO '5s'");
     await client.query(`SET search_path TO "${schemaName}", public`);
 
+    // Marker table for one-shot data fixups run by db/seed.js. Created FIRST so a
+    // later block failing for one tenant can never leave the seed without it.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS seed_markers (
+        key VARCHAR(100) PRIMARY KEY,
+        applied_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     // Add new columns to appointments (idempotent)
     await client.query(`
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS cancelled_by_user_id UUID;
@@ -351,17 +369,72 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_phone VARCHAR(20);
     `);
 
-    // Fix phone format constraint: digits-only (no + prefix) to match VARCHAR(20) column width.
-    // The webhook layer strips any leading + before storage, so + is never present in DB.
+    // Phone format constraint: digits-only (no + prefix) to match the VARCHAR(20)
+    // column width. The webhook layer strips any leading + before storage.
+    //
+    // This block used to DROP and re-ADD the constraint UNCONDITIONALLY on every
+    // boot for every tenant, and `EXCEPTION WHEN duplicate_object` caught none of
+    // the ways that actually fails:
+    //   - ADD CONSTRAINT ... CHECK takes ACCESS EXCLUSIVE on patients and
+    //     full-scans it to validate. With the 5s lock_timeout set above, a tenant
+    //     with live traffic raises lock_not_available.
+    //   - one legacy row still carrying a '+' raises check_violation.
+    // Either one made client.query throw → runTenantMigrations throw → migrate.js
+    // swallow it per-tenant with a console.error, so EVERY later block in this
+    // file (feedback_request_sent, payment_status, doctor_hospitals,
+    // reminder_confirmations, documents, email_unsubscribes …) silently never ran
+    // for that tenant while the deploy still reported success.
+    //
+    // Now conditional, in the same shape as the idx_wa_messages_msg_id rebuild
+    // below: look patients' CHECK constraints up in pg_constraint scoped to
+    // current_schema() and only touch anything when none of them already carries
+    // the wanted predicate. createTenantSchema declares the same predicate inline
+    // on CREATE TABLE (Postgres names it patients_phone_check), so a fresh schema
+    // now matches here and skips — previously it ended up with two identical
+    // CHECKs, both evaluated on every patient write. If a schema somehow has both,
+    // the redundant patients_phone_format is dropped (metadata-only, no scan).
+    //
+    // NOT VALID is deliberate, chosen over normalising the existing rows: the
+    // constraint exists to keep NEW writes clean, and NOT VALID enforces it on
+    // every insert/update while skipping the validating full scan — so it can
+    // neither time out under lock_timeout nor fail on a pre-existing '+' row.
+    // Normalising instead would mean a full UPDATE of patients on every tenant
+    // during a deploy AND would still leave the validating scan in place.
+    // Belt and braces: EXCEPTION WHEN OTHERS inside and .catch() outside, so a
+    // failure here can never take down the rest of this file again.
     await client.query(`
-      DO $$ BEGIN
-        -- Drop old constraint if it exists (old regex allowed + prefix which can exceed VARCHAR(20))
-        ALTER TABLE patients DROP CONSTRAINT IF EXISTS patients_phone_format;
-        ALTER TABLE patients
-          ADD CONSTRAINT patients_phone_format CHECK (phone ~ '^[0-9]{7,20}$');
-      EXCEPTION WHEN duplicate_object THEN NULL;
+      DO $$
+      DECLARE
+        wanted CONSTANT text := '^[0-9]{7,20}$';
+        has_wanted boolean;
+        has_dup    boolean;
+      BEGIN
+        SELECT
+          bool_or(strpos(pg_get_constraintdef(c.oid), wanted) > 0),
+          bool_or(c.conname = 'patients_phone_format' AND strpos(pg_get_constraintdef(c.oid), wanted) > 0)
+            AND bool_or(c.conname = 'patients_phone_check' AND strpos(pg_get_constraintdef(c.oid), wanted) > 0)
+        INTO has_wanted, has_dup
+        FROM pg_constraint c
+        JOIN pg_class     t ON t.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = current_schema()
+          AND t.relname = 'patients'
+          AND c.contype = 'c';
+
+        IF NOT COALESCE(has_wanted, false) THEN
+          ALTER TABLE patients DROP CONSTRAINT IF EXISTS patients_phone_format;
+          ALTER TABLE patients
+            ADD CONSTRAINT patients_phone_format CHECK (phone ~ '^[0-9]{7,20}$') NOT VALID;
+          RAISE NOTICE 'patients_phone_format added (NOT VALID) in %', current_schema();
+        ELSIF COALESCE(has_dup, false) THEN
+          ALTER TABLE patients DROP CONSTRAINT patients_phone_format;
+          RAISE NOTICE 'dropped duplicate patients_phone_format in %', current_schema();
+        END IF;
+      EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'patients_phone_format migration skipped in %: % (%)',
+          current_schema(), SQLERRM, SQLSTATE;
       END $$;
-    `);
+    `).catch(err => logger.warn('patients_phone_format migration skipped', { schema: schemaName, error: err.message }));
 
     // Add new indexes (idempotent)
     await client.query(`
@@ -443,8 +516,19 @@ async function runTenantMigrations(schemaName) {
     // Track WHY a slot is blocked: slots blocked automatically by a doctor leave
     // are marked so that deleting the leave only un-blocks those slots and never
     // releases slots an admin blocked manually for another reason.
+    //
+    // blocked_by_holiday is the same idea for clinic holidays. Declaring a
+    // holiday used to insert a clinic_holidays row and nothing else — the slots
+    // stayed 'available' forever (the nightly generator only INSERTs, it never
+    // deletes), so the ONLY thing keeping them unbookable was the NOT EXISTS
+    // filter in the date-LIST queries. A patient holding a date list cached
+    // before the holiday was declared tapped straight past it and booked a day
+    // the clinic was shut. The flag has to be separate from blocked_by_leave so
+    // that deleting a holiday releases only the slots THAT holiday blocked —
+    // never a doctor's leave days and never slots an admin blocked by hand.
     await client.query(`
       ALTER TABLE time_slots ADD COLUMN IF NOT EXISTS blocked_by_leave BOOLEAN DEFAULT false;
+      ALTER TABLE time_slots ADD COLUMN IF NOT EXISTS blocked_by_holiday BOOLEAN DEFAULT false;
     `);
 
     // Soft-delete columns for hospitals and patients

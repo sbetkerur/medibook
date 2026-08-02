@@ -12,12 +12,6 @@ export default function SuperAdminPage() {
   const [tenants, setTenants] = useState([]);
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [showCreate, setShowCreate] = useState(false);
-  const [form, setForm] = useState({
-    name: '', slug: '', owner_email: '', owner_password: '',
-    owner_name: '', plan: 'starter',
-  });
-  const [creating, setCreating] = useState(false);
 
   // Suspension modal state
   const [suspendModal, setSuspendModal] = useState(null); // { tenant }
@@ -77,23 +71,6 @@ export default function SuperAdminPage() {
       setStats(s.data);
     } catch { toast.error('Failed to load data'); }
     finally { setLoading(false); }
-  }
-
-  async function createTenant() {
-    if (!form.name || !form.slug || !form.owner_email) {
-      toast.error('Name, slug, and email are required');
-      return;
-    }
-    setCreating(true);
-    try {
-      const { data } = await api.post('/superadmin/tenants', form);
-      toast.success(`Tenant "${data.tenant.name}" created!`);
-      setShowCreate(false);
-      setForm({ name: '', slug: '', owner_email: '', owner_password: '', owner_name: '', plan: 'starter' });
-      fetchAll();
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to create tenant');
-    } finally { setCreating(false); }
   }
 
   async function openPasswordModal(tenant) {
@@ -206,10 +183,6 @@ export default function SuperAdminPage() {
     finally { setLoadingHealth(null); }
   }
 
-  function slugify(name) {
-    return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  }
-
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Top nav */}
@@ -241,11 +214,11 @@ export default function SuperAdminPage() {
               </div>
               <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-orange-400">
                 <p className="text-xs text-gray-500 uppercase tracking-wide">Appts (30d)</p>
-                <p className="text-3xl font-bold text-gray-900">{(stats.total_appointments_30d ?? 0).toLocaleString()}</p>
+                <p className="text-3xl font-bold text-gray-900">{(parseInt(stats.total_appointments_30d) || 0).toLocaleString('en-IN')}</p>
               </div>
               <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-pink-400">
                 <p className="text-xs text-gray-500 uppercase tracking-wide">Total Patients</p>
-                <p className="text-3xl font-bold text-gray-900">{(stats.total_patients ?? 0).toLocaleString()}</p>
+                <p className="text-3xl font-bold text-gray-900">{(parseInt(stats.total_patients) || 0).toLocaleString('en-IN')}</p>
               </div>
               {stats.mrr != null && (
                 <div className="bg-white rounded-xl p-4 shadow-sm border-l-4 border-yellow-400">
@@ -764,66 +737,6 @@ export default function SuperAdminPage() {
         </div>
       )}
 
-      {/* Create Tenant Modal */}
-      {showCreate && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-lg shadow-2xl">
-            <div className="flex items-center justify-between mb-5">
-              <h2 className="text-lg font-semibold text-gray-900">Create New Tenant</h2>
-              <button onClick={() => setShowCreate(false)} className="text-gray-400 hover:text-gray-600 text-xl">✕</button>
-            </div>
-
-            <div className="space-y-3">
-              {[
-                ['Clinic Name *', 'name', 'text', 'e.g. Apollo Clinic Mumbai'],
-                ['Slug (URL ID) *', 'slug', 'text', 'e.g. apollo-mumbai'],
-                ['Owner Email *', 'owner_email', 'email', 'admin@apollomumbai.com'],
-                ['Owner Name', 'owner_name', 'text', 'Dr. Sharma'],
-                ['Password', 'owner_password', 'password', 'Min 8 chars, uppercase + number'],
-              ].map(([label, name, type, placeholder]) => (
-                <div key={name}>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">{label}</label>
-                  <input type={type} value={form[name]}
-                    onChange={e => {
-                      const val = e.target.value;
-                      setForm(f => ({
-                        ...f,
-                        [name]: val,
-                        ...(name === 'name' && !f.slug ? { slug: slugify(val) } : {}),
-                      }));
-                    }}
-                    placeholder={placeholder}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-                </div>
-              ))}
-
-              <div>
-                <label className="block text-xs font-medium text-gray-600 mb-1">Plan</label>
-                <select value={form.plan} onChange={e => setForm(f => ({ ...f, plan: e.target.value }))}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                  <option value="starter">Starter (Free)</option>
-                  <option value="growth">Growth (₹1,999/mo)</option>
-                  <option value="professional">Professional (₹4,999/mo)</option>
-                  <option value="enterprise">Enterprise (₹9,999/mo)</option>
-                </select>
-              </div>
-
-              <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 text-xs text-blue-700">
-                📱 WhatsApp uses a shared global number — no per-tenant credentials needed.
-              </div>
-            </div>
-
-            <div className="flex gap-3 mt-5">
-              <button onClick={() => setShowCreate(false)}
-                className="flex-1 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50 transition">Cancel</button>
-              <button onClick={createTenant} disabled={creating}
-                className="flex-1 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-                {creating ? 'Creating...' : 'Create Tenant'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
