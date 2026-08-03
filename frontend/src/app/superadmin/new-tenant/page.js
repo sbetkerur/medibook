@@ -7,10 +7,8 @@ import toast from 'react-hot-toast';
 const STEPS = ['Clinic Info', 'Plan Selection', 'WhatsApp Config', 'Review & Create'];
 
 const PLAN_DETAILS = {
-  starter:      { icon: '🌱', color: 'border-gray-300',   badge: 'bg-gray-100 text-gray-700',   desc: 'Perfect for small clinics just getting started.' },
-  growth:       { icon: '🚀', color: 'border-blue-400',   badge: 'bg-blue-100 text-blue-700',   desc: 'For growing clinics with multiple doctors.' },
-  professional: { icon: '⭐', color: 'border-purple-400', badge: 'bg-purple-100 text-purple-700', desc: 'For established multi-branch clinics.' },
-  enterprise:   { icon: '🏆', color: 'border-yellow-400', badge: 'bg-yellow-100 text-yellow-700', desc: 'Unlimited scale for large hospital networks.' },
+  starter:      { icon: '🌱', color: 'border-gray-300',   badge: 'bg-gray-100 text-gray-700',   desc: 'Single-chair clinics. Up to two dentists, one location.' },
+  professional: { icon: '⭐', color: 'border-purple-400', badge: 'bg-purple-100 text-purple-700', desc: 'Everything else. Priced per branch — set the agreed amount on the tenant after creating it.' },
 };
 
 function slugify(name) {
@@ -256,7 +254,7 @@ export default function NewTenantPage() {
                 <p className="text-sm text-gray-500">Choose the subscription plan for this clinic.</p>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {(plans.length ? plans : ['starter','growth','professional','enterprise'].map(id => ({ id, name: id, max_doctors: 0, price_monthly: 0 }))).map(p => {
+                {(plans.length ? plans : ['starter','professional'].map(id => ({ id, name: id, max_doctors: 0, price_monthly: 0 }))).map(p => {
                   const pd = PLAN_DETAILS[p.id] || PLAN_DETAILS.starter;
                   return (
                     <button key={p.id} onClick={() => set('plan', p.id)}
@@ -268,8 +266,20 @@ export default function NewTenantPage() {
                       <div className="text-base font-semibold text-gray-900 capitalize">{p.name}</div>
                       <div className="text-sm text-gray-500 mt-1">{pd.desc}</div>
                       <div className="mt-3 space-y-1">
-                        {p.max_doctors > 0 && <div className="text-xs text-gray-600">👨‍⚕️ Up to {p.max_doctors === 999 ? 'unlimited' : p.max_doctors} doctors</div>}
-                        {p.max_appointments_per_month > 0 && <div className="text-xs text-gray-600">📅 {p.max_appointments_per_month === 99999 ? 'Unlimited' : p.max_appointments_per_month.toLocaleString()} appts/month</div>}
+                        {/* NULL is the unlimited sentinel (was 999 / 99999). A
+                            plain `> 0` test hides the row entirely for NULL,
+                            which reads as missing data rather than "no limit".
+                            0/undefined still hides — that's the offline
+                            fallback above, where the real limits are unknown. */}
+                        {(p.max_doctors === null || p.max_doctors > 0) && (
+                          <div className="text-xs text-gray-600">👨‍⚕️ {p.max_doctors === null ? 'Unlimited' : `Up to ${p.max_doctors}`} doctors</div>
+                        )}
+                        {(p.max_branches === null || p.max_branches > 0) && (
+                          <div className="text-xs text-gray-600">🏥 {p.max_branches === null ? 'Unlimited' : `Up to ${p.max_branches}`} {p.max_branches === 1 ? 'branch' : 'branches'}</div>
+                        )}
+                        {(p.max_appointments_per_month === null || p.max_appointments_per_month > 0) && (
+                          <div className="text-xs text-gray-600">📅 {p.max_appointments_per_month === null ? 'Unlimited' : p.max_appointments_per_month.toLocaleString()} appts/month</div>
+                        )}
                         <div className="text-sm font-semibold text-gray-900 mt-2">
                           {p.price_monthly === 0 ? 'Free' : `₹${p.price_monthly.toLocaleString('en-IN')}/mo`}
                         </div>

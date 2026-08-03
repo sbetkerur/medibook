@@ -40,8 +40,14 @@ async function seed() {
   let tenant = (await query(`SELECT * FROM tenants WHERE slug=$1`, [slug])).rows[0];
   if (!tenant) {
     const r = await query(`
+      -- 'professional', not 'growth': this fixture seeds TWO branches
+      -- (Banjara Hills + KPHB) to exercise the "clinics near me" flow, and
+      -- Professional is the only tier that allows more than one. The inserts
+      -- below go through tenantQuery rather than POST /hospitals so they would
+      -- bypass the cap either way — but a demo tenant sitting over its own
+      -- plan limit is exactly the fixture that teaches the wrong rule.
       INSERT INTO tenants (name, slug, schema_name, owner_email, plan, status, city)
-      VALUES ('Smile Dental Clinic', $1, $2, 'demo@medibook.com', 'growth', 'active', 'Bengaluru')
+      VALUES ('Smile Dental Clinic', $1, $2, 'demo@medibook.com', 'professional', 'active', 'Bengaluru')
       RETURNING *
     `, [slug, schema]);
     tenant = r.rows[0];

@@ -98,6 +98,13 @@ async function insertAppointmentWithRetry(client, f) {
  * Counts appointments created this calendar month (any status — cancellations
  * still consumed a booking).
  *
+ * DORMANT as of the dentist-count pricing model: every seeded tier stores NULL
+ * for max_appointments_per_month, so this returns `allowed` on the first branch
+ * without ever counting. Deliberately left wired into the three booking paths
+ * rather than deleted — it is the seam for re-introducing volume pricing, and
+ * reviving it should cost one migration, not a re-thread through the bot flow,
+ * the walk-in route and the follow-up route.
+ *
  * Fails open on DB errors so a plans-table hiccup never blocks bookings.
  *
  * @param {object} tenant - row from public.tenants (needs schema_name + plan)
