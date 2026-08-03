@@ -59,4 +59,3 @@ export function getLegalDoc(slug) {
   };
 }
 
-export const LEGAL_SLUGS = Object.keys(DOCS);

@@ -15,12 +15,6 @@
 // here would imply an agreement that does not exist.
 const CURRENT_TERMS_VERSION = '1.0';
 
-// Terms changes need notice before they bind (ToS Clause 13: 30 days for
-// material changes). Set this when publishing a new version so the acceptance
-// UI can show the date the new terms take effect. null = effective immediately,
-// which is only correct for the very first version.
-const TERMS_EFFECTIVE_FROM = null;
-
 /**
  * Has this tenant accepted the version currently in force?
  *
@@ -36,6 +30,5 @@ function hasAcceptedCurrentTerms(tenant) {
 
 module.exports = {
   CURRENT_TERMS_VERSION,
-  TERMS_EFFECTIVE_FROM,
   hasAcceptedCurrentTerms,
 };

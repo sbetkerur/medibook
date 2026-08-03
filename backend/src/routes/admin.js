@@ -31,6 +31,10 @@ const logger = require('../utils/logger');
 
 router.get('/terms', async (req, res) => {
   try {
+    // Fresh SELECT, deliberately NOT req.tenant. tenantMiddleware caches the
+    // tenants row (see middleware/auth.js), so req.tenant can hold a
+    // pre-acceptance copy for the rest of the cache TTL — an admin who just
+    // accepted would keep being re-prompted. Do not "optimise" this away.
     const r = await query(
       `SELECT terms_accepted_at, terms_version, terms_accepted_by FROM tenants WHERE id = $1`,
       [req.user.tenant_id]
@@ -55,6 +59,13 @@ router.get('/terms', async (req, res) => {
 router.post('/terms/accept', adminOnly, async (req, res) => {
   try {
     const { version } = req.body || {};
+    // A missing version is a malformed request, not a stale client. Separating
+    // them matters: 409 tells the UI to reload and re-prompt, which would be
+    // the wrong remedy — and a misleading "terms have been updated" message —
+    // for a caller that simply never sent the field.
+    if (!version) {
+      return res.status(400).json({ error: 'version is required' });
+    }
     // Reject a stale version outright rather than silently recording the
     // current one. A client that has been open across a terms change would
     // otherwise POST the version the user actually READ while we store the
