@@ -37,17 +37,27 @@ Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on eve
 boot, so schema changes in `migrate.js` / `tenantMigrate.js` must be idempotent
 (`IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` / versioned `runMigration`).
 
-Deploying via CLI — `railway up` archives the **git root** by default (even
-when run from inside `backend/`), which has no start script, so the build
-fails with Railpack "No start command detected" and an empty `configFile` in
-the deployment meta. ALWAYS pass the service dir with `--path-as-root`
-(from the repo root, or use `npm run deploy:backend` / `deploy:frontend`):
+Deploying via CLI — `railway up` archives the **git root**, which is exactly
+what both services expect: each has `rootDirectory` set in Railway (`/backend`,
+`/frontend`) and finds its own `railway.toml` and `Dockerfile` under it. Run it
+from the repo root with no path argument (or `npm run deploy:backend` /
+`deploy:frontend`):
 
 ```bash
-railway up ./backend  --path-as-root --service backend  --detach
-railway up ./frontend --path-as-root --service frontend --detach
+railway up --service backend  --detach
+railway up --service frontend --detach
 railway deployment list --service backend --json   # poll status (detached mode doesn't wait)
 ```
+
+Do NOT pass `--path-as-root ./backend`. It used to be required, but the
+services now set `rootDirectory` themselves, so Railway applies `/backend` on
+top of an archive whose root is ALREADY `backend/` and the build fails in
+seconds. The tell is `configFile: "/railway.toml"` in the deployment meta
+where a working deploy shows `"/backend/railway.toml"`. `railway logs --build`
+shows only "scheduling build on Metal builder" for this failure — the real
+cause is only visible in the deployment `meta`, via the GraphQL API
+(`backboard.railway.com/graphql/v2`, bearer `user.accessToken` from
+`~/.railway/config.json`; note `user.token` is empty).
 
 Seed credentials: super admin `admin@medibook.com` / `SuperAdmin@123`;
 tenant admin `demo@medibook.com` / `Demo@123456` (slug `demo-clinic`).
