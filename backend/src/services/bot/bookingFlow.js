@@ -1,6 +1,6 @@
 'use strict';
 
-const { tenantQuery, pool } = require('../../db');
+const { tenantQuery, pool, query } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
 const { toZonedTime } = require('../../utils/dateTz');
 const logger = require('../../utils/logger');
@@ -22,6 +22,27 @@ const {
   notifyAdminWhatsApp,
 } = require('./utils');
 
+/**
+ * Read and clear `global_bot_sessions.pending_hospital_id` in one statement, so
+ * two messages racing through booking can't both consume the same preset.
+ * Returns null on any failure — a branch preselection is a convenience, and it
+ * must never be the reason a booking can't start.
+ */
+async function _takePendingHospital(phone) {
+  try {
+    const r = await query(
+      `UPDATE global_bot_sessions SET pending_hospital_id = NULL
+        WHERE phone = $1 AND pending_hospital_id IS NOT NULL
+        RETURNING pending_hospital_id`,
+      [phone]
+    );
+    return r.rows[0]?.pending_hospital_id || null;
+  } catch (err) {
+    logger.warn('Could not read pending branch', { phone: maskPhone(phone), error: err.message });
+    return null;
+  }
+}
+
 async function startBooking(phone, schema, tenant, send, ctx) {
   const hospitals = await tenantQuery(schema,
     `SELECT id, name, city FROM hospitals WHERE is_active=true ORDER BY name`);
@@ -30,6 +51,24 @@ async function startBooking(phone, schema, tenant, send, ctx) {
     await send.text('No clinics available right now. Please try again later.');
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
+  }
+
+  // A branch chosen at the "clinics near me" city step — asking again would
+  // undo the whole point of picking by location. It lives on the GLOBAL session
+  // because the synthesised "Hi" that follows clinic selection resets this
+  // session's context, so it could not have been parked here.
+  //
+  // Consumed one-shot: cleared whether or not it still resolves, so a branch
+  // that has since been deactivated can't wedge every future booking, and a
+  // patient who books twice is asked normally the second time.
+  const presetId = await _takePendingHospital(phone);
+  if (presetId) {
+    const preset = hospitals.rows.find(h => h.id === presetId);
+    if (preset) {
+      ctx.hospital_id = preset.id;
+      ctx.hospital_name = preset.name;
+      return showDepartments(phone, schema, tenant, send, ctx);
+    }
   }
 
   if (hospitals.rows.length === 1) {

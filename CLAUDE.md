@@ -83,12 +83,30 @@ replaces real data, and the >`MAX_CITY_ROWS` "type your city" fallback is
 tested on the real-city count so padding can never push a real city off the
 list. Dedup is on `normalizeCity`, so a tenant storing "bengaluru" doesn't
 double the row. Tapping it parks the session in
-`select_city` and asks for a city; picking one lists just that city's clinics
+`select_city` and asks for a city; picking one lists that city's **branches**
 (≤10, WhatsApp's row cap) into the same `search_matches` shortlist the name
 search uses, so a numbered reply resolves identically. Two rules carry over
-unchanged: a city with exactly ONE clinic is still shown as a list rather than
+unchanged: a city with exactly ONE branch is still shown as a list rather than
 auto-attached (choosing a city is not naming a clinic), and the full roster is
-still never listed. The trigger is matched on message TEXT, not the interactive
+still never listed.
+
+Rows are BRANCHES, not clinics — a clinic with two branches in one city is two
+rows, since "which of your branches?" three steps later is the question picking
+by location was meant to answer. `services/bot/clinicBranches.js`
+(`listActiveBranches`) reads `hospitals` from every active tenant's schema; it
+is one `tenantQuery` per clinic, run concurrently and caught INDIVIDUALLY so one
+broken schema can't take the entry step down. It is therefore loaded LAZILY —
+never on a plain name search, and never for the entry prompt (which offers the
+button unconditionally). A branch with no `city` falls back to `tenants.city`.
+Consequence: a clinic with NO `hospitals` row is invisible to this path.
+Row ids are `br:<tenantId>:<hospitalId>` (`resolveBranchRef`, which re-checks
+the tenant is still active — a shortlist outlives the message that sent it).
+The chosen branch is parked on `global_bot_sessions.pending_hospital_id`, NOT in
+the tenant session context, because selecting a clinic hands the engine a
+synthesised "Hi" and a greeting resets that context to empty;
+`bookingFlow.startBooking` consumes it one-shot (cleared even when it no longer
+resolves, so a deactivated branch can't wedge every future booking) and skips
+the branch question. Every path that clears the clinic clears it too. The trigger is matched on message TEXT, not the interactive
 reply id — `wa.sendButtons` mints its own opaque ids — and deliberately does NOT
 accept a bare "city"/"near", which would shadow real searches like "City Dental
 Care". That match lives in `isNearbyTrigger` (exported for tests): a tap sends
