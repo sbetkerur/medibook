@@ -19,7 +19,7 @@
  */
 process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 const { matchCity, normalizeCity, buildCityChoices, DEFAULT_CITIES } = require('../src/services/bot/clinicSearch');
-const { NEARBY_RE, CITY_ROW_PREFIX } = require('../src/routes/webhook');
+const { NEARBY_RE, CITY_ROW_PREFIX, isNearbyTrigger } = require('../src/routes/webhook');
 
 let passed = 0, failed = 0;
 function check(name, actual, expected) {
@@ -133,6 +133,42 @@ check('a padded default resolves when typed',
   matchCity(buildCityChoices([]), 'chennai'), 'Chennai');
 check('"newdelhi" reaches the padded "New Delhi"',
   matchCity(buildCityChoices([]), 'newdelhi'), 'New Delhi');
+
+// ── 5. TAPPING the button, not just typing the phrase ────────
+// The regression that made the feature look dead: wa.sendButtons sends an
+// opaque `btn_0_<ts>` id alongside the title, so a guard of `!buttonId` threw
+// away the tap the button exists for and the phrase fell through to the clinic
+// name search ("no clinic found matching '📍 Clinics near me'").
+const TENANT_A = '11111111-1111-4111-8111-111111111111';
+const tap = (over) => isNearbyTrigger({
+  text: '📍 Clinics near me', buttonId: 'btn_0_1234567890',
+  cityRowId: null, tenantIds: [TENANT_A], ...over,
+});
+
+check('TAPPING the button opens the picker', tap(), true);
+check('typing the phrase still opens the picker',
+  tap({ buttonId: null }), true);
+check('the numbered text fallback ("near me") opens it',
+  tap({ text: 'near me', buttonId: null }), true);
+
+// Ids we DO recognise must win over the phrase.
+check('a city row is an ANSWER to the picker, not a request to reopen it',
+  tap({ text: 'Hyderabad', buttonId: 'city:Hyderabad', cityRowId: 'Hyderabad' }), false);
+check('a clinic row tap is never hijacked by its title',
+  isNearbyTrigger({ text: 'Nearby', buttonId: TENANT_A, cityRowId: null, tenantIds: [TENANT_A] }), false);
+// ...but an unrecognised id is not evidence of anything — the text decides.
+check('an unknown button id does not suppress the phrase',
+  tap({ buttonId: 'btn_2_999' }), true);
+
+// The guards that already held must keep holding through the new predicate.
+check('a greeting is not a nearby trigger', tap({ text: 'hi', buttonId: null }), false);
+check('bare "city" is still a name search', tap({ text: 'city', buttonId: null }), false);
+check('a real clinic name is still a name search',
+  tap({ text: 'Smile Dental', buttonId: null }), false);
+check('empty text is not a trigger', tap({ text: '', buttonId: null }), false);
+check('null text is not a trigger', tap({ text: null, buttonId: null }), false);
+check('missing tenantIds does not throw',
+  isNearbyTrigger({ text: 'near me', buttonId: 'btn_0_1', cityRowId: null }), true);
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);
