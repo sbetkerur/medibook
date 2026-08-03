@@ -8,7 +8,7 @@ const wa = require('../services/whatsapp');
 const logger = require('../utils/logger');
 const { handleReminderConfirmation } = require('../jobs/reminders');
 const { isEnabled } = require('../utils/featureFlags');
-const { isRealAppSecret } = require('../utils/errors');
+const { isRealAppSecret, UUID_RE } = require('../utils/errors');
 // maskPhone moved to services/bot/utils.js — the bot engine, the booking flow
 // and the reminder cron log the same value and each needed it too.
 const { parseChoiceNumber, maskPhone, isOptedOut } = require('../services/bot/utils');
@@ -18,6 +18,7 @@ const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { sendPatientText } = require('../services/outbound');
 const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST, matchCity,
         buildCityChoices, normalizeCity } = require('../services/bot/clinicSearch');
+const { listActiveBranches } = require('../services/bot/clinicBranches');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -278,6 +279,27 @@ const NEARBY_RE = /^(📍\s*)?(clinics?\s+near\s+me|near\s+me|near\s*by|my\s+cit
 // the tenant UUIDs the clinic shortlist uses as row ids.
 const CITY_ROW_PREFIX = 'city:';
 
+// Row id for a BRANCH in the city picker: `br:<tenantId>:<hospitalId>`. Both
+// ids are needed — the tenant to route to, the hospital to preselect — and the
+// prefix keeps it distinguishable from a bare tenant UUID (the name-search
+// shortlist) and from a `city:` row.
+const BRANCH_ROW_PREFIX = 'br:';
+
+/**
+ * Resolve a `br:` row id (or a stored shortlist entry) back to its clinic and
+ * branch. Returns null unless the tenant is STILL active — a shortlist can
+ * outlive a clinic being suspended, and a stale tap must not attach a patient
+ * to it. The hospital id is not verified here: bookingFlow re-checks it against
+ * the live branch list and falls back to asking, so one lookup does the job.
+ */
+function resolveBranchRef(ref, activeTenants) {
+  if (typeof ref !== 'string' || !ref.startsWith(BRANCH_ROW_PREFIX)) return null;
+  const [tenantId, hospitalId] = ref.slice(BRANCH_ROW_PREFIX.length).split(':');
+  if (!UUID_RE.test(tenantId || '') || !UUID_RE.test(hospitalId || '')) return null;
+  const tenant = (activeTenants || []).find(t => t.id === tenantId);
+  return tenant ? { tenant, hospitalId } : null;
+}
+
 // WhatsApp rejects a list with more than 10 rows outright (Meta #131009).
 const MAX_CITY_ROWS = 10;
 
@@ -489,7 +511,7 @@ async function processIncomingMessage(msg) {
       leavingClinic = prev?.rows[0]?.name || null;
       await query(
         `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant',
-           search_matches=NULL, last_activity=NOW() WHERE phone=$1`,
+           search_matches=NULL, pending_hospital_id=NULL, last_activity=NOW() WHERE phone=$1`,
         [phone]
       ).catch(() => {});
     }
@@ -512,7 +534,7 @@ async function processIncomingMessage(msg) {
       // backfills it). The COALESCE is belt-and-braces for a deployment that
       // has written settings.city out of band — the column always wins.
       const tenantsR = await query(
-        `SELECT id, name, COALESCE(city, settings->>'city') AS city
+        `SELECT id, name, slug, schema_name, COALESCE(city, settings->>'city') AS city
            FROM tenants WHERE status='active' ORDER BY name`
       );
       const activeTenants = tenantsR.rows;
@@ -529,6 +551,9 @@ async function processIncomingMessage(msg) {
       // messaging the shared number should never be silently attached to a
       // clinic they did not name.
       let selected = null;
+      // Set alongside `selected` when they arrived via a branch row, so booking
+      // can skip "which branch?" — see pending_hospital_id below.
+      let pickedBranchId = null;
       const trimmed = (text || '').trim();
       const isGreeting = GREETING_RE.test(trimmed);
 
@@ -536,19 +561,20 @@ async function processIncomingMessage(msg) {
       // A second way in, for a patient who knows where they are but not what
       // their clinic is called. It still never lists the roster: a city has to
       // be chosen first, and only that city's clinics are ever shown.
-      // Cities that actually have a clinic, followed by the default metros
+      // Branches are what the city picker lists, and loading them costs one
+      // query PER active clinic (`hospitals` is per-tenant). So it is lazy:
+      // a plain name search must never pay for it. Memoised per message.
+      let _branches = null;
+      const getBranches = async () => {
+        if (_branches === null) _branches = await listActiveBranches(activeTenants);
+        return _branches;
+      };
+      // Cities that actually have a branch, followed by the default metros
       // (`DEFAULT_CITIES`). The defaults mean this list is never empty, so the
-      // location button below is always offered — a default city with no
-      // clinics is not a dead end, it answers "no clinics in X yet" and points
-      // back at the name search.
-      const knownCities = buildCityChoices(activeTenants.map(t => t.city));
-
-      // How many of those can actually resolve to a clinic. Drives the row-cap
-      // decision below: padding is only ever allowed to fill space the real
-      // cities didn't need.
-      const clinicCityCount = new Set(
-        activeTenants.map(t => normalizeCity(t.city || '')).filter(Boolean)
-      ).size;
+      // location button is always offered — a default city with no branches is
+      // not a dead end, it answers "no clinics in X yet" and points back at the
+      // name search.
+      const getKnownCities = async () => buildCityChoices((await getBranches()).map(b => b.city));
 
       // Tapping a city row, or typing one while we were asking. A typed city is
       // only read as a city in `select_city` — elsewhere "Pune" is far more
@@ -559,7 +585,7 @@ async function processIncomingMessage(msg) {
         : null;
       const pickedCity = cityRowId || (
         globalSession?.state === 'select_city' && trimmed && !isGreeting
-          ? matchCity(knownCities, trimmed)
+          ? matchCity(await getKnownCities(), trimmed)
           : null
       );
 
@@ -571,12 +597,20 @@ async function processIncomingMessage(msg) {
            VALUES ($1,'select_city',NOW(),$2,NULL)
            ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_city',
              last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
-             search_matches=NULL`,
+             search_matches=NULL, pending_hospital_id=NULL`,
           [phone, msgId || null]
         ).catch(() => {});
 
+        const knownCities = await getKnownCities();
+        // How many cities can actually resolve to a branch. Drives the row-cap
+        // decision: padding is only ever allowed to fill space real cities
+        // didn't need.
+        const clinicCityCount = new Set(
+          (await getBranches()).map(b => normalizeCity(b.city)).filter(Boolean)
+        ).size;
+
         if (!knownCities.length) {
-          // Only reachable if DEFAULT_CITIES is emptied AND no clinic has a
+          // Only reachable if DEFAULT_CITIES is emptied AND no branch has a
           // city — sendList would otherwise be called with zero rows.
           await wa.sendText(phone,
             `📍 Clinic locations aren't set up yet.\n\n🔍 Please send your clinic's name instead — a few letters are enough.`,
@@ -603,23 +637,29 @@ async function processIncomingMessage(msg) {
       }
 
       if (pickedCity) {
-        const cityClinics = activeTenants.filter(t =>
-          (t.city || '').trim().toLowerCase() === pickedCity.trim().toLowerCase()
-        );
+        // BRANCHES, not clinics: a clinic with two branches in this city is two
+        // rows, because "which of your branches?" three steps later is exactly
+        // the question choosing by location was supposed to answer.
+        const wanted = normalizeCity(pickedCity);
+        const cityBranches = (await getBranches()).filter(b => normalizeCity(b.city) === wanted);
+        const shownBranches = cityBranches.slice(0, MAX_CITY_ROWS);
+
         // Back to the normal search state either way: whatever happens next is
-        // a clinic choice, not another city.
-        const shownCityClinics = cityClinics.slice(0, MAX_CITY_ROWS);
+        // a clinic choice, not another city. The shortlist stores `br:` refs so
+        // a numbered reply resolves to the same branch the rows offered.
         await query(
-          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
-           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb)
+          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches, pending_hospital_id)
+           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb,NULL)
            ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
              last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
-             search_matches=EXCLUDED.search_matches`,
+             search_matches=EXCLUDED.search_matches, pending_hospital_id=NULL`,
           [phone, msgId || null,
-           shownCityClinics.length ? JSON.stringify(shownCityClinics.map(t => t.id)) : null]
+           shownBranches.length
+             ? JSON.stringify(shownBranches.map(b => BRANCH_ROW_PREFIX + b.tenant_id + ':' + b.hospital_id))
+             : null]
         ).catch(() => {});
 
-        if (!shownCityClinics.length) {
+        if (!shownBranches.length) {
           await wa.sendText(phone,
             `📍 No clinics in *${pickedCity}* yet.\n\n🔍 Please send your clinic's name instead.`,
             null, null
@@ -627,42 +667,57 @@ async function processIncomingMessage(msg) {
           return;
         }
 
-        // Shown as a list even when there is exactly ONE clinic in the city.
+        // Shown as a list even when there is exactly ONE branch in the city.
         // Choosing a city is not naming a clinic, and the entry point's rule is
         // that a patient is never silently attached to a clinic they did not
         // pick — the same reason there is no auto-assign when only one tenant
         // is onboarded.
-        const more = cityClinics.length > shownCityClinics.length
-          ? `\n\nShowing ${shownCityClinics.length} of ${cityClinics.length} — send your clinic's name if it isn't listed.`
+        const more = cityBranches.length > shownBranches.length
+          ? `\n\nShowing ${shownBranches.length} of ${cityBranches.length} — send your clinic's name if it isn't listed.`
           : '';
+        // The address is the useful second line when every row is the same
+        // clinic; once two clinics share a city the clinic's name is what
+        // actually tells them apart, so it leads.
+        const oneClinic = new Set(shownBranches.map(b => b.tenant_id)).size === 1;
         await wa.sendList(phone,
-          `📍 ${cityClinics.length} clinic${cityClinics.length !== 1 ? 's' : ''} in *${pickedCity}*.\n\nPick yours:${more}`,
+          `📍 ${cityBranches.length} clinic${cityBranches.length !== 1 ? 's' : ''} in *${pickedCity}*.\n\nPick yours:${more}`,
           'Select clinic',
           [{
             title: pickedCity.slice(0, 24),
-            rows: shownCityClinics.map(t => ({
-              id: t.id,
-              title: shortLabel(t.name),
-              description: t.name,
+            rows: shownBranches.map(b => ({
+              id: BRANCH_ROW_PREFIX + b.tenant_id + ':' + b.hospital_id,
+              title: (b.hospital_name || b.tenant_name).slice(0, 24),
+              description: (oneClinic
+                ? b.address
+                : [b.tenant_name, b.address].filter(Boolean).join(' · ')).slice(0, 72),
             })),
           }], null, null
         ).catch(err => logger.error('Failed to send city clinic list', { error: err.message }));
         return;
       }
 
-      // 1. Tap on a shortlist row — row id is the tenant UUID.
+      // 1. Tap on a shortlist row — a `br:` branch ref from the city picker, or
+      //    a bare tenant UUID from the name-search shortlist.
       if (buttonId) {
-        selected = activeTenants.find(t => t.id === buttonId) || null;
+        const ref = resolveBranchRef(buttonId, activeTenants);
+        if (ref) { selected = ref.tenant; pickedBranchId = ref.hospitalId; }
+        else selected = activeTenants.find(t => t.id === buttonId) || null;
       }
 
       // 2. "2" — a pick from the numbered shortlist we last sent this phone.
       //    Re-checked against activeTenants so a stale reply can't select a
       //    tenant that has since been deactivated.
+      //    Entries are branch refs when the shortlist came from the city picker
+      //    and bare tenant ids when it came from a name search, so both shapes
+      //    have to resolve here.
       const shortlist = Array.isArray(globalSession?.search_matches) ? globalSession.search_matches : [];
       if (!selected && trimmed && shortlist.length) {
         const n = parseChoiceNumber(trimmed);
         if (n >= 1 && n <= shortlist.length) {
-          selected = activeTenants.find(t => t.id === shortlist[n - 1]) || null;
+          const entry = shortlist[n - 1];
+          const ref = resolveBranchRef(entry, activeTenants);
+          if (ref) { selected = ref.tenant; pickedBranchId = ref.hospitalId; }
+          else selected = activeTenants.find(t => t.id === entry) || null;
         }
       }
 
@@ -678,14 +733,20 @@ async function processIncomingMessage(msg) {
       }
 
       if (selected) {
-        // Patient matched a clinic — confirm and route
+        // Patient matched a clinic — confirm and route. `pending_hospital_id`
+        // carries a branch picked at the city step through to booking: the
+        // synthesised "Hi" below resets the TENANT session's context, so a
+        // branch parked there would be wiped before bookingFlow could read it.
+        // Always written (NULL when they got here by name), so a branch from an
+        // earlier city pick can never leak into a later name search.
         await query(
-          `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id)
-           VALUES ($1,$2,'active',NOW(),$3)
+          `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id, pending_hospital_id)
+           VALUES ($1,$2,'active',NOW(),$3,$4)
            ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
              search_matches=NULL, last_activity=NOW(),
-             last_wa_message_id=EXCLUDED.last_wa_message_id`,
-          [phone, selected.id, msgId || null]
+             last_wa_message_id=EXCLUDED.last_wa_message_id,
+             pending_hospital_id=EXCLUDED.pending_hospital_id`,
+          [phone, selected.id, msgId || null, pickedBranchId || null]
         );
         // Resolve the tenant BEFORE confirming, for two reasons the old order
         // made impossible: the confirmation is a patient-facing message sent
@@ -720,11 +781,11 @@ async function processIncomingMessage(msg) {
 
         // Record the message id so a Meta redelivery doesn't re-send this prompt.
         await query(
-          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
-           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb)
+          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches, pending_hospital_id)
+           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb,NULL)
            ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
              last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
-             search_matches=EXCLUDED.search_matches`,
+             search_matches=EXCLUDED.search_matches, pending_hospital_id=NULL`,
           [phone, msgId || null, shown.length ? JSON.stringify(shown.map(t => t.id)) : null]
         ).catch(() => {});
 
@@ -768,22 +829,19 @@ async function processIncomingMessage(msg) {
 
         // The location path is offered as an EXTRA, never as a replacement: the
         // body still asks for the clinic's name, so a patient who knows it is
-        // not made to pick a city first. `DEFAULT_CITIES` keeps `knownCities`
-        // non-empty, so this is offered on every first contact — a picked city
-        // with no clinics yet is answered, not dead-ended. The hint line matters
-        // because wa.sendButtons degrades to numbered text if the interactive
-        // send fails, and "📍 Clinics near me" is a phrase NEARBY_RE also
-        // accepts typed.
-        if (knownCities.length) {
-          await wa.sendButtons(
-            phone,
-            `${prompt}\n\n📍 Or reply *${NEARBY_BUTTON_LABEL.replace('📍 ', '')}* to browse by city.`,
-            [NEARBY_BUTTON_LABEL], null, null
-          ).catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
-        } else {
-          await wa.sendText(phone, prompt, null, null)
-            .catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
-        }
+        // not made to pick a city first. Offered unconditionally — `DEFAULT_CITIES`
+        // guarantees the picker has rows, and a city with no branches is
+        // answered ("no clinics in X yet"), not a dead end. Deliberately does
+        // NOT consult the branch list: this line runs on EVERY first-contact
+        // message, and loading branches costs a query per clinic. The hint line
+        // matters because wa.sendButtons degrades to numbered text if the
+        // interactive send fails, and "📍 Clinics near me" is a phrase
+        // NEARBY_RE also accepts typed.
+        await wa.sendButtons(
+          phone,
+          `${prompt}\n\n📍 Or reply *${NEARBY_BUTTON_LABEL.replace('📍 ', '')}* to browse by city.`,
+          [NEARBY_BUTTON_LABEL], null, null
+        ).catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
         return;
       }
     } else {
@@ -798,7 +856,7 @@ async function processIncomingMessage(msg) {
         // "2" pick a clinic they were never shown.
         await query(
           `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant',
-             search_matches=NULL, last_activity=NOW() WHERE phone=$1`,
+             search_matches=NULL, pending_hospital_id=NULL, last_activity=NOW() WHERE phone=$1`,
           [phone]
         ).catch(() => {});
         logger.warn('Tenant deactivated — global session reset', { phone: maskPhone(phone) });
@@ -1050,3 +1108,7 @@ module.exports.CITY_ROW_PREFIX = CITY_ROW_PREFIX;
 // Exported for tests: the tap-vs-type distinction here is exactly what broke the
 // button once (see isNearbyTrigger), so it is pinned by tests/clinicNearby.
 module.exports.isNearbyTrigger = isNearbyTrigger;
+// Exported for tests: a branch row carries BOTH ids, and resolving it against a
+// stale shortlist must not attach a patient to a suspended clinic.
+module.exports.BRANCH_ROW_PREFIX = BRANCH_ROW_PREFIX;
+module.exports.resolveBranchRef = resolveBranchRef;

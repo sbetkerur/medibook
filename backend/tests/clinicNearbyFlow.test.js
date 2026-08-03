@@ -26,8 +26,10 @@ process.env.PORT = process.env.TEST_PORT || '3099';
 // module afterwards hands back the SAME cached instance webhook.js holds, so
 // patching its exports here is what webhook.js actually calls.
 require('../src/index');
-const { query } = require('../src/db');
+const { query, tenantQuery } = require('../src/db');
 const { createTenantSchema, runTenantMigrations } = require('../src/db/tenantMigrate');
+const { DEFAULT_CITIES } = require('../src/services/bot/clinicSearch');
+const { BRANCH_ROW_PREFIX } = require('../src/routes/webhook');
 const wa = require('../src/services/whatsapp');
 
 let sent = [];
@@ -43,10 +45,21 @@ const RUN = Date.now().toString(36);
 const PHONES = ['919990000801', '919990000802', '919990000803', '919990000804', '919990000805'];
 
 // Invented so they cannot collide with a real clinic's name or city.
+// The picker lists BRANCHES, so Aurelia has two in one city — the case that
+// made clinic-level rows wrong (you picked the clinic, then got asked which
+// branch anyway). Borealis's branch has no city of its own, exercising the
+// fallback to the clinic's city.
 const FIXTURES = [
-  { key: 'a', name: 'Aurelia Dental Clinic',    city: 'Quintonia' },
-  { key: 'b', name: 'Borealis Dental Clinic',   city: 'Quintonia' },
-  { key: 'c', name: 'Cassiopeia Dental Clinic', city: 'Zephyrhaven' },
+  { key: 'a', name: 'Aurelia Dental Clinic', city: 'Quintonia', branches: [
+    { name: 'Aurelia Northgate', address: '1 North Road', city: 'Quintonia' },
+    { name: 'Aurelia Southgate', address: '2 South Road', city: 'Quintonia' },
+  ] },
+  { key: 'b', name: 'Borealis Dental Clinic', city: 'Quintonia', branches: [
+    { name: 'Borealis Main', address: '3 Main Street', city: null },
+  ] },
+  { key: 'c', name: 'Cassiopeia Dental Clinic', city: 'Zephyrhaven', branches: [
+    { name: 'Cassiopeia Central', address: '4 Central Avenue', city: 'Zephyrhaven' },
+  ] },
 ];
 
 let passed = 0, failed = 0;
@@ -85,7 +98,8 @@ const text = t => ({ type: 'text', text: { body: t } });
 const listReply = (id, title) => ({ type: 'interactive', interactive: { type: 'list_reply', list_reply: { id, title } } });
 
 const sessionOf = async phone => (await query(
-  `SELECT state, tenant_id, search_matches FROM global_bot_sessions WHERE phone=$1`, [phone]
+  `SELECT state, tenant_id, search_matches, pending_hospital_id
+     FROM global_bot_sessions WHERE phone=$1`, [phone]
 )).rows[0] || null;
 
 async function dropFixtures() {
@@ -114,7 +128,17 @@ async function createFixtures() {
     // session and a wa_messages row into it.
     await createTenantSchema(schema);
     await runTenantMigrations(schema);
-    made[f.key] = r.rows[0];
+    made[f.key] = { ...r.rows[0], schema, branches: [] };
+
+    // Branches are what the picker lists, so a tenant row alone is invisible.
+    for (const b of f.branches) {
+      const h = await tenantQuery(schema,
+        `INSERT INTO hospitals (name, address, city, phone, is_active)
+         VALUES ($1,$2,$3,'0000000000',true) RETURNING id, name`,
+        [b.name, b.address, b.city]
+      );
+      made[f.key].branches.push(h.rows[0]);
+    }
   }
   return made;
 }
@@ -147,36 +171,62 @@ async function createFixtures() {
   // their own cities, and that is correct behaviour, not a failure.
   check('our cities are offered', ['Quintonia', 'Zephyrhaven'].every(c => titles.includes(c)), true);
   check('cities are de-duplicated', titles.filter(t => t === 'Quintonia').length, 1);
-  check('cities are sorted', titles, [...titles].sort((a, b) => a.localeCompare(b)));
+  // Ordering — branch cities first and alphabetical, DEFAULT_CITIES appended in
+  // their own fixed order — is pinned exhaustively against buildCityChoices in
+  // tests/clinicNearby.unit.test.js. It is NOT re-derived here: a clinic in a
+  // city that is ALSO a default (Hyderabad) is indistinguishable from padding by
+  // name, so any positional assertion would depend on which other clinics happen
+  // to be in the dev database.
+  check('our two cities keep their relative order',
+    titles.indexOf('Quintonia') < titles.indexOf('Zephyrhaven'), true);
+  check('the default metros are offered too',
+    DEFAULT_CITIES.every(c => titles.includes(c)), true);
   check('city row ids are namespaced', rows.every(r => r.id === 'city:' + r.title), true);
   check('session parked in select_city', (await sessionOf(P1))?.state, 'select_city');
 
-  // ── Picking a city lists only that city's clinics ────────────
+  // ── Picking a city lists that city's BRANCHES ────────────────
+  // Aurelia's two branches are two rows: choosing by location has to end at a
+  // location, not at a clinic that then asks which of its branches you meant.
   out = await inbound(P1, listReply('city:Quintonia', 'Quintonia'));
-  check('city pick returns a clinic list', out[0]?.type, 'list');
+  check('city pick returns a branch list', out[0]?.type, 'list');
   checkMatch('names the city', out[0]?.text, /Quintonia/);
-  const quint = (out[0]?.sections?.[0]?.rows || []).map(r => r.title).sort();
-  check('exactly that city\'s clinics', quint, ['Aurelia Dental Clinic', 'Borealis Dental Clinic'].sort());
+  const quintRows = out[0]?.sections?.[0]?.rows || [];
+  check('every branch in that city, both of Aurelia\'s',
+    quintRows.map(r => r.title).sort(),
+    ['Aurelia Northgate', 'Aurelia Southgate', 'Borealis Main']);
+  check('branch rows carry clinic AND branch id',
+    quintRows.every(r => r.id.startsWith(BRANCH_ROW_PREFIX) && r.id.split(':').length === 3), true);
+  checkMatch('two clinics share the city, so the clinic name leads the subtitle',
+    quintRows.find(r => r.title === 'Borealis Main')?.description, /^Borealis Dental Clinic/);
   let st = await sessionOf(P1);
   check('back to select_tenant', st?.state, 'select_tenant');
-  check('shortlist stored so a numbered reply resolves', (st?.search_matches || []).length, 2);
+  check('shortlist stored so a numbered reply resolves', (st?.search_matches || []).length, 3);
   check('still not attached to any clinic', st?.tenant_id, null);
 
-  // ── A city with ONE clinic is confirmed, never auto-attached ──
+  // ── A city with ONE branch is confirmed, never auto-attached ──
   await inbound(P2, text('Hi'));
   await inbound(P2, text('nearby'));
   out = await inbound(P2, listReply('city:Zephyrhaven', 'Zephyrhaven'));
-  check('single-clinic city still returns a list', out[0]?.type, 'list');
+  check('single-branch city still returns a list', out[0]?.type, 'list');
   const solo = out[0]?.sections?.[0]?.rows || [];
   check('one row', solo.length, 1);
+  checkMatch('one clinic in the city, so the address is the subtitle',
+    solo[0]?.description, /^4 Central Avenue/);
   check('NOT auto-attached to the only clinic', (await sessionOf(P2))?.tenant_id, null);
 
-  // ── Selecting the clinic finally attaches ────────────────────
+  // ── Selecting the branch attaches AND remembers the branch ───
   out = await inbound(P2, listReply(solo[0].id, solo[0].title));
   st = await sessionOf(P2);
-  check('clinic selected → session active', st?.state, 'active');
-  check('attached to the clinic that was picked', st?.tenant_id, T.c.id);
+  check('branch selected → session active', st?.state, 'active');
+  check('attached to the clinic that owns the branch', st?.tenant_id, T.c.id);
+  check('the branch is parked for booking to consume',
+    st?.pending_hospital_id, T.c.branches[0].id);
   checkMatch('confirms the clinic', out.map(o => o.text).join(' | '), /Clinic selected/i);
+
+  // The preset must not survive a restart — "Hi" means start over, and the
+  // branch was part of what they were starting over from.
+  await inbound(P2, text('Hi'));
+  check('"Hi" clears the parked branch', (await sessionOf(P2))?.pending_hospital_id, null);
 
   // ── Typing a city while being asked for one ──────────────────
   await inbound(P3, text('Hi'));

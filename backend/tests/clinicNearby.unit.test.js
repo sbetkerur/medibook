@@ -19,7 +19,8 @@
  */
 process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 const { matchCity, normalizeCity, buildCityChoices, DEFAULT_CITIES } = require('../src/services/bot/clinicSearch');
-const { NEARBY_RE, CITY_ROW_PREFIX, isNearbyTrigger } = require('../src/routes/webhook');
+const { NEARBY_RE, CITY_ROW_PREFIX, isNearbyTrigger,
+        BRANCH_ROW_PREFIX, resolveBranchRef } = require('../src/routes/webhook');
 
 let passed = 0, failed = 0;
 function check(name, actual, expected) {
@@ -169,6 +170,37 @@ check('empty text is not a trigger', tap({ text: '', buttonId: null }), false);
 check('null text is not a trigger', tap({ text: null, buttonId: null }), false);
 check('missing tenantIds does not throw',
   isNearbyTrigger({ text: 'near me', buttonId: 'btn_0_1', cityRowId: null }), true);
+
+// ── 6. Branch rows ──────────────────────────────────────────
+// A clinic can have two branches in one city, so the picker lists BRANCHES.
+// The row has to carry both ids: the clinic to route to, the branch to
+// preselect so booking doesn't ask again.
+const T1 = '11111111-1111-4111-8111-111111111111';
+const T2 = '22222222-2222-4222-8222-222222222222';
+const H1 = '33333333-3333-4333-8333-333333333333';
+const TENANTS = [{ id: T1, name: 'Smile Dental Clinic' }];
+const refOf = (t, h) => BRANCH_ROW_PREFIX + t + ':' + h;
+
+check('a branch ref resolves to its clinic and branch',
+  resolveBranchRef(refOf(T1, H1), TENANTS),
+  { tenant: TENANTS[0], hospitalId: H1 });
+check('the prefix keeps it distinct from a bare tenant id',
+  resolveBranchRef(T1, TENANTS), null);
+check('a city row is not a branch ref',
+  resolveBranchRef('city:Hyderabad', TENANTS), null);
+check('an opaque button id is not a branch ref',
+  resolveBranchRef('btn_0_1234', TENANTS), null);
+
+// A shortlist outlives the message that sent it: a clinic suspended in between
+// must not still be attachable.
+check('a branch of a clinic that is no longer active resolves to null',
+  resolveBranchRef(refOf(T2, H1), TENANTS), null);
+check('malformed ref (no hospital id)',
+  resolveBranchRef(BRANCH_ROW_PREFIX + T1, TENANTS), null);
+check('malformed ref (non-uuid ids)',
+  resolveBranchRef(BRANCH_ROW_PREFIX + 'abc:def', TENANTS), null);
+check('null ref', resolveBranchRef(null, TENANTS), null);
+check('empty tenant list', resolveBranchRef(refOf(T1, H1), []), null);
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

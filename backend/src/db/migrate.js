@@ -119,6 +119,17 @@ async function migrate() {
       UPDATE tenants SET city = settings->>'city' WHERE city IS NULL AND settings->>'city' IS NOT NULL;
     `);
 
+    // ── GLOBAL BOT SESSIONS: pending branch ───────────────────
+    // Which BRANCH the patient tapped at the "clinics near me" city step, so
+    // booking doesn't ask again. It lives here rather than in the tenant's
+    // bot_sessions context because selecting a clinic hands the engine a
+    // synthesised "Hi", and a greeting resets that context to empty — anything
+    // parked there would be wiped before booking could read it. Consumed
+    // one-shot by bookingFlow.startBooking and cleared on every clinic reset.
+    await client.query(`
+      ALTER TABLE global_bot_sessions ADD COLUMN IF NOT EXISTS pending_hospital_id UUID;
+    `);
+
     // ── ADMIN ACCESS LOGS ─────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS admin_access_logs (
