@@ -91,7 +91,12 @@ auto-attached (choosing a city is not naming a clinic), and the full roster is
 still never listed. The trigger is matched on message TEXT, not the interactive
 reply id — `wa.sendButtons` mints its own opaque ids — and deliberately does NOT
 accept a bare "city"/"near", which would shadow real searches like "City Dental
-Care". Clinic city lives in `tenants.city` (public schema, indexed on
+Care". That match lives in `isNearbyTrigger` (exported for tests): a tap sends
+BOTH an opaque `btn_0_<ts>` id and the title as the body, so gating on
+"no buttonId" silently limits the button to typed text only — the ids that
+suppress it are the ones we mint and recognise (a `city:` row, which is an
+ANSWER to the picker, and a tenant-UUID row, so a clinic named "Nearby Dental"
+can't have its tap hijacked), never the mere presence of an id. Clinic city lives in `tenants.city` (public schema, indexed on
 `lower(city)`); it was previously read from `settings->>'city'`, which nothing
 ever wrote. A clinic with no city is invisible to this path. Pass
 `null, null` for token/phoneId to the `whatsapp.js` senders — they fall back to

@@ -281,6 +281,31 @@ const CITY_ROW_PREFIX = 'city:';
 // WhatsApp rejects a list with more than 10 rows outright (Meta #131009).
 const MAX_CITY_ROWS = 10;
 
+/**
+ * Does this message open the city picker?
+ *
+ * This used to be `!buttonId && NEARBY_RE.test(text)`, which meant the picker
+ * only ever opened for TYPED text: a tap on the button sends BOTH an opaque
+ * `btn_0_<ts>` id and the title as the body, so `!buttonId` rejected the very
+ * tap the button exists for. The patient got "no clinic found matching
+ * '📍 Clinics near me'" instead of the city list.
+ *
+ * So the phrase is matched on the TEXT, as the button contract requires, and
+ * the ids we DO recognise are what suppresses it:
+ *  - a `city:` row — that is an answer to this picker, not a request to reopen
+ *    it, and it must fall through to `pickedCity` below;
+ *  - a tenant UUID row — a clinic legitimately named "Nearby Dental" shortens
+ *    to a row title NEARBY_RE would otherwise swallow, hijacking the tap.
+ * Any other id is one we did not mint a meaning for, so the text decides.
+ */
+function isNearbyTrigger({ text, buttonId, cityRowId, tenantIds }) {
+  const trimmed = (text || '').trim();
+  if (!trimmed || GREETING_RE.test(trimmed)) return false;
+  if (cityRowId) return false;
+  if (buttonId && Array.isArray(tenantIds) && tenantIds.includes(buttonId)) return false;
+  return NEARBY_RE.test(trimmed);
+}
+
 // A bare "yes" or "4" is only meaningful as an answer to something. These are
 // the two questions a CLINIC asks unprompted, via the reminder and feedback
 // crons — the only cases where the sender, not the patient, decides which
@@ -538,7 +563,7 @@ async function processIncomingMessage(msg) {
           : null
       );
 
-      if (!buttonId && !isGreeting && NEARBY_RE.test(trimmed)) {
+      if (isNearbyTrigger({ text: trimmed, buttonId, cityRowId, tenantIds: activeTenants.map(t => t.id) })) {
         // Record the message id first, for the same reason the shortlist below
         // does: a Meta redelivery must not re-send this prompt.
         await query(
@@ -1022,3 +1047,6 @@ module.exports.resolveAskingTenant = resolveAskingTenant;
 // Care" is a tenant in the search fixtures). See tests/clinicNearby.unit.test.js.
 module.exports.NEARBY_RE = NEARBY_RE;
 module.exports.CITY_ROW_PREFIX = CITY_ROW_PREFIX;
+// Exported for tests: the tap-vs-type distinction here is exactly what broke the
+// button once (see isNearbyTrigger), so it is pinned by tests/clinicNearby.
+module.exports.isNearbyTrigger = isNearbyTrigger;
