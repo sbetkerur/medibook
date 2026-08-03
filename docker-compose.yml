@@ -41,7 +41,13 @@ services:
       # Override localhost URLs with Docker service names
       DATABASE_URL: postgresql://postgres:password@postgres:5432/medibook
       REDIS_URL: redis://redis:6379
-      NODE_ENV: production
+      # development, NOT production: this stack is local (CLAUDE.md documents it
+      # as "postgres + redis for local dev"), and index.js treats the prod
+      # environment as a promise about the deployment — a placeholder
+      # META_APP_SECRET and a localhost FRONTEND_URL are both fatal there. With
+      # NODE_ENV=production the container crash-looped on those guards forever,
+      # which is the guards working correctly against a mislabelled environment.
+      NODE_ENV: development
       PORT: 3001
     depends_on:
       postgres:
