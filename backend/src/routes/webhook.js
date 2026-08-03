@@ -16,7 +16,8 @@ const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { sendPatientText } = require('../services/outbound');
-const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST, matchCity } = require('../services/bot/clinicSearch');
+const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST, matchCity,
+        buildCityChoices, normalizeCity } = require('../services/bot/clinicSearch');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -510,9 +511,19 @@ async function processIncomingMessage(msg) {
       // A second way in, for a patient who knows where they are but not what
       // their clinic is called. It still never lists the roster: a city has to
       // be chosen first, and only that city's clinics are ever shown.
-      const knownCities = [...new Set(
-        activeTenants.map(t => (t.city || '').trim()).filter(Boolean)
-      )].sort((a, b) => a.localeCompare(b));
+      // Cities that actually have a clinic, followed by the default metros
+      // (`DEFAULT_CITIES`). The defaults mean this list is never empty, so the
+      // location button below is always offered — a default city with no
+      // clinics is not a dead end, it answers "no clinics in X yet" and points
+      // back at the name search.
+      const knownCities = buildCityChoices(activeTenants.map(t => t.city));
+
+      // How many of those can actually resolve to a clinic. Drives the row-cap
+      // decision below: padding is only ever allowed to fill space the real
+      // cities didn't need.
+      const clinicCityCount = new Set(
+        activeTenants.map(t => normalizeCity(t.city || '')).filter(Boolean)
+      ).size;
 
       // Tapping a city row, or typing one while we were asking. A typed city is
       // only read as a city in `select_city` — elsewhere "Pune" is far more
@@ -540,20 +551,24 @@ async function processIncomingMessage(msg) {
         ).catch(() => {});
 
         if (!knownCities.length) {
-          // No clinic has a city recorded yet. Say so, instead of sending an
-          // empty picker the patient cannot act on.
+          // Only reachable if DEFAULT_CITIES is emptied AND no clinic has a
+          // city — sendList would otherwise be called with zero rows.
           await wa.sendText(phone,
             `📍 Clinic locations aren't set up yet.\n\n🔍 Please send your clinic's name instead — a few letters are enough.`,
             null, null
           ).catch(err => logger.error('Failed to send no-cities prompt', { error: err.message }));
-        } else if (knownCities.length <= MAX_CITY_ROWS) {
+        } else if (clinicCityCount <= MAX_CITY_ROWS) {
+          // Real cities all fit, so the defaults can pad out whatever room is
+          // left. Truncation only ever falls on the padding.
           await wa.sendList(phone, '📍 Which city are you in?', 'Select city', [{
             title: 'Cities',
-            rows: knownCities.map(c => ({ id: CITY_ROW_PREFIX + c, title: c })),
+            rows: knownCities.slice(0, MAX_CITY_ROWS).map(c => ({ id: CITY_ROW_PREFIX + c, title: c })),
           }], null, null).catch(err =>
             logger.error('Failed to send city list', { error: err.message }));
         } else {
-          // More cities than a list message can hold — ask them to type it.
+          // More clinic cities than a list message can hold — ask them to type
+          // it. Tested on the REAL city count, not the padded list: padding must
+          // never be what pushes a city with actual clinics off the picker.
           await wa.sendText(phone,
             `📍 Which city are you in?\n\nPlease send your city's name.`,
             null, null
@@ -728,11 +743,12 @@ async function processIncomingMessage(msg) {
 
         // The location path is offered as an EXTRA, never as a replacement: the
         // body still asks for the clinic's name, so a patient who knows it is
-        // not made to pick a city first. Only offered once some clinic actually
-        // has a city, so the button can't lead to a dead end. The hint line
-        // matters because wa.sendButtons degrades to numbered text if the
-        // interactive send fails, and "📍 Clinics near me" is a phrase
-        // NEARBY_RE also accepts typed.
+        // not made to pick a city first. `DEFAULT_CITIES` keeps `knownCities`
+        // non-empty, so this is offered on every first contact — a picked city
+        // with no clinics yet is answered, not dead-ended. The hint line matters
+        // because wa.sendButtons degrades to numbered text if the interactive
+        // send fails, and "📍 Clinics near me" is a phrase NEARBY_RE also
+        // accepts typed.
         if (knownCities.length) {
           await wa.sendButtons(
             phone,
