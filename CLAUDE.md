@@ -30,6 +30,7 @@ cd backend && node tests/clinicNearbyFlow.test.js    # entry routing e2e (needs 
                                                      # seeds + drops its own tenants)
 cd backend && node tests/slotPlanner.unit.test.js
 cd backend && node tests/restartGreeting.unit.test.js
+cd backend && node tests/billingDrift.unit.test.js   # per-branch billing staleness
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every

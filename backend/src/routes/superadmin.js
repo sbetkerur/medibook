@@ -60,7 +60,12 @@ router.get('/stats', async (req, res) => {
       query(`SELECT COUNT(*) FROM tenants WHERE status='active'`),
       query(`SELECT plan, COUNT(*) as count FROM tenants GROUP BY plan ORDER BY count DESC`),
       query(`SELECT COUNT(*) as new_tenants FROM tenants WHERE created_at >= NOW() - INTERVAL '30 days'`),
-      query(`SELECT COALESCE(SUM(p.price_monthly), 0) as mrr FROM tenants t LEFT JOIN plans p ON p.id=t.plan WHERE t.status='active'`),
+      // billing_monthly first: Professional is priced PER BRANCH with a
+      // negotiated discount, so a multi-branch group's real revenue is a
+      // number only the deal knows. Falling straight through to price_monthly
+      // would report one branch's list price for the largest customers.
+      query(`SELECT COALESCE(SUM(COALESCE(t.billing_monthly, p.price_monthly)), 0) as mrr
+               FROM tenants t LEFT JOIN plans p ON p.id=t.plan WHERE t.status='active'`),
       query(`SELECT COUNT(*) FROM tenants WHERE created_at >= ${IST_MONTH_START_TS_SQL}`),
     ]);
     const mrr = parseInt(mrrR.rows[0].mrr) || 0;
@@ -315,7 +320,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
 // ── UPDATE TENANT ─────────────────────────────────────────────
 router.patch('/tenants/:id', validateUUID(), async (req, res) => {
   try {
-    const { status, plan, name, suspension_reason, city } = req.body;
+    const { status, plan, name, suspension_reason, city, billing_monthly } = req.body;
 
     const VALID_STATUSES = ['active', 'suspended', 'inactive'];
     if (status && !VALID_STATUSES.includes(status)) {
@@ -336,7 +341,10 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
         updates.push('suspension_reason=NULL', 'suspended_at=NULL');
       }
     }
-    const VALID_PLANS = ['starter', 'growth', 'professional', 'enterprise'];
+    // Keep in sync with the tiers seeded in db/migrate.js and with
+    // validate.js's createTenant enum. 'enterprise' and 'growth' were retired
+    // (migrations 22 and 23) and cannot be assigned again.
+    const VALID_PLANS = ['starter', 'professional'];
     if (plan && !VALID_PLANS.includes(plan)) {
       return res.status(400).json({ error: `Invalid plan. Must be one of: ${VALID_PLANS.join(', ')}` });
     }
@@ -347,6 +355,20 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
     if (city !== undefined) {
       params.push(typeof city === 'string' ? (city.trim() || null) : null);
       updates.push(`city=$${params.length}`);
+    }
+    // The negotiated monthly amount, overriding the tier's list price — set it
+    // for any Professional tenant with more than one branch. `!== undefined`
+    // like city above, because null is the meaningful "revert to list price"
+    // value and truthiness would also swallow a deliberate 0 (a free pilot).
+    if (billing_monthly !== undefined) {
+      if (billing_monthly === null) {
+        updates.push('billing_monthly=NULL');
+      } else if (!Number.isInteger(billing_monthly) || billing_monthly < 0) {
+        return res.status(400).json({ error: 'billing_monthly must be a non-negative integer (rupees per month) or null' });
+      } else {
+        params.push(billing_monthly);
+        updates.push(`billing_monthly=$${params.length}`);
+      }
     }
 
     if (!updates.length) return res.json({ message: 'Nothing to update' });
@@ -456,6 +478,34 @@ router.get('/tenants/:id/health', validateUUID(), async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+/**
+ * Is a tenant's stored billing amount stale for its current branch count?
+ *
+ * Professional bills ₹1,799 for the first branch and a per-deal discount on
+ * each additional one, so the real figure lives in tenants.billing_monthly and
+ * NOTHING keeps it in step as branches are added. The exact expected amount
+ * can't be recomputed (the discount isn't stored), but it is always bounded:
+ * at worst no discount (price × branches), at best every extra branch free
+ * (price). Outside that window means stale for today's branch count.
+ *
+ * Shared by GET /tenants/:id/quota and GET /billing so the per-tenant panel and
+ * the revenue roll-up can never disagree about what counts as under-billed.
+ *
+ * @returns {null|'missing_override'|'outside_expected_range'}
+ */
+function billingDriftFlag({ listPrice, billingMonthly, branches }) {
+  if (listPrice == null || branches == null || branches < 1) return null;
+  // The certain case: several branches, still billing the list price of one.
+  if (branches > 1 && billingMonthly == null) return 'missing_override';
+  if (billingMonthly != null &&
+      (billingMonthly < listPrice || billingMonthly > listPrice * branches)) {
+    // Branches added since the amount was agreed — or removed, leaving the
+    // clinic over-billed.
+    return 'outside_expected_range';
+  }
+  return null;
+}
+
 // ── LIST PLANS ────────────────────────────────────────────────
 router.get('/plans', async (req, res) => {
   try {
@@ -469,9 +519,13 @@ router.get('/billing', async (req, res) => {
   try {
     const [planBreakdown, recentChanges] = await Promise.all([
       query(`
+        -- SUM of per-tenant amounts, not tenant_count * list price: with
+        -- Professional billed per branch and discounted per deal, the two
+        -- diverge for exactly the tenants worth the most. COALESCE keeps
+        -- Starter/Growth (billing_monthly NULL) on the list price.
         SELECT p.id, p.name, p.price_monthly,
                COUNT(t.id) AS tenant_count,
-               (COUNT(t.id) * p.price_monthly) AS subtotal
+               COALESCE(SUM(COALESCE(t.billing_monthly, p.price_monthly)), 0) AS subtotal
         FROM plans p
         LEFT JOIN tenants t ON t.plan = p.id AND t.status = 'active'
         GROUP BY p.id, p.name, p.price_monthly
@@ -489,6 +543,51 @@ router.get('/billing', async (req, res) => {
 
     const mrr = planBreakdown.rows.reduce((sum, p) => sum + parseInt(p.subtotal || 0), 0);
 
+    // ── Billing drift sweep ──────────────────────────────────
+    // The MRR above is only as honest as tenants.billing_monthly, and nothing
+    // updates that when a branch is added. This is the one screen where a
+    // wrong revenue number actually gets looked at, so the tenants dragging it
+    // out of true are listed right next to it.
+    //
+    // Branch counts live in each tenant's own schema, so this is one query per
+    // active tenant — the same shape as bot/clinicBranches.listActiveBranches,
+    // run concurrently and caught INDIVIDUALLY so a single schema mid-migration
+    // degrades to "unknown branch count" instead of taking the billing page
+    // down. Acceptable here because /billing is an on-demand admin view, not a
+    // hot path.
+    const billableR = await query(`
+      SELECT t.id, t.name, t.slug, t.schema_name, t.plan, t.billing_monthly, p.price_monthly
+        FROM tenants t LEFT JOIN plans p ON p.id = t.plan
+       WHERE t.status = 'active'
+    `);
+
+    const alerts = (await Promise.all(billableR.rows.map(async (t) => {
+      let branches = null;
+      try {
+        const r = await tenantQuery(t.schema_name,
+          `SELECT COUNT(*) FROM hospitals WHERE is_active=true AND deleted_at IS NULL`);
+        branches = parseInt(r.rows[0].count);
+      } catch (err) {
+        logger.warn('billing drift: branch count failed', { tenant: t.slug, error: err.message });
+        return null; // unknown branch count — can't judge, don't guess
+      }
+      const listPrice = t.price_monthly ?? null;
+      const flag = billingDriftFlag({ listPrice, billingMonthly: t.billing_monthly, branches });
+      if (!flag) return null;
+      return {
+        tenant_id: t.id,
+        name: t.name,
+        slug: t.slug,
+        plan: t.plan,
+        branches,
+        billing_monthly: t.billing_monthly ?? null,
+        effective_monthly: t.billing_monthly ?? listPrice,
+        expected_min: listPrice,
+        expected_max: listPrice != null ? listPrice * branches : null,
+        flag,
+      };
+    }))).filter(Boolean);
+
     res.json({
       mrr_total: mrr,
       by_plan: planBreakdown.rows.map(p => ({
@@ -497,6 +596,7 @@ router.get('/billing', async (req, res) => {
         subtotal: parseInt(p.subtotal || 0),
       })),
       recent_changes: recentChanges.rows,
+      billing_alerts: alerts,
     });
   } catch (err) { handleError(res, err, 'GET /superadmin/billing'); }
 });
@@ -756,32 +856,61 @@ router.post('/tenants/:id/feature-flags', validateUUID(), async (req, res) => {
 router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
   try {
     const tenantR = await query(
-      `SELECT t.*, p.max_appointments_per_month, p.max_doctors FROM tenants t JOIN plans p ON p.id=t.plan WHERE t.id=$1`,
+      // LEFT JOIN, not JOIN: `plans` can legitimately be empty (pricing is not
+      // currently defined), and an inner join turned that into a 404 for every
+      // tenant — the panel vanished rather than reporting "no limit". A missing
+      // plan row now reads the same as an unlimited one, which is what the
+      // NULL-limit handling below already expects.
+      `SELECT t.*, p.max_appointments_per_month, p.max_doctors, p.max_branches, p.price_monthly
+         FROM tenants t LEFT JOIN plans p ON p.id=t.plan WHERE t.id=$1`,
       [req.params.id]
     );
     if (!tenantR.rows[0]) return res.status(404).json({ error: 'Not found' });
     const t = tenantR.rows[0];
 
-    const [apptCount, doctorCount] = await Promise.all([
+    const [apptCount, doctorCount, branchCount] = await Promise.all([
       // Must match bookingCore.checkMonthlyQuota exactly — this panel reports the
       // quota that route enforces, and a UTC month start made the two disagree
       // for the first 5.5 hours of the 1st.
       tenantQuery(t.schema_name, `SELECT COUNT(*) FROM appointments WHERE created_at >= ${IST_MONTH_START_TS_SQL}`),
       tenantQuery(t.schema_name, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
+      // Same predicate as the branch cap in POST /hospitals and as
+      // clinicBranches.listActiveBranches — three places counting "a live
+      // branch" differently is how a clinic gets billed for a deleted one.
+      tenantQuery(t.schema_name, `SELECT COUNT(*) FROM hospitals WHERE is_active=true AND deleted_at IS NULL`),
     ]);
 
     const appts = parseInt(apptCount.rows[0].count);
     const doctors = parseInt(doctorCount.rows[0].count);
-    // NULL limit = unlimited plan (e.g. enterprise) — report 0% and never recommend an upgrade
+    const branches = parseInt(branchCount.rows[0].count);
+    // NULL limit = unlimited plan — report 0% and never recommend an upgrade
     const apptPct = t.max_appointments_per_month ? Math.round((appts / t.max_appointments_per_month) * 100) : 0;
     const doctorPct = t.max_doctors ? Math.round((doctors / t.max_doctors) * 100) : 0;
+    const branchPct = t.max_branches ? Math.round((branches / t.max_branches) * 100) : 0;
+
+    // Billing drift for this one tenant — same rule as the /billing sweep.
+    const listPrice = t.price_monthly ?? null;
+    const effectiveMonthly = t.billing_monthly ?? listPrice;
+    const billingFlag = billingDriftFlag({
+      listPrice, billingMonthly: t.billing_monthly, branches,
+    });
 
     res.json({
       tenant_id: t.id,
       plan: t.plan,
       appointments: { used: appts, limit: t.max_appointments_per_month, percent: apptPct },
       doctors: { used: doctors, limit: t.max_doctors, percent: doctorPct },
-      upgrade_recommended: apptPct >= 80 || doctorPct >= 80,
+      branches: { used: branches, limit: t.max_branches, percent: branchPct },
+      billing: {
+        list_price_per_branch: listPrice,
+        billing_monthly: t.billing_monthly ?? null,   // the agreed override, if any
+        effective_monthly: effectiveMonthly,          // what MRR counts for this tenant today
+        // Bounds implied by today's branch count: no discount .. every extra branch free.
+        expected_min: listPrice,
+        expected_max: listPrice != null ? listPrice * Math.max(branches, 1) : null,
+        flag: billingFlag,                            // null | 'missing_override' | 'outside_expected_range'
+      },
+      upgrade_recommended: apptPct >= 80 || doctorPct >= 80 || branchPct >= 80,
       upgrade_prompt: t.upgrade_prompt,
     });
   } catch (err) { handleError(res, err); }
@@ -866,3 +995,8 @@ router.post('/tenants/:id/users/:userId/reset-password', resetTenantPasswordLimi
 });
 
 module.exports = router;
+
+// Exported for tests — the rule that decides whether a clinic is being
+// under-billed is pure, and it is the one piece of the per-branch pricing model
+// with no other way to verify it (branch counts need a live tenant schema).
+module.exports.billingDriftFlag = billingDriftFlag;

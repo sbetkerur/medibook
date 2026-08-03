@@ -4,11 +4,17 @@ const { query } = require('../db');
 const logger = require('../utils/logger');
 const axios = require('axios');
 
+// API requests per minute. Deliberately NOT read from the `plans` table: this
+// is an abuse guard, not a product quota, and it has to answer on every request
+// without a DB round-trip. Keys must stay in sync with the tiers seeded in
+// db/migrate.js — an unknown plan falls back to the starter limit below.
 const PLAN_LIMITS = {
+// Professional keeps a real ceiling even though it is the top tier and has
+// unlimited APPOINTMENTS and DOCTORS. Those are product quotas; this is an
+// abuse guard, and the old unlimited entry existed for a ₹9,999 tier that no
+// longer does. 300/min is ~5 requests a second — far above any real dashboard.
   starter: 60,
-  growth: 120,
   professional: 300,
-  enterprise: null, // unlimited
 };
 
 // Per-endpoint overrides (req.path pattern -> max per minute)
@@ -104,7 +110,7 @@ module.exports = async function tenantRateLimit(req, res, next) {
 
   const plan = req.tenant?.plan || 'starter';
   const planLimit = PLAN_LIMITS[plan] ?? PLAN_LIMITS.starter;
-  if (planLimit === null) return next(); // enterprise: unlimited
+  if (planLimit === null) return next(); // no tier is unlimited today; kept for future tiers
 
   const limit = getEndpointLimit(req.tenant, req.path, planLimit);
 
@@ -136,7 +142,9 @@ module.exports = async function tenantRateLimit(req, res, next) {
         limit,
         plan,
         retry_after: 60,
-        upgrade_hint: plan !== 'enterprise' ? 'Upgrade your plan for a higher request limit.' : undefined,
+        // 'professional' is the top tier now — offering it an upgrade points at
+        // nothing to buy.
+        upgrade_hint: plan !== 'professional' ? 'Upgrade your plan for a higher request limit.' : undefined,
       });
     }
 

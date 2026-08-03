@@ -20,7 +20,11 @@ export default function DoctorsTab({
   return (
     <div className="space-y-4">
       {/* Plan quota warning */}
-      {settings && settings.plan_limits && settings.usage && settings.usage.active_doctors >= settings.plan_limits.max_doctors && (
+      {/* max_doctors == null means UNLIMITED. Without that guard `n >= null`
+          coerces to `n >= 0` and every top-tier clinic sees "limit reached". */}
+      {settings && settings.plan_limits && settings.usage &&
+        settings.plan_limits.max_doctors != null &&
+        settings.usage.active_doctors >= settings.plan_limits.max_doctors && (
         <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 flex items-center gap-3">
           <span className="text-xl">⚠️</span>
           <div>

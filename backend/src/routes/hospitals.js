@@ -1,6 +1,7 @@
 'use strict';
 const router = require('express').Router();
-const { tenantQuery } = require('../db');
+const crypto = require('crypto');
+const { query, tenantQuery, tenantTransaction } = require('../db');
 const { validate, schemas } = require('../middleware/validate');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
@@ -21,13 +22,52 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
   try {
     const { name, address, city, phone } = req.body;
     const s = req.tenant.schema_name;
-    const r = await tenantQuery(s,
-      `INSERT INTO hospitals (name, address, city, phone) VALUES ($1,$2,$3,$4) RETURNING *`,
-      [name, address, city, phone]);
+
+    // Branch quota. Professional is the per-branch tier (max_branches NULL =
+    // unlimited); Starter and Growth are single-location and capped at 1, so a
+    // second branch is the upgrade conversation. Same shape as the max_doctors
+    // check in doctors.js: NULL means no cap, and the count runs inside the
+    // transaction under an advisory lock so two concurrent creates can't both
+    // read "0 branches" and both insert.
+    const planR = await query(`SELECT max_branches FROM plans WHERE id=$1`, [req.tenant.plan]);
+    const planLimit = planR.rows[0]?.max_branches ?? null;
+
+    const lockId = crypto.createHash('sha256').update(`branch_quota:${s}`).digest().readInt32BE(0);
+
+    const r = await tenantTransaction(s, async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock($1)`, [lockId]);
+
+      if (planLimit !== null) {
+        // Matches how clinicBranches.listActiveBranches counts a live branch —
+        // a soft-deleted one must not consume quota the clinic can't reclaim.
+        const countR = await client.query(
+          `SELECT COUNT(*) FROM hospitals WHERE is_active=true AND deleted_at IS NULL`);
+        const current = parseInt(countR.rows[0].count);
+        if (current >= planLimit) {
+          const err = new Error(`QUOTA:${current}/${planLimit}`);
+          err.isQuota = true;
+          throw err;
+        }
+      }
+
+      return client.query(
+        `INSERT INTO hospitals (name, address, city, phone) VALUES ($1,$2,$3,$4) RETURNING *`,
+        [name, address, city, phone]);
+    });
+
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_HOSPITAL', 'hospital', r.rows[0].id,
       null, { name, city }, req.ip);
     res.json({ hospital: r.rows[0] });
-  } catch (err) { handleError(res, err); }
+  } catch (err) {
+    if (err.isQuota) {
+      const [cur, max] = err.message.replace('QUOTA:', '').split('/');
+      return res.status(403).json({
+        error: `Branch limit reached for your plan (${cur}/${max}). Upgrade to Professional to add more branches.`,
+        quota_exceeded: true,
+      });
+    }
+    handleError(res, err);
+  }
 });
 
 router.patch('/hospitals/:id', adminOnly, validateUUID(), validate(schemas.updateHospital), async (req, res) => {

@@ -105,6 +105,23 @@ async function migrate() {
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT false;
     `);
 
+    // ── PER-BRANCH PRICING SUPPORT ────────────────────────────
+    // plans.max_branches  — how many `hospitals` rows a tier allows. NULL is
+    //   unlimited, matching max_doctors. Professional is the per-branch tier,
+    //   so it is the only one that may hold more than one.
+    // tenants.billing_monthly — the NEGOTIATED monthly rupee amount for this
+    //   clinic, overriding the tier's list price. It exists because
+    //   Professional is quoted per branch with a discount worked out per deal:
+    //   3 branches at ₹3,799 less 15% is a number no formula in this codebase
+    //   can derive, and a branch count is not even reachable from a
+    //   public-schema join (hospitals lives in the tenant's schema). Storing
+    //   the agreed figure keeps MRR exact for every clinic, discounted or not.
+    //   NULL means "bill the list price", which is right for Starter/Growth.
+    await client.query(`
+      ALTER TABLE plans   ADD COLUMN IF NOT EXISTS max_branches    INTEGER;
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS billing_monthly INTEGER;
+    `);
+
     // ── TENANTS: city ─────────────────────────────────────────
     // A real column, not settings->>'city': the bot looks clinics up by city at
     // first contact, and a JSONB key can't be indexed case-insensitively without
@@ -292,13 +309,71 @@ async function migrate() {
     });
 
     // ── SEED PLANS ────────────────────────────────────────────
+    // TWO tiers, no free tier: the entry plan is paid (₹799). Trials are an
+    // operational choice (put them on Starter and don't invoice for a month),
+    // NOT a ₹0 row — a permanent free tier covering two dentists would cover
+    // most of the market outright and stop single-chair clinics ever
+    // converting.
+    //
+    // Priced on DENTIST COUNT and BRANCH COUNT, never on appointment volume
+    // (max_appointments_per_month is NULL on both tiers) — a clinic is never
+    // told "you have run out of bookings this month", which is a terrible
+    // message to send a business that is paying you to take bookings.
+    //
+    //   Starter      ₹799  — 2 dentists, 1 branch. The single-chair practice
+    //                        that makes up most of the market.
+    //   Professional ₹1799 — unlimited dentists, unlimited branches. Anything
+    //                        bigger. Priced PER BRANCH (see below).
+    //
+    // A third dentist or a second location moves a clinic to Professional;
+    // those are the only two upgrade triggers, and both are rarer than
+    // crossing a volume ceiling would be. Expansion revenue is therefore thin
+    // and growth is mostly new-logo — a deliberate trade for a sell that fits
+    // on one line.
+    //
+    // ⚠️ Professional's price_monthly is the FIRST branch only. Every
+    // ADDITIONAL branch is billed at ₹1,799 less a discount agreed per deal,
+    // applied PER ADDED BRANCH — not as a discount on the whole invoice:
+    //
+    //     monthly = 1799 + (branches - 1) × 1799 × (1 - discount)
+    //
+    //     e.g. 3 branches at 20% off additional branches:
+    //          1799 + 2 × 1799 × 0.80 = 1799 + 2878 = ₹4,677
+    //
+    // That figure is not computed here. The discount is per-contract, and
+    // `hospitals` lives in the tenant's own schema, so a branch count is not
+    // reachable from a public-schema join at all. The agreed total is stored
+    // on `tenants.billing_monthly`, and every revenue read is
+    // COALESCE(t.billing_monthly, p.price_monthly). A single-branch
+    // Professional tenant therefore needs no override — price_monthly is
+    // already exact. Set billing_monthly the moment a SECOND branch is added,
+    // or MRR keeps reporting one branch, and re-set it on every branch added
+    // after that.
+    //
+    // NULL means UNLIMITED, and every reader already agrees on that:
+    //   bookingCore.checkMonthlyQuota  → limit null → allowed (now always)
+    //   doctors.js POST / CSV import   → planLimit null → no doctor cap
+    //   superadmin /tenants/:id/quota  → reports 0%, never suggests an upgrade
+    // Hence NULL rather than the old 999 / 99999 sentinels, which every
+    // consumer had to special-case. checkMonthlyQuota is left wired up but
+    // dormant: it costs one indexed lookup and is the seam to re-introduce
+    // volume pricing without touching the booking paths.
+    //
+    // DO UPDATE, not DO NOTHING: this file is the single source of truth for
+    // pricing (there is no admin UI that edits `plans`), and migrate re-runs on
+    // every deploy, so changing a price here is the whole deployment step. The
+    // trade-off is that hand-edits made directly in the database are reverted
+    // on the next boot — change prices here, not in psql.
     await client.query(`
-      INSERT INTO plans (id, name, max_doctors, max_appointments_per_month, price_monthly) VALUES
-        ('starter',      'Starter',      3,    200,  0),
-        ('growth',       'Growth',       10,   1000, 1999),
-        ('professional', 'Professional', 25,   5000, 4999),
-        ('enterprise',   'Enterprise',   999,  99999,9999)
-      ON CONFLICT (id) DO NOTHING;
+      INSERT INTO plans (id, name, max_doctors, max_appointments_per_month, max_branches, price_monthly) VALUES
+        ('starter',      'Starter',      2,    NULL, 1,    799),
+        ('professional', 'Professional', NULL, NULL, NULL, 1799)
+      ON CONFLICT (id) DO UPDATE SET
+        name                       = EXCLUDED.name,
+        max_doctors                = EXCLUDED.max_doctors,
+        max_appointments_per_month = EXCLUDED.max_appointments_per_month,
+        max_branches               = EXCLUDED.max_branches,
+        price_monthly              = EXCLUDED.price_monthly;
     `);
 
     // ── SEED SUPER ADMIN ──────────────────────────────────────
@@ -532,8 +607,40 @@ async function migrate() {
       `);
     });
 
+    // ── DROP THE ENTERPRISE TIER ──────────────────────────────
+    // Pricing was cut from four tiers to three. The other three are re-seeded
+    // above by id, so only 'enterprise' is left orphaned on already-deployed
+    // databases; the seed can't remove it because it only touches ids it
+    // lists. MUST stay scoped to 'enterprise' — widening this to the other ids
+    // would delete the rows the seed just wrote, since the seed runs earlier in
+    // this same function.
+    //
+    // Any tenant still sitting on plan='enterprise' keeps that value and is
+    // read as unlimited (no matching row → NULL limits), which is what they
+    // were paying for. They can't be moved BACK to it: it's gone from
+    // superadmin's VALID_PLANS and validate.js's createTenant enum.
+    await runMigration(client, 22, 'drop_enterprise_plan', async () => {
+      await client.query(`DELETE FROM plans WHERE id = 'enterprise'`);
+    });
+
+    // ── DROP THE GROWTH TIER ──────────────────────────────────
+    // Cut from three tiers to two. Growth was ₹1,799 for 6 dentists and one
+    // branch; Professional is now ₹1,799 for UNLIMITED dentists and branches,
+    // so moving a Growth tenant across costs them nothing and strictly widens
+    // their limits — no notice period, no repricing, no one loses a feature.
+    //
+    // The UPDATE must run BEFORE the DELETE and both must be in this one
+    // migration: a tenant left pointing at a deleted plan gets NULL limits from
+    // the LEFT JOINs, i.e. silently unlimited everything at ₹799. Same reason
+    // the enterprise migration above deliberately did NOT reassign — nobody was
+    // on it. Scoped to 'growth' so it can never touch the seeded rows.
+    await runMigration(client, 23, 'drop_growth_plan', async () => {
+      await client.query(`UPDATE tenants SET plan = 'professional' WHERE plan = 'growth'`);
+      await client.query(`DELETE FROM plans WHERE id = 'growth'`);
+    });
+
     console.log('✅ Public schema migrations complete');
-    console.log('✅ Plans seeded (starter, growth, professional, enterprise)');
+    console.log('✅ Plans seeded (starter ₹799, professional ₹1799/branch)');
     // Only claim this when a super admin was actually seeded — otherwise the
     // "no super admin seeded" warning above and this line contradict each other.
     if (superPassword) console.log(`✅ Super admin ensured: ${superEmail}`);

@@ -150,10 +150,10 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
                   <div className="flex justify-between text-sm mb-1">
                     <span className="text-gray-600">Dentists</span>
                     <span className="font-medium text-gray-900">
-                      {settings.usage?.active_doctors ?? '—'} / {settings.plan_limits.max_doctors === 999 ? '∞' : settings.plan_limits.max_doctors}
+                      {settings.usage?.active_doctors ?? '—'} / {settings.plan_limits.max_doctors == null ? '∞' : settings.plan_limits.max_doctors}
                     </span>
                   </div>
-                  {settings.usage?.active_doctors != null && settings.plan_limits.max_doctors !== 999 && (
+                  {settings.usage?.active_doctors != null && settings.plan_limits.max_doctors != null && (
                     <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
                       <div
                         className={`h-full rounded-full transition-all ${
@@ -170,10 +170,10 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
                   <div className="flex justify-between text-sm mb-1">
                     <span className="text-gray-600">Appts this month</span>
                     <span className="font-medium text-gray-900">
-                      {settings.usage?.appointments_this_month ?? '—'} / {settings.plan_limits.max_appointments_per_month === 99999 ? '∞' : settings.plan_limits.max_appointments_per_month}
+                      {settings.usage?.appointments_this_month ?? '—'} / {settings.plan_limits.max_appointments_per_month == null ? '∞' : settings.plan_limits.max_appointments_per_month}
                     </span>
                   </div>
-                  {settings.usage?.appointments_this_month != null && settings.plan_limits.max_appointments_per_month !== 99999 && (
+                  {settings.usage?.appointments_this_month != null && settings.plan_limits.max_appointments_per_month != null && (
                     <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
                       <div
                         className={`h-full rounded-full transition-all ${
