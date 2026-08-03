@@ -192,7 +192,49 @@ function matchCity(cities, input) {
   return prefix.length === 1 ? prefix[0].city : null;
 }
 
+/**
+ * The metros the city picker always offers, so it is never empty and the entry
+ * prompt can always show the location button. Canonical spellings — they are
+ * deduped against tenant cities on `normalizeCity`, so a variant spelling here
+ * would put two rows for the same place in front of the patient.
+ */
+const DEFAULT_CITIES = ['New Delhi', 'Mumbai', 'Chennai', 'Kolkata', 'Bengaluru', 'Hyderabad'];
+
+/**
+ * Build the city picker's rows: every city that actually has an active clinic
+ * first, then the defaults that aren't already covered.
+ *
+ * Defaults are APPENDED, never substituted — a clinic in a city outside the
+ * default six has to stay reachable by tap, and a hard-coded list that replaced
+ * real data would make it invisible. Real cities sort first for the same
+ * reason: when the list has to be truncated to WhatsApp's row cap, the cities
+ * that can actually resolve to a clinic are the ones worth keeping.
+ *
+ * Dedup is on `normalizeCity` rather than the raw string, so two tenants that
+ * stored "Bengaluru" and "bengaluru" produce ONE row — the city filter is
+ * case-insensitive, so a second row would just show the same clinics again.
+ * The tenant's own spelling wins over the default's.
+ */
+function buildCityChoices(tenantCities) {
+  const withClinics = [];
+  const seen = new Set();
+  for (const raw of (Array.isArray(tenantCities) ? tenantCities : [])) {
+    const city = String(raw == null ? '' : raw).trim();
+    if (!city) continue;
+    const n = normalizeCity(city);
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
+    withClinics.push(city);
+  }
+  withClinics.sort((a, b) => a.localeCompare(b));
+
+  const extras = DEFAULT_CITIES.filter(c => !seen.has(normalizeCity(c)));
+  return [...withClinics, ...extras];
+}
+
 module.exports = {
+  DEFAULT_CITIES,
+  buildCityChoices,
   IGNORED_WORDS,
   shortLabel,
   MIN_QUERY_LEN,

@@ -74,8 +74,15 @@ onboarded.
 
 **"Clinics near me" is the second entry, never the first.** The name search
 stays the primary path; the entry prompt merely ALSO offers a location button
-(`NEARBY_RE` in `routes/webhook.js`), and only when some tenant actually has a
-city — otherwise the button would dead-end. Tapping it parks the session in
+(`NEARBY_RE` in `routes/webhook.js`). The picker is padded with
+`DEFAULT_CITIES` (`bot/clinicSearch.js` — the six metros), so it is never empty
+and the button is always offered; a picked city with no clinics is answered
+("no clinics in X yet") rather than dead-ending. `buildCityChoices` puts cities
+that actually HAVE clinics first and appends the defaults — the padding never
+replaces real data, and the >`MAX_CITY_ROWS` "type your city" fallback is
+tested on the real-city count so padding can never push a real city off the
+list. Dedup is on `normalizeCity`, so a tenant storing "bengaluru" doesn't
+double the row. Tapping it parks the session in
 `select_city` and asks for a city; picking one lists just that city's clinics
 (≤10, WhatsApp's row cap) into the same `search_matches` shortlist the name
 search uses, so a numbered reply resolves identically. Two rules carry over

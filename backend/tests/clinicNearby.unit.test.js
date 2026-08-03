@@ -18,7 +18,7 @@
  * Run: node tests/clinicNearby.unit.test.js
  */
 process.env.NODE_ENV = process.env.NODE_ENV || 'test';
-const { matchCity, normalizeCity } = require('../src/services/bot/clinicSearch');
+const { matchCity, normalizeCity, buildCityChoices, DEFAULT_CITIES } = require('../src/services/bot/clinicSearch');
 const { NEARBY_RE, CITY_ROW_PREFIX } = require('../src/routes/webhook');
 
 let passed = 0, failed = 0;
@@ -96,6 +96,43 @@ check('blank entries in the list are ignored', matchCity(['', null, 'Pune'], 'Pu
 // normalizeCity must NOT strip "dental"/"clinic" the way the clinic-name
 // normalizer does — those are noise in a clinic name, not in a place name.
 check('city normalizer keeps every word', normalizeCity('Clinic Town'), 'clinic town');
+
+// ── 4. The picker's rows: real cities, padded with the defaults ──
+// The defaults exist so the picker is never empty and the location button can
+// always be offered. They must never cost a real clinic its row.
+check('no clinics anywhere → the six defaults, in listed order',
+  buildCityChoices([]), DEFAULT_CITIES);
+check('null input is treated as no clinics',
+  buildCityChoices(null), DEFAULT_CITIES);
+check('Kolkata is spelled canonically',
+  DEFAULT_CITIES.includes('Kolkata'), true);
+
+// A clinic city outside the six must stay reachable — the defaults ADD to the
+// list, they never replace it.
+check('a non-default clinic city is kept, and sorts ahead of the padding',
+  buildCityChoices(['Pune']), ['Pune', ...DEFAULT_CITIES]);
+check('real cities sort alphabetically among themselves',
+  buildCityChoices(['Pune', 'Goa']).slice(0, 2), ['Goa', 'Pune']);
+
+// Dedup is on normalizeCity: the city filter downstream is case-insensitive, so
+// a second row would just show the same clinics twice.
+check('a clinic in a default city does not double the row',
+  buildCityChoices(['Mumbai']), ['Mumbai', 'New Delhi', 'Chennai', 'Kolkata', 'Bengaluru', 'Hyderabad']);
+check('case variant of a default is deduped, tenant spelling wins',
+  buildCityChoices(['bengaluru']).filter(c => normalizeCity(c) === 'bengaluru'), ['bengaluru']);
+check('two tenants in the same city, different case → one row',
+  buildCityChoices(['Pune', 'pune']).filter(c => normalizeCity(c) === 'pune'), ['Pune']);
+check('spacing variant of a default is deduped',
+  buildCityChoices(['new  delhi']).filter(c => normalizeCity(c) === 'new delhi'), ['new  delhi']);
+check('blank and null clinic cities are ignored',
+  buildCityChoices(['', null, '   ']), DEFAULT_CITIES);
+
+// A default city with no clinics is still a valid pick — the caller answers
+// "no clinics in X yet". matchCity has to resolve it for the typed fallback.
+check('a padded default resolves when typed',
+  matchCity(buildCityChoices([]), 'chennai'), 'Chennai');
+check('"newdelhi" reaches the padded "New Delhi"',
+  matchCity(buildCityChoices([]), 'newdelhi'), 'New Delhi');
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);
