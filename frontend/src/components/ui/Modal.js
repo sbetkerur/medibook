@@ -23,7 +23,7 @@ export default function Modal({ title, onClose, children, wide }) {
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className={`bg-white rounded-2xl shadow-2xl w-full ${wide === 'xl' ? 'max-w-3xl' : wide ? 'max-w-2xl' : 'max-w-lg'} max-h-[85vh] md:max-h-[92vh] flex flex-col`}
+        className={`bg-white rounded-2xl shadow-2xl w-full ${wide === 'xl' ? 'max-w-3xl' : wide ? 'max-w-2xl' : 'max-w-lg'} max-h-[85vh] supports-[max-height:85dvh]:max-h-[85dvh] md:max-h-[92vh] md:supports-[max-height:92dvh]:max-h-[92dvh] flex flex-col`}
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between gap-2 px-4 py-3 md:px-6 md:py-4 border-b border-gray-100 shrink-0">

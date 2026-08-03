@@ -930,7 +930,7 @@ export default function SuperAdminPage() {
       {/* Suspension Reason Modal */}
       {pwModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3 sm:p-4">
-          <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-lg shadow-2xl max-h-[85vh] overflow-y-auto">
+          <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-lg shadow-2xl max-h-[85vh] supports-[max-height:85dvh]:max-h-[85dvh] overflow-y-auto">
             <div className="flex items-center justify-between gap-2 mb-1">
               <h2 className="text-base font-semibold text-gray-900">Reset Password</h2>
               <button onClick={() => setPwModal(null)} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">✕</button>

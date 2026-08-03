@@ -145,7 +145,37 @@ export default function DoctorPage() {
   return (
     <div className="flex flex-col md:flex-row h-screen supports-[height:100dvh]:h-[100dvh] bg-gray-50">
       {/* Left Column */}
-      <div className="w-full md:w-96 shrink-0 max-h-[45vh] md:max-h-none bg-white border-b md:border-b-0 md:border-r border-gray-200 flex flex-col">
+      {/* Two mobile-specific rules here, both learned from rendering this at
+          360x640 rather than from reading it:
+
+          1. The cap is only applied once an appointment is SELECTED. With
+             nothing selected the pane below is an empty "Select an
+             appointment" placeholder, so capping the list at 45dvh showed a
+             dentist 2 of 8 appointments — the second one sliced in half —
+             while 55% of the screen sat empty. Unselected, the list takes the
+             height; selected, it yields so the detail is readable.
+          2. dvh, not vh. The PARENT is already clamped to 100dvh (the visible
+             viewport), so a child sized against the larger address-bar-collapsed
+             viewport claims a bigger share than intended — on a phone losing
+             ~12% to the bar, 45vh is really ~51% of what is actually visible.
+
+          Unselected uses `flex-1 min-h-0` rather than simply dropping the cap.
+          Dropping it made the pane's height content-driven, which left its
+          inner `flex-1 overflow-auto` list unbounded and therefore inert — the
+          8th appointment sat below the fold and was only reachable because the
+          BODY happened to scroll. That works by accident: this shell is not
+          `overflow-hidden` today, but dashboard's is, and the moment anyone
+          matched them here those rows would become unreachable. `min-h-0` is
+          the required half — a flex child will not shrink below its content
+          without it, so the scroller never gets a bounded height.
+
+          All of it collapses on desktop (`md:flex-none`, `md:shrink-0`,
+          `md:max-h-none`), where the panes sit side by side full-height. */}
+      <div className={`w-full md:w-96 md:shrink-0 md:flex-none md:max-h-none bg-white border-b md:border-b-0 md:border-r border-gray-200 flex flex-col ${
+        selectedAppt
+          ? 'shrink-0 max-h-[45vh] supports-[max-height:45dvh]:max-h-[45dvh]'
+          : 'flex-1 min-h-0'
+      }`}>
         <div className="p-5 border-b border-gray-100">
           <div className="flex items-center justify-between gap-2 mb-1">
             <h1 className="text-lg font-bold text-gray-900 min-w-0 truncate">{headerName}</h1>
@@ -208,8 +238,13 @@ export default function DoctorPage() {
         </div>
       </div>
 
-      {/* Right Column */}
-      <div ref={detailRef} className="flex-1 overflow-auto">
+      {/* Right Column.
+          Hidden on mobile until something is selected: with nothing chosen it
+          renders only a "Select an appointment" placeholder, and on a phone
+          (flex-col) it still claimed half the column — squeezing the list to
+          ~133px, about 1.5 rows of 8. Desktop is unaffected: the panes sit
+          side by side there and the placeholder is useful signposting. */}
+      <div ref={detailRef} className={`flex-1 overflow-auto ${selectedAppt ? '' : 'hidden md:block'}`}>
         {!selectedAppt ? (
           <div className="flex items-center justify-center h-full">
             <div className="text-center text-gray-400">

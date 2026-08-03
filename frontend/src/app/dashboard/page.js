@@ -2120,7 +2120,7 @@ export default function Dashboard() {
     {/* ── CANCEL APPOINTMENT MODAL ── */}
     {cancellingAppt && (
       <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] overflow-y-auto">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] supports-[max-height:90dvh]:max-h-[90dvh] overflow-y-auto">
           <h3 className="text-base font-semibold text-gray-900 mb-1">Cancel Appointment</h3>
           <div className="text-sm text-gray-600 mb-4 bg-gray-50 rounded-lg p-3">
             <div><span className="font-medium">{cancellingAppt.patient_name}</span> · {cancellingAppt.patient_phone}</div>
@@ -2154,7 +2154,7 @@ export default function Dashboard() {
     {/* ── BULK CANCEL REASON MODAL ── */}
     {bulkCancelling && (
       <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] overflow-y-auto">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] supports-[max-height:90dvh]:max-h-[90dvh] overflow-y-auto">
           <h3 className="text-base font-semibold text-gray-900 mb-1">
             Cancel {selectedApptIds.size} appointment{selectedApptIds.size !== 1 ? 's' : ''}
           </h3>
@@ -2375,7 +2375,7 @@ export default function Dashboard() {
     {/* ── APPOINTMENT NOTES MODAL (A5) ── */}
     {editingNotesId && (
       <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] overflow-y-auto">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] supports-[max-height:90dvh]:max-h-[90dvh] overflow-y-auto">
           <h3 className="text-base font-semibold text-gray-900 mb-1">Clinical Notes</h3>
           <p className="text-xs text-gray-400 mb-4">Add observations, treatment details, or follow-up instructions for this appointment.</p>
           <textarea

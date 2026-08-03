@@ -19,7 +19,7 @@ export default function ConfirmModal({ title, message, onConfirm, onCancel, dang
         aria-modal="true"
         aria-labelledby="confirm-modal-title"
         aria-describedby="confirm-modal-message"
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5 max-h-[90vh] overflow-y-auto"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5 max-h-[90vh] supports-[max-height:90dvh]:max-h-[90dvh] overflow-y-auto"
       >
         <h3 id="confirm-modal-title" className="text-base font-semibold text-gray-900 mb-2 break-words">{title}</h3>
         <p id="confirm-modal-message" className="text-sm text-gray-600 mb-5 break-words">{message}</p>
