@@ -20,7 +20,93 @@ const { validate, schemas } = require('../middleware/validate');
 const { VALID_ROLES, UUID_RE, validateUUID, handleError } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { IST_TODAY_SQL, IST_MONTH_START_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
+const { CURRENT_TERMS_VERSION, hasAcceptedCurrentTerms } = require('../config/terms');
 const logger = require('../utils/logger');
+
+// ── TERMS OF SERVICE ACCEPTANCE ───────────────────────────────
+// The evidence trail behind the click-wrap contract. See config/terms.js and
+// migration 24 for why this exists; in short, DPDP s.8(2) requires a contract
+// between the clinic (Data Fiduciary) and us (Processor), and an unproven
+// acceptance is not one.
+
+router.get('/terms', async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT terms_accepted_at, terms_version, terms_accepted_by FROM tenants WHERE id = $1`,
+      [req.user.tenant_id]
+    );
+    const tenant = r.rows[0];
+    if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+    res.json({
+      accepted: hasAcceptedCurrentTerms(tenant),
+      current_version: CURRENT_TERMS_VERSION,
+      accepted_version: tenant.terms_version || null,
+      accepted_at: tenant.terms_accepted_at || null,
+      accepted_by: tenant.terms_accepted_by || null,
+      can_accept: req.user.role === 'admin',
+    });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// adminOnly: accepting binds the whole clinic to the contract, so reception
+// and dentist accounts must not be able to do it on the owner's behalf.
+router.post('/terms/accept', adminOnly, async (req, res) => {
+  try {
+    const { version } = req.body || {};
+    // Reject a stale version outright rather than silently recording the
+    // current one. A client that has been open across a terms change would
+    // otherwise POST the version the user actually READ while we store the
+    // newer one — an acceptance of text they were never shown.
+    if (version !== CURRENT_TERMS_VERSION) {
+      return res.status(409).json({
+        error: 'Terms have been updated. Please reload and review the current version.',
+        current_version: CURRENT_TERMS_VERSION,
+      });
+    }
+
+    // First acceptance wins. Re-accepting the SAME version must not overwrite
+    // the original timestamp — the evidence of when the contract was formed is
+    // the whole point, and a later click would quietly move that date forward.
+    // A NEW version does overwrite, which is correct: that is a fresh contract.
+    const r = await query(
+      `UPDATE tenants
+          SET terms_accepted_at = NOW(),
+              terms_version     = $2,
+              terms_accepted_ip = $3,
+              terms_accepted_by = $4
+        WHERE id = $1
+          AND (terms_version IS DISTINCT FROM $2)
+        RETURNING terms_accepted_at, terms_version`,
+      [req.user.tenant_id, CURRENT_TERMS_VERSION, req.ip, req.user.email]
+    );
+
+    // No row updated means this version was already accepted — idempotent,
+    // not an error. Return the existing record.
+    if (!r.rows[0]) {
+      const existing = await query(
+        `SELECT terms_accepted_at, terms_version FROM tenants WHERE id = $1`,
+        [req.user.tenant_id]
+      );
+      return res.json({ accepted: true, already: true, ...existing.rows[0] });
+    }
+
+    await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
+      'ACCEPT_TERMS', 'tenant', req.user.tenant_id,
+      null, { version: CURRENT_TERMS_VERSION, accepted_by: req.user.email }, req.ip);
+
+    logger.info('Terms accepted', {
+      tenant_id: req.user.tenant_id,
+      version: CURRENT_TERMS_VERSION,
+      by: req.user.email,
+    });
+
+    res.json({ accepted: true, ...r.rows[0] });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
 
 // ── DASHBOARD STATS ───────────────────────────────────────────
 router.get('/dashboard', async (req, res) => {

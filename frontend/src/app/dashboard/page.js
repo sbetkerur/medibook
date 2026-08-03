@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation';
 import api, { clearSessionTimers, resetSessionTimers } from '@/lib/api';
 import { todayIST } from '@/lib/dateIST';
 import ErrorBoundary from '@/components/ErrorBoundary';
+import TermsGate from '@/components/TermsGate';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
 import Modal from '@/components/ui/Modal';
@@ -175,6 +176,8 @@ export default function Dashboard() {
   // Onboarding state
   const [onboarding, setOnboarding] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  // null = accepted, or not yet checked. Set only when acceptance is OUTSTANDING.
+  const [terms, setTerms] = useState(null);
 
   // Medical history edit state
   const [medHistory, setMedHistory] = useState({ blood_type: '', allergies: '', conditions: '', medications: '', notes: '' });
@@ -271,6 +274,7 @@ export default function Dashboard() {
     fetchStats();
     fetchAnalyticsSummary();
     fetchOnboarding();
+    fetchTermsStatus();
 
     // Session timeout warning: fires 5 minutes before JWT expires
     const onSessionWarning = (e) => {
@@ -497,6 +501,17 @@ export default function Dashboard() {
       // `onboarding_completed` false forever.
       if (!data.onboarding_completed) setShowOnboarding(true);
     } catch { /* silent */ }
+  }, []);
+
+  // Terms gate. Fails OPEN on error: a network blip or a backend that predates
+  // migration 24 must not lock an admin out of their own dashboard. The cost of
+  // missing one prompt is that it appears on the next login; the cost of a
+  // false positive is a clinic that cannot work at all.
+  const fetchTermsStatus = useCallback(async () => {
+    try {
+      const { data } = await api.get('/admin/terms');
+      if (!data.accepted) setTerms(data);
+    } catch { /* silent — fail open */ }
   }, []);
 
   const pollNotifications = useCallback(async () => {
@@ -1172,6 +1187,15 @@ export default function Dashboard() {
 
   return (
     <>
+    {/* Terms gate. Rendered above the shell so it overlays everything; blocking
+        for admins, advisory for other roles. See components/TermsGate.js. */}
+    {terms && (
+      <TermsGate
+        version={terms.current_version}
+        canAccept={terms.can_accept}
+        onAccepted={() => setTerms(null)}
+      />
+    )}
     {/* `h-screen` is 100vh, which on mobile browsers is the viewport WITHOUT the
         collapsing address bar — and because this shell is `overflow-hidden` with
         <main> as the only scroller, the extra height is not reachable by

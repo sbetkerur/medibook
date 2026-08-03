@@ -9,6 +9,7 @@ const { validate, schemas } = require('../middleware/validate');
 const emailService = require('../services/email');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
+const { CURRENT_TERMS_VERSION, hasAcceptedCurrentTerms } = require('../config/terms');
 
 // Skip rate limits outside production — same policy as the global authLimiter
 // in index.js. Without this, repeated local test runs exhaust the hourly
@@ -131,7 +132,18 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
       // normalizedSlug, not the raw body value — the client stores this and
       // sends it back on subsequent logins, so returning an untrimmed copy
       // would hand back a slug that no longer matches the one we looked up.
-      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug: normalizedSlug }
+      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug: normalizedSlug },
+      // Terms gate. Returned on login because `tenant` is already in hand — a
+      // separate status call would be a second round trip on every sign-in.
+      // Only an admin can clear the gate (accepting binds the clinic), so
+      // reception and dentist logins are told the state but see no prompt;
+      // blocking them would lock out the whole practice until the owner
+      // happens to log in.
+      terms: {
+        accepted: hasAcceptedCurrentTerms(tenant),
+        current_version: CURRENT_TERMS_VERSION,
+        can_accept: userR.rows[0].role === 'admin',
+      }
     });
   } catch (err) {
     handleError(res, err);

@@ -639,6 +639,32 @@ async function migrate() {
       await client.query(`DELETE FROM plans WHERE id = 'growth'`);
     });
 
+    // ── TERMS OF SERVICE ACCEPTANCE ───────────────────────────
+    // DPDP Act s.8(2) lets a Data Fiduciary (the clinic) engage a Processor
+    // (us) only under a valid contract, so we must be able to PROVE each
+    // tenant accepted the Terms + incorporated DPA. Click-wrap is valid under
+    // IT Act s.10A, but only if the acceptance record exists — a published
+    // policy with no evidence of assent is not a contract, which would leave
+    // the liability cap unenforceable exactly when it matters.
+    //
+    // Recorded per TENANT, not per user: the contract is with the clinic, and
+    // whichever admin accepts binds it. `terms_accepted_by` keeps the email
+    // rather than a user id on purpose — the row must stay meaningful as
+    // evidence after that staff member is deleted from the tenant schema.
+    //
+    // Version is stored, not assumed: when the Terms change, CURRENT_TERMS_VERSION
+    // moves ahead of the stored value and the gate re-prompts. Never backfill
+    // these columns for existing tenants — a fabricated acceptance is worse
+    // than none, since it is evidence of a contract that was never agreed.
+    await runMigration(client, 24, 'tenant_terms_acceptance', async () => {
+      await client.query(`
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS terms_version VARCHAR(20);
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS terms_accepted_ip VARCHAR(45);
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS terms_accepted_by VARCHAR(255);
+      `);
+    });
+
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter ₹799, professional ₹1799/branch)');
     // Only claim this when a super admin was actually seeded — otherwise the

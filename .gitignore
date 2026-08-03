@@ -35,3 +35,6 @@ pids/
 # Postgres portable (local only)
 pg_portable/
 .claude/worktrees/
+
+# Lead lists — real business contact data, keep out of git
+leads/
