@@ -92,7 +92,7 @@ export default function LoginPage() {
             <h1 className="text-2xl font-bold text-gray-900">Reset Password</h1>
             <p className="text-gray-500 text-sm mt-1">Enter your email to receive a reset link</p>
           </div>
-          <div className="bg-white rounded-2xl shadow-xl p-8">
+          <div className="bg-white rounded-2xl shadow-xl p-6 sm:p-8">
             <form onSubmit={handleForgotPassword} className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
@@ -142,7 +142,7 @@ export default function LoginPage() {
           <p className="text-gray-500 text-sm mt-1">WhatsApp Appointment System</p>
         </div>
 
-        <div className="bg-white rounded-2xl shadow-xl p-8">
+        <div className="bg-white rounded-2xl shadow-xl p-6 sm:p-8">
           {/* Mode tabs */}
           <div className="flex rounded-xl bg-gray-100 p-1 mb-6">
             {[['clinic', 'Clinic Admin'], ['super', 'Super Admin']].map(([val, label]) => (

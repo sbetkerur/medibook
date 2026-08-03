@@ -49,14 +49,16 @@ export default function SlotsTab({ doctors, isAdmin }) {
 
   return (
     <div className="space-y-4">
+      {/* Full width below sm: a select is as wide as its longest option, so a
+          long dentist name overflowed a 320px screen. */}
       <div className="flex gap-3 flex-wrap">
         <select value={selDoctor} onChange={e => setSelDoctor(e.target.value)}
-          className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          className="w-full sm:w-auto min-w-0 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
           <option value="">Select Doctor</option>
           {(doctors || []).map(d => <option key={d.id} value={d.id}>Dr. {d.name}</option>)}
         </select>
         <input type="date" value={selDate} onChange={e => setSelDate(e.target.value)}
-          className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          className="w-full sm:w-auto min-w-0 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
       </div>
 
       {!selDoctor ? (
@@ -65,9 +67,9 @@ export default function SlotsTab({ doctors, isAdmin }) {
         <div className="bg-white rounded-xl p-8 text-center text-gray-400">Loading...</div>
       ) : (
         <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-          <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+          <div className="px-4 md:px-5 py-3 border-b border-gray-100 flex flex-wrap items-center justify-between gap-2">
             <h3 className="font-semibold text-gray-800">{slots.length} slots on {selDate}</h3>
-            <div className="flex gap-3 text-xs text-gray-500">
+            <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500">
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-400 inline-block"></span>Available</span>
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-blue-400 inline-block"></span>Booked</span>
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-400 inline-block"></span>Blocked</span>
@@ -87,7 +89,7 @@ export default function SlotsTab({ doctors, isAdmin }) {
                 {slot.patient_name && <div className="truncate text-xs mt-0.5 opacity-75 w-full">{slot.patient_name.split(' ')[0]}</div>}
               </div>
             ))}
-            {!slots.length && <div className="col-span-8 py-6 text-center text-gray-400">No slots generated for this date</div>}
+            {!slots.length && <div className="col-span-full py-6 text-center text-gray-400">No slots generated for this date</div>}
           </div>
         </div>
       )}

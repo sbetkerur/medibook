@@ -61,11 +61,13 @@ export default function HolidaysTab({ hospitals, isAdmin, setConfirmModal }) {
       <div className="bg-white rounded-xl p-5 shadow-sm">
         <h3 className="font-semibold text-gray-800 mb-4">Add Clinic Holiday / Closure</h3>
         <form onSubmit={addHoliday} className="flex flex-wrap gap-3 items-end">
-          <div>
+          {/* A select is as wide as its widest option, so a long branch name would
+              overflow a 320px viewport — pinned to the row width below sm. */}
+          <div className="w-full sm:w-auto">
             <label className="block text-xs font-medium text-gray-700 mb-1">Clinic Branch</label>
             <select value={holidayForm.hospital_id}
               onChange={e => setHolidayForm(f => ({ ...f, hospital_id: e.target.value }))}
-              className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              className="w-full sm:w-auto border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
               <option value="">— All Branches —</option>
               {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
             </select>

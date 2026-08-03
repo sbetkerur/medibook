@@ -90,17 +90,20 @@ export default function TestBotTab({ isAdmin }) {
           {/* WhatsApp-style chat bubbles */}
           <div className="p-4 space-y-3 bg-[#e5ddd5] min-h-[80px]">
             {/* Outgoing user message */}
+            {/* max-w-xs/sm are wider than a 320px screen and bot replies carry
+                unbreakable strings (links, booking IDs), so cap by percentage
+                and break words below sm. */}
             <div className="flex justify-end">
-              <div className="bg-[#dcf8c6] rounded-lg rounded-tr-none px-3 py-2 max-w-xs shadow-sm">
-                <p className="text-sm text-gray-800">{botResponse.message}</p>
+              <div className="bg-[#dcf8c6] rounded-lg rounded-tr-none px-3 py-2 max-w-[85%] sm:max-w-xs shadow-sm">
+                <p className="text-sm text-gray-800 break-words">{botResponse.message}</p>
                 <p className="text-xs text-gray-400 text-right mt-0.5">You</p>
               </div>
             </div>
             {/* Bot responses */}
             {botResponse.responses?.map((r, i) => (
               <div key={i} className="flex justify-start">
-                <div className="bg-white rounded-lg rounded-tl-none px-3 py-2 max-w-sm shadow-sm">
-                  <p className="text-sm text-gray-800 whitespace-pre-wrap">{r.text}</p>
+                <div className="bg-white rounded-lg rounded-tl-none px-3 py-2 max-w-[85%] sm:max-w-sm shadow-sm min-w-0">
+                  <p className="text-sm text-gray-800 whitespace-pre-wrap break-words">{r.text}</p>
                   {r.buttons && (
                     <div className="mt-2 pt-2 border-t border-gray-100 flex flex-col gap-1.5">
                       {r.buttons.map((b, bi) => (

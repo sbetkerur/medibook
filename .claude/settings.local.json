@@ -209,7 +209,10 @@
       "PowerShell(cd C:\\\\claude_projects\\\\medibook\\\\backend; foreach \\($f in @\\('src/routes/doctors.js','src/routes/appointments.js','src/routes/patients.js','src/routes/admin.js','src/routes/services.js','src/routes/events.js','src/middleware/auth.js'\\)\\) { node --check $f; if \\($?\\) { Write-Output \"check ok: $f\" } })",
       "Bash(SEED_DEMO_RESET=true npm run seed)",
       "Bash(echo \"=== exit: $?\")",
-      "Bash(docker exec *)"
+      "Bash(docker exec *)",
+      "PowerShell($p = \"C:\\\\Program Files\\\\Docker\\\\Docker\\\\Docker Desktop.exe\"; if \\(Test-Path $p\\) { Start-Process $p; \"launched\" } else { \"not found at $p\" })",
+      "Bash(break)",
+      "Bash(echo \"--- exit: $? \\(no output above = clean\\) ---\")"
     ]
   }
 }

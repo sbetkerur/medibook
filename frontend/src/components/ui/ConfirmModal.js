@@ -12,15 +12,17 @@ export default function ConfirmModal({ title, message, onConfirm, onCancel, dang
     <div
       className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50"
     >
+      {/* Scrolls rather than growing past the viewport: a long title/message on
+          a phone in landscape (~320px tall) left no way to reach the buttons. */}
       <div
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="confirm-modal-title"
         aria-describedby="confirm-modal-message"
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5 max-h-[90vh] overflow-y-auto"
       >
-        <h3 id="confirm-modal-title" className="text-base font-semibold text-gray-900 mb-2">{title}</h3>
-        <p id="confirm-modal-message" className="text-sm text-gray-600 mb-5">{message}</p>
+        <h3 id="confirm-modal-title" className="text-base font-semibold text-gray-900 mb-2 break-words">{title}</h3>
+        <p id="confirm-modal-message" className="text-sm text-gray-600 mb-5 break-words">{message}</p>
         <div className="flex gap-3">
           <button onClick={onCancel}
             className="flex-1 px-4 py-2.5 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">

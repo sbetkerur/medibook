@@ -1172,7 +1172,12 @@ export default function Dashboard() {
 
   return (
     <>
-    <div className="flex h-screen bg-gray-50 overflow-hidden">
+    {/* `h-screen` is 100vh, which on mobile browsers is the viewport WITHOUT the
+        collapsing address bar — and because this shell is `overflow-hidden` with
+        <main> as the only scroller, the extra height is not reachable by
+        scrolling: the last row of every tab sat permanently under the browser
+        chrome. Prefer 100dvh where supported, keeping 100vh as the fallback. */}
+    <div className="flex h-screen supports-[height:100dvh]:h-[100dvh] bg-gray-50 overflow-hidden">
       {/* Mobile sidebar overlay */}
       {sidebarOpen && (
         <div className="fixed inset-0 z-40 bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} />
@@ -1649,7 +1654,9 @@ export default function Dashboard() {
                 Click <span className="text-orange-500 font-medium">blocked</span> to unblock.
                 <span className="text-blue-600 font-medium"> Booked</span> slots cannot be changed.
               </p>
-              <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
+              {/* 4 columns at 320px leaves ~46px of content per tile, which the
+                  word "available" overflows. Drop to 3 on the narrowest screens. */}
+              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
                 {slots.map(slot => {
                   const style = {
                     available: 'bg-green-100 text-green-700 border-green-200 hover:bg-green-200 cursor-pointer',
@@ -1700,7 +1707,7 @@ export default function Dashboard() {
               placeholder="e.g. Apollo Clinic Hyderabad"
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">City</label>
               <input value={hospitalForm.city} onChange={e => setHospitalForm(f => ({ ...f, city: e.target.value }))}
@@ -1842,15 +1849,15 @@ export default function Dashboard() {
               ) : (
                 <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
                   {patientHistory.map(a => (
-                    <div key={a.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                      <div>
-                        <div className="text-sm font-medium text-gray-900">Dr. {a.doctor_name}</div>
+                    <div key={a.id} className="flex items-center justify-between gap-2 p-3 bg-gray-50 rounded-lg">
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-gray-900 truncate">Dr. {a.doctor_name}</div>
                         <div className="text-xs text-gray-500 mt-0.5">
                           {(() => { try { return format(parseISO(a.appointment_date), 'EEE, d MMM yyyy'); } catch { return a.appointment_date; } })()}
                           {' '}at {a.appointment_time?.slice(0, 5)}
                         </div>
                       </div>
-                      <div className="text-right">
+                      <div className="text-right shrink-0">
                         <Badge status={a.status} />
                         <div className="text-xs text-gray-400 mt-1 font-mono">{a.booking_id}</div>
                       </div>
@@ -1917,6 +1924,9 @@ export default function Dashboard() {
                         </div>
                       </div>
                     </div>
+                    {/* The delete button below is hover-revealed at md+; a touch
+                        device never fires hover, so it stays visible on mobile
+                        or document deletion is unreachable there. */}
                     <div className="flex gap-2 flex-shrink-0">
                       {/* The blob fetch is adminOnly server-side (it is the only
                           route that returns file_data — a full scan or X-ray),
@@ -1951,7 +1961,7 @@ export default function Dashboard() {
                             toast.success('Document deleted');
                           } catch { toast.error('Delete failed'); }
                         }}
-                        className="text-xs text-red-400 hover:text-red-600 px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity">✕</button>
+                        className="text-xs text-red-400 hover:text-red-600 px-2 py-1 md:opacity-0 md:group-hover:opacity-100 transition-opacity">✕</button>
                       )}
                     </div>
                   </div>
@@ -2086,7 +2096,7 @@ export default function Dashboard() {
     {/* ── CANCEL APPOINTMENT MODAL ── */}
     {cancellingAppt && (
       <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] overflow-y-auto">
           <h3 className="text-base font-semibold text-gray-900 mb-1">Cancel Appointment</h3>
           <div className="text-sm text-gray-600 mb-4 bg-gray-50 rounded-lg p-3">
             <div><span className="font-medium">{cancellingAppt.patient_name}</span> · {cancellingAppt.patient_phone}</div>
@@ -2120,7 +2130,7 @@ export default function Dashboard() {
     {/* ── BULK CANCEL REASON MODAL ── */}
     {bulkCancelling && (
       <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] overflow-y-auto">
           <h3 className="text-base font-semibold text-gray-900 mb-1">
             Cancel {selectedApptIds.size} appointment{selectedApptIds.size !== 1 ? 's' : ''}
           </h3>
@@ -2341,7 +2351,7 @@ export default function Dashboard() {
     {/* ── APPOINTMENT NOTES MODAL (A5) ── */}
     {editingNotesId && (
       <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] overflow-y-auto">
           <h3 className="text-base font-semibold text-gray-900 mb-1">Clinical Notes</h3>
           <p className="text-xs text-gray-400 mb-4">Add observations, treatment details, or follow-up instructions for this appointment.</p>
           <textarea

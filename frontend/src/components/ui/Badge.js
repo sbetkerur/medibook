@@ -8,7 +8,9 @@ export default function Badge({ status }) {
     no_show: 'bg-gray-100 text-gray-600',
   };
   return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${map[status] || 'bg-gray-100 text-gray-600'}`}>
+    // whitespace-nowrap: two-word labels ("no show") otherwise break across two
+    // lines inside the pill when the badge sits in a narrow mobile card.
+    <span className={`whitespace-nowrap px-2 py-0.5 rounded-full text-xs font-medium capitalize ${map[status] || 'bg-gray-100 text-gray-600'}`}>
       {status?.replace('_', ' ')}
     </span>
   );

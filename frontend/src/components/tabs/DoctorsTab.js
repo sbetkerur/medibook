@@ -80,34 +80,39 @@ export default function DoctorsTab({
             {!d.is_active && (
               <p className="mt-2 text-xs text-red-400 font-medium">⚠️ Inactive — hidden from bot</p>
             )}
+            {/* Two columns still fit a 320px phone (~124px per button); only the
+                vertical padding is raised to a thumb-sized target below sm. */}
             <div className="mt-4 pt-3 border-t border-gray-100 grid grid-cols-2 gap-2">
               {isAdmin && (
               <button onClick={() => openEditDoctor(d)}
-                className="px-3 py-2 text-xs font-medium border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
+                className="px-3 py-3 sm:py-2 text-xs font-medium border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
                 ✏️ Edit
               </button>
               )}
               {isAdmin && (
               <button onClick={() => openSchedule(d)}
-                className="px-3 py-2 text-xs font-medium border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 transition">
+                className="px-3 py-3 sm:py-2 text-xs font-medium border border-blue-200 text-blue-600 rounded-lg hover:bg-blue-50 transition">
                 📅 Schedule
               </button>
               )}
               <button onClick={() => openSlotsViewer(d)}
-                className="px-3 py-2 text-xs font-medium border border-green-200 text-green-600 rounded-lg hover:bg-green-50 transition">
+                className="px-3 py-3 sm:py-2 text-xs font-medium border border-green-200 text-green-600 rounded-lg hover:bg-green-50 transition">
                 ⏰ View Slots
               </button>
               {isAdmin && (
               <button onClick={() => toggleDoctorStatus(d)}
-                className={`px-3 py-2 text-xs font-medium border rounded-lg transition ${d.is_active ? 'border-red-200 text-red-500 hover:bg-red-50' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
+                className={`px-3 py-3 sm:py-2 text-xs font-medium border rounded-lg transition ${d.is_active ? 'border-red-200 text-red-500 hover:bg-red-50' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
                 {d.is_active ? '🚫 Deactivate' : '✅ Activate'}
               </button>
               )}
             </div>
           </div>
         ))}
+        {/* col-span-full, not col-span-3: the grid is 1 column on a phone, and a
+            fixed 3-column span there conjures two implicit columns that widen the
+            row past the viewport. */}
         {!doctors.length && (
-          <div className="col-span-3 text-center py-16">
+          <div className="col-span-full text-center py-16">
             <div className="text-4xl mb-3">🦷</div>
             <p className="text-gray-500 font-medium">No dentists yet</p>
             <p className="text-gray-400 text-sm mt-1">Click "Add Dentist" to get started</p>

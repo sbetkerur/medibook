@@ -16,7 +16,7 @@ const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { sendPatientText } = require('../services/outbound');
-const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST } = require('../services/bot/clinicSearch');
+const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST, matchCity } = require('../services/bot/clinicSearch');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -259,6 +259,27 @@ const RESTART_GREETING_RE = /^(hi|hello|hey|restart|helo|hy|hai)$/i;
 // in the clinic-search state "menu" is no more a clinic name than "hi" is.
 const GREETING_RE = /^(hi|hello|hey|start|restart|menu|main menu|helo|hy|hai)$/i;
 
+// The "clinics near me" entry, offered ALONGSIDE the name search — a patient
+// who already knows their clinic's name must never be made to pick a city
+// first. Matched on the message TEXT rather than the interactive reply id:
+// wa.sendButtons mints its own opaque ids (`btn_0_<timestamp>`), so the id a
+// tap returns is not something a caller can recognise. Accepting the typed
+// forms is also what keeps the numbered TEXT fallback usable when the
+// interactive send fails.
+const NEARBY_BUTTON_LABEL = '📍 Clinics near me';
+// Bare "near" and bare "city" are deliberately NOT accepted: "City Dental
+// Clinic" and "Garden City Dental" are entirely plausible tenant names, and
+// shadowing a real search term with the city picker is worse than making the
+// patient type two more words.
+const NEARBY_RE = /^(📍\s*)?(clinics?\s+near\s+me|near\s+me|near\s*by|my\s+city)$/i;
+
+// Row id prefix for the city picker. Namespaced so it can never collide with
+// the tenant UUIDs the clinic shortlist uses as row ids.
+const CITY_ROW_PREFIX = 'city:';
+
+// WhatsApp rejects a list with more than 10 rows outright (Meta #131009).
+const MAX_CITY_ROWS = 10;
+
 // A bare "yes" or "4" is only meaningful as an answer to something. These are
 // the two questions a CLINIC asks unprompted, via the reminder and feedback
 // crons — the only cases where the sender, not the patient, decides which
@@ -461,8 +482,12 @@ async function processIncomingMessage(msg) {
 
     if (!globalSession || !globalSession.tenant_id || globalSession.state === 'select_tenant') {
       // Load all active tenants
+      // `city` moved from the settings JSONB to a real column (migrate.js
+      // backfills it). The COALESCE is belt-and-braces for a deployment that
+      // has written settings.city out of band — the column always wins.
       const tenantsR = await query(
-        `SELECT id, name, settings->>'city' as city FROM tenants WHERE status='active' ORDER BY name`
+        `SELECT id, name, COALESCE(city, settings->>'city') AS city
+           FROM tenants WHERE status='active' ORDER BY name`
       );
       const activeTenants = tenantsR.rows;
 
@@ -480,6 +505,110 @@ async function processIncomingMessage(msg) {
       let selected = null;
       const trimmed = (text || '').trim();
       const isGreeting = GREETING_RE.test(trimmed);
+
+      // ── "CLINICS NEAR ME" ────────────────────────────────────────
+      // A second way in, for a patient who knows where they are but not what
+      // their clinic is called. It still never lists the roster: a city has to
+      // be chosen first, and only that city's clinics are ever shown.
+      const knownCities = [...new Set(
+        activeTenants.map(t => (t.city || '').trim()).filter(Boolean)
+      )].sort((a, b) => a.localeCompare(b));
+
+      // Tapping a city row, or typing one while we were asking. A typed city is
+      // only read as a city in `select_city` — elsewhere "Pune" is far more
+      // likely to be part of a clinic's name than an answer to a question we
+      // never asked.
+      const cityRowId = buttonId && buttonId.startsWith(CITY_ROW_PREFIX)
+        ? buttonId.slice(CITY_ROW_PREFIX.length)
+        : null;
+      const pickedCity = cityRowId || (
+        globalSession?.state === 'select_city' && trimmed && !isGreeting
+          ? matchCity(knownCities, trimmed)
+          : null
+      );
+
+      if (!buttonId && !isGreeting && NEARBY_RE.test(trimmed)) {
+        // Record the message id first, for the same reason the shortlist below
+        // does: a Meta redelivery must not re-send this prompt.
+        await query(
+          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
+           VALUES ($1,'select_city',NOW(),$2,NULL)
+           ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_city',
+             last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
+             search_matches=NULL`,
+          [phone, msgId || null]
+        ).catch(() => {});
+
+        if (!knownCities.length) {
+          // No clinic has a city recorded yet. Say so, instead of sending an
+          // empty picker the patient cannot act on.
+          await wa.sendText(phone,
+            `📍 Clinic locations aren't set up yet.\n\n🔍 Please send your clinic's name instead — a few letters are enough.`,
+            null, null
+          ).catch(err => logger.error('Failed to send no-cities prompt', { error: err.message }));
+        } else if (knownCities.length <= MAX_CITY_ROWS) {
+          await wa.sendList(phone, '📍 Which city are you in?', 'Select city', [{
+            title: 'Cities',
+            rows: knownCities.map(c => ({ id: CITY_ROW_PREFIX + c, title: c })),
+          }], null, null).catch(err =>
+            logger.error('Failed to send city list', { error: err.message }));
+        } else {
+          // More cities than a list message can hold — ask them to type it.
+          await wa.sendText(phone,
+            `📍 Which city are you in?\n\nPlease send your city's name.`,
+            null, null
+          ).catch(err => logger.error('Failed to send city prompt', { error: err.message }));
+        }
+        return;
+      }
+
+      if (pickedCity) {
+        const cityClinics = activeTenants.filter(t =>
+          (t.city || '').trim().toLowerCase() === pickedCity.trim().toLowerCase()
+        );
+        // Back to the normal search state either way: whatever happens next is
+        // a clinic choice, not another city.
+        const shownCityClinics = cityClinics.slice(0, MAX_CITY_ROWS);
+        await query(
+          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
+           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb)
+           ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
+             last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
+             search_matches=EXCLUDED.search_matches`,
+          [phone, msgId || null,
+           shownCityClinics.length ? JSON.stringify(shownCityClinics.map(t => t.id)) : null]
+        ).catch(() => {});
+
+        if (!shownCityClinics.length) {
+          await wa.sendText(phone,
+            `📍 No clinics in *${pickedCity}* yet.\n\n🔍 Please send your clinic's name instead.`,
+            null, null
+          ).catch(err => logger.error('Failed to send empty-city prompt', { error: err.message }));
+          return;
+        }
+
+        // Shown as a list even when there is exactly ONE clinic in the city.
+        // Choosing a city is not naming a clinic, and the entry point's rule is
+        // that a patient is never silently attached to a clinic they did not
+        // pick — the same reason there is no auto-assign when only one tenant
+        // is onboarded.
+        const more = cityClinics.length > shownCityClinics.length
+          ? `\n\nShowing ${shownCityClinics.length} of ${cityClinics.length} — send your clinic's name if it isn't listed.`
+          : '';
+        await wa.sendList(phone,
+          `📍 ${cityClinics.length} clinic${cityClinics.length !== 1 ? 's' : ''} in *${pickedCity}*.\n\nPick yours:${more}`,
+          'Select clinic',
+          [{
+            title: pickedCity.slice(0, 24),
+            rows: shownCityClinics.map(t => ({
+              id: t.id,
+              title: shortLabel(t.name),
+              description: t.name,
+            })),
+          }], null, null
+        ).catch(err => logger.error('Failed to send city clinic list', { error: err.message }));
+        return;
+      }
 
       // 1. Tap on a shortlist row — row id is the tenant UUID.
       if (buttonId) {
@@ -597,8 +726,23 @@ async function processIncomingMessage(msg) {
             `A few letters are enough — you can leave out "dental" and "clinic".`;
         }
 
-        await wa.sendText(phone, prompt, null, null)
-          .catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
+        // The location path is offered as an EXTRA, never as a replacement: the
+        // body still asks for the clinic's name, so a patient who knows it is
+        // not made to pick a city first. Only offered once some clinic actually
+        // has a city, so the button can't lead to a dead end. The hint line
+        // matters because wa.sendButtons degrades to numbered text if the
+        // interactive send fails, and "📍 Clinics near me" is a phrase
+        // NEARBY_RE also accepts typed.
+        if (knownCities.length) {
+          await wa.sendButtons(
+            phone,
+            `${prompt}\n\n📍 Or reply *${NEARBY_BUTTON_LABEL.replace('📍 ', '')}* to browse by city.`,
+            [NEARBY_BUTTON_LABEL], null, null
+          ).catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
+        } else {
+          await wa.sendText(phone, prompt, null, null)
+            .catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
+        }
         return;
       }
     } else {
@@ -857,3 +1001,8 @@ module.exports.GREETING_RE = GREETING_RE;
 // must never be read as a star rating, and an answer must never be handed to a
 // clinic whose session cannot receive it (see tests/askingTenant.unit.test.js).
 module.exports.resolveAskingTenant = resolveAskingTenant;
+// Exported for tests: the "clinics near me" trigger has a sharp edge of its own
+// — it must not swallow a query that is really a clinic name ("City Dental
+// Care" is a tenant in the search fixtures). See tests/clinicNearby.unit.test.js.
+module.exports.NEARBY_RE = NEARBY_RE;
+module.exports.CITY_ROW_PREFIX = CITY_ROW_PREFIX;

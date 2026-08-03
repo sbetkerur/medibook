@@ -194,6 +194,7 @@ const schemas = {
       .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
       .optional(),
     owner_name: Joi.string().max(255).optional().allow('', null),
+    city: Joi.string().trim().max(100).optional().allow('', null),
     plan: Joi.string().valid('starter', 'growth', 'professional', 'enterprise').optional().default('starter'),
   }),
 };

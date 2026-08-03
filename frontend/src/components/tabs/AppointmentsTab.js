@@ -95,7 +95,7 @@ export default function AppointmentsTab({
                       className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
                     {isAdmin && (
                     <button onClick={() => onMessagePatient(a.patient_phone || '')}
-                      className="text-xs text-green-500 hover:text-green-700">📤</button>
+                      className="text-xs text-green-500 hover:text-green-700 px-1.5 py-1 -my-1">📤</button>
                     )}
                   </div>
                 </div>
@@ -109,24 +109,24 @@ export default function AppointmentsTab({
               <div className="flex flex-wrap gap-2 pt-1">
                 {a.status === 'confirmed' && (<>
                   <button onClick={() => updateApptStatus(a.id, 'completed')}
-                    className="px-3 py-1.5 text-xs bg-blue-50 text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-100 transition">
+                    className="px-3 py-2 text-xs bg-blue-50 text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-100 transition">
                     ✅ Done
                   </button>
                   <button onClick={() => updateApptStatus(a.id, 'no_show')}
-                    className="px-3 py-1.5 text-xs bg-gray-50 text-gray-500 border border-gray-200 rounded-lg hover:bg-gray-100 transition">
+                    className="px-3 py-2 text-xs bg-gray-50 text-gray-500 border border-gray-200 rounded-lg hover:bg-gray-100 transition">
                     🚫 No Show
                   </button>
                   <button onClick={() => onCancelAppt(a)}
-                    className="px-3 py-1.5 text-xs bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition">
+                    className="px-3 py-2 text-xs bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition">
                     ✕ Cancel
                   </button>
                 </>)}
                 <button onClick={() => printReceipt(a.id)}
-                  className="px-3 py-1.5 text-xs bg-purple-50 text-purple-600 border border-purple-200 rounded-lg hover:bg-purple-100 transition">
+                  className="px-3 py-2 text-xs bg-purple-50 text-purple-600 border border-purple-200 rounded-lg hover:bg-purple-100 transition">
                   🖨️ Receipt
                 </button>
                 <button onClick={() => onEditNotes(a)}
-                  className={`px-3 py-1.5 text-xs border rounded-lg transition ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                  className={`px-3 py-2 text-xs border rounded-lg transition ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
                   📝 {a.notes ? 'Notes' : 'Add Note'}
                 </button>
               </div>

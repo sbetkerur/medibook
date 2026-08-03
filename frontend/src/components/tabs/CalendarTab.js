@@ -112,10 +112,12 @@ export default function CalendarTab() {
               const todayStr = todayIST();
               const isToday = dateStr === todayStr;
               const isSelected = selectedCalDay === dateStr;
+              // p-1 below sm: seven columns leave ~42px per cell at 320px, and
+              // p-2 left only ~26px of that for the 24px day-number circle.
               return (
                 <div key={day}
                   onClick={() => { setSelectedCalDay(dateStr); setCalDayAppts(dayAppts); }}
-                  className={`border-r border-b border-gray-100 min-h-[76px] p-2 cursor-pointer transition-colors
+                  className={`border-r border-b border-gray-100 min-h-[76px] p-1 sm:p-2 cursor-pointer transition-colors
                     ${isSelected ? 'bg-blue-50' : 'hover:bg-gray-50'}`}>
                   <div className={`text-sm font-medium mb-1 w-6 h-6 flex items-center justify-center rounded-full mx-auto
                     ${isToday ? 'bg-blue-600 text-white' : 'text-gray-700'}`}>
