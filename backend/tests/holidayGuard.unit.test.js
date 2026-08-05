@@ -235,7 +235,7 @@ async function run() {
   await test('control: an open day still returns its slots', async () => {
     const sink = [];
     await bookingFlow.handleSelectDate(PHONE, SCHEMA, tenant, makeSend(sink), ctxAtDateStep(), OPEN_DAY);
-    assert(sink.some(m => m.type === 'list' && /Select Time/.test(m.text)),
+    assert(sink.some(m => m.type === 'list' && (m.sections || []).some(s => /^Slots on /.test(s.title))),
       'open day offered no times — the guard is over-blocking: ' + JSON.stringify(sink));
   });
 
@@ -245,7 +245,7 @@ async function run() {
     // The stale row is still in _dates, so the "was it offered?" check passes —
     // only the slot query can catch this.
     await bookingFlow.handleSelectDate(PHONE, SCHEMA, tenant, makeSend(sink), ctxAtDateStep(), SHUT_DAY);
-    assert(!sink.some(m => m.type === 'list' && /Select Time/.test(m.text)),
+    assert(!sink.some(m => m.type === 'list' && (m.sections || []).some(s => /^Slots on /.test(s.title))),
       'slots were offered on a declared holiday: ' + JSON.stringify(sink));
     assert(sink.some(m => /No slots/i.test(m.text)), 'expected a "no slots" reply: ' + JSON.stringify(sink));
   });
@@ -261,7 +261,7 @@ async function run() {
     db.holidays.push({ date: SHUT_DAY, hospital_id: OTHER_HOSP });
     const sink = [];
     await bookingFlow.handleSelectDate(PHONE, SCHEMA, tenant, makeSend(sink), ctxAtDateStep(), SHUT_DAY);
-    assert(sink.some(m => m.type === 'list' && /Select Time/.test(m.text)),
+    assert(sink.some(m => m.type === 'list' && (m.sections || []).some(s => /^Slots on /.test(s.title))),
       'another branch\'s holiday closed this branch: ' + JSON.stringify(sink));
   });
 

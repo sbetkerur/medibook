@@ -8,17 +8,6 @@ const logger = require('./logger');
  * @param {string} label  - Label for error log (e.g. 'sendReminders')
  * @param {Function} callback - async (tenant) => void
  */
-async function forEachActiveTenant(label, callback) {
-  const { rows } = await query(`SELECT * FROM tenants WHERE status='active'`);
-  for (const tenant of rows) {
-    try {
-      await callback(tenant);
-    } catch (err) {
-      logger.error(`${label} failed for ${tenant.name}`, { error: err.message });
-    }
-  }
-}
-
 /**
  * Iterate over all active tenants in parallel batches.
  * Up to `concurrency` tenants are processed simultaneously.
@@ -47,4 +36,4 @@ async function forEachActiveTenantParallel(label, callback, concurrency = 5) {
   }
 }
 
-module.exports = { forEachActiveTenant, forEachActiveTenantParallel };
+module.exports = { forEachActiveTenantParallel };

@@ -41,8 +41,10 @@ export default function OverviewTab({
             {statsLastUpdated ? `Updated ${statsLastUpdated.toLocaleTimeString()}` : ''}
             {statsRefreshing && <span className="ml-2 text-blue-500 animate-pulse">↻ Refreshing...</span>}
           </span>
+          {/* Bare text at 51x16 — padding gives it a thumb-sized row without
+              changing how it looks. */}
           <button onClick={() => fetchStats(true)} disabled={statsRefreshing}
-            className="text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50 transition">
+            className="shrink-0 px-3 py-2.5 -my-2 -mr-3 text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50 transition md:px-0 md:py-0 md:m-0">
             ↻ Refresh
           </button>
         </div>
@@ -51,6 +53,22 @@ export default function OverviewTab({
           <StatCard label="Upcoming" value={stats?.upcoming_appointments} icon="🗓" color="border-green-500" />
           <StatCard label="Patients" value={stats?.total_patients} icon="👥" color="border-purple-500" />
           <StatCard label="Open Slots" value={stats?.available_slots} icon="⏰" color="border-orange-500" />
+          {/* Treatment the clinic has already advised and nobody has booked —
+              revenue agreed and sitting idle. It was a filter chip on another
+              tab; an owner should see the number without going looking. */}
+          <StatCard
+            label="Unbooked Treatment"
+            value={stats?.outstanding_treatments == null
+              ? '—'
+              : stats.outstanding_treatment_value > 0
+                ? `₹${Number(stats.outstanding_treatment_value).toLocaleString('en-IN')}`
+                : String(stats.outstanding_treatments)}
+            sub={stats?.outstanding_treatments != null
+              ? `${stats.outstanding_treatments} treatment${stats.outstanding_treatments === 1 ? '' : 's'} to book`
+              : null}
+            icon="🩺"
+            color="border-teal-500"
+          />
           <StatCard
             label="Revenue (30d)"
             value={analyticsSummary ? `₹${Number(analyticsSummary.revenue_30d || 0).toLocaleString('en-IN')}` : '—'}

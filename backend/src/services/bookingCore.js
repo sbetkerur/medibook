@@ -64,6 +64,10 @@ const SLOT_DAY_OPEN_SQL = `
  * @param {string} f.appointmentTime - HH:MM[:SS]
  * @param {string} [f.visitType='in_person']
  * @param {string|null} [f.notes=null]
+ * @param {string|null} [f.departmentId=null] - treatment booked FOR; falls back
+ *   to the doctor's primary department (a doctor renders several treatments)
+ * @param {string|null} [f.treatmentPlanId=null] - multi-visit course this visit belongs to
+ * @param {number|null} [f.visitNumber=null] - 1-based position within that plan
  * @returns {Promise<{bookingId: string, row: object}>}
  */
 async function insertAppointmentWithRetry(client, f) {
@@ -73,12 +77,21 @@ async function insertAppointmentWithRetry(client, f) {
     try {
       await client.query('SAVEPOINT booking_insert');
       const r = await client.query(
+        // department_id is the treatment booked FOR. It falls back to the doctor's
+        // primary department for callers that don't know one (the walk-in desk),
+        // but must be passed explicitly wherever the patient chose a treatment —
+        // a doctor can belong to several departments, so the doctor no longer
+        // identifies the treatment.
         `INSERT INTO appointments
-         (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed',$9)
+         (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status, notes, department_id,
+          treatment_plan_id, visit_number)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed',$9,
+                 COALESCE($10::uuid, (SELECT department_id FROM doctors WHERE id=$3)),
+                 $11,$12)
          RETURNING *`,
         [bookingId, f.patientId, f.doctorId, f.hospitalId, f.slotId || null,
-         f.appointmentDate, f.appointmentTime, f.visitType || 'in_person', f.notes || null]);
+         f.appointmentDate, f.appointmentTime, f.visitType || 'in_person', f.notes || null,
+         f.departmentId || null, f.treatmentPlanId || null, f.visitNumber || null]);
       await client.query('RELEASE SAVEPOINT booking_insert');
       return { bookingId, row: r.rows[0] };
     } catch (insertErr) {

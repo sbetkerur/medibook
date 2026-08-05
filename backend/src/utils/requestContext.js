@@ -12,10 +12,6 @@ function runWithContext(context, fn) {
   return storage.run(context, fn);
 }
 
-function getContext() {
-  return storage.getStore() || {};
-}
-
 function getRequestId() {
   return storage.getStore()?.requestId;
 }
@@ -36,4 +32,4 @@ function setTenantId(tenantId) {
   if (store) store.tenantId = tenantId;
 }
 
-module.exports = { runWithContext, getContext, getRequestId, getTenantId, setTenantId };
+module.exports = { runWithContext, getRequestId, getTenantId, setTenantId };

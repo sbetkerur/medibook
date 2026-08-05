@@ -8,7 +8,7 @@ const logger = require('../../utils/logger');
 const IST = 'Asia/Kolkata';
 const emailService = require('../email');
 const wa = require('../whatsapp');
-const { SLOT_LOOKAHEAD_DAYS } = require('../../utils/errors');
+const { SLOT_LOOKAHEAD_DAYS, CRON_LOOKAHEAD_DAYS } = require('../../utils/errors');
 const {
   STATES,
   fuzzyFind,
@@ -21,6 +21,53 @@ const {
   logMessage,
   notifyAdminWhatsApp,
 } = require('./utils');
+
+/**
+ * The "I don't know what I need" option, offered ahead of the named treatments.
+ *
+ * A sentinel rather than a real department row: it deliberately matches NO
+ * department, so it lists every dentist at the branch instead of narrowing to
+ * one specialty.
+ *
+ * It passes no department to the booking, which means
+ * insertAppointmentWithRetry falls back to the chosen dentist's PRIMARY
+ * department — so the receipt reads "General Dentistry" for a consultation with
+ * a general dentist. That is the honest label for a visit where nothing has been
+ * diagnosed yet; the actual treatment is recorded on the treatment plan the
+ * dentist writes afterwards, and that plan's own sittings carry it explicitly.
+ */
+const GENERAL_CONSULT = { id: 'general_consult', name: '🩺 Consultation / Not sure' };
+
+/**
+ * Header + footer for a step of the booking flow. Both cap at 60 characters
+ * (whatsapp.js). The header carries the question so the body can carry only
+ * information — that separation is what stops every message looking the same.
+ *
+ * This used to read "Step N of 5", which was a promise the flow did not keep:
+ * after step 4 came the name, the date of birth and the reason for the visit,
+ * all unnumbered, before the confirmation billed itself as step 5. Counting
+ * honestly would advertise "1 of 8", and the total differs anyway between a new
+ * patient and a returning one who only picks a profile. A number that is either
+ * wrong or discouraging is worse than no number on a flow this short.
+ */
+const STEP = (header) => ({ header, footer: 'Reply Menu to start over' });
+const BRANCH_STEP = { header: 'Which branch?', footer: 'Reply Menu to start over' };
+
+/**
+ * One WhatsApp list row for a dentist. Specialisation leads because a treatment
+ * can list a specialist and a general dentist side by side now that dentists
+ * belong to several departments — "Endodontist" vs "General Dentist" is the
+ * distinction the patient is actually choosing on. WhatsApp truncates row
+ * descriptions at 72 chars, so trim rather than let it cut mid-word server-side.
+ */
+function doctorListRow(d) {
+  return {
+    id: d.id,
+    title: `Dr. ${d.name}`,
+    description: [d.specialization, d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : '']
+      .filter(Boolean).join(' • ').slice(0, 72),
+  };
+}
 
 /**
  * Read and clear `global_bot_sessions.pending_hospital_id` in one statement, so
@@ -80,10 +127,10 @@ async function startBooking(phone, schema, tenant, send, ctx) {
   // Multiple branches — show interactive list/buttons so the user taps, not types
   ctx._hospitals = hospitals.rows;
 
-  const prompt = `🏥 *Select a Branch*\n\nWhich ${tenant.name} branch would you like to visit?`;
+  const prompt = 'Which one is easiest for you to get to?';
 
   if (hospitals.rows.length <= 3) {
-    await send.buttons(prompt, hospitals.rows.map(h => h.name.slice(0, 20)));
+    await send.buttons(prompt, hospitals.rows.map(h => h.name.slice(0, 20)), BRANCH_STEP);
   } else {
     const sections = [{
       title: 'Our Branches',
@@ -93,7 +140,7 @@ async function startBooking(phone, schema, tenant, send, ctx) {
         description: (h.city || '').slice(0, 72),
       })),
     }];
-    await send.list(prompt, 'View Branches', sections);
+    await send.list(prompt, 'See branches', sections, BRANCH_STEP);
   }
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
@@ -147,9 +194,9 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
 
 // Helper: render the branch picker (buttons or list depending on count)
 async function _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows) {
-  const prompt = `🏥 *Select a Branch*\n\nWhich ${tenant.name} branch would you like to visit?`;
+  const prompt = 'Which one is easiest for you to get to?';
   if (hospitalRows.length <= 3) {
-    await send.buttons(prompt, hospitalRows.map(h => h.name.slice(0, 20)));
+    await send.buttons(prompt, hospitalRows.map(h => h.name.slice(0, 20)), BRANCH_STEP);
   } else {
     const sections = [{
       title: 'Our Branches',
@@ -159,7 +206,7 @@ async function _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows)
         description: (h.city || '').slice(0, 72),
       })),
     }];
-    await send.list(prompt, 'View Branches', sections);
+    await send.list(prompt, 'See branches', sections, BRANCH_STEP);
   }
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
@@ -169,10 +216,15 @@ async function showDepartments(phone, schema, tenant, send, ctx) {
   ctx.visit_type = 'in_person';
   ctx.visit_label = '🦷 In-Clinic Visit';
 
+  // Via doctor_departments, not doctors.department_id: a dentist can render
+  // several treatments (a GP who also does simple RCTs), and the join table is
+  // the bookable set. The doctor's primary department is always in it.
   const depts = await tenantQuery(schema,
     `SELECT DISTINCT d.id, d.name FROM departments d
-     JOIN doctors doc ON doc.department_id=d.id
+     JOIN doctor_departments dd ON dd.department_id=d.id
+     JOIN doctors doc ON doc.id=dd.doctor_id
      WHERE d.hospital_id=$1 AND d.is_active=true AND doc.is_active=true
+       AND doc.hospital_id=$1
      ORDER BY d.name`, [ctx.hospital_id]);
 
   if (!depts.rows.length) {
@@ -181,7 +233,14 @@ async function showDepartments(phone, schema, tenant, send, ctx) {
     return;
   }
 
-  ctx._depts = depts.rows;
+  // Most patients arrive with a symptom, not a diagnosis: they book a
+  // consultation with the clinic and the dentist decides what the treatment is.
+  // Forcing a specialty first asks the patient a question only the dentist can
+  // answer — and picking wrong lands them with the wrong dentist. So the first
+  // option is always "not sure", which books any available dentist; the named
+  // treatments stay for the patients who DO know (a returning braces case).
+  const options = [GENERAL_CONSULT, ...depts.rows];
+  ctx._depts = options;
 
   // Smart-intent shortcut: if detectIntent() recognised a treatment in the
   // user's free text (e.g. "book root canal"), skip the treatment picker and
@@ -194,31 +253,54 @@ async function showDepartments(phone, schema, tenant, send, ctx) {
     }
   }
 
-  if (depts.rows.length <= 3) {
-    await send.buttons('🦷 *Select Treatment*\n\nWhat dental treatment do you need?',
-      depts.rows.map(d => d.name));
+  const prompt = 'Not sure what you need? Pick the first option — the dentist will advise at your visit.';
+  if (options.length <= 3) {
+    await send.buttons(prompt, options.map(d => d.name), STEP('What do you need?'));
   } else {
-    const sections = [{ title: 'Treatments', rows: depts.rows.map(d => ({ id: d.id, title: d.name })) }];
-    await send.list('🦷 *Select Treatment*\n\nWhat dental treatment do you need?', 'View Treatments', sections);
+    const sections = [{
+      title: 'Appointments',
+      rows: options.map(d => ({
+        id: d.id,
+        title: d.name,
+        ...(d.id === GENERAL_CONSULT.id ? { description: 'Any available dentist' } : {}),
+      })),
+    }];
+    await send.list(prompt, 'Choose', sections, STEP('What do you need?'));
   }
   await updateSession(schema, phone, STATES.SELECT_DEPARTMENT, ctx);
 }
 
-async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input) {
+async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input, buttonId) {
   let depts = ctx._depts || [];
   // Re-fetch from DB if cache is missing (e.g. session resumed after expiry).
   // Without this, a stale empty _depts leaves the user permanently stuck.
   if (!depts.length && ctx.hospital_id) {
     const r = await tenantQuery(schema,
       `SELECT DISTINCT d.id, d.name FROM departments d
-       JOIN doctors doc ON doc.department_id=d.id
+       JOIN doctor_departments dd ON dd.department_id=d.id
+       JOIN doctors doc ON doc.id=dd.doctor_id
        WHERE d.hospital_id=$1 AND d.is_active=true AND doc.is_active=true
+         AND doc.hospital_id=$1
        ORDER BY d.name`, [ctx.hospital_id]);
-    depts = r.rows;
+    depts = [GENERAL_CONSULT, ...r.rows];
     ctx._depts = depts;
   }
   const deptNumChoice = parseChoiceNumber(input);
-  const dept = depts.find(d => d.id === choice) || fuzzyFind(depts, input)
+  // "not sure" / "any" / "consultation" typed freely resolves to the sentinel.
+  // Checked before fuzzyFind, whose scoring over department NAMES would never
+  // match these words — and whose one-match rule would otherwise reject them.
+  //
+  // Gated on !buttonId ("typed, not tapped"), matching the idiom in botEngine.
+  // This was `!choice`, which is NEVER true: choice is `buttonId || lowerInput`
+  // and the engine returns early when both are absent, so the whole synonym
+  // list was dead and typing "any" or "checkup" fell through to the "I couldn't
+  // tell which treatment you meant" re-prompt. Only "not sure" and
+  // "consultation" appeared to work, by accidental substring match against
+  // GENERAL_CONSULT's own name — which is also why the tests passed.
+  const wantsGeneral = !buttonId && /^(not sure|dont know|don'?t know|any|anyone|any doctor|any dentist|consult|consultation|general|checkup|check up)$/i
+    .test(input.trim());
+  const dept = (wantsGeneral ? GENERAL_CONSULT : null)
+    || depts.find(d => d.id === choice) || fuzzyFind(depts, input)
     || (deptNumChoice >= 1 && deptNumChoice <= depts.length ? depts[deptNumChoice - 1] : null);
   if (!dept) {
     // Same reasoning as dentist selection: an unrecognised or ambiguous reply
@@ -238,13 +320,56 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
     return;
   }
 
-  ctx.department_id = dept.id;
-  ctx.department_name = dept.name;
+  const isGeneralConsult = dept.id === GENERAL_CONSULT.id;
 
-  const doctors = await tenantQuery(schema,
-    `SELECT id, name, qualification, consultation_fee FROM doctors
-     WHERE department_id=$1 AND hospital_id=$2 AND is_active=true ORDER BY name`,
-    [dept.id, ctx.hospital_id]);
+  // On the "not sure" path, ask what brings them in BEFORE showing dentists.
+  // Collected after the slot — as it was for every path — the answer arrived
+  // too late to affect anything: the dentist, day and time were already chosen,
+  // so it could only ever be a note. Asked here it can still route a patient in
+  // pain, and it puts any multi-visit warning in front of them before they
+  // commit to a time. Named treatments skip this: choosing "Root Canal" has
+  // already answered the question.
+  if (isGeneralConsult && !ctx.chief_complaint) {
+    ctx._complaint_first = true;
+    ctx._pending_dept_id = dept.id;
+    ctx._pending_dept_name = dept.name;
+    return askChiefComplaint(phone, schema, send, ctx);
+  }
+  // Nothing is diagnosed yet on a consultation, so no department is recorded —
+  // the dentist's plan supplies it later. See GENERAL_CONSULT.
+  ctx.department_id = isGeneralConsult ? null : dept.id;
+  ctx.department_name = isGeneralConsult ? 'Consultation' : dept.name;
+
+  // A consultation is with the clinic, so every dentist at the branch is
+  // offered. Otherwise: every dentist who renders this treatment, not just
+  // those whose PRIMARY department it is — the general dentist offering root
+  // canals has to appear alongside the endodontist. Specialists first (the
+  // doctor whose primary department this is leads the list), then by name.
+  const doctors = isGeneralConsult
+    ? await tenantQuery(schema,
+        // General dentists first, then by fee, then by name. Alphabetical put
+        // the ₹700 endodontist at the top of the list for a patient who had
+        // just said they did NOT know what they needed — the one person least
+        // able to judge whether a specialist is warranted. A consultation
+        // should default to the generalist; specialists stay one tap away.
+        `SELECT d.id, d.name, d.qualification, d.consultation_fee, d.specialization,
+                false AS is_primary
+         FROM doctors d
+         LEFT JOIN departments dep ON dep.id = d.department_id
+         WHERE d.hospital_id=$1 AND d.is_active=true
+         ORDER BY (COALESCE(d.specialization,'') ILIKE '%general%'
+                   OR COALESCE(dep.name,'') ILIKE 'general%') DESC,
+                  d.consultation_fee ASC NULLS LAST,
+                  d.name`,
+        [ctx.hospital_id])
+    : await tenantQuery(schema,
+        `SELECT d.id, d.name, d.qualification, d.consultation_fee, d.specialization,
+                (d.department_id = $1) AS is_primary
+         FROM doctors d
+         JOIN doctor_departments dd ON dd.doctor_id=d.id AND dd.department_id=$1
+         WHERE d.hospital_id=$2 AND d.is_active=true
+         ORDER BY is_primary DESC, d.name`,
+        [dept.id, ctx.hospital_id]);
 
   if (!doctors.rows.length) {
     await send.text(`No dentists available for ${dept.name}.\n\nReply *Menu* to choose another treatment.`);
@@ -265,19 +390,20 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input)
   const note = treatmentNotes[dept.name];
   if (note) await send.text(note);
 
+  // The heading already says "dentist" — repeating it in the body ("Select
+  // Dentist / Available General Dentistry dentists:") said the same word three
+  // times. The body now carries information the header cannot.
+  const doctorPrompt = isGeneralConsult
+    ? 'Anyone available, or pick a name you know.'
+    : `Everyone below treats ${dept.name.toLowerCase()}.`;
   if (doctors.rows.length <= 3) {
-    await send.buttons(`🦷 *Select Dentist*\n\nAvailable ${dept.name} dentists:`,
-      doctors.rows.map(d => `Dr. ${d.name}`));
+    await send.buttons(doctorPrompt, doctors.rows.map(d => `Dr. ${d.name}`), STEP('Choose a dentist'));
   } else {
     const sections = [{
-      title: `${dept.name} Dentists`,
-      rows: doctors.rows.map(d => ({
-        id: d.id,
-        title: `Dr. ${d.name}`,
-        description: [d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : ''].filter(Boolean).join(' • ')
-      }))
+      title: `${dept.name} Dentists`.slice(0, 24),
+      rows: doctors.rows.map(doctorListRow),
     }];
-    await send.list(`🦷 *Select Dentist*`, 'View Dentists', sections);
+    await send.list(doctorPrompt, 'See dentists', sections, STEP('Choose a dentist'));
   }
   await updateSession(schema, phone, STATES.SELECT_DOCTOR, ctx);
 }
@@ -297,11 +423,7 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       await send.list(
         `❓ I couldn't tell which dentist you meant.\n\nPlease pick one from the list:`,
         'View Dentists',
-        [{ title: 'Dentists', rows: doctors.map(d => ({
-          id: d.id,
-          title: `Dr. ${d.name}`,
-          description: [d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : ''].filter(Boolean).join(' • '),
-        })) }]
+        [{ title: 'Dentists', rows: doctors.map(doctorListRow) }]
       );
       await updateSession(schema, phone, STATES.SELECT_DOCTOR, ctx);
       return;
@@ -320,12 +442,23 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   // for the 5.5 hours after IST midnight, which would exclude today's slots.
   const nowInIST = toZonedTime(new Date(), IST);
   const todayStr = format(nowInIST, 'yyyy-MM-dd');
-  const endStr = format(addDays(nowInIST, SLOT_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
 
-  const datesResult = await tenantQuery(schema, `
+  // Scoped to the BRANCH the patient chose, not just the dentist. A visiting
+  // consultant is at one branch on Tuesdays and another on Thursdays, and
+  // slotGenerator stamps each slot with the branch that weekday belongs to
+  // (`doctor_hospitals`), so a doctor-only filter offered a patient who picked
+  // Banjara Hills the dentist's Jubilee Hills days — and the confirmation,
+  // the appointment row and the reminder all then named the wrong address.
+  //
+  // The holiday check is correlated on the SLOT's own hospital_id for the same
+  // reason: keyed on the session's branch, a holiday at Banjara Hills hid the
+  // doctor's Jubilee Hills days, the exact inversion of the per-branch rule
+  // isBlockedDay() implements in the generator.
+  const findDates = async (windowDays) => tenantQuery(schema, `
     SELECT slot_date::text AS date, COUNT(*) AS slots
     FROM time_slots
     WHERE doctor_id = $1
+      AND hospital_id = $4
       AND slot_date BETWEEN $2 AND $3
       AND status = 'available'
       AND (
@@ -338,12 +471,27 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       )
       AND NOT EXISTS (
         SELECT 1 FROM clinic_holidays ch
-        WHERE ch.holiday_date = slot_date AND (ch.hospital_id = $4 OR ch.hospital_id IS NULL)
+        WHERE ch.holiday_date = slot_date
+          AND (ch.hospital_id IS NULL OR ch.hospital_id = time_slots.hospital_id)
       )
     GROUP BY slot_date
     ORDER BY slot_date
     LIMIT 7
-  `, [doc.id, todayStr, endStr, ctx.hospital_id]);
+  `, [doc.id, todayStr, format(addDays(nowInIST, windowDays), 'yyyy-MM-dd'), ctx.hospital_id]);
+
+  // The usual two-week window first. If it comes back empty, look across the
+  // whole generated horizon before giving up: visiting specialists attend
+  // fortnightly or monthly, so their next clinic is routinely further out than
+  // two weeks. The slots already exist (the cron generates CRON_LOOKAHEAD_DAYS
+  // ahead) — a patient booking a treatment sitting with a visiting endodontist
+  // was simply told "contact the clinic", which is what the whole self-booking
+  // flow exists to avoid, and there is no alternative dentist to offer them.
+  let datesResult = await findDates(SLOT_LOOKAHEAD_DAYS);
+  let beyondUsualWindow = false;
+  if (!datesResult.rows.length) {
+    datesResult = await findDates(CRON_LOOKAHEAD_DAYS);
+    beyondUsualWindow = datesResult.rows.length > 0;
+  }
 
   const dates = datesResult.rows.map(r => ({
     date: r.date,
@@ -351,22 +499,29 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     slots: parseInt(r.slots),
   }));
 
+  // Say so, rather than letting a date three weeks out look like an oversight.
+  if (beyondUsualWindow) {
+    await send.text(
+      `📅 Dr. ${doc.name} has no free slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\n` +
+      `Their next available date is *${dates[0].label.replace(/^Today \(|\)$/g, '')}*.`
+    );
+  }
+
   if (!dates.length) {
     // Offer other dentists in the same department so the user doesn't have to
     // restart the entire booking flow just to try a different doctor.
     const otherDoctors = doctors.filter(d => d.id !== doc.id);
     if (otherDoctors.length > 0) {
-      await send.text(`Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days. Here are other dentists available for ${ctx.department_name}:`);
+      // CRON_LOOKAHEAD_DAYS, not SLOT_LOOKAHEAD_DAYS: reaching here means the
+      // widened search found nothing either, so quoting the two-week figure
+      // would understate how far ahead we actually looked.
+      await send.text(`Dr. ${doc.name} has no available slots in the next ${CRON_LOOKAHEAD_DAYS} days. Here are other dentists available for ${ctx.department_name}:`);
       if (otherDoctors.length <= 3) {
         await send.buttons('🦷 *Select Dentist*', otherDoctors.map(d => `Dr. ${d.name}`));
       } else {
         const sections = [{
           title: `${ctx.department_name} Dentists`,
-          rows: otherDoctors.map(d => ({
-            id: d.id,
-            title: `Dr. ${d.name}`,
-            description: [d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : ''].filter(Boolean).join(' • ')
-          })),
+          rows: otherDoctors.map(doctorListRow),
         }];
         await send.list('🦷 *Select Dentist*', 'View Dentists', sections);
       }
@@ -375,7 +530,7 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       // No other doctors in this department — guide user back to menu
       const deptLabel = ctx.department_name || 'this specialty';
       await send.text(
-        `Dr. ${doc.name} has no available slots in the next ${SLOT_LOOKAHEAD_DAYS} days, and there are no other dentists available for ${deptLabel} right now.\n\nPlease try again later or contact the clinic directly.\n\nReply *Menu* to go back to the main menu.`
+        `Dr. ${doc.name} has no available slots in the next ${CRON_LOOKAHEAD_DAYS} days, and there are no other dentists available for ${deptLabel} right now.\n\nPlease try again later or contact the clinic directly.\n\nReply *Menu* to go back to the main menu.`
       );
       await updateSession(schema, phone, STATES.IDLE, {});
     }
@@ -406,9 +561,16 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
 
   const sections = [{
     title: 'Available Dates',
-    rows: dates.map(d => ({ id: d.date, title: d.label, description: `${d.slots} slots available` }))
+    // "12 slots available" on every row is noise — the number only matters when
+    // it is small enough to create urgency.
+    rows: dates.map(d => ({
+      id: d.date,
+      title: d.label,
+      ...(d.slots <= 3 ? { description: `Only ${d.slots} left` } : {}),
+    })),
   }];
-  await send.list(`📅 *Select Date*\n\nAvailable dates for Dr. ${doc.name}:`, 'Choose Date', sections);
+  await send.list(`Dr. ${doc.name} is free on these days.`, 'Pick a day', sections,
+    STEP('When suits you?'));
   await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
 }
 
@@ -477,16 +639,19 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
   // SLOT_DAY_OPEN_SQL re-checks leaves and holidays against the date the patient
   // actually chose. The date list this came from was filtered when it was BUILT;
   // a holiday declared since then does not retroactively edit the cached rows.
+  // hospital_id: same visiting-consultant reason as findDates above — the slots
+  // offered must be the ones at the branch the patient picked.
   const { SLOT_DAY_OPEN_SQL } = require('../bookingCore');
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
+       AND hospital_id=$3
        AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
             OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                 AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
        AND ${SLOT_DAY_OPEN_SQL}
      ORDER BY start_time`,
-    [ctx.doctor_id, resolvedDate]);
+    [ctx.doctor_id, resolvedDate, ctx.hospital_id]);
 
   if (!slots.rows.length) {
     // Auto-suggest next available dates instead of dead-ending
@@ -494,13 +659,15 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
       SELECT slot_date::text AS date, COUNT(*) AS slots
       FROM time_slots
       WHERE doctor_id = $1
+        AND hospital_id = $3
         AND slot_date > $2
         AND status = 'available'
         AND NOT EXISTS (
           SELECT 1 FROM doctor_leaves dl WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
         )
         AND NOT EXISTS (
-          SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date AND (ch.hospital_id = $3 OR ch.hospital_id IS NULL)
+          SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date
+            AND (ch.hospital_id IS NULL OR ch.hospital_id = time_slots.hospital_id)
         )
       GROUP BY slot_date
       ORDER BY slot_date
@@ -536,7 +703,12 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
       title: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`,
     })),
   }];
-  await send.list(`⏰ *Select Time*\n\nAvailable slots on ${dateLabel}:`, 'Choose Time', sections);
+  // The dentist's name is a nicety here, not a guarantee: the slot picker is
+  // also reached by paths that never set it (a resumed session, reschedule),
+  // and "with Dr. undefined" is worse than not naming them at all.
+  const withDoctor = ctx.doctor_name ? ` with Dr. ${ctx.doctor_name}` : '';
+  await send.list(`${dateLabel}${withDoctor}.`, 'Pick a time', sections,
+    STEP('What time?'));
   await updateSession(schema, phone, STATES.SELECT_SLOT, ctx);
 }
 
@@ -575,7 +747,7 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
   const patients = await getPatients(schema, phone);
   if (patients.length === 0) {
     // No profiles yet — collect new patient details
-    await send.text('👤 *Patient Name*\n\nPlease enter the full name of the patient:');
+    await send.text('Nearly there — what name should the appointment be under?');
     await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
     return;
   }
@@ -609,7 +781,7 @@ async function handleSelectPatient(phone, schema, send, ctx, choice, input) {
     /^➕|^add new|^new person|^new$/i.test(input) ||
     /^btn_1/i.test(choice)
   ) {
-    await send.text('👤 *New Patient Name*\n\nPlease enter the full name of the person being booked:');
+    await send.text('What is the full name of the person you are booking for?');
     await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
     return;
   }
@@ -639,19 +811,36 @@ async function handleSelectPatient(phone, schema, send, ctx, choice, input) {
 }
 
 async function askChiefComplaint(phone, schema, send, ctx) {
+  // On the "not sure" path this was already asked BEFORE the dentist, so asking
+  // again after the name would be the second time — and worse, the patient's
+  // next word ("Confirm") would be captured as their reason for visiting.
+  // Every caller routes through here, so the guard belongs here.
+  if (ctx.chief_complaint) {
+    return showConfirmation(phone, schema, send, ctx, updateSession);
+  }
   await send.buttons(
-    '🦷 *Reason for Visit*\n\nWhat brings you in today?',
-    ['🚨 Pain / Emergency', '🔍 Checkup / Cleaning', '✨ Cosmetic / Other']
+    'It helps the dentist prepare — or type it in your own words.',
+    ['🚨 Pain / Emergency', '🔍 Checkup / Cleaning', '✨ Cosmetic / Other'],
+    { header: 'What brings you in?' }
   );
   await updateSession(schema, phone, STATES.COLLECT_CHIEF_COMPLAINT, ctx);
 }
 
-async function handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSessionFn) {
+async function handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSessionFn, tenant) {
   const complaintMap = { btn_0: '🚨 Pain/Emergency', btn_1: '🔍 Checkup/Cleaning', btn_2: '✨ Cosmetic/Other' };
   const matchedKey = Object.keys(complaintMap).find(k =>
     (choice || '').startsWith(k + '_') || choice === k
   );
   ctx.chief_complaint = matchedKey ? complaintMap[matchedKey] : (input || null);
+
+  // Asked BEFORE the dentist when the patient said "not sure" (see
+  // showDepartments): at that point the answer can still change who they see.
+  // Asked after the slot on every other path, where it is only a note for the
+  // dentist. `_complaint_first` says which of the two we are in.
+  if (ctx._complaint_first) {
+    delete ctx._complaint_first;
+    return handleSelectDept(phone, schema, tenant, send, ctx, ctx._pending_dept_id, ctx._pending_dept_name);
+  }
   return showConfirmation(phone, schema, send, ctx, updateSessionFn);
 }
 
@@ -667,27 +856,29 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
       const feeR = await tenantQuery(schema,
         `SELECT consultation_fee FROM doctors WHERE id=$1`, [ctx.doctor_id]);
       const fee = feeR.rows[0]?.consultation_fee;
-      if (fee > 0) feeText = `\n💰 Consultation Fee: ₹${fee}`;
+      // Just "Fee": on the consultation path the line above already reads
+      // "Consultation · <name>", and "Consultation ₹300" under it said it twice.
+      if (fee > 0) feeText = `\nFee ₹${fee}`;
     } catch (_) {}
   }
 
-  const complaintLine = ctx.chief_complaint ? `\n📝 *Reason:* ${ctx.chief_complaint}` : '';
+  // Eight lines each opening with a different emoji read as clutter, not care.
+  // The shape below leads with WHEN and WHO — the two things a patient checks —
+  // then the supporting detail in one quiet block. One glyph, used once.
+  const complaintLine = ctx.chief_complaint ? `\n_${ctx.chief_complaint}_` : '';
   const summary =
-    `📋 *Please review your booking*\n\n` +
-    `🦷 *Clinic:* ${ctx.hospital_name}\n` +
-    `🏷 *Treatment:* ${ctx.department_name}\n` +
-    `👨‍⚕️ *Dentist:* Dr. ${ctx.doctor_name}\n` +
-    `📅 *Date:* ${dateLabel}\n` +
-    `⏰ *Time:* ${time}` +
+    `*${dateLabel}*\n` +
+    `*${time}* with Dr. ${ctx.doctor_name}\n\n` +
+    `${ctx.hospital_name}\n` +
+    `${ctx.department_name} · ${ctx.patient_name}` +
     feeText +
-    complaintLine +
-    `\n👤 *Patient:* ${ctx.patient_name}\n\n` +
-    `Tap *Confirm* to book your appointment.`;
+    complaintLine;
 
   // sendConfirmButtons binds btn_0/btn_1 to THIS message: a stale "✅ Confirm"
   // tap from an abandoned earlier booking must not book this one (botEngine's
   // CONFIRM_BOOKING branch checks the binding).
-  await sendConfirmButtons(send, ctx, summary, ['✅ Confirm', '❌ Cancel']);
+  await sendConfirmButtons(send, ctx, summary, ['✅ Confirm', '❌ Cancel'],
+    { header: 'Check and confirm', footer: 'Nothing is booked until you confirm' });
   await updateSessionFn(schema, phone, STATES.CONFIRM_BOOKING, ctx);
 }
 
@@ -774,6 +965,35 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
         `UPDATE patients SET visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`, [patientId]);
     }
 
+    // A treatment sitting: re-check the course under the plan's row lock BEFORE
+    // touching the slot. Locks go plan → slot everywhere (POST
+    // /treatment-plans/:id/visits does the same); a receptionist booking the
+    // same sitting from the dashboard while the patient confirms on WhatsApp
+    // would deadlock against the opposite order.
+    //
+    // The session context was written when the patient tapped *Treatment* —
+    // possibly days ago on an abandoned flow — and the clinic may have booked
+    // this sitting at the desk since. The session is not the authority on how
+    // many sittings remain; this count is.
+    let planVisitNumber = null;
+    if (ctx.treatment_plan_id) {
+      const lockedPlan = await client.query(
+        `SELECT id, status, total_visits FROM treatment_plans WHERE id=$1 FOR UPDATE`,
+        [ctx.treatment_plan_id]);
+      const counts = await client.query(`
+        SELECT COUNT(*) FILTER (WHERE status <> 'cancelled')::int AS booked_visits
+        FROM appointments WHERE treatment_plan_id = $1
+      `, [ctx.treatment_plan_id]);
+      const live = lockedPlan.rows[0];
+      const booked = counts.rows[0].booked_visits;
+      if (!live || !['proposed', 'in_progress'].includes(live.status) || booked >= live.total_visits) {
+        const err = new Error('PLAN_NOT_BOOKABLE');
+        err.code = 'PLAN_NOT_BOOKABLE';
+        throw err;
+      }
+      planVisitNumber = booked + 1;
+    }
+
     // Atomic slot lock. The time predicate re-checks that the slot hasn't
     // passed — a patient can sit on the confirm screen for hours (4h session
     // window) and previously could confirm a slot whose start time had gone by.
@@ -789,7 +1009,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
               OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                   AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
          AND ${SLOT_DAY_OPEN_SQL}
-       RETURNING id`,
+       RETURNING id, hospital_id`,
       [ctx.slot_id]);
 
     if (!slotUpdate.rows.length) {
@@ -844,17 +1064,63 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     ({ bookingId } = await insertAppointmentWithRetry(client, {
       patientId,
       doctorId: ctx.doctor_id,
-      hospitalId: ctx.hospital_id,
+      // The branch comes from the LOCKED SLOT, not the session. For a visiting
+      // consultant the two can disagree — the slot carries the branch that
+      // weekday belongs to (doctor_hospitals), while ctx holds whichever branch
+      // the patient picked several steps earlier. The slot is the row the
+      // dentist's calendar was actually generated from, so it wins; the session
+      // value is only the fallback for a slot predating the hospital_id column.
+      hospitalId: slotUpdate.rows[0].hospital_id || ctx.hospital_id,
       slotId: ctx.slot_id,
       appointmentDate: ctx.appointment_date,
       appointmentTime: ctx.appointment_time,
       visitType: ctx.visit_type || 'in_person',
-      notes: ctx.chief_complaint || null,
+      notes: ctx.chief_complaint
+        || (ctx.treatment_plan_title ? `${ctx.treatment_plan_title} — visit ${planVisitNumber}` : null),
+      // The treatment the patient actually picked. Can't be re-derived from the
+      // doctor any more — a dentist belongs to several departments.
+      departmentId: ctx.department_id || null,
+      treatmentPlanId: ctx.treatment_plan_id || null,
+      visitNumber: planVisitNumber,
     }));
+
+    // First sitting booked ⇒ the course has started. Same derivation the admin
+    // routes use, so a plan can't end up in a status the dashboard disagrees with.
+    if (ctx.treatment_plan_id) {
+      const { derivePlanStatus } = require('../../utils/treatmentPlan');
+      const after = await client.query(`
+        SELECT COUNT(*) FILTER (WHERE status = 'completed')::int AS completed_visits,
+               COUNT(*) FILTER (WHERE status <> 'cancelled')::int AS booked_visits
+        FROM appointments WHERE treatment_plan_id = $1
+      `, [ctx.treatment_plan_id]);
+      const planR = await client.query(
+        `SELECT status, total_visits FROM treatment_plans WHERE id=$1`, [ctx.treatment_plan_id]);
+      const next = derivePlanStatus(planR.rows[0].status, {
+        totalVisits: planR.rows[0].total_visits,
+        completedVisits: after.rows[0].completed_visits,
+        bookedVisits: after.rows[0].booked_visits,
+      });
+      if (next !== planR.rows[0].status) {
+        await client.query(`UPDATE treatment_plans SET status=$1, updated_at=NOW() WHERE id=$2`,
+          [next, ctx.treatment_plan_id]);
+      }
+    }
 
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    // Not a fault — the sitting was booked or the course closed while this
+    // patient was mid-flow. Saying "something went wrong" would send them
+    // round again for an appointment they already have.
+    if (err.code === 'PLAN_NOT_BOOKABLE') {
+      logger.info('Treatment sitting no longer bookable', { plan: ctx.treatment_plan_id });
+      await send.text(
+        'ℹ️ All sittings for this treatment are already booked.\n\n' +
+        'Reply *My* to see your appointments, or *Menu* for the main menu.'
+      );
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
     logger.error('Booking transaction failed', { error: err.message });
     await send.text(
       '⚠️ *Something went wrong*\n\n' +
@@ -887,18 +1153,21 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
 
   // Send confirmation and post-transaction side-effects in parallel.
   const confirmationText =
-    `🎉 *Appointment Confirmed!*\n\n` +
-    `🪪 Booking ID: *${bookingId}*\n` +
-    `👨‍⚕️ Dr. ${ctx.doctor_name}\n` +
-    `🦷 ${ctx.hospital_name}\n` +
-    `📅 ${dateLabel} at ${(ctx.appointment_time || '').slice(0, 5)}\n\n` +
-    `🦷 *Before your visit:*\n` +
-    `• Arrive 10 minutes early\n` +
-    `• Bring any previous dental X-rays or records\n` +
-    `• Inform us of any medications or allergies\n` +
-    `• Avoid eating 1 hour before the appointment\n\n` +
-    `📌 Save your Booking ID to reschedule or cancel.\n` +
-    `We'll send you a reminder 24 hours before. See you then! 😊`;
+    // This is the message a patient scrolls back to — and screenshots. It leads
+    // with the appointment itself, not with a celebration, and the boilerplate
+    // ("arrive 10 minutes early, bring your X-rays, tell us about medications,
+    // don't eat beforehand") is cut to the one line that is actually true for
+    // every visit. Generic advice repeated in full to everyone is what makes a
+    // clinic's messages feel automated; the reminder 24h before is where a
+    // per-treatment checklist already belongs (see the department checklist in
+    // jobs/reminders.js).
+    `✅ *Booked*\n\n` +
+    `*${dateLabel}*\n` +
+    `*${(ctx.appointment_time || '').slice(0, 5)}* with Dr. ${ctx.doctor_name}\n\n` +
+    `${ctx.hospital_name}\n` +
+    `Booking ID *${bookingId}*\n\n` +
+    `Please arrive 10 minutes early, and bring any previous X-rays or a list of your medicines.\n\n` +
+    `We'll remind you the day before. Reply *Menu* to reschedule or cancel.`;
 
   await Promise.allSettled([
     // Enhancement 12: try approved WhatsApp template first (works outside 24h session window);

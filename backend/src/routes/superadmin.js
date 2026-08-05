@@ -422,7 +422,11 @@ router.get('/tenants/:id/stats', validateUUID(), async (req, res) => {
 
     const [appts, patients, doctors] = await Promise.all([
       tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE created_at >= NOW() - INTERVAL '30 days'`),
-      tenantQuery(s, `SELECT COUNT(*) FROM patients`),
+      // deleted_at IS NULL, matching /stats, /quota and the stats-cache
+      // writers. Without it these panels counted GDPR-anonymised rows and
+      // reported a higher patient count than the platform roll-up does for
+      // the same tenant.
+      tenantQuery(s, `SELECT COUNT(*) FROM patients WHERE deleted_at IS NULL`),
       tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
     ]);
     res.json({
@@ -445,7 +449,11 @@ router.get('/tenants/:id/health', validateUUID(), async (req, res) => {
       tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE created_at >= NOW() - INTERVAL '30 days'`),
       tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE created_at >= NOW() - INTERVAL '7 days'`),
       tenantQuery(s, `SELECT MAX(created_at) as last FROM appointments`),
-      tenantQuery(s, `SELECT COUNT(*) FROM patients`),
+      // deleted_at IS NULL, matching /stats, /quota and the stats-cache
+      // writers. Without it these panels counted GDPR-anonymised rows and
+      // reported a higher patient count than the platform roll-up does for
+      // the same tenant.
+      tenantQuery(s, `SELECT COUNT(*) FROM patients WHERE deleted_at IS NULL`),
       tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
       tenantQuery(s, `SELECT COUNT(*) FROM time_slots WHERE slot_date >= ${IST_TODAY_SQL} AND status='available'`),
     ]);

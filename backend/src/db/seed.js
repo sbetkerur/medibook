@@ -174,19 +174,34 @@ async function seed() {
       [hospital2.id, name]);
     deptIds2[name] = r.rows[0].id;
   }
-  // Deactivate any old non-dental departments (scoped to both known branches only)
-  await tenantQuery(schema,
-    `UPDATE departments SET is_active=false
-     WHERE hospital_id IN ($${deptList.length+1},$${deptList.length+2})
-       AND name NOT IN (${deptList.map((_,i)=>`$${i+1}`).join(',')})`,
-    [...deptList, hospital.id, hospital2.id]);
+  // Deactivate any old non-dental departments (scoped to both known branches only).
+  //
+  // Gated on SEED_DEMO_RESET like every other write here that can undo an admin
+  // edit. Ungated, this ran on EVERY boot and deactivated any department whose
+  // name is not one of the seven hardcoded strings — so a "Teeth Whitening"
+  // category an operator added to the demo tenant silently disappeared at the
+  // next deploy, with no audit-log entry. That is the same class of regression
+  // the legacy-doctor cleanup below was rewritten to stop.
+  if (SEED_DEMO_RESET) {
+    const deactivated = await tenantQuery(schema,
+      `UPDATE departments SET is_active=false
+       WHERE hospital_id IN ($${deptList.length+1},$${deptList.length+2})
+         AND name NOT IN (${deptList.map((_,i)=>`$${i+1}`).join(',')})`,
+      [...deptList, hospital.id, hospital2.id]);
+    console.log(`✅ Non-seed departments deactivated: ${deactivated.rowCount} (SEED_DEMO_RESET)`);
+  }
   console.log(`✅ ${deptList.length} dental treatment categories — Branch 1`);
   console.log(`✅ ${deptList2.length} dental treatment categories — Branch 2 (KPHB)`);
 
   // ── DENTISTS ──────────────────────────────────────────────────
   // branch: 1 = Banjara Hills, 2 = KPHB
+  // `dept` is the PRIMARY department; `alsoDepts` are the other treatments the
+  // dentist renders (doctor_departments). The general dentists carry extras
+  // because that's how Indian clinics actually run — the GP does simple root
+  // canals and extractions, and refers the hard ones to the specialist on staff.
   const doctorDefs = [
-    { name: 'Kavitha Reddy',   spec: 'General Dentist',              qual: 'BDS',                           dept: 'General Dentistry',       fee: 300,  duration: 30, branch: 1 },
+    { name: 'Kavitha Reddy',   spec: 'General Dentist',              qual: 'BDS',                           dept: 'General Dentistry',       fee: 300,  duration: 30, branch: 1,
+      alsoDepts: ['Root Canal Treatment', 'Oral Surgery'] },
     { name: 'Arjun Sharma',    spec: 'Endodontist',                  qual: 'BDS, MDS (Endodontics)',        dept: 'Root Canal Treatment',    fee: 700,  duration: 60, branch: 1 },
     { name: 'Preethi Nair',    spec: 'Orthodontist',                 qual: 'BDS, MDS (Orthodontics)',       dept: 'Orthodontics & Braces',   fee: 600,  duration: 45, branch: 1 },
     { name: 'Rohit Malhotra',  spec: 'Implantologist',               qual: 'BDS, MDS, Fellow (Implants)',   dept: 'Dental Implants',         fee: 1000, duration: 60, branch: 1 },
@@ -194,7 +209,8 @@ async function seed() {
     { name: 'Divya Rao',       spec: 'Pediatric Dentist',            qual: 'BDS, MDS (Pedodontics)',        dept: 'Pediatric Dentistry',     fee: 350,  duration: 30, branch: 1 },
     { name: 'Vinod Kumar',     spec: 'Oral & Maxillofacial Surgeon', qual: 'BDS, MDS (Oral Surgery)',       dept: 'Oral Surgery',            fee: 800,  duration: 60, branch: 1 },
     // KPHB branch dentists
-    { name: 'Meghna Iyer',     spec: 'General Dentist',              qual: 'BDS',                           dept: 'General Dentistry',       fee: 300,  duration: 30, branch: 2 },
+    { name: 'Meghna Iyer',     spec: 'General Dentist',              qual: 'BDS',                           dept: 'General Dentistry',       fee: 300,  duration: 30, branch: 2,
+      alsoDepts: ['Root Canal Treatment'] },
     { name: 'Suresh Babu',     spec: 'Endodontist',                  qual: 'BDS, MDS (Endodontics)',        dept: 'Root Canal Treatment',    fee: 650,  duration: 60, branch: 2 },
     { name: 'Anjali Verma',    spec: 'Cosmetic Dentist',             qual: 'BDS, MDS (Prosthodontics)',     dept: 'Cosmetic Dentistry',      fee: 500,  duration: 45, branch: 2 },
   ];
@@ -249,14 +265,22 @@ async function seed() {
     const ex = await tenantQuery(schema,
       `SELECT id FROM doctors WHERE name=$1 AND hospital_id=$2`, [d.name, hospId]);
     if (ex.rows[0]) {
-      // Re-activate if previously deactivated, update details
-      await tenantQuery(schema, `
-        UPDATE doctors SET
-          specialization=$1, qualification=$2, department_id=$3,
-          consultation_fee=$4, slot_duration_minutes=$5,
-          hospital_id=$6, is_active=true
-        WHERE id=$7
-      `, [d.spec, d.qual, deptMap[d.dept], d.fee, d.duration, hospId, ex.rows[0].id]);
+      // Only under SEED_DEMO_RESET. Ungated, this re-applied specialization,
+      // qualification, department, FEE, slot duration, branch and is_active for
+      // all ten seeded dentists on EVERY boot — so raising Dr. Kavitha Reddy's
+      // consultation fee from ₹300 to ₹400 through the dashboard lasted exactly
+      // until the next deploy, silently and with no audit trail. The row is
+      // still adopted either way; what changes is whether the seed's opinion of
+      // its contents overrides the clinic's.
+      if (SEED_DEMO_RESET) {
+        await tenantQuery(schema, `
+          UPDATE doctors SET
+            specialization=$1, qualification=$2, department_id=$3,
+            consultation_fee=$4, slot_duration_minutes=$5,
+            hospital_id=$6, is_active=true
+          WHERE id=$7
+        `, [d.spec, d.qual, deptMap[d.dept], d.fee, d.duration, hospId, ex.rows[0].id]);
+      }
       doctorIds.push({ id: ex.rows[0].id, duration: d.duration, name: d.name, hospital_id: hospId });
     } else {
       const r = await tenantQuery(schema, `
@@ -265,6 +289,20 @@ async function seed() {
         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
       `, [hospId, deptMap[d.dept], d.name, d.spec, d.qual, d.fee, d.duration]);
       doctorIds.push({ id: r.rows[0].id, duration: d.duration, name: d.name, hospital_id: hospId });
+    }
+
+    // Bookable department set. The primary is included explicitly rather than
+    // left to the tenantMigrate backfill: migrate runs BEFORE seed on every boot
+    // (entrypoint.sh), so a doctor created here would otherwise be unbookable
+    // over WhatsApp until the NEXT restart.
+    const doctorId = doctorIds[doctorIds.length - 1].id;
+    const deptIdsForDoctor = [d.dept, ...(d.alsoDepts || [])]
+      .map(name => deptMap[name])
+      .filter(Boolean);
+    for (const deptId of deptIdsForDoctor) {
+      await tenantQuery(schema,
+        `INSERT INTO doctor_departments (doctor_id, department_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [doctorId, deptId]);
     }
   }
   console.log(`✅ ${doctorDefs.length} dentists added/updated (7 Banjara Hills + 3 KPHB):`);
@@ -279,7 +317,10 @@ async function seed() {
         VALUES ($1,$2,'10:00','17:00',true,'13:00','14:00')
         ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
           start_time='10:00', end_time='17:00', is_working=true,
-          lunch_start_time='13:00', lunch_end_time='14:00'
+          lunch_start_time='13:00', lunch_end_time='14:00',
+          -- Same reasoning as the lunch columns below: a re-run must be a true
+          -- reset, so clear any visiting-consultant week pattern left behind.
+          week_of_month=NULL
       `, [doc.id, dow]);
     }
     // Saturday: working half-day (10AM–1PM, no lunch break)
@@ -289,8 +330,11 @@ async function seed() {
       VALUES ($1,6,'10:00','13:00',true)
       ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
         start_time='10:00', end_time='13:00', is_working=true,
-        lunch_start_time=NULL, lunch_end_time=NULL
+        lunch_start_time=NULL, lunch_end_time=NULL, week_of_month=NULL
     `, [doc.id]);
+    // Per-day branch overrides too: the demo dentists are all resident, so a
+    // re-seed must leave nobody visiting another branch on a weekday.
+    await tenantQuery(schema, `DELETE FROM doctor_hospitals WHERE doctor_id=$1`, [doc.id]);
   }
   console.log('✅ Schedules set (Mon–Fri 10AM–5PM lunch 1–2PM, Sat 10AM–1PM)');
 

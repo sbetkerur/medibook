@@ -47,7 +47,7 @@ router.get('/analytics', makeAnalyticsLimiter(), async (req, res) => {
       tenantQuery(s, `
         SELECT COALESCE(dep.name, 'General') as name, COUNT(a.id) as count FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
-        LEFT JOIN departments dep ON dep.id=d.department_id
+        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         WHERE a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
           AND a.status IN ('confirmed', 'completed')
         GROUP BY COALESCE(dep.name, 'General') ORDER BY count DESC
@@ -122,6 +122,13 @@ router.get('/analytics/heatmap', makeAnalyticsLimiter(), async (req, res) => {
 });
 
 // ── REVENUE DASHBOARD (A6) ────────────────────────────────────
+// All three queries below are bounded at BOTH ends. Without the upper bound
+// every confirmed FUTURE appointment counted as revenue already taken — and
+// slots are generated 60 days ahead, so a clinic with 40 confirmed bookings
+// next month saw that month appear as banked income and a total inflated by
+// the same amount. /analytics/summary was fixed for exactly this and this
+// endpoint — the one actually labelled "revenue" — was not, so the two figures
+// on the same dashboard did not reconcile and the larger one was wrong.
 router.get('/analytics/revenue', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
@@ -135,6 +142,7 @@ router.get('/analytics/revenue', makeAnalyticsLimiter(), async (req, res) => {
         FROM appointments a JOIN doctors d ON d.id=a.doctor_id
         WHERE a.status IN ('confirmed','completed')
           AND a.appointment_date >= ${IST_TODAY_SQL} - ($1 * INTERVAL '1 month')
+          AND a.appointment_date <= ${IST_TODAY_SQL}
         GROUP BY DATE_TRUNC('month', a.appointment_date)
         ORDER BY month_date
       `, [months]),
@@ -144,9 +152,10 @@ router.get('/analytics/revenue', makeAnalyticsLimiter(), async (req, res) => {
                COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)), 0)::int AS revenue
         FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
-        LEFT JOIN departments dep ON dep.id=d.department_id
+        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         WHERE a.status IN ('confirmed','completed')
           AND a.appointment_date >= ${IST_TODAY_SQL} - ($1 * INTERVAL '1 month')
+          AND a.appointment_date <= ${IST_TODAY_SQL}
         GROUP BY COALESCE(dep.name, 'General') ORDER BY revenue DESC
       `, [months]),
       tenantQuery(s, `
@@ -156,9 +165,10 @@ router.get('/analytics/revenue', makeAnalyticsLimiter(), async (req, res) => {
                COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)), 0)::int AS revenue
         FROM appointments a
         JOIN doctors d ON d.id=a.doctor_id
-        LEFT JOIN departments dep ON dep.id=d.department_id
+        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         WHERE a.status IN ('confirmed','completed')
           AND a.appointment_date >= ${IST_TODAY_SQL} - ($1 * INTERVAL '1 month')
+          AND a.appointment_date <= ${IST_TODAY_SQL}
         GROUP BY d.name, dep.name, d.specialization
         ORDER BY revenue DESC LIMIT 10
       `, [months]),

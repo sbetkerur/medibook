@@ -228,7 +228,7 @@ async function run() {
     assert.strictEqual(db.appointments[0].status, 'confirmed', 'appointment was cancelled by a stale tap');
     assert.strictEqual(db.slots.get('slot-9'), 'booked', 'slot was released by a stale tap');
     assert(/older message/.test(texts()), 'expected a re-ask: ' + texts());
-    assert(!/Appointment Cancelled/.test(texts()), 'cancellation confirmation was sent');
+    assert(!/\*Cancelled\*/.test(texts()), 'cancellation confirmation was sent');
   });
 
   await test('a stale btn_1 tap does not silently answer "keep" either — it re-asks', async () => {
@@ -249,7 +249,7 @@ async function run() {
     reset();
     await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, freshIds[0]);
     assert.strictEqual(db.appointments[0].status, 'cancelled', 'fresh tap did not cancel: ' + texts());
-    assert(/Appointment Cancelled/.test(texts()));
+    assert(/\*Cancelled\*/.test(texts()), texts());
   });
 
   await test('tapping the real "Yes, Cancel It" button cancels', async () => {
@@ -269,7 +269,7 @@ async function run() {
     reset();
     await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, ids[1]);
     assert.strictEqual(db.appointments[0].status, 'confirmed');
-    assert(/still on/.test(texts()), texts());
+    assert(/Still on/.test(texts()), texts());
   });
 
   await test('typed "yes" still cancels (unchanged)', async () => {
@@ -316,7 +316,7 @@ async function run() {
     reset();
     await handleRescheduleConfirm(PHONE, SCHEMA, tenant, send, ctx, ids[0]);
     assert.strictEqual(db.appointments[0].rescheduled, true, 'real tap did not reschedule: ' + texts());
-    assert(/Rescheduled/.test(texts()));
+    assert(/\*Moved\*/.test(texts()), texts());
   });
 
   await test('typed "yes" still reschedules; "no, keep it" still does not', async () => {
@@ -364,7 +364,11 @@ async function run() {
     const ctx = { _dates: [{ date: '2099-01-05', label: 'Mon, 5 Jan', slots: 4 }], doctor_id: 'doc-1', hospital_id: 'h-1' };
     reset();
     await handleSelectDate(PHONE, SCHEMA, tenant, send, ctx, '2099-01-05');
-    assert(/Select Time/.test(texts()), texts());
+    // Assert the slot picker was actually rendered, not the wording of it —
+    // `texts()` only joins message bodies, and the step title now lives in
+    // WhatsApp's header slot with the times in the list rows.
+    assert(sent.some(m => m.type === 'list' && (m.sections || []).some(s => /^Slots on /.test(s.title))),
+      texts());
     assert.strictEqual(db.sessions.get(PHONE).state, STATES.SELECT_SLOT);
   });
 

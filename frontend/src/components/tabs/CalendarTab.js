@@ -4,6 +4,7 @@ import api from '@/lib/api';
 import { todayIST } from '@/lib/dateIST';
 import { format, parseISO } from 'date-fns';
 import Badge from '@/components/ui/Badge';
+import toast from 'react-hot-toast';
 
 // The month cursor is derived from the IST date, never `new Date()` — on a
 // device set to UTC, "now" is still on the previous day (and, on the 1st, the
@@ -18,7 +19,8 @@ function istMonthStart() {
 // buttons refetch directly.
 export default function CalendarTab() {
   const [calendarDate, setCalendarDate] = useState(istMonthStart);
-  const [calendarAppts, setCalendarAppts] = useState([]);
+  // A date -> appointments map, not a list (see the byDate build below).
+  const [calendarAppts, setCalendarAppts] = useState({});
   const [selectedCalDay, setSelectedCalDay] = useState(null);
   const [calDayAppts, setCalDayAppts] = useState([]);
 
@@ -29,13 +31,31 @@ export default function CalendarTab() {
       // The backend caps `limit` at 100 and sorts DESC — a busy month can exceed
       // that, silently dropping the earliest days. Page through until has_more
       // is false (safety cap of 10 pages = 1000 appointments).
+      // A failure PART-WAY through must not discard the pages already fetched.
+      // Previously any rejection inside this loop threw out of the whole
+      // function into a silent catch, so `all` was dropped and calendarAppts
+      // was never set: one transient 429 or a 502 during a redeploy rendered
+      // every day of a fully-booked month with no badge and no error at all,
+      // which staff read as an empty month. Partial data with a warning is the
+      // honest answer; nothing, silently, is not.
       const all = [];
+      let partial = false;
       for (let page = 1; page <= 10; page++) {
-        const { data } = await api.get(
-          `/admin/appointments?from=${startDate}&to=${endDate}&limit=100&page=${page}&status=confirmed,completed`
-        );
-        all.push(...(data.appointments || []));
-        if (!data.has_more) break;
+        try {
+          const { data } = await api.get(
+            `/admin/appointments?from=${startDate}&to=${endDate}&limit=100&page=${page}&status=confirmed,completed`
+          );
+          all.push(...(data.appointments || []));
+          if (!data.has_more) break;
+        } catch {
+          partial = true;
+          break;
+        }
+      }
+      if (partial) {
+        toast.error(all.length
+          ? 'Some appointments could not be loaded — this month may be incomplete'
+          : 'Could not load this month’s appointments');
       }
       // Group by date
       const byDate = {};
@@ -45,7 +65,7 @@ export default function CalendarTab() {
         byDate[d].push(a);
       });
       setCalendarAppts(byDate);
-    } catch { /* silent */ }
+    } catch { toast.error('Could not load this month’s appointments'); }
   }, []);
 
   useEffect(() => {

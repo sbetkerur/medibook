@@ -265,6 +265,8 @@ app.use('/api/admin', require('./routes/analytics'));
 // admin.js: dashboard, staff, settings, feedback, audit-logs, bot-tester, calendar
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/admin', require('./routes/services'));  // A1 service catalog + A4 holidays
+app.use('/api/admin', require('./routes/treatmentPlans')); // multi-visit courses, payments, lab work
+app.use('/api/admin', require('./routes/recalls'));        // recare / check-up loop
 app.use('/api/admin', require('./routes/events'));    // SSE real-time dashboard
 app.use('/api/superadmin', require('./routes/superadmin'));
 
@@ -438,6 +440,8 @@ app.use('/api/v1/admin',    require('./routes/patients'));
 app.use('/api/v1/admin',    require('./routes/analytics'));
 app.use('/api/v1/admin',    require('./routes/admin'));
 app.use('/api/v1/admin',    require('./routes/services'));
+app.use('/api/v1/admin',    require('./routes/treatmentPlans'));
+app.use('/api/v1/admin',    require('./routes/recalls'));
 app.use('/api/v1/admin',    require('./routes/events'));
 app.use('/api/v1/superadmin', require('./routes/superadmin'));
 
@@ -579,6 +583,8 @@ const server = app.listen(PORT, () => {
     const { startWebhookRetryCron } = require('./jobs/retryWebhooks');
     const { startBackupCron } = require('./jobs/backupManager');
     const { startSessionCleanerCron } = require('./jobs/sessionCleaner');
+    const { startTreatmentNudgeCron } = require('./jobs/treatmentNudges');
+    const { startRecallCron } = require('./jobs/recalls');
     // Track cron tasks so we can stop them gracefully before DB closes.
     // Only ONE backup cron is registered (backupManager's spawn()-based daily
     // job) — slotGenerator.js's exec()-based weekly startBackupReminderCron was
@@ -589,6 +595,8 @@ const server = app.listen(PORT, () => {
       startWebhookRetryCron(),
       startBackupCron(),
       startSessionCleanerCron(),
+      startTreatmentNudgeCron(),
+      startRecallCron(),
     ];
     startBotWorker();
   }

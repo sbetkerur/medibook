@@ -19,6 +19,8 @@ import HospitalsTab from '@/components/tabs/HospitalsTab';
 import FeedbackTab from '@/components/tabs/FeedbackTab';
 import AnalyticsTab from '@/components/tabs/AnalyticsTab';
 import ServicesTab from '@/components/tabs/ServicesTab';
+import TreatmentPlansTab from '@/components/tabs/TreatmentPlansTab';
+import RecordTreatmentModal from '@/components/RecordTreatmentModal';
 import HolidaysTab from '@/components/tabs/HolidaysTab';
 import StaffTab from '@/components/tabs/StaffTab';
 import SettingsTab from '@/components/tabs/SettingsTab';
@@ -36,13 +38,22 @@ const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
   has_lunch: false,
   lunch_start_time: '13:00',
   lunch_end_time: '14:00',
+  // Visiting consultants only. '' = the dentist's primary branch;
+  // [] = every week (which is what a resident dentist always means).
+  hospital_id: '',
+  week_of_month: [],
 }));
+
+// "1st Saturday", "3rd Tuesday" — counted as the Nth occurrence of that weekday
+// in the month, which is how clinics say it. Alternate weeks = 1st, 3rd and 5th.
+const WEEK_LABELS = ['1st', '2nd', '3rd', '4th', '5th'];
 
 // Modal, ConfirmModal imported from @/components/ui
 
 const NAV = [
   { id: 'overview', label: 'Overview', icon: '📊' },
   { id: 'appointments', label: 'Appointments', icon: '📅' },
+  { id: 'treatments', label: 'Treatments', icon: '🩺' },
   { id: 'doctors', label: 'Dentists', icon: '🦷' },
   { id: 'hospitals', label: 'Clinics', icon: '🏥' },
   { id: 'patients', label: 'Patients', icon: '👥' },
@@ -94,15 +105,25 @@ export default function Dashboard() {
   const [editingDoctor, setEditingDoctor] = useState(null);
   const [doctorForm, setDoctorForm] = useState({
     name: '', specialization: '', qualification: '',
-    hospital_id: '', department_id: '', consultation_fee: '', slot_duration_minutes: '30',
+    // department_id is the PRIMARY treatment (what receipts and analytics show);
+    // extra_department_ids are the OTHER treatments this dentist renders. The two
+    // are combined into department_ids on save.
+    hospital_id: '', department_id: '', extra_department_ids: [], consultation_fee: '', slot_duration_minutes: '30',
   });
   const [doctorSaving, setDoctorSaving] = useState(false);
+  // The appointment a treatment is being recorded against, opened from the
+  // appointment row itself. Null when the modal is closed.
+  const [recordTreatmentAppt, setRecordTreatmentAppt] = useState(null);
 
   // Schedule state
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [schedulingDoctor, setSchedulingDoctor] = useState(null);
   const [schedule, setSchedule] = useState(DEFAULT_SCHEDULE);
   const [scheduleSaving, setScheduleSaving] = useState(false);
+  // Visiting consultant: attends particular branches on particular weekdays,
+  // often only on some weeks of the month. Hidden by default — it would be
+  // noise on the resident dentists who make up most of a clinic.
+  const [isVisiting, setIsVisiting] = useState(false);
   const [generatingSlots, setGeneratingSlots] = useState(false);
 
   // Slot viewer state
@@ -144,6 +165,7 @@ export default function Dashboard() {
   // Settings state (`settings` is shared with DoctorsTab; the editable form
   // and save state live inside SettingsTab)
   const [settings, setSettings] = useState(null);
+  const [settingsFailed, setSettingsFailed] = useState(false);
 
   // Notifications state
   const [notifications, setNotifications] = useState([]);
@@ -151,6 +173,11 @@ export default function Dashboard() {
   const [showNotifDropdown, setShowNotifDropdown] = useState(false);
   // Keys (appointment id + booking_id) of notifications already shown, so SSE
   // and the 30s poll never double-insert or re-count the same booking.
+  // Generation tokens for modals whose data is fetched per selection. A slow
+  // response from a PREVIOUS selection must never overwrite the current one —
+  // see openPatientHistory and fetchSlots below for what that looked like.
+  const patientHistoryReqRef = useRef(0);
+  const slotsReqRef = useRef(0);
   const notifSeenKeys = useRef(new Set());
   // Companion insertion-order array so the Set above can be capped cheaply —
   // a reception desk left open all day would otherwise grow this without
@@ -477,11 +504,19 @@ export default function Dashboard() {
 
   // `settings` is shared (read by DoctorsTab), so it stays here and is passed to
   // SettingsTab, which derives its editable form from it.
+  // settingsFailed distinguishes "still loading" from "load failed". Without
+  // it a failure left `settings` at null and SettingsTab rendered "Loading
+  // settings..." indefinitely — the toast expires in four seconds and there was
+  // no retry, so the tab looked permanently stuck.
   const fetchSettings = useCallback(async () => {
     try {
       const { data } = await api.get('/admin/settings');
       setSettings(data);
-    } catch { toast.error('Failed to load settings'); }
+      setSettingsFailed(false);
+    } catch {
+      setSettingsFailed(true);
+      toast.error('Failed to load settings');
+    }
   }, []);
 
   const fetchAnalyticsSummary = useCallback(async () => {
@@ -707,12 +742,25 @@ export default function Dashboard() {
     setPatientHistoryLoading(true);
     setMedHistoryEditing(false);
     setShowPatientHistory(true);
+    // Generation token — the guard SlotsTab implements for the same hazard.
+    // Without it, opening patient A, closing, then opening patient B raced: B's
+    // smaller payloads landed first and rendered, then A's slower ones
+    // overwrote them. The modal header (name, phone, DOB) comes from
+    // selectedPatient, so it read B while the Allergies / Chronic Conditions /
+    // Medications rows and the entire appointment history were A's — with
+    // medHistoryFailed false, so nothing warned. Clicking Edit → Save then
+    // PATCHed A's medical history onto B permanently. For clinical fields this
+    // is the worst possible failure, so every write below is gated on the
+    // request still being the current one.
+    const requestId = ++patientHistoryReqRef.current;
+    const isStale = () => requestId !== patientHistoryReqRef.current;
     try {
       const [histData, medData, docsData] = await Promise.allSettled([
         api.get(`/admin/patients/${patient.id}/appointments`),
         api.get(`/admin/patients/${patient.id}/medical-history`),
         api.get(`/admin/patients/${patient.id}/documents`),
       ]);
+      if (isStale()) return;
       if (histData.status === 'fulfilled') setPatientHistory(histData.value.data.appointments || []);
       if (medData.status === 'fulfilled') {
         const mh = medData.value.data.patient?.medical_history || {};
@@ -729,17 +777,56 @@ export default function Dashboard() {
       if (docsData.status === 'fulfilled') setPatientDocuments(docsData.value.data.documents || []);
       // Promise.allSettled never rejects, so the surrounding catch was dead code.
     } catch { toast.error('Failed to load history'); }
-    finally { setPatientHistoryLoading(false); }
+    finally { if (!isStale()) setPatientHistoryLoading(false); }
   }
 
   async function updateApptStatus(apptId, newStatus) {
     try {
-      await api.patch(`/admin/appointments/${apptId}`, { status: newStatus });
+      const { data } = await api.patch(`/admin/appointments/${apptId}`, { status: newStatus });
       setAppointments(prev => prev.map(a => a.id === apptId ? { ...a, status: newStatus } : a));
       toast.success(`Marked as ${newStatus.replace('_', ' ')}`);
+      // The moment to book the next sitting is while the patient is still at the
+      // desk — they have their diary in mind and the clinic controls the slot.
+      // The WhatsApp nudge exists for when this is missed, not instead of it.
+      if (newStatus === 'completed' && data?.appointment?.treatment_plan_id) {
+        promptNextSitting(data.appointment.treatment_plan_id);
+      }
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to update status');
     }
+  }
+
+  /** Offer to book the next sitting of a course that still has one outstanding. */
+  async function promptNextSitting(planId) {
+    try {
+      const { data } = await api.get(`/admin/treatment-plans/${planId}`);
+      const plan = data.treatment_plan;
+      if (!plan?.canBookNext || !['proposed', 'in_progress'].includes(plan.status)) return;
+      setConfirmModal({
+        title: 'Book the next sitting?',
+        message: `${plan.title} — sitting ${plan.nextVisitNumber} of ${plan.total_visits}`
+          + (plan.treating_doctor_name ? ` with Dr. ${plan.treating_doctor_name}` : '')
+          + '. Book the next free slot now, while the patient is still here?',
+        danger: false,
+        onConfirm: async () => {
+          // Dismiss FIRST. ConfirmModal does not close itself — it is dismissed
+          // only through onCancel — so leaving it up made the Confirm button
+          // look inert, and a second click booked ANOTHER sitting: the backend
+          // re-counts under FOR UPDATE and happily issues the next visit. That
+          // is a real appointment, an atomically locked slot the bot can no
+          // longer offer, a monthly-quota decrement, and a confirmation sent to
+          // a patient for a date they never agreed to. A double-click on the
+          // first press did the same.
+          setConfirmModal(null);
+          try {
+            const { data: booked } = await api.post(`/admin/treatment-plans/${planId}/visits`, { after_days: 7 });
+            toast.success(`Sitting ${booked.visit_number} booked — ${booked.date} at ${String(booked.time).slice(0, 5)}`);
+          } catch (err) {
+            toast.error(err.response?.data?.error || 'Could not book the next sitting');
+          }
+        },
+      });
+    } catch { /* the prompt is a convenience; never block the status change */ }
   }
 
   async function confirmCancelAppointment() {
@@ -763,7 +850,7 @@ export default function Dashboard() {
 
   function openAddDoctor() {
     setEditingDoctor(null);
-    setDoctorForm({ name: '', specialization: '', qualification: '', hospital_id: '', department_id: '', consultation_fee: '', slot_duration_minutes: '30' });
+    setDoctorForm({ name: '', specialization: '', qualification: '', hospital_id: '', department_id: '', extra_department_ids: [], consultation_fee: '', slot_duration_minutes: '30' });
     fetchHospitals();
     setShowDoctorModal(true);
   }
@@ -776,6 +863,9 @@ export default function Dashboard() {
       qualification: doc.qualification || '',
       hospital_id: doc.hospital_id || '',
       department_id: doc.department_id || '',
+      extra_department_ids: (doc.departments || [])
+        .map(d => d.id)
+        .filter(id => id !== doc.department_id),
       consultation_fee: doc.consultation_fee ?? '',
       slot_duration_minutes: doc.slot_duration_minutes ?? '30',
     });
@@ -790,11 +880,16 @@ export default function Dashboard() {
     if (!doctorForm.hospital_id) return toast.error('Please select a hospital');
     setDoctorSaving(true);
     try {
+      const { extra_department_ids, ...rest } = doctorForm;
       const payload = {
-        ...doctorForm,
+        ...rest,
         consultation_fee: Number(doctorForm.consultation_fee) || 0,
         slot_duration_minutes: Number(doctorForm.slot_duration_minutes) || 30,
         department_id: doctorForm.department_id || null,
+        // Always sent, even when empty — the backend treats a present
+        // department_ids as "replace the whole set", which is how unticking the
+        // last extra treatment actually removes it.
+        department_ids: [doctorForm.department_id, ...extra_department_ids].filter(Boolean),
       };
       if (editingDoctor) {
         await api.patch(`/admin/doctors/${editingDoctor.id}`, payload);
@@ -827,10 +922,19 @@ export default function Dashboard() {
             has_lunch: !!(saved.lunch_start_time && saved.lunch_end_time),
             lunch_start_time: saved.lunch_start_time?.slice(0, 5) || '13:00',
             lunch_end_time: saved.lunch_end_time?.slice(0, 5) || '14:00',
+            hospital_id: saved.hospital_id || '',
+            week_of_month: saved.week_of_month || [],
           };
         }));
+        // Show the visiting controls if the saved schedule already uses them,
+        // even when the flag on the doctor was never set.
+        setIsVisiting(Boolean(doc.is_visiting) ||
+          data.schedule.some(s => s.hospital_id || (s.week_of_month || []).length));
+      } else {
+        setIsVisiting(Boolean(doc.is_visiting));
       }
     } catch { /* use defaults */ }
+    if (!hospitals.length) fetchHospitals();
     setShowScheduleModal(true);
   }
 
@@ -844,8 +948,19 @@ export default function Dashboard() {
         end_time: d.end_time,
         lunch_start_time: d.is_working && d.has_lunch ? d.lunch_start_time : null,
         lunch_end_time:   d.is_working && d.has_lunch ? d.lunch_end_time   : null,
+        // Only sent for a visiting consultant. Turning the toggle off clears
+        // both, restoring "primary branch, every week" — otherwise a dentist
+        // who stopped visiting would keep a hidden per-day branch override.
+        hospital_id: isVisiting ? (d.hospital_id || null) : null,
+        week_of_month: isVisiting ? (d.week_of_month || []) : [],
       }));
       await api.post(`/admin/doctors/${schedulingDoctor.id}/schedule`, { schedules });
+      // Cosmetic flag — it only decides whether these controls open next time.
+      // Best-effort: the schedule itself is already saved and is what matters.
+      if (Boolean(schedulingDoctor.is_visiting) !== isVisiting) {
+        await api.patch(`/admin/doctors/${schedulingDoctor.id}`, { is_visiting: isVisiting })
+          .catch(() => {});
+      }
       toast.success('Schedule saved');
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to save schedule');
@@ -882,22 +997,29 @@ export default function Dashboard() {
     setSlotsDate(today);
     setSlots([]);
     setShowSlotsModal(true);
-    setSlotsLoading(true);
-    try {
-      const { data } = await api.get(`/admin/slots?doctor_id=${doc.id}&date=${today}`);
-      setSlots(data.slots || []);
-    } catch { toast.error('Failed to load slots'); }
-    finally { setSlotsLoading(false); }
+    await fetchSlots(doc.id, today);
   }
 
+  // Guarded against out-of-order responses. The date input calls this on EVERY
+  // change, so stepping the spinner from the 5th to the 7th fires three
+  // overlapping requests; whichever answers last used to win. That left the
+  // grid showing the 5th's slots while the input read the 7th — and clicking a
+  // tile then called toggleSlotStatus with the 5th's slot id, blocking a slot
+  // on the wrong day and removing it from the WhatsApp booking flow while the
+  // day on screen looked untouched. SlotsTab guards this; this duplicate did not.
   async function fetchSlots(docId, date) {
     if (!docId || !date) return;
+    const requestId = ++slotsReqRef.current;
     setSlotsLoading(true);
     try {
       const { data } = await api.get(`/admin/slots?doctor_id=${docId}&date=${date}`);
+      if (requestId !== slotsReqRef.current) return;
       setSlots(data.slots || []);
-    } catch { toast.error('Failed to load slots'); }
-    finally { setSlotsLoading(false); }
+    } catch {
+      if (requestId === slotsReqRef.current) toast.error('Failed to load slots');
+    } finally {
+      if (requestId === slotsReqRef.current) setSlotsLoading(false);
+    }
   }
 
   async function toggleSlotStatus(slot) {
@@ -1219,7 +1341,10 @@ export default function Dashboard() {
             <div className="text-xl font-bold text-blue-600">🏥 MediBook</div>
             <div className="text-xs text-gray-400 mt-1 truncate">{user?.tenant || 'Admin Portal'}</div>
           </div>
-          <button className="md:hidden text-gray-400 hover:text-gray-600 p-1" onClick={() => setSidebarOpen(false)}>✕</button>
+          {/* Same reasoning as the hamburger: icon-only, and the only way to
+              dismiss the drawer without a lucky tap on the overlay. */}
+          <button className="md:hidden w-11 h-11 -mr-2 flex items-center justify-center text-gray-400 hover:text-gray-600"
+            aria-label="Close menu" onClick={() => setSidebarOpen(false)}>✕</button>
         </div>
         <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
           {/* Hide the tabs whose backing endpoint is adminOnly, rather than
@@ -1249,7 +1374,11 @@ export default function Dashboard() {
       <div className="flex-1 flex flex-col overflow-hidden">
         <header className="bg-white border-b border-gray-200 px-4 md:px-6 py-4 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3 min-w-0 flex-1">
-            <button className="md:hidden p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 transition shrink-0" onClick={() => setSidebarOpen(true)}>
+            {/* 44px hit area: this is the ONLY way into the navigation on a
+                phone, and it was a 32x32 icon with no accessible name. The
+                desktop look is unaffected — it is md:hidden. */}
+            <button className="md:hidden w-11 h-11 -ml-2 flex items-center justify-center rounded-lg text-gray-500 hover:bg-gray-100 transition shrink-0"
+              aria-label="Open menu" onClick={() => setSidebarOpen(true)}>
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
               </svg>
@@ -1273,8 +1402,10 @@ export default function Dashboard() {
             )}
             {/* Notification Bell */}
             <div className="relative">
-              <button onClick={() => setShowNotifDropdown(v => !v)}
-                className="relative px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">
+              {/* Icon-only, so it gets a square 40px target on touch and keeps
+                  its compact pill on desktop. */}
+              <button onClick={() => setShowNotifDropdown(v => !v)} aria-label="Notifications"
+                className="relative w-10 h-10 flex items-center justify-center text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition md:w-auto md:h-auto md:px-3 md:py-1.5">
                 🔔
                 {notifCount > 0 && (
                   <span className="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center font-bold leading-none">
@@ -1353,7 +1484,10 @@ export default function Dashboard() {
                       : 'Finish these steps to activate your WhatsApp bot'}
                   </p>
                 </div>
-                <button onClick={() => setShowOnboarding(false)} className="text-blue-400 hover:text-blue-600 text-lg">✕</button>
+                {/* Was 15x28 — the smallest target in the app, on a banner
+                    that occupies the top of every phone screen until dismissed. */}
+                <button onClick={() => setShowOnboarding(false)} aria-label="Dismiss setup checklist"
+                  className="shrink-0 w-10 h-10 -mt-2 -mr-2 flex items-center justify-center text-blue-400 hover:text-blue-600 text-lg md:w-auto md:h-auto md:m-0">✕</button>
               </div>
               <div className="space-y-2">
                 {onboarding.steps.map(step => (
@@ -1424,6 +1558,7 @@ export default function Dashboard() {
               }}
               onEditNotes={(a) => { setEditingNotesId(a.id); setNotesText(a.notes || ''); }}
               onCancelAppt={(a) => { setCancellingAppt(a); setCancelReason(''); }}
+              onRecordTreatment={(a) => setRecordTreatmentAppt(a)}
             />
           )}
 
@@ -1528,6 +1663,7 @@ export default function Dashboard() {
           {/* ── SETTINGS ── */}
           {tab === 'settings' && !tabLoading && (
             <SettingsTab
+              settingsFailed={settingsFailed}
               settings={settings}
               fetchSettings={fetchSettings}
               isAdmin={isAdmin}
@@ -1550,6 +1686,14 @@ export default function Dashboard() {
           {/* ── AUDIT LOGS ── */}
           {tab === 'audit' && isAdmin && !tabLoading && (
             <AuditTab />
+          )}
+
+          {/* ── TREATMENTS (multi-visit courses) ── */}
+          {/* Recording and progressing a treatment is everyday clinic work, so
+              the tab is open to all roles; declining/cancelling a plan is
+              admin-gated server-side, hence isAdmin rather than hiding the tab. */}
+          {tab === 'treatments' && !tabLoading && (
+            <TreatmentPlansTab isAdmin={isAdmin} setConfirmModal={setConfirmModal} />
           )}
 
           {/* ── SLOTS ── */}
@@ -1606,7 +1750,9 @@ export default function Dashboard() {
               <select value={doctorForm.hospital_id}
                 onChange={e => {
                   const hid = e.target.value;
-                  setDoctorForm(f => ({ ...f, hospital_id: hid, department_id: '' }));
+                  // Departments belong to a branch, so both selections are stale
+                  // the moment the branch changes.
+                  setDoctorForm(f => ({ ...f, hospital_id: hid, department_id: '', extra_department_ids: [] }));
                   if (hid) fetchDepartments(hid);
                 }}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required>
@@ -1616,15 +1762,65 @@ export default function Dashboard() {
             </div>
             <div className="sm:col-span-2">
               <label className="block text-xs font-medium text-gray-700 mb-1">
-                Department <span className="text-gray-400 font-normal">(optional)</span>
+                Primary Treatment <span className="text-gray-400 font-normal">(optional)</span>
               </label>
               <select value={doctorForm.department_id}
-                onChange={e => setDoctorForm(f => ({ ...f, department_id: e.target.value }))}
+                onChange={e => {
+                  const primary = e.target.value;
+                  // Promoting an extra to primary must not leave it ticked below,
+                  // or it would show up twice.
+                  setDoctorForm(f => ({
+                    ...f,
+                    department_id: primary,
+                    extra_department_ids: f.extra_department_ids.filter(id => id !== primary),
+                  }));
+                }}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 disabled={!doctorForm.hospital_id}>
                 <option value="">— None —</option>
                 {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
               </select>
+              <p className="mt-1 text-[11px] text-gray-400">Shown on receipts and in reports.</p>
+            </div>
+            {/* A dentist routinely renders treatments outside their primary one —
+                a GP doing simple root canals and extractions. Ticking them here
+                is what makes the dentist appear when a patient picks that
+                treatment in WhatsApp. */}
+            <div className="sm:col-span-2">
+              <label className="block text-xs font-medium text-gray-700 mb-1">
+                Also Treats <span className="text-gray-400 font-normal">(optional)</span>
+              </label>
+              {!doctorForm.hospital_id ? (
+                <p className="text-xs text-gray-400 border border-dashed border-gray-200 rounded-lg px-3 py-2">
+                  Select a hospital first.
+                </p>
+              ) : departments.filter(d => d.id !== doctorForm.department_id).length === 0 ? (
+                <p className="text-xs text-gray-400 border border-dashed border-gray-200 rounded-lg px-3 py-2">
+                  No other treatments set up for this branch.
+                </p>
+              ) : (
+                <div className="border border-gray-200 rounded-lg p-2 max-h-40 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1">
+                  {departments.filter(d => d.id !== doctorForm.department_id).map(d => {
+                    const checked = doctorForm.extra_department_ids.includes(d.id);
+                    return (
+                      <label key={d.id} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer">
+                        <input type="checkbox" checked={checked}
+                          onChange={() => setDoctorForm(f => ({
+                            ...f,
+                            extra_department_ids: checked
+                              ? f.extra_department_ids.filter(id => id !== d.id)
+                              : [...f.extra_department_ids, d.id],
+                          }))}
+                          className="rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+                        <span className="text-xs text-gray-700">{d.name}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+              <p className="mt-1 text-[11px] text-gray-400">
+                Patients booking these treatments will see this dentist as an option.
+              </p>
             </div>
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">
@@ -2004,6 +2200,21 @@ export default function Dashboard() {
           <p className="text-xs text-gray-500 mb-3">
             Set working hours for each day. Toggle <strong>Lunch</strong> to block a break window — no slots will be generated during that time. After saving, click <strong>Save &amp; Generate Slots</strong> to create bookable slots for the next 7 days.
           </p>
+
+          {/* Visiting consultants: the specialist who comes on alternate
+              Saturdays, or does Monday at one branch and Wednesday at another.
+              Off by default so resident dentists keep the simpler form. */}
+          <label className="flex items-start gap-2 mb-3 p-2.5 rounded-lg bg-amber-50 cursor-pointer">
+            <input type="checkbox" checked={isVisiting}
+              onChange={e => setIsVisiting(e.target.checked)}
+              className="mt-0.5 rounded border-gray-300 text-amber-600 focus:ring-amber-500" />
+            <span className="text-xs text-gray-700">
+              <strong>Visiting consultant</strong>
+              <span className="block text-gray-500 mt-0.5">
+                Attends on some weeks only, or at a different branch on different days.
+              </span>
+            </span>
+          </label>
           {/* Header row */}
           <div className="hidden sm:grid grid-cols-[90px_60px_1fr_1fr_70px_1fr_1fr] gap-2 px-2 text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">
             <span>Day</span><span>On</span><span>Start</span><span>End</span><span>Lunch</span><span>Break Start</span><span>Break End</span>
@@ -2014,7 +2225,11 @@ export default function Dashboard() {
               <div className={`sm:hidden rounded-lg p-3 mb-1 ${day.is_working ? 'bg-blue-50' : 'bg-gray-50'}`}>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-sm font-semibold text-gray-700">{DAYS[day.day_of_week]}</span>
-                  <label className="flex items-center gap-2 cursor-pointer">
+                  {/* The switch itself stays 36x20; the LABEL is the hit area,
+                      and at content height that was a 20px-tall target on the
+                      screen reception uses to set a dentist's week. The negative
+                      margin keeps the row looking the same. */}
+                  <label className="flex items-center gap-2 cursor-pointer py-2.5 -my-2.5 pl-3 -ml-3">
                     <span className="text-xs text-gray-400">{day.is_working ? 'Working' : 'Off'}</span>
                     <div className="relative">
                       <input type="checkbox" className="sr-only" checked={day.is_working} onChange={e => updateScheduleDay(i, 'is_working', e.target.checked)} />
@@ -2034,7 +2249,7 @@ export default function Dashboard() {
                       <input type="time" value={day.end_time} onChange={e => updateScheduleDay(i, 'end_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full" />
                     </div>
                   </div>
-                  <label className="flex items-center gap-2 cursor-pointer mb-2">
+                  <label className="flex items-center gap-2 cursor-pointer mb-2 py-2.5 -my-0.5 pr-3">
                     <div className="relative">
                       <input type="checkbox" className="sr-only" checked={day.has_lunch} onChange={e => updateScheduleDay(i, 'has_lunch', e.target.checked)} />
                       <div className={`w-9 h-5 rounded-full transition-colors ${day.has_lunch ? 'bg-orange-400' : 'bg-gray-300'}`} />
@@ -2059,7 +2274,9 @@ export default function Dashboard() {
               {/* Desktop row layout */}
               <div className={`hidden sm:grid grid-cols-[90px_60px_1fr_1fr_70px_1fr_1fr] gap-2 items-center px-2 py-2 rounded-lg transition-colors ${day.is_working ? 'bg-blue-50' : 'bg-gray-50'}`}>
                 <span className="text-sm font-medium text-gray-700">{DAYS[day.day_of_week]}</span>
-                <label className="flex items-center cursor-pointer">
+                {/* Same padding on the ≥640px row: a tablet in portrait renders
+                    this layout and is still a touch device. */}
+                <label className="flex items-center cursor-pointer py-2.5 -my-2.5">
                   <div className="relative">
                     <input type="checkbox" className="sr-only"
                       checked={day.is_working}
@@ -2076,7 +2293,7 @@ export default function Dashboard() {
                   disabled={!day.is_working}
                   onChange={e => updateScheduleDay(i, 'end_time', e.target.value)}
                   className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-30 disabled:bg-gray-100 w-full" />
-                <label className={`flex items-center gap-1 cursor-pointer ${!day.is_working ? 'opacity-30 pointer-events-none' : ''}`}>
+                <label className={`flex items-center gap-1 cursor-pointer py-2.5 -my-2.5 ${!day.is_working ? 'opacity-30 pointer-events-none' : ''}`}>
                   <div className="relative">
                     <input type="checkbox" className="sr-only"
                       checked={day.has_lunch}
@@ -2096,6 +2313,46 @@ export default function Dashboard() {
                   onChange={e => updateScheduleDay(i, 'lunch_end_time', e.target.value)}
                   className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:opacity-30 disabled:bg-gray-100 w-full" />
               </div>
+
+              {/* Visiting sub-row, shared by both layouts. Only for working days —
+                  a branch or week pattern on a day off means nothing. */}
+              {isVisiting && day.is_working && (
+                <div className="mt-1 mb-1 ml-0 sm:ml-2 px-2.5 py-2 rounded-lg bg-amber-50/60 border border-amber-100 flex flex-col sm:flex-row sm:items-center gap-2">
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-[11px] text-gray-500 w-10">Branch</span>
+                    <select value={day.hospital_id}
+                      onChange={e => updateScheduleDay(i, 'hospital_id', e.target.value)}
+                      className="border border-gray-200 rounded px-2 py-1 text-xs bg-white min-w-[10rem]">
+                      <option value="">Primary branch</option>
+                      {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="text-[11px] text-gray-500">Weeks</span>
+                    {WEEK_LABELS.map((label, wi) => {
+                      const week = wi + 1;
+                      const on = (day.week_of_month || []).includes(week);
+                      return (
+                        <button key={week} type="button"
+                          onClick={() => updateScheduleDay(i, 'week_of_month',
+                            on ? day.week_of_month.filter(w => w !== week)
+                               : [...(day.week_of_month || []), week].sort((a, b) => a - b))}
+                          // Five chips in a row: small AND adjacent, so a
+                          // mis-tap silently changes which weeks a consultant
+                          // attends. 36px square on touch, compact on desktop.
+                          className={`w-9 h-9 flex items-center justify-center rounded text-[11px] font-medium border transition-colors md:w-auto md:h-auto md:px-2 md:py-1 ${
+                            on ? 'bg-amber-500 text-white border-amber-500'
+                               : 'bg-white text-gray-500 border-gray-200 hover:bg-gray-50'}`}>
+                          {label}
+                        </button>
+                      );
+                    })}
+                    <span className="text-[11px] text-gray-400">
+                      {(day.week_of_month || []).length ? '' : 'every week'}
+                    </span>
+                  </div>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -2115,6 +2372,17 @@ export default function Dashboard() {
           </button>
         </div>
       </Modal>
+    )}
+
+    {/* ── RECORD TREATMENT ── */}
+    {/* Mounted at the page root so the Appointments tab can open it against the
+        visit the dentist just finished. */}
+    {recordTreatmentAppt && (
+      <RecordTreatmentModal
+        appointment={recordTreatmentAppt}
+        onClose={() => setRecordTreatmentAppt(null)}
+        onSaved={() => { if (tab === 'treatments') setTab('treatments'); }}
+      />
     )}
 
     {/* ── CANCEL APPOINTMENT MODAL ── */}

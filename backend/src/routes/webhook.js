@@ -11,7 +11,7 @@ const { isEnabled } = require('../utils/featureFlags');
 const { isRealAppSecret, UUID_RE } = require('../utils/errors');
 // maskPhone moved to services/bot/utils.js — the bot engine, the booking flow
 // and the reminder cron log the same value and each needed it too.
-const { parseChoiceNumber, maskPhone, isOptedOut } = require('../services/bot/utils');
+const { parseChoiceNumber, maskPhone, isOptedOut, logMessage } = require('../services/bot/utils');
 const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
@@ -316,14 +316,21 @@ const MAX_CITY_ROWS = 10;
  * the ids we DO recognise are what suppresses it:
  *  - a `city:` row — that is an answer to this picker, not a request to reopen
  *    it, and it must fall through to `pickedCity` below;
+ *  - a `br:` BRANCH row — likewise an answer, and its title is a hospital name;
  *  - a tenant UUID row — a clinic legitimately named "Nearby Dental" shortens
  *    to a row title NEARBY_RE would otherwise swallow, hijacking the tap.
  * Any other id is one we did not mint a meaning for, so the text decides.
+ *
+ * The `br:` case was missing. The city picker lists BRANCHES, whose titles are
+ * hospital names, so a branch called "Nearby" or "Near By" matched NEARBY_RE on
+ * its own title: tapping it reopened the city picker instead of attaching the
+ * patient, an unbreakable loop for that branch.
  */
 function isNearbyTrigger({ text, buttonId, cityRowId, tenantIds }) {
   const trimmed = (text || '').trim();
   if (!trimmed || GREETING_RE.test(trimmed)) return false;
   if (cityRowId) return false;
+  if (typeof buttonId === 'string' && buttonId.startsWith(BRANCH_ROW_PREFIX)) return false;
   if (buttonId && Array.isArray(tenantIds) && tenantIds.includes(buttonId)) return false;
   return NEARBY_RE.test(trimmed);
 }
@@ -334,6 +341,20 @@ function isNearbyTrigger({ text, buttonId, cityRowId, tenantIds }) {
 // clinic the message belongs to.
 const CONFIRMATION_REPLY_RE = /^(yes|no|confirm|haan|nahi|ha|ok|sure|nope)\b/i;
 const RATING_REPLY_RE = /^[1-5]$/;
+// The third clinic-initiated question: "your next sitting isn't booked yet",
+// sent by jobs/treatmentNudges.js. Must match botEngine's TREATMENT_KEYWORD_RE
+// — the redirect and the handler have to agree on what counts as the answer, or
+// the message is handed to a clinic whose engine will not act on it.
+const TREATMENT_REPLY_RE = /^(my )?(treatment|treatments|sitting|next sitting|book treatment|book my treatment)$/i;
+// The fourth: the six-month check-up recall (jobs/recalls.js), which tells the
+// patient to reply *Menu*. Months can pass between the ask and the answer, so
+// the chance the patient has since searched for a different clinic on the
+// shared number is higher here than anywhere else — and "Menu" is the one word
+// that is ALSO a perfectly ordinary instruction to the current clinic. The
+// state checks below are what keep the two apart: a redirect only happens when
+// the current clinic has nothing in flight AND the asking clinic still has an
+// open recall.
+const RECALL_REPLY_RE = /^(menu|book|book appointment|checkup|check up|check-up)$/i;
 
 /**
  * If this message is an answer to a question a DIFFERENT clinic asked, return
@@ -350,8 +371,13 @@ async function resolveAskingTenant(phone, text, currentTenant) {
   const trimmed = (text || '').trim();
   if (!trimmed) return null;
 
+  // RECALL is tested LAST: its vocabulary ("book", "menu") is the broadest, and
+  // a word that is also a confirmation or a treatment reply belongs to the
+  // narrower question.
   const kind = RATING_REPLY_RE.test(trimmed) ? KINDS.FEEDBACK
+    : TREATMENT_REPLY_RE.test(trimmed) ? KINDS.TREATMENT
     : CONFIRMATION_REPLY_RE.test(trimmed) ? KINDS.CONFIRMATION
+    : RECALL_REPLY_RE.test(trimmed) ? KINDS.RECALL
     : null;
   if (!kind) return null;
 
@@ -388,6 +414,45 @@ async function resolveAskingTenant(phone, text, currentTenant) {
       const s = await tenantQuery(asking.schema_name,
         `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
       if (s.rows[0]?.state !== 'collect_feedback_rating') return null;
+    } else if (kind === KINDS.TREATMENT) {
+      // botEngine only accepts the *Treatment* keyword from a resting state, so
+      // redirecting into a clinic that is mid-flow would feed the word to that
+      // flow's current step instead of opening the treatment list.
+      const s = await tenantQuery(asking.schema_name,
+        `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
+      const st = s.rows[0]?.state || 'idle';
+      if (st !== 'idle' && st !== 'main_menu') return null;
+      // The pending row is a hint with a TTL; this is the authoritative check.
+      // A course the clinic has since booked, finished or cancelled is not
+      // waiting for anything, and the word belongs to the current clinic.
+      const openPlan = await tenantQuery(asking.schema_name, `
+        SELECT 1
+        FROM treatment_plans tp
+        JOIN patients p ON p.id = tp.patient_id
+        LEFT JOIN appointments a ON a.treatment_plan_id = tp.id AND a.status <> 'cancelled'
+        WHERE p.phone = $1 AND p.deleted_at IS NULL
+          AND tp.status IN ('proposed','in_progress')
+        GROUP BY tp.id
+        HAVING COUNT(a.id) < tp.total_visits
+        LIMIT 1`, [phone]);
+      if (!openPlan.rows.length) return null;
+    } else if (kind === KINDS.RECALL) {
+      // Same resting-state rule as TREATMENT: "Menu" handed to a clinic that is
+      // mid-flow resets THAT flow instead of opening the menu the recall meant.
+      const s = await tenantQuery(asking.schema_name,
+        `SELECT state FROM bot_sessions WHERE phone=$1`, [phone]);
+      const st = s.rows[0]?.state || 'idle';
+      if (st !== 'idle' && st !== 'main_menu') return null;
+      // Authoritative check: a recall the patient has already acted on (the
+      // cron's closeActedOnRecalls flips it to 'booked') is not waiting for
+      // anything, and the word belongs to the clinic they are looking at.
+      const openRecall = await tenantQuery(asking.schema_name, `
+        SELECT 1 FROM patient_recalls r
+        JOIN patients p ON p.id = r.patient_id
+        WHERE p.phone = $1 AND p.deleted_at IS NULL
+          AND r.status = 'due' AND r.last_sent_at IS NOT NULL
+        LIMIT 1`, [phone]);
+      if (!openRecall.rows.length) return null;
     } else {
       // Mirror the reminder intercept further down, which only consumes a
       // confirmation when the session is idle and otherwise falls through into
@@ -455,6 +520,8 @@ async function processIncomingMessage(msg) {
     let buttonId = null;
     let unsupportedType = null;
     let audioId = null;
+    // What a template quick-reply actually SAID, when routing uses its payload.
+    let templateButtonLabel = null;
 
     if (msg.type === 'text') {
       text = msg.text?.body || '';
@@ -468,7 +535,19 @@ async function processIncomingMessage(msg) {
         text = inter.list_reply.title;
       }
     } else if (msg.type === 'button') {
-      text = msg.button?.text || '';
+      // A quick-reply tap on a TEMPLATE (not an interactive message — those
+      // arrive as type 'interactive'). Meta sends both the visible label and the
+      // payload set when the template was created, and we used only the label,
+      // which forced every template button to be worded exactly like the keyword
+      // it triggers ("Treatment", "Yes").
+      //
+      // Routing on the PAYLOAD lets a button read "Book my next sitting" while
+      // carrying the token the engine already understands. Deliberately fed in
+      // as `text`, NOT as buttonId: several steps gate on the ABSENCE of a
+      // buttonId (the *Treatment* keyword, the clinics-near-me trigger), so a
+      // template tap must behave exactly as if the patient had typed it.
+      templateButtonLabel = msg.button?.text || '';
+      text = msg.button?.payload || templateButtonLabel;
     } else if (msg.type === 'audio') {
       audioId = msg.audio?.id || null;
       unsupportedType = 'audio';
@@ -482,7 +561,10 @@ async function processIncomingMessage(msg) {
     // What the patient ACTUALLY sent, captured before routing may rewrite
     // `text` (see the clinic-selection branch). The message history must show
     // the clinic name they typed, not the greeting we synthesised from it.
-    const inboundContent = (text || buttonId || '').slice(0, 500);
+    // The label first: for a template quick-reply, `text` has been replaced by
+    // the payload, and clinic history must show what the patient tapped, not
+    // the token it routed on.
+    const inboundContent = (templateButtonLabel || text || buttonId || '').slice(0, 500);
 
     // ── GLOBAL SESSION ROUTING (shared WhatsApp number) ──────────
     // All tenants share one phone number. Route each patient to their chosen clinic
@@ -619,10 +701,10 @@ async function processIncomingMessage(msg) {
         } else if (clinicCityCount <= MAX_CITY_ROWS) {
           // Real cities all fit, so the defaults can pad out whatever room is
           // left. Truncation only ever falls on the padding.
-          await wa.sendList(phone, '📍 Which city are you in?', 'Select city', [{
+          await wa.sendList(phone, "Pick the nearest one and I'll show you the clinics there.", 'Select city', [{
             title: 'Cities',
             rows: knownCities.slice(0, MAX_CITY_ROWS).map(c => ({ id: CITY_ROW_PREFIX + c, title: c })),
-          }], null, null).catch(err =>
+          }], null, null, { header: 'Which city are you in?', footer: 'Or reply Hi to search by name' }).catch(err =>
             logger.error('Failed to send city list', { error: err.message }));
         } else {
           // More clinic cities than a list message can hold — ask them to type
@@ -761,7 +843,9 @@ async function processIncomingMessage(msg) {
         const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
         tenant = r.rows[0] || null;
         if (tenant && !(await isOptedOut(tenant.schema_name, phone))) {
-          await sendPatientText(tenant.schema_name, phone, `✅ Clinic selected: *${selected.name}*`)
+          // The clinic's own welcome follows immediately and carries its name in
+          // the header, so this is a one-line handover, not a second greeting.
+          await sendPatientText(tenant.schema_name, phone, `✅ Connecting you to *${selected.name}*…`)
             .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
         }
 
@@ -790,7 +874,9 @@ async function processIncomingMessage(msg) {
         ).catch(() => {});
 
         if (shown.length) {
-          const body = `🔍 ${matches.length} clinics match *"${trimmed}"*.\n\nPick yours:`;
+          const body = matches.length === 1
+            ? `One clinic matches *"${trimmed}"*.`
+            : `${matches.length} clinics match *"${trimmed}"*.`;
           await wa.sendList(phone, body, 'Select clinic', [{
             title: 'Matching clinics',
             rows: shown.map(t => ({
@@ -798,33 +884,37 @@ async function processIncomingMessage(msg) {
               title: shortLabel(t.name),
               description: t.city ? `${t.name} — ${t.city}` : t.name,
             })),
-          }], null, null).catch(err =>
+          }], null, null,
+          { header: 'Is this yours?', footer: 'Reply Hi to search again' }).catch(err =>
             logger.error('Failed to send clinic shortlist', { error: err.message }));
           return;
         }
 
-        let prompt;
+        // This is the very first thing a patient ever reads from the product,
+        // and it was the last surface still in the original voice: a header for
+        // the question, the body carrying only what to do next, and the
+        // "leave out dental and clinic" hint moved to the footer where a hint
+        // belongs. Each branch says what actually happened rather than opening
+        // with ❌.
+        let prompt, header;
         if (tooGeneric) {
-          prompt = `🔍 Almost — nearly every clinic here is a "dental clinic".\n\n` +
-            `Please send the distinctive part of your clinic's name (e.g. *Smile* for "Smile Dental Clinic").`;
+          header = 'Almost';
+          prompt = `Nearly every clinic here is a "dental clinic" — send the distinctive part of the name instead. *Smile*, for "Smile Dental Clinic".`;
         } else if (matches.length > MAX_SHORTLIST) {
-          prompt = `🔍 *"${trimmed}"* matches ${matches.length} clinics — too many to show.\n\n` +
-            `Please send a bit more of your clinic's name.`;
+          header = `${matches.length} clinics match that`;
+          prompt = `*"${trimmed}"* is too broad to list. A few more letters will narrow it down.`;
         } else if (trimmed && !isGreeting) {
-          prompt = `❌ No clinic found matching *"${trimmed}"*.\n\n` +
-            `Please check the spelling and send your clinic's name again. ` +
-            `You can leave out "dental" and "clinic".`;
+          header = 'No match for that name';
+          prompt = `Nothing here is called *"${trimmed}"*. Worth checking the spelling — or browse by city instead.`;
         } else if (leavingClinic) {
           // They were with a clinic and asked to start over. Say so — a plain
           // "welcome" to someone who was three steps into a booking reads as
           // though the bot forgot them.
-          prompt = `🔄 Starting over — you've left *${leavingClinic}*.\n\n` +
-            `🔍 Send a clinic's name to continue. ` +
-            `A few letters are enough — you can leave out "dental" and "clinic".`;
+          header = 'Starting over';
+          prompt = `You've left *${leavingClinic}*.\n\nSend another clinic's name to continue.`;
         } else {
-          prompt = `👋 Welcome to MediBook!\n\n` +
-            `🔍 Please send your clinic's name to search for it. ` +
-            `A few letters are enough — you can leave out "dental" and "clinic".`;
+          header = 'Welcome to MediBook';
+          prompt = `Send your clinic's name and I'll take you to them. A few letters are enough.`;
         }
 
         // The location path is offered as an EXTRA, never as a replacement: the
@@ -840,7 +930,8 @@ async function processIncomingMessage(msg) {
         await wa.sendButtons(
           phone,
           `${prompt}\n\n📍 Or reply *${NEARBY_BUTTON_LABEL.replace('📍 ', '')}* to browse by city.`,
-          [NEARBY_BUTTON_LABEL], null, null
+          [NEARBY_BUTTON_LABEL], null, null,
+          { header, footer: 'You can leave out "dental" and "clinic"' }
         ).catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
         return;
       }
@@ -869,24 +960,20 @@ async function processIncomingMessage(msg) {
       return;
     }
 
-    // ── ANSWERS GO BACK TO WHOEVER ASKED ─────────────────────────
-    // Everything above routes by the clinic the PATIENT chose. Reminders and
-    // feedback requests are asked by a CLINIC, and the answer ("yes", "4")
-    // names nobody — so for a patient who has since switched clinics it landed
-    // in the wrong schema and was silently dropped. Hand it back to the asker
-    // for this message only; the patient's selected clinic is left alone.
-    const redirect = await resolveAskingTenant(phone, text, tenant);
-    if (redirect) {
-      logger.info('Reply redirected to the clinic that asked', {
-        phone: maskPhone(phone), from: tenant.slug, to: redirect.slug,
-      });
-      tenant = redirect;
-    }
-
     // Idempotency — atomic INSERT dedup using the unique partial index on
     // wa_message_id. This must run BEFORE rate limits and the voice/unsupported
     // branches: Meta redelivers on missed ACKs, and a redelivered voice message
     // used to be transcribed and fed through the state machine twice.
+    //
+    // Keyed on the patient's SELECTED clinic, and therefore deliberately BEFORE
+    // the pending-reply redirect below. The redirect is not stable across
+    // redeliveries: it fires only while the asking clinic is still waiting, and
+    // handling the reply clears that pending row. So with the dedup running
+    // after it, the first delivery wrote its marker in clinic A's schema and the
+    // redelivery — no longer redirected — looked for that marker in clinic B's,
+    // found nothing, and processed the same message a second time, sending B's
+    // main menu to a patient who was never talking to B. The selected clinic is
+    // the one value that is the same on both passes.
     if (msgId) {
       try {
         const inserted = await tenantQuery(
@@ -905,6 +992,25 @@ async function processIncomingMessage(msg) {
         // Non-conflict errors (e.g. DB down) — log and still process rather than silently drop
         logger.warn('Message dedup check failed, processing anyway', { msgId, error: dupErr.message });
       }
+    }
+
+    // ── ANSWERS GO BACK TO WHOEVER ASKED ─────────────────────────
+    // Everything above routes by the clinic the PATIENT chose. Reminders and
+    // feedback requests are asked by a CLINIC, and the answer ("yes", "4")
+    // names nobody — so for a patient who has since switched clinics it landed
+    // in the wrong schema and was silently dropped. Hand it back to the asker
+    // for this message only; the patient's selected clinic is left alone.
+    const redirect = await resolveAskingTenant(phone, text, tenant);
+    if (redirect) {
+      logger.info('Reply redirected to the clinic that asked', {
+        phone: maskPhone(phone), from: tenant.slug, to: redirect.slug,
+      });
+      // The answer belongs in the ASKING clinic's history too — it is the reply
+      // to a message only they sent, and the dedup row above lives in the other
+      // schema. Different schema, so the unique index cannot collide; logMessage
+      // swallows its own errors, so history never blocks handling the reply.
+      await logMessage(redirect.schema_name, phone, 'in', msg.type, inboundContent, msgId);
+      tenant = redirect;
     }
 
     // Per-tenant rate limiting: max 60 messages/minute (Redis-backed, multi-instance safe)
@@ -1068,8 +1174,12 @@ if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT ==
       const origSendList = waModule.sendList;
 
       waModule.sendText = async (to, text) => { responses.push({ type: 'text', text }); };
-      waModule.sendButtons = async (to, text, buttons) => { responses.push({ type: 'buttons', text, buttons }); };
-      waModule.sendList = async (to, text, label, sections) => { responses.push({ type: 'list', text, label, sections }); };
+      // Include the header/footer slots — without them this endpoint reports a
+      // message the patient would never see, which is the opposite of its job.
+      waModule.sendButtons = async (to, text, buttons, _t, _p, opts = {}) =>
+        { responses.push({ type: 'buttons', text, buttons, ...opts }); };
+      waModule.sendList = async (to, text, label, sections, _t, _p, opts = {}) =>
+        { responses.push({ type: 'list', text, label, sections, ...opts }); };
 
       try {
         await botEngine.handle({ phone, text: message, buttonId: button_id, tenant });

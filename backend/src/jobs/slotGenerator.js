@@ -69,8 +69,10 @@ function computeDaySlotTimes(startTime, endTime, duration, lunchStartTime = null
  * @param {object}   doc          - { hospital_id, duration, schedules[] }
  * @param {Date}     today        - IST "now"
  * @param {number}   days         - how many days PAST today to plan
- * @param {Function} isBlockedDay - (dateStr) => boolean; leave/holiday check
- * @returns {Array<{dateStr: string, st: string, et: string}>}
+ * @param {Function} isBlockedDay - (dateStr, hospitalId) => boolean; leave/holiday
+ *   check. Takes the branch because clinic holidays are per hospital, and a
+ *   visiting doctor's day can belong to a different branch than their primary.
+ * @returns {Array<{dateStr: string, st: string, et: string, hospitalId: string}>}
  */
 function planDoctorSlots(doc, today, days, isBlockedDay) {
   // "HH:MM" strings compare correctly lexicographically, which is why the slot
@@ -83,18 +85,53 @@ function planDoctorSlots(doc, today, days, isBlockedDay) {
     const sched = doc.schedules.find(s => s.dow === date.getDay());
     if (!sched) continue;
 
+    // A visiting consultant who comes on the 1st and 3rd Saturday. Empty or
+    // absent means every week, which is what every schedule meant before this
+    // existed — so an unset value must never filter anything out.
+    if (!matchesWeekOfMonth(sched.weeksOfMonth, date)) continue;
+
+    // The branch for THIS weekday (doctor_hospitals), falling back to the
+    // doctor's primary. Stamped per slot rather than per doctor: one doctor row
+    // can now serve Monday at one branch and Wednesday at another.
+    const hospitalId = sched.hospitalId || doc.hospital_id;
+
     const dateStr = format(date, 'yyyy-MM-dd');
-    if (isBlockedDay(dateStr)) continue;
+    if (isBlockedDay(dateStr, hospitalId)) continue;
 
     for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
       // Today only: skip slots whose start time has already passed. Booking
       // rejects them anyway (see completeBooking's time predicate), so
       // generating them would just show patients times they cannot take.
       if (i === 0 && st <= nowHHMM) continue;
-      planned.push({ dateStr, st, et });
+      planned.push({ dateStr, st, et, hospitalId });
     }
   }
   return planned;
+}
+
+/**
+ * Which occurrence of its weekday this date is within the month: the 1st
+ * Saturday is 1, the 2nd is 2, and so on up to 5.
+ *
+ * Counted by day-of-month rather than by calendar week, which is what "1st and
+ * 3rd Saturday" means to a clinic — the 1st Saturday is simply the first one
+ * that falls in the month, regardless of where the week boundary lands.
+ */
+function weekOfMonth(date) {
+  return Math.floor((date.getDate() - 1) / 7) + 1;
+}
+
+/**
+ * Does this date fall on one of the weeks the doctor attends?
+ *
+ * Fails OPEN on anything empty or malformed: a doctor whose schedule carries no
+ * week restriction (every existing row) must keep generating every week. The
+ * failure mode of getting this backwards is a specialist silently losing their
+ * entire calendar, which nobody would notice until a patient couldn't book.
+ */
+function matchesWeekOfMonth(weeks, date) {
+  if (!Array.isArray(weeks) || weeks.length === 0) return true;
+  return weeks.includes(weekOfMonth(date));
 }
 
 /** Wrap a promise with a hard timeout */
@@ -130,8 +167,11 @@ async function flushSlots(schema, batch) {
  */
 async function flushPlanned(schema, planned, docId, hospitalId) {
   let batch = [];
-  for (const { dateStr, st, et } of planned) {
-    batch.push({ docId, hospitalId, dateStr, st, et, maxCapacity: 1 });
+  for (const p of planned) {
+    const { dateStr, st, et } = p;
+    // Per-slot branch (a visiting doctor's Wednesday can be at another branch);
+    // the argument is the doctor's primary, used when the day carries none.
+    batch.push({ docId, hospitalId: p.hospitalId || hospitalId, dateStr, st, et, maxCapacity: 1 });
     if (batch.length >= BATCH_SIZE) {
       await flushSlots(schema, batch);
       batch = [];
@@ -193,12 +233,18 @@ async function updateNoShowScores(schema) {
 }
 
 async function generateSlotsForTenant(schema) {
+  // doctor_hospitals supplies the branch for a given weekday when the doctor
+  // visits more than one. LEFT JOIN, so a doctor without those rows behaves
+  // exactly as before: every day at doctors.hospital_id.
   const doctors = await tenantQuery(schema,
     `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
             s.day_of_week, s.start_time, s.end_time,
-            s.lunch_start_time, s.lunch_end_time
+            s.lunch_start_time, s.lunch_end_time, s.week_of_month,
+            dh.hospital_id AS day_hospital_id
      FROM doctors d
      JOIN doctor_schedules s ON s.doctor_id=d.id
+     LEFT JOIN doctor_hospitals dh
+       ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
      WHERE d.is_active=true AND s.is_working=true`);
 
   if (!doctors.rows.length) return 0;
@@ -219,6 +265,8 @@ async function generateSlotsForTenant(schema) {
       end: row.end_time,
       lunchStart: row.lunch_start_time || null,
       lunchEnd:   row.lunch_end_time   || null,
+      weeksOfMonth: row.week_of_month || null,
+      hospitalId: row.day_hospital_id || null,
     });
   }
 
@@ -291,8 +339,8 @@ async function generateSlotsForTenant(schema) {
   async function generateForDoctor(docId, doc) {
     // Same planner the per-doctor path uses; only the blocked-day lookup differs,
     // because this sweep prefetches leaves/holidays for every doctor at once.
-    const planned = planDoctorSlots(doc, today, CRON_LOOKAHEAD_DAYS, (dateStr) =>
-      holidaySet.has(`${doc.hospital_id}:${dateStr}`) ||  // hospital-specific holiday
+    const planned = planDoctorSlots(doc, today, CRON_LOOKAHEAD_DAYS, (dateStr, hospitalId) =>
+      holidaySet.has(`${hospitalId}:${dateStr}`) ||       // holiday at the branch worked THAT day
       clinicWideHolidays.has(dateStr) ||                  // clinic-wide holiday
       publicHolidaySet.has(dateStr) ||                    // Indian public holiday
       leaveSet.has(`${docId}:${dateStr}`)                 // doctor-specific leave
@@ -531,9 +579,12 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
   const docR = await tenantQuery(schema,
     `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
             s.day_of_week, s.start_time, s.end_time,
-            s.lunch_start_time, s.lunch_end_time
+            s.lunch_start_time, s.lunch_end_time, s.week_of_month,
+            dh.hospital_id AS day_hospital_id
      FROM doctors d
      JOIN doctor_schedules s ON s.doctor_id=d.id
+     LEFT JOIN doctor_hospitals dh
+       ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
      WHERE d.id=$1 AND d.is_active=true AND s.is_working=true`,
     [doctorId]);
 
@@ -549,8 +600,14 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
       end: r.end_time,
       lunchStart: r.lunch_start_time || null,
       lunchEnd: r.lunch_end_time || null,
+      weeksOfMonth: r.week_of_month || null,
+      hospitalId: r.day_hospital_id || null,
     })),
   };
+  // Every branch this doctor works at, so the holiday lookup below covers the
+  // one they are at on each day rather than only their primary.
+  const doctorHospitalIds = [...new Set(
+    [doc.hospital_id, ...doc.schedules.map(s => s.hospitalId)].filter(Boolean))];
 
   // Fetch leaves for this doctor in the lookahead window
   // Use IST "today" — same reason as generateSlotsForTenant.
@@ -574,13 +631,20 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
   // Fetch clinic holidays (hospital-specific + clinic-wide) — the nightly cron
   // skips these, but this per-doctor path previously did not, so regenerating
   // after a schedule change quietly recreated bookable slots on declared holidays.
-  const holidaySet = new Set(); // dateStr values that block this doctor's hospital
+  // Keyed "hospitalId:date", plus a clinic-wide set: a visiting doctor can be at
+  // a different branch on different days, and a holiday at one branch must not
+  // wipe out the day they spend at the other.
+  const holidaySet = new Set();
+  const clinicWideHolidays = new Set();
   try {
     const holidaysR = await tenantQuery(schema,
-      `SELECT holiday_date::text as holiday_date FROM clinic_holidays
-       WHERE holiday_date BETWEEN $1 AND $2 AND (hospital_id = $3 OR hospital_id IS NULL)`,
-      [todayStr, lookaheadEnd, doc.hospital_id]);
-    for (const h of holidaysR.rows) holidaySet.add(h.holiday_date);
+      `SELECT hospital_id::text, holiday_date::text as holiday_date FROM clinic_holidays
+       WHERE holiday_date BETWEEN $1 AND $2 AND (hospital_id = ANY($3::uuid[]) OR hospital_id IS NULL)`,
+      [todayStr, lookaheadEnd, doctorHospitalIds]);
+    for (const h of holidaysR.rows) {
+      if (h.hospital_id) holidaySet.add(`${h.hospital_id}:${h.holiday_date}`);
+      else clinicWideHolidays.add(h.holiday_date);
+    }
   } catch (err) {
     // Fail closed for the same reason as doctor_leaves: an empty holiday set
     // means slots get generated on days the clinic is shut, and patients book
@@ -605,8 +669,11 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
     }
   } catch (_) {}
 
-  const isBlockedDay = (dateStr) =>
-    leaveSet.has(dateStr) || holidaySet.has(dateStr) || publicHolidaySet.has(dateStr);
+  const isBlockedDay = (dateStr, hospitalId) =>
+    leaveSet.has(dateStr) ||
+    holidaySet.has(`${hospitalId}:${dateStr}`) ||
+    clinicWideHolidays.has(dateStr) ||
+    publicHolidaySet.has(dateStr);
 
   // One plan, used by both the preview and the insert — a dry run that walked
   // its own loop could report slots the real run would not create.
@@ -629,6 +696,8 @@ module.exports = {
   generateSlotsForDoctor,
   computeDaySlotTimes,
   planDoctorSlots,
+  weekOfMonth,
+  matchesWeekOfMonth,
   updateNoShowScores,
   cleanupExpiredSlots,
 };

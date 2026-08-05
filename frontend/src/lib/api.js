@@ -69,10 +69,23 @@ async function performTokenRefresh(failedAccessToken) {
       const current = localStorage.getItem('refresh_token');
       if (current && current !== refreshToken) {
         const freshAccess = localStorage.getItem('token');
-        if (freshAccess) return freshAccess;
+        if (freshAccess) return adoptToken(freshAccess);
       }
       throw refreshErr;
     }
+  };
+
+  // Adopting a token another tab rotated is just as much a refresh as doing it
+  // ourselves, and must announce itself the same way. It didn't: these paths
+  // returned the token bare, so `medibook:token-refreshed` never fired and
+  // resetSessionTimers() never re-armed. The dashboard's SSE stream closes
+  // itself on a token_expired frame and reconnects only on that event, so after
+  // a cross-tab rotation the dashboard sat with no live bookings until some
+  // later refresh happened to go through doRefresh().
+  const adoptToken = (token) => {
+    resetSessionTimers();
+    window.dispatchEvent(new CustomEvent('medibook:token-refreshed', { detail: { token } }));
+    return token;
   };
 
   const lockedRefresh = async () => {
@@ -80,7 +93,7 @@ async function performTokenRefresh(failedAccessToken) {
     // Only reuse the stored token if it differs from the one that just 401'd
     // (a same-token 401 means expiry/revocation — a real refresh is needed).
     const stored = localStorage.getItem('token');
-    if (stored && failedAccessToken && stored !== failedAccessToken) return stored;
+    if (stored && failedAccessToken && stored !== failedAccessToken) return adoptToken(stored);
     return doRefresh();
   };
 

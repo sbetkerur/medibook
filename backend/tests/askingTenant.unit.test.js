@@ -34,6 +34,7 @@ const world = {
   currentState: 'idle',          // bot_sessions.state in the SELECTED clinic
   askingState: 'idle',           // bot_sessions.state in the ASKING clinic
   askingHasReminder: true,       // an unanswered reminder_confirmations row?
+  askingHasOpenPlan: true,       // a treatment course with a sitting left to book?
 };
 
 function rows(r) { return { rows: r, rowCount: r.length }; }
@@ -61,6 +62,9 @@ async function routeTenantQuery(schema, sql, params = []) {
   if (q.includes('reminder_confirmations')) {
     return rows(world.askingHasReminder ? [{ '?column?': 1 }] : []);
   }
+  if (q.includes('FROM treatment_plans tp')) {
+    return rows(world.askingHasOpenPlan ? [{ '?column?': 1 }] : []);
+  }
   return rows([]);
 }
 
@@ -79,6 +83,7 @@ const PHONE = '919333333333';
 function scenario(overrides) {
   Object.assign(world, {
     pendingTenantId: 'tenant-a', currentState: 'idle', askingState: 'idle', askingHasReminder: true,
+    askingHasOpenPlan: true,
   }, overrides);
 }
 
@@ -135,6 +140,47 @@ async function run() {
   await test('a confirmation is still not redirected when no reminder is outstanding', async () => {
     scenario({ askingHasReminder: false });
     assert.strictEqual(await resolveAskingTenant(PHONE, 'yes', TENANT_B), null);
+  });
+
+  // ── The third clinic-initiated question: "book your next sitting" ──
+  await test('*Treatment* goes back to the clinic that asked, not the one selected', async () => {
+    scenario({});
+    const r = await resolveAskingTenant(PHONE, 'Treatment', TENANT_B);
+    assert.strictEqual(r?.id, 'tenant-a');
+  });
+
+  await test('*Treatment* at the selected clinic\'s main menu still redirects', async () => {
+    // Unlike a digit, "treatment" is not a menu option anywhere, so it can only
+    // be an answer to the nudge.
+    scenario({ currentState: 'main_menu' });
+    assert.strictEqual((await resolveAskingTenant(PHONE, 'treatment', TENANT_B))?.id, 'tenant-a');
+  });
+
+  await test('HIGH: *Treatment* is NOT redirected into an asking clinic that is mid-flow', async () => {
+    // botEngine only accepts the keyword from a resting state. Redirected into
+    // a clinic sitting at select_date, the word would be eaten by that step.
+    scenario({ askingState: 'select_date' });
+    assert.strictEqual(await resolveAskingTenant(PHONE, 'Treatment', TENANT_B), null);
+  });
+
+  await test('HIGH: *Treatment* is not redirected once the course has no sitting left', async () => {
+    // The pending row has a 7-day TTL; the clinic may have booked the sitting at
+    // the desk since. The word then belongs to the clinic the patient is with.
+    scenario({ askingHasOpenPlan: false });
+    assert.strictEqual(await resolveAskingTenant(PHONE, 'Treatment', TENANT_B), null);
+  });
+
+  await test('mid-conversation with the selected clinic, *Treatment* is not redirected', async () => {
+    scenario({ currentState: 'select_slot' });
+    assert.strictEqual(await resolveAskingTenant(PHONE, 'Treatment', TENANT_B), null);
+  });
+
+  await test('a word that merely CONTAINS "treatment" is not an answer', async () => {
+    // "no treatment yet" starts with a confirmation word, so it must still be
+    // classed as a confirmation — not silently promoted to a treatment reply.
+    scenario({});
+    const r = await resolveAskingTenant(PHONE, 'I want treatment info', TENANT_B);
+    assert.strictEqual(r, null, 'a sentence was treated as the nudge keyword');
   });
 
   await test('a rating is not redirected unless the asker is on the rating step', async () => {

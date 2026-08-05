@@ -29,7 +29,16 @@ const db = {
     { id: 'dept-1', name: 'General Dentistry' },
     { id: 'dept-2', name: 'Orthodontics & Braces' },
   ],
-  doctors: [{ id: 'doc-1', name: 'Priya Sharma', qualification: 'BDS', consultation_fee: 500 }],
+  // `departments` is the BOOKABLE set (doctor_departments), `department_id` the
+  // primary. Dr Priya is a general dentist who also takes braces cases — the
+  // ordinary Indian arrangement, and the reason a dentist has to be reachable
+  // from a treatment that isn't their primary one.
+  doctors: [
+    { id: 'doc-1', name: 'Priya Sharma', qualification: 'BDS', consultation_fee: 500,
+      specialization: 'General Dentist', department_id: 'dept-1', departments: ['dept-1', 'dept-2'] },
+    { id: 'doc-2', name: 'Rahul Menon', qualification: 'BDS, MDS', consultation_fee: 800,
+      specialization: 'Orthodontist', department_id: 'dept-2', departments: ['dept-2'] },
+  ],
   slotDates: [{ date: '2099-01-05', slots: '4' }],
   slots: [
     { id: 'slot-1', start_time: '10:00:00', end_time: '10:30:00' },
@@ -37,6 +46,9 @@ const db = {
   ],
   bookedSlots: new Set(),
   appointments: [],
+  // Ongoing multi-visit treatments for PHONE. Shaped like getOpenPlans' rows:
+  // only courses with a sitting still to book ever appear here.
+  treatmentPlans: [],
 };
 
 function rows(r) { return { rows: r, rowCount: r.length }; }
@@ -98,7 +110,26 @@ async function routeQuery(sql, params = []) {
   // catalog
   if (q.includes('FROM hospitals')) return rows(db.hospitals);
   if (q.includes('FROM departments d')) return rows(db.departments);
-  if (q.includes('FROM doctors WHERE department_id')) return rows(db.doctors);
+  // Ongoing treatments with a sitting left to book (treatmentFlow.getOpenPlans).
+  if (q.includes('FROM treatment_plans tp')) return rows(db.treatmentPlans);
+
+  // "Not sure" — every dentist at the branch, no department filter at all. The
+  // marker is the literal `false AS is_primary`, which only that query has.
+  if (q.includes('false AS is_primary')) {
+    return rows(db.doctors.map(d => ({ ...d, is_primary: false })));
+  }
+  // Dentists for a treatment, joined through doctor_departments ($1 = department).
+  // Filtered here rather than returning everyone, so a test can prove that a
+  // dentist whose PRIMARY department is something else still shows up — and that
+  // one who doesn't render the treatment does not.
+  if (q.includes('JOIN doctor_departments dd ON dd.doctor_id')) {
+    const deptId = params[0];
+    const matching = db.doctors
+      .filter(d => d.departments.includes(deptId))
+      .map(d => ({ ...d, is_primary: d.department_id === deptId }))
+      .sort((a, b) => (b.is_primary - a.is_primary) || a.name.localeCompare(b.name));
+    return rows(matching);
+  }
   if (q.startsWith('SELECT consultation_fee FROM doctors')) return rows([{ consultation_fee: 500 }]);
 
   // slot dates + slots
@@ -162,10 +193,19 @@ wa.sendText = async (to, text) => { sent.push({ type: 'text', text }); };
 // confirmButtonIndex), so a test tapping a hardcoded id is no longer tapping
 // the button the bot rendered — it is tapping a stale one, which is the whole
 // point of that check.
-wa.sendButtons = async (to, text, buttons) => {
-  sent.push({ type: 'buttons', text, buttons, ids: buttons.map((_, i) => `btn_${i}_${Date.now()}`) });
+// `opts` is WhatsApp's own header/footer slots. Captured here — and folded into
+// `all` — so assertions can match a step title without caring whether it lives
+// in the header or the body, which is exactly the kind of presentation detail
+// that should be free to change.
+wa.sendButtons = async (to, text, buttons, _t, _p, opts = {}) => {
+  sent.push({ type: 'buttons', text, buttons, ...opts,
+    all: [opts.header, text, opts.footer].filter(Boolean).join('\n'),
+    ids: buttons.map((_, i) => `btn_${i}_${Date.now()}`) });
 };
-wa.sendList = async (to, text, label, sections) => { sent.push({ type: 'list', text, sections }); };
+wa.sendList = async (to, text, label, sections, _t, _p, opts = {}) => {
+  sent.push({ type: 'list', text, sections, ...opts,
+    all: [opts.header, text, opts.footer].filter(Boolean).join('\n') });
+};
 wa.sendBookingConfirmationTemplate = async () => { throw new Error('template not approved (test)'); };
 
 const botEngine = require('../src/services/botEngine');
@@ -192,39 +232,117 @@ async function run() {
 
   await test('Hi shows main menu', async () => {
     const r = await send('Hi');
-    assert(r.some(m => m.type === 'buttons' && /Welcome/.test(m.text)), 'no welcome buttons');
+    assert(r.some(m => m.type === 'buttons' && /how can we help|Book an appointment/.test(m.all)), 'no welcome buttons');
     assert.strictEqual(state(), 'main_menu');
   });
 
-  await test('Tapping Book button starts booking (single hospital → treatments)', async () => {
+  await test('Tapping Book button starts booking (single hospital → what do you need)', async () => {
     const r = await send('📅 Book Appointment', 'btn_0_1700000000001');
-    assert(r.some(m => /Select Treatment/.test(m.text)), 'treatment picker not shown: ' + JSON.stringify(r));
+    assert(r.some(m => /What do you need/.test(m.all)), 'treatment picker not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_department');
+  });
+
+  // Patients arrive with a symptom, not a diagnosis. The first option must let
+  // them book the clinic without naming a treatment only the dentist can name.
+  await test('the "not sure" option is offered FIRST, ahead of the named treatments', async () => {
+    const picker = sent.find(m => /What do you need/.test(m.all));
+    const names = picker.buttons || (picker.sections?.[0].rows || []).map(r => r.title);
+    assert(/Not sure|Consultation/i.test(names[0]),
+      'consultation option is not first: ' + JSON.stringify(names));
   });
 
   await test('REGRESSION: tapping a treatment button advances to dentist selection (not main-menu reset)', async () => {
     const r = await send('Orthodontics & Braces', 'btn_1_1700000000002');
     assert(!r.some(m => /How can I help you today|Booking cancelled/.test(m.text)),
       'flow was reset to main menu — stale-button bug is back');
-    assert(r.some(m => /Select Dentist/.test(m.text)), 'dentist picker not shown: ' + JSON.stringify(r));
+    assert(r.some(m => /Choose a dentist/.test(m.all)), 'dentist picker not shown: ' + JSON.stringify(r));
+    assert.strictEqual(state(), 'select_doctor');
+  });
+
+  // ── Multi-department dentists ───────────────────────────────
+  // A dentist belongs to several treatments. Booking by treatment must reach
+  // everyone who renders it, not only those whose PRIMARY department it is —
+  // otherwise the general dentist who does simple root canals is unbookable for
+  // one, which is the normal arrangement in an Indian clinic.
+  await test('a treatment lists every dentist who renders it, specialist first', async () => {
+    const picker = sent.find(m => /Choose a dentist/.test(m.all));
+    assert(picker, 'no dentist picker in the last exchange');
+    const names = (picker.buttons || (picker.sections?.[0].rows || []).map(r => r.title));
+    assert(names.some(n => /Rahul Menon/.test(n)),
+      'the orthodontist is missing from their own treatment: ' + JSON.stringify(names));
+    assert(names.some(n => /Priya Sharma/.test(n)),
+      'the general dentist who also does braces is missing — multi-department listing is broken: '
+      + JSON.stringify(names));
+    // The dentist whose primary department this is leads: a patient scanning the
+    // list should see the specialist before the generalist.
+    assert(/Rahul Menon/.test(names[0]),
+      'specialist should be listed first for their own treatment: ' + JSON.stringify(names));
+  });
+
+  await test('a dentist is NOT offered for a treatment they do not render', async () => {
+    await send('Hi');
+    await send('📅 Book Appointment', 'btn_0_1700000000101');
+    const r = await send('General Dentistry', 'dept-1');
+    const picker = r.find(m => /Choose a dentist/.test(m.all));
+    assert(picker, 'dentist picker not shown: ' + JSON.stringify(r));
+    const names = (picker.buttons || (picker.sections?.[0].rows || []).map(r2 => r2.title));
+    assert(names.some(n => /Priya Sharma/.test(n)), 'general dentist missing: ' + JSON.stringify(names));
+    assert(!names.some(n => /Rahul Menon/.test(n)),
+      'the orthodontist was offered for general dentistry — the department filter is not applied: '
+      + JSON.stringify(names));
+  });
+
+  await test('choosing "not sure" offers EVERY dentist at the branch, not one specialty', async () => {
+    await send('Hi');
+    await send('📅 Book Appointment', 'btn_0_1700000000103');
+    // "Not sure" now asks what brings them in FIRST — the answer can still
+    // change who they see at that point, which it could not once the dentist,
+    // day and time were already chosen.
+    const asked = await send('🩺 Consultation / Not sure', 'general_consult');
+    assert(asked.some(m => /What brings you in/.test(m.all)),
+      'complaint should be asked before dentists on the consult path: ' + JSON.stringify(asked));
+    const r = await send('🔍 Checkup / Cleaning', 'btn_1_1700000000105');
+    const picker = r.find(m => /Choose a dentist/.test(m.all));
+    assert(picker, 'dentist picker not shown: ' + JSON.stringify(r));
+    const names = picker.buttons || (picker.sections?.[0].rows || []).map(r2 => r2.title);
+    assert(names.some(n => /Priya Sharma/.test(n)) && names.some(n => /Rahul Menon/.test(n)),
+      'a consultation should reach the whole clinic: ' + JSON.stringify(names));
+  });
+
+  await test('typing "not sure" works as well as tapping it', async () => {
+    await send('Hi');
+    await send('📅 Book Appointment', 'btn_0_1700000000104');
+    await send('not sure');
+    const r = await send('🔍 Checkup / Cleaning', 'btn_1_1700000000106');
+    assert(r.some(m => /Choose a dentist/.test(m.all)),
+      'typed "not sure" did not reach dentist selection: ' + JSON.stringify(r));
+    assert.strictEqual(state(), 'select_doctor');
+  });
+
+  // Back to the Orthodontics booking the rest of the flow continues from.
+  await test('resuming the braces booking with the general dentist', async () => {
+    await send('Hi');
+    await send('📅 Book Appointment', 'btn_0_1700000000102');
+    const r = await send('Orthodontics & Braces', 'dept-2');
+    assert(r.some(m => /Choose a dentist/.test(m.all)), 'dentist picker not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_doctor');
   });
 
   await test('Tapping a dentist (list reply with UUID buttonId) shows dates', async () => {
     const r = await send('Dr. Priya Sharma', 'doc-1');
-    assert(r.some(m => /Select Date/.test(m.text)), 'date picker not shown: ' + JSON.stringify(r));
+    assert(r.some(m => /When suits you|free on these days/.test(m.all)), 'date picker not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_date');
   });
 
   await test('Tapping a date (list reply) shows time slots', async () => {
     const r = await send('Mon, 5 Jan', '2099-01-05');
-    assert(r.some(m => /Select Time/.test(m.text)), 'slot picker not shown: ' + JSON.stringify(r));
+    assert(r.some(m => /What time|Pick a time|with Dr\./.test(m.all)), 'slot picker not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_slot');
   });
 
   await test('Tapping a slot (new patient) asks for name', async () => {
     const r = await send('10:00 – 10:30', 'slot-1');
-    assert(r.some(m => /Patient Name/.test(m.text)), 'name prompt not shown: ' + JSON.stringify(r));
+    assert(r.some(m => /what name/i.test(m.text)), 'name prompt not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'collect_name');
   });
 
@@ -236,16 +354,17 @@ async function run() {
     assert.strictEqual(state(), 'collect_name');
   });
 
-  await test('REGRESSION: unrecognised gender reply re-prompts instead of silently storing "other"', async () => {
+  await test('a malformed date of birth re-asks and still offers Skip', async () => {
     await send('Asha Verma');
     assert.strictEqual(state(), 'collect_dob');
+    // Gender and email are no longer asked; DOB is optional but must not accept
+    // rubbish silently — a bad date re-prompts WITH the escape hatch visible.
+    const bad = await send('femle');
+    assert(bad.some(m => /doesn't look like a date/i.test(m.text)), JSON.stringify(bad));
+    assert(bad.some(m => (m.buttons || []).some(b => /skip/i.test(b))), 'no Skip offered');
+    assert.strictEqual(state(), 'collect_dob');
     await send('15/08/1990');
-    assert.strictEqual(state(), 'collect_gender');
-    // A typo / stale tap used to fall through to 'other' and advance the flow.
-    const r = await send('femle');
-    assert(r.some(m => /choose one of the options/i.test(m.text)),
-      'expected gender re-prompt: ' + JSON.stringify(r));
-    assert.strictEqual(state(), 'collect_gender', 'should stay on gender step');
+    assert.strictEqual(state(), 'collect_chief_complaint');
     const ctxRaw = db.sessions.get(PHONE).context;
     const ctx = JSON.parse(require('../src/utils/encryption').decrypt(ctxRaw._enc));
     assert.strictEqual(ctx.patient_gender, undefined, 'gender must not be set from an unrecognised reply');
@@ -255,14 +374,10 @@ async function run() {
   // button the summary actually minted.
   let confirmBtnId = null;
 
-  await test('Typed name → DOB → gender → email skip → reason → confirmation summary', async () => {
-    assert.strictEqual(state(), 'collect_gender');
-    await send('Female', 'btn_1_1700000000004');
-    assert.strictEqual(state(), 'collect_email');
-    await send('⏭ Skip', 'btn_0_1700000000005');
+  await test('Typed name → DOB → reason → confirmation summary', async () => {
     assert.strictEqual(state(), 'collect_chief_complaint');
     const r = await send('🔍 Checkup / Cleaning', 'btn_1_1700000000006');
-    const summary = r.find(m => /review your booking/.test(m.text));
+    const summary = r.find(m => /Check and confirm/.test(m.all));
     assert(summary, 'confirmation summary not shown: ' + JSON.stringify(r));
     confirmBtnId = summary.ids[0];
     assert.strictEqual(state(), 'confirm_booking');
@@ -284,7 +399,7 @@ async function run() {
     const r = await send('✅ Confirm', confirmBtnId);
     assert(!r.some(m => /How can I help you today/.test(m.text)),
       'confirm tap was reset to main menu — stale-button bug is back');
-    assert(r.some(m => /Appointment Confirmed/.test(m.text)), 'confirmation not sent: ' + JSON.stringify(r));
+    assert(r.some(m => /\*Booked\*/.test(m.text)), 'confirmation not sent: ' + JSON.stringify(r));
     assert.strictEqual(db.appointments.length, 1, 'appointment row not created');
     assert(db.bookedSlots.has('slot-1'), 'slot not marked booked');
     assert.strictEqual(state(), 'idle');
@@ -294,8 +409,62 @@ async function run() {
     await send('Hi');
     await send('📅 Book Appointment', 'btn_0_1700000000008'); // back into select_department
     const r = await send('🗓 My Appointments', 'btn_1_1700000000009');
-    assert(r.some(m => /Welcome/.test(m.text)), 'main-menu escape broken: ' + JSON.stringify(r));
+    // Every main-menu send now goes through sendMainMenu, so this asserts the
+    // shared shape (clinic name in the header) rather than one path's wording —
+    // it was matching the old duplicate copy that this consolidation removed.
+    assert(r.some(m => m.type === 'buttons' && m.header === tenant.name),
+      'main-menu escape broken: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'main_menu');
+  });
+
+  // ── Patient books their own subsequent sittings ─────────────
+  // The first sitting of a treatment is booked at the desk; every one after it
+  // is the patient's, prompted by a nudge that says "Reply *Treatment*".
+  await test('with no ongoing treatment, *Treatment* says so instead of dead-ending', async () => {
+    db.treatmentPlans = [];
+    await send('Hi');
+    const r = await send('Treatment');
+    assert(r.some(m => /no treatment sittings/i.test(m.text)),
+      'expected a plain "nothing waiting" reply: ' + JSON.stringify(r));
+  });
+
+  await test('the greeting surfaces an ongoing treatment (all 3 menu buttons are taken)', async () => {
+    db.treatmentPlans = [{
+      id: 'plan-1', title: 'Root canal 36', total_visits: 3, booked_visits: 1,
+      hospital_id: 'hosp-1', hospital_name: 'Smile Dental',
+      department_id: 'dept-1', department_name: 'General Dentistry',
+      treating_doctor_id: 'doc-2', doctor_name: 'Rahul Menon',
+      qualification: 'BDS, MDS', consultation_fee: 800, specialization: 'Orthodontist',
+      completed_visits: 1,
+    }];
+    const r = await send('Hi');
+    assert(r.some(m => /Ongoing treatment/i.test(m.text)), 'greeting did not mention it: ' + JSON.stringify(r));
+    assert(r.some(m => /visit 2 of 3/.test(m.text)), 'greeting did not say which sitting is next');
+  });
+
+  await test('*Treatment* with ONE course skips the picker and goes straight to dates', async () => {
+    await send('Hi');
+    const r = await send('Treatment');
+    assert(r.some(m => /Root canal 36/.test(m.text)), 'treatment not named: ' + JSON.stringify(r));
+    assert(r.some(m => /When suits you|free on these days/.test(m.all)),
+      'one course should not ask "which treatment?": ' + JSON.stringify(r));
+    assert.strictEqual(state(), 'select_date');
+  });
+
+  await test('the sitting is booked with the TREATING dentist, not re-picked by the patient', async () => {
+    const picker = sent.find(m => /When suits you|free on these days/.test(m.all));
+    assert(/Rahul Menon/.test(picker.text),
+      'dates should be the treating dentist\'s: ' + JSON.stringify(picker.text));
+  });
+
+  await test('*Treatment* mid-booking does NOT hijack the flow', async () => {
+    await send('Hi');
+    await send('📅 Book Appointment', 'btn_0_1700000000201'); // now at select_department
+    const r = await send('Treatment');
+    // It is not a treatment list, and not a silent no-op — the department step
+    // owns the message and re-asks.
+    assert(!r.some(m => /When suits you|free on these days/.test(m.all)), 'treatment keyword hijacked an active booking');
+    assert.strictEqual(state(), 'select_department');
   });
 
   console.log(`\nResults: ${pass} passed, ${fail} failed`);

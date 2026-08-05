@@ -27,6 +27,7 @@ export default function AppointmentsTab({
   onAddWalkin,
   onEditNotes,
   onCancelAppt,
+  onRecordTreatment,
 }) {
   const fmtDate = (d) => { try { return format(parseISO(d), 'd MMM yy'); } catch { return d; } };
 
@@ -92,10 +93,13 @@ export default function AppointmentsTab({
                   <div className="font-medium text-gray-900 truncate">{a.patient_name}</div>
                   <div className="flex items-center gap-1.5 mt-0.5">
                     <a href={waLink(a.patient_phone)} target="_blank" rel="noreferrer"
-                      className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
+                      className="inline-block py-2 text-xs text-green-600 hover:underline">{a.patient_phone}</a>
+                    {/* Icon-only next to a phone number, so it needs a real
+                        target on touch; negative margins keep the row's visual
+                        height unchanged. */}
                     {isAdmin && (
-                    <button onClick={() => onMessagePatient(a.patient_phone || '')}
-                      className="text-xs text-green-500 hover:text-green-700 px-1.5 py-1 -my-1">📤</button>
+                    <button onClick={() => onMessagePatient(a.patient_phone || '')} aria-label="Message patient on WhatsApp"
+                      className="shrink-0 w-10 h-10 -my-3 flex items-center justify-center text-xs text-green-500 hover:text-green-700 md:w-auto md:h-auto md:my-0 md:px-1.5 md:py-1">📤</button>
                     )}
                   </div>
                 </div>
@@ -128,6 +132,15 @@ export default function AppointmentsTab({
                 <button onClick={() => onEditNotes(a)}
                   className={`px-3 py-2 text-xs border rounded-lg transition ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
                   📝 {a.notes ? 'Notes' : 'Add Note'}
+                </button>
+                {/* Recording the treatment has to happen HERE, on the visit the
+                    dentist just finished — not on a separate tab that asks the
+                    front desk to find this appointment again in a dropdown. If
+                    it costs more than a few seconds it does not get done, and
+                    nothing downstream of it works. */}
+                <button onClick={() => onRecordTreatment(a)}
+                  className="px-3 py-2 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded-lg hover:bg-teal-100 transition">
+                  🩺 Treatment
                 </button>
               </div>
             </div>
@@ -214,6 +227,10 @@ export default function AppointmentsTab({
                       <button onClick={() => onEditNotes(a)} title="Edit clinical notes"
                         className={`px-2 py-1 text-xs border rounded hover:bg-gray-100 transition whitespace-nowrap ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
                         📝 {a.notes ? 'Notes' : 'Add Note'}
+                      </button>
+                      <button onClick={() => onRecordTreatment(a)} title="Record a treatment the dentist advised"
+                        className="px-2 py-1 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded hover:bg-teal-100 transition whitespace-nowrap">
+                        🩺 Treatment
                       </button>
                     </div>
                   </td>

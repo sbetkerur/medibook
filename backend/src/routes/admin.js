@@ -149,7 +149,10 @@ router.get('/dashboard', async (req, res) => {
     // "Today" is the IST calendar day, not CURRENT_DATE (the UTC date, which is
     // a day behind IST between 00:00 and 05:30 IST — the dashboard used to show
     // yesterday's queue for the first 5.5 hours of every clinic day).
-    const [upcoming, recentAppts, ...liveStats] = await Promise.allSettled([
+    // `outstanding` is destructured explicitly: it sits before the cache-gated
+    // block, so folding it into ...liveStats would shift every index the
+    // statsData mapping below depends on.
+    const [upcoming, recentAppts, outstanding, ...liveStats] = await Promise.allSettled([
       tenantQuery(s, `SELECT COUNT(*) FROM appointments WHERE appointment_date>${IST_TODAY_SQL} AND status='confirmed'`),
       tenantQuery(s, `
         SELECT a.booking_id, a.appointment_date, a.appointment_time, a.status,
@@ -160,6 +163,24 @@ router.get('/dashboard', async (req, res) => {
         WHERE a.appointment_date=${IST_TODAY_SQL}
         ORDER BY a.appointment_time
         LIMIT 10
+      `),
+      // Treatment advised and never booked. This is the number an owner cares
+      // about most — it is revenue already agreed and sitting idle — so it runs
+      // live rather than off the 15-minute stats cache. Counted on BOOKED
+      // sittings, not completed: a course whose remaining visits are already on
+      // the calendar is not outstanding work.
+      // The per-plan HAVING has to run in a subquery: grouping by tp.id makes
+      // every group one row, so COUNT(*) at that level is always 1.
+      tenantQuery(s, `
+        SELECT COUNT(*)::int AS plans, COALESCE(SUM(estimated_cost), 0)::int AS value
+        FROM (
+          SELECT tp.id, tp.estimated_cost
+          FROM treatment_plans tp
+          LEFT JOIN appointments a ON a.treatment_plan_id = tp.id AND a.status <> 'cancelled'
+          WHERE tp.status IN ('proposed','in_progress')
+          GROUP BY tp.id, tp.estimated_cost, tp.total_visits
+          HAVING COUNT(a.id) < tp.total_visits
+        ) open_plans
       `),
       // Only run heavy queries if cache miss
       ...(cached ? [] : [
@@ -192,7 +213,7 @@ router.get('/dashboard', async (req, res) => {
     }
 
     // Log any rejected queries
-    [upcoming, recentAppts, ...liveStats].forEach((r, i) => {
+    [upcoming, recentAppts, outstanding, ...liveStats].forEach((r, i) => {
       if (r.status === 'rejected') logger.warn(`Dashboard query [${i}] failed`, { error: r.reason?.message });
     });
 
@@ -203,6 +224,8 @@ router.get('/dashboard', async (req, res) => {
       available_slots: statsData?.available_slots ?? null,
       appointments_month: statsData?.appointments_month ?? null,
       todays_schedule: val(recentAppts, 'rows', []),
+      outstanding_treatments: val(outstanding, 'plans', null),
+      outstanding_treatment_value: val(outstanding, 'value', null),
       cache_hit: !!cached,
     });
   } catch (err) { handleError(res, err); }
@@ -480,9 +503,23 @@ router.get('/feedback', async (req, res) => {
     }
     const where = ['1=1'];
     const params = [];
+    // Validated, not just parsed. parseInt('abc') is NaN, which node-postgres
+    // serialises as the string "NaN"; Postgres rejects it for an integer column
+    // and a normal dashboard tab answered 500 for a typo in a query string.
+    // Every other filter here is validated first — these two were not.
+    const ratingBound = (v) => {
+      const n = parseInt(v, 10);
+      return Number.isInteger(n) && n >= 1 && n <= 5 ? n : null;
+    };
+    if (min_rating !== undefined && ratingBound(min_rating) === null) {
+      return res.status(400).json({ error: 'min_rating must be an integer between 1 and 5' });
+    }
+    if (max_rating !== undefined && ratingBound(max_rating) === null) {
+      return res.status(400).json({ error: 'max_rating must be an integer between 1 and 5' });
+    }
     if (doctor_id) { params.push(doctor_id); where.push(`a.doctor_id=$${params.length}`); }
-    if (min_rating) { params.push(parseInt(min_rating)); where.push(`af.rating>=$${params.length}`); }
-    if (max_rating) { params.push(parseInt(max_rating)); where.push(`af.rating<=$${params.length}`); }
+    if (min_rating !== undefined) { params.push(ratingBound(min_rating)); where.push(`af.rating>=$${params.length}`); }
+    if (max_rating !== undefined) { params.push(ratingBound(max_rating)); where.push(`af.rating<=$${params.length}`); }
     params.push(safeLimit, offset);
     const r = await tenantQuery(s, `
       SELECT af.*, p.name as patient_name, d.name as doctor_name,
@@ -659,15 +696,23 @@ router.get('/audit-logs', adminOnly, async (req, res) => {
     const conditions = ['1=1'];
     const params = [];
 
+    // audit_logs.created_at is TIMESTAMPTZ and servers run UTC, so a bare
+    // `created_at >= $1::date` coerces the date literal at UTC — putting the
+    // boundary at 05:30 IST. Filtering a single day therefore HID everything
+    // logged before 05:30 that day and silently INCLUDED 00:00-05:30 of the
+    // next one; every audit query and its CSV export was shifted 5.5 hours.
+    // For a log whose entire purpose is attribution, "the action isn't in the
+    // log for the day it happened" is the wrong answer. Build the boundary as
+    // an IST wall-clock timestamp and let Postgres convert it back.
     if (from) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) return res.status(400).json({ error: 'Invalid from date (YYYY-MM-DD)' });
       params.push(from);
-      conditions.push(`created_at >= $${params.length}::date`);
+      conditions.push(`created_at >= (($${params.length}::date)::timestamp AT TIME ZONE 'Asia/Kolkata')`);
     }
     if (to) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(to)) return res.status(400).json({ error: 'Invalid to date (YYYY-MM-DD)' });
       params.push(to);
-      conditions.push(`created_at < ($${params.length}::date + INTERVAL '1 day')`);
+      conditions.push(`created_at < ((($${params.length}::date + INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Kolkata')`);
     }
     if (action) {
       params.push(action.toUpperCase());

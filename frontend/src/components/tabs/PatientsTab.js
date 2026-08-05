@@ -51,8 +51,11 @@ export default function PatientsTab({
                   <div className="font-medium text-gray-900 cursor-pointer truncate" onClick={() => openPatientHistory(p)}>
                     {p.name || '—'}
                   </div>
+                  {/* inline-block + py: a bare inline <a> is only as tall as
+                      its text (16px), and this is how reception actually opens
+                      a chat with the patient. */}
                   <a href={waLink(p.phone)} target="_blank" rel="noreferrer"
-                    className="text-xs text-green-600 hover:underline">+{p.phone}</a>
+                    className="inline-block py-2 text-xs text-green-600 hover:underline">+{p.phone}</a>
                 </div>
                 <div className="text-xs text-gray-400 text-right shrink-0">
                   <div className="capitalize">{p.gender || '—'}</div>

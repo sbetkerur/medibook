@@ -38,7 +38,8 @@ export default function DoctorsTab({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-4">
           <p className="text-sm text-gray-500">{doctors.length} dentist{doctors.length !== 1 ? 's' : ''}</p>
-          <label className="flex items-center gap-2 cursor-pointer select-none">
+          {/* The switch is 32x16; the label is the hit area, so pad it. */}
+          <label className="flex items-center gap-2 cursor-pointer select-none py-2.5 -my-2.5">
             <div className="relative">
               <input type="checkbox" className="sr-only" checked={showInactive}
                 onChange={e => setShowInactive(e.target.checked)} />
@@ -81,6 +82,18 @@ export default function DoctorsTab({
               </div>
             </div>
             <div className="mt-2 text-xs text-gray-400">{d.slot_duration_minutes}min slots · {d.department_name || 'No dept'}</div>
+            {/* Every treatment this dentist is bookable for. The primary is shown
+                above; the rest are what makes them reachable from another
+                treatment's list in the bot — worth seeing at a glance. */}
+            {Array.isArray(d.departments) && d.departments.length > 1 && (
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                {d.departments.filter(dep => dep.id !== d.department_id).map(dep => (
+                  <span key={dep.id} className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 text-[10px] leading-4">
+                    {dep.name}
+                  </span>
+                ))}
+              </div>
+            )}
             {!d.is_active && (
               <p className="mt-2 text-xs text-red-400 font-medium">⚠️ Inactive — hidden from bot</p>
             )}

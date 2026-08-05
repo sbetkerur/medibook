@@ -30,6 +30,7 @@ const STATES = {
   COLLECT_FEEDBACK_RATING: 'collect_feedback_rating',
   COLLECT_FEEDBACK_COMMENT: 'collect_feedback_comment',
   RESUME_CONFIRM: 'resume_confirm',
+  SELECT_TREATMENT_PLAN: 'select_treatment_plan',
 };
 
 function genBookingId() {
@@ -102,9 +103,9 @@ function maskPhone(phone) {
 // they carry their own intent and are matched by the callers' text patterns.
 
 /** Send a confirm prompt and remember which buttons it minted. */
-async function sendConfirmButtons(send, ctx, bodyText, buttons) {
+async function sendConfirmButtons(send, ctx, bodyText, buttons, opts) {
   const from = Date.now();
-  await send.buttons(bodyText, buttons);
+  await send.buttons(bodyText, buttons, opts);
   // Same process, same clock as whatsapp.js's Date.now() — the ids this send
   // just created are exactly those with a timestamp in [from, to].
   ctx._confirm_btns = { from, to: Date.now() };

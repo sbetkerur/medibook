@@ -47,6 +47,40 @@ const {
   handleCancelConfirm,
 } = require('./bot/appointmentFlow');
 
+const {
+  showTreatmentPlans,
+  handleSelectTreatmentPlan,
+} = require('./bot/treatmentFlow');
+
+/**
+ * The main menu — ONE implementation.
+ *
+ * There were five copies of this send, and a copy-wide change reached only two
+ * of them: arriving via a stale-button tap or the mid-flow fallback still got
+ * the old `👋 Welcome … to *Clinic*!` with no header or footer, so the clinic's
+ * branding changed depending on which path a patient came in by. Every caller
+ * now goes through here.
+ *
+ * @param {string} [lead] - replaces the greeting line, for the cases that need
+ *   to say something first ("Booking cancelled.").
+ */
+async function sendMainMenu(send, tenant, patient, lead) {
+  const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
+  const body = lead || (patient?.name
+    ? `Hello${firstName} — how can we help today?`
+    : 'Book an appointment, check an existing one, or manage a booking — all here on WhatsApp.');
+  return send.buttons(
+    body,
+    ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status'],
+    { header: String(tenant.name).slice(0, 60), footer: 'Reply Hi any time to start over' }
+  );
+}
+
+// "Book my next sitting." Deliberately narrow: it must not swallow a plain
+// "book" (that is the ordinary booking menu option) and must not fire on the
+// word "treatment" buried in a sentence describing symptoms.
+const TREATMENT_KEYWORD_RE = /^(my )?(treatment|treatments|sitting|next sitting|book treatment|book my treatment)$/i;
+
 // ── SMART INTENT DETECTION ────────────────────────────────────
 // Detects shortcuts in free-text to skip bot flow steps.
 // Returns an object with detected intent hints, or null.
@@ -155,13 +189,16 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       await logMessage(schema, phone, 'out', 'text', t, id);
       return id;
     },
-    buttons: async (t, btns) => {
-      const id = await wa.sendButtons(phone, t, btns, waToken, waPhoneId);
+    // `opts` carries { header, footer } — WhatsApp's own slots, not bold text
+    // faked inside the body. History logs the body only, which is what the
+    // clinic reads back; the header/footer are chrome.
+    buttons: async (t, btns, opts) => {
+      const id = await wa.sendButtons(phone, t, btns, waToken, waPhoneId, opts);
       await logMessage(schema, phone, 'out', 'buttons', t, id);
       return id;
     },
-    list: async (t, label, sections) => {
-      const id = await wa.sendList(phone, t, label, sections, waToken, waPhoneId);
+    list: async (t, label, sections, opts) => {
+      const id = await wa.sendList(phone, t, label, sections, waToken, waPhoneId, opts);
       await logMessage(schema, phone, 'out', 'list', t, id);
       return id;
     },
@@ -215,13 +252,24 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     const patient = await getPatient(schema, phone).catch(() => null);
     const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
-    const subtitle = patient?.name
-      ? 'How can I help you today?'
-      : 'Book a dental appointment, check your status, or manage existing bookings.';
-    await send.buttons(
-      `🦷 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
-    );
+    await sendMainMenu(send, tenant, patient);
+    // WhatsApp caps interactive messages at three buttons and all three are
+    // spoken for, so an ongoing treatment is surfaced as a follow-up line rather
+    // than a fourth option. Only shown when there is actually a sitting left to
+    // book — otherwise it is noise on every greeting. Best-effort: a failure
+    // here must never cost the patient their menu.
+    try {
+      const { getOpenPlans, planLabel } = require('./bot/treatmentFlow');
+      const openPlans = await getOpenPlans(schema, phone);
+      if (openPlans.length) {
+        await send.text(
+          `🦷 *Ongoing treatment*\n\n${openPlans.map(planLabel).join('\n')}\n\n` +
+          `Reply *Treatment* to book your next sitting.`
+        );
+      }
+    } catch (err) {
+      logger.warn('Open treatment lookup failed on greeting', { error: err.message });
+    }
     return;
   }
 
@@ -322,17 +370,29 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return;
   }
 
+  // ── "Book my next treatment sitting" ─────────────────────────
+  // Accepted from a resting state only, so it can never hijack a step of a
+  // booking already in progress. This is the keyword the nudge cron and the
+  // treatment reminders tell the patient to send.
+  //
+  // MUST stay ABOVE the IDLE fallback below. It used to sit under it, and the
+  // fallback returns unconditionally for an idle session — so the `IDLE` half
+  // of this test was dead code and the nudge's own call to action did nothing
+  // on the first reply. Idle is the NORMAL state for the patient this cron
+  // targets: their sitting was booked at the desk, so they have no bot session
+  // in flight, and every completed flow ends at IDLE. They tapped "Book my
+  // next sitting" and got the generic main menu; only a second "Treatment"
+  // (now from MAIN_MENU) worked. Every test for this keyword sends "Hi" first,
+  // which parks the session at MAIN_MENU, which is why the suite stayed green.
+  if ((session.state === STATES.IDLE || session.state === STATES.MAIN_MENU)
+      && !buttonId && TREATMENT_KEYWORD_RE.test(input.trim())) {
+    return showTreatmentPlans(phone, schema, tenant, send, ctx);
+  }
+
   // ── IDLE fallback — any non-greeting message when session is idle ──
   if (session.state === STATES.IDLE) {
     const patient = await getPatient(schema, phone);
-    const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
-    const subtitle = patient?.name
-      ? 'How can I help you today?'
-      : 'Book a dental appointment, check your status, or manage existing bookings.';
-    await send.buttons(
-      `🦷 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
-    );
+    await sendMainMenu(send, tenant, patient);
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
@@ -355,6 +415,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       await send.text(
         `ℹ️ *Help*\n\n` +
         `• Reply *Book* — Book an appointment\n` +
+        `• Reply *Treatment* — Book your next treatment sitting\n` +
         `• Reply *Status* — Check appointment status\n` +
         `• Reply *My* — View your appointments\n` +
         `• Reply *Menu* — Return to main menu\n` +
@@ -363,7 +424,18 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       );
       return;
     }
-    await send.text('Please choose an option from the menu. Reply *Menu* to see the menu again.');
+    // Free text at the menu is the most likely thing a real person sends first
+    // ("I need a dentist", "tooth pain"), and it used to get the flattest reply
+    // in the product. Two changes: when detectIntent recognises a complaint,
+    // just START the booking with that hint rather than telling them off; and
+    // when it doesn't, re-offer the menu with the buttons attached instead of a
+    // bare line of text pointing at a menu they can no longer see.
+    const intents = detectIntent(input);
+    if (intents?.department_hint) {
+      return startBooking(phone, schema, tenant, send, { ...ctx, ...intents });
+    }
+    await sendMainMenu(send, tenant, await getPatient(schema, phone).catch(() => null),
+      `Sorry — I didn't follow that. I can do these three things, or reply *Help* for what else I understand.`);
     return;
   }
 
@@ -412,10 +484,8 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   if (BOOKING_STATES.includes(session.state)) {
     // Explicit typed escape keywords
     if (/^(cancel|exit|back|quit|0|main menu|mainmenu)$/i.test(input)) {
-      await send.buttons(
-        '❌ Booking cancelled.\n\nWhat would you like to do?',
-        ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
-      );
+      await sendMainMenu(send, tenant, await getPatient(schema, phone).catch(() => null),
+        'No problem — nothing was booked. What would you like to do?');
       await updateSession(schema, phone, STATES.MAIN_MENU, {});
       return;
     }
@@ -433,15 +503,15 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       /book appointment|my appointments|check status/i.test(input);
 
     if (staleMainMenuButton) {
-      const patient = await getPatient(schema, phone);
-      const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
-      await send.buttons(
-        `👋 Welcome${firstName} to *${tenant.name}*!\n\nHow can I help you today?`,
-        ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
-      );
+      await sendMainMenu(send, tenant, await getPatient(schema, phone).catch(() => null));
       await updateSession(schema, phone, STATES.MAIN_MENU, {});
       return;
     }
+  }
+
+  // ── TREATMENT SITTINGS ───────────────────────────────────────
+  if (session.state === STATES.SELECT_TREATMENT_PLAN) {
+    return handleSelectTreatmentPlan(phone, schema, tenant, send, ctx, choice, input);
   }
 
   // ── BOOKING FLOW ─────────────────────────────────────────────
@@ -449,7 +519,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return handleSelectHospital(phone, schema, tenant, send, ctx, choice, input);
   }
   if (session.state === STATES.SELECT_DEPARTMENT) {
-    return handleSelectDept(phone, schema, tenant, send, ctx, choice, input);
+    return handleSelectDept(phone, schema, tenant, send, ctx, choice, input, buttonId);
   }
   if (session.state === STATES.SELECT_DOCTOR) {
     return handleSelectDoctor(phone, schema, tenant, send, ctx, choice, input);
@@ -475,17 +545,30 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       return;
     }
     ctx.patient_name = input;
-    await send.text('🎂 *Date of Birth*\n\nEnter your DOB in DD/MM/YYYY format:\nExample: 15/08/1990');
+    // A question, not a form field. Same information, a third of the words.
+    await send.buttons('And your date of birth? Use DD/MM/YYYY — for example 15/08/1990.',
+      ['⏭ Skip'], { header: 'Date of birth (optional)' });
     await updateSession(schema, phone, STATES.COLLECT_DOB, ctx);
     return;
   }
   if (session.state === STATES.COLLECT_DOB) {
+    // Optional. Nothing in the product branches on age — it is a clinical record
+    // the dentist can complete at the chair, and demanding it before a patient in
+    // pain can book was the largest remaining piece of friction in this flow.
+    if (/^skip$/i.test(input.trim()) || /^btn_0/.test(buttonId || '')) {
+      return askChiefComplaint(phone, schema, send, ctx);
+    }
     if (buttonId) {
-      await send.text('🎂 Please *type* the date of birth in DD/MM/YYYY format:\nExample: 15/08/1990');
+      await send.buttons('Please *type* the date of birth as DD/MM/YYYY, or skip.',
+        ['⏭ Skip'], { header: 'Date of birth (optional)' });
       return;
     }
     const m = input.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-    if (!m) { await send.text('Invalid format. Please use DD/MM/YYYY\nExample: 15/08/1990'); return; }
+    if (!m) {
+      await send.buttons('That doesn\'t look like a date. Use DD/MM/YYYY — for example 15/08/1990.',
+        ['⏭ Skip'], { header: 'Date of birth (optional)' });
+      return;
+    }
     const [, dd, mm, yyyy] = m;
     const day = parseInt(dd, 10), mon = parseInt(mm, 10), yr = parseInt(yyyy, 10);
     const parsedDate = new Date(yr, mon - 1, day);
@@ -494,47 +577,27 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       parsedDate.getMonth() === mon - 1 &&
       parsedDate.getDate() === day;
     if (!isValidDate || yr < 1900 || parsedDate > today || (today.getFullYear() - yr) > 150) {
-      await send.text('Please enter a valid date of birth in DD/MM/YYYY format.\nExample: 15/08/1990');
+      await send.buttons('That date doesn\'t look right. Use DD/MM/YYYY — for example 15/08/1990.',
+        ['⏭ Skip'], { header: 'Date of birth (optional)' });
       return;
     }
     ctx.patient_dob = `${yyyy}-${mm.padStart(2,'0')}-${dd.padStart(2,'0')}`;
-    await send.buttons('👤 *Your Gender*', ['Male', 'Female', 'Other']);
-    await updateSession(schema, phone, STATES.COLLECT_GENDER, ctx);
-    return;
+    return askChiefComplaint(phone, schema, send, ctx);
   }
-  if (session.state === STATES.COLLECT_GENDER) {
-    // Check female BEFORE male — 'female' contains 'male' so order matters.
-    // Unrecognised replies must RE-PROMPT, not silently fall through to 'other':
-    // a typo or a stale button tap used to write 'other' into the patient record
-    // and advance the flow, unlike every other collection step here.
-    const gender =
-      /\bfemale\b|^btn_1/i.test(choice) ? 'female' :
-      /\bmale\b|^btn_0/i.test(choice)   ? 'male'   :
-      /\bother\b|^btn_2/i.test(choice)  ? 'other'  : null;
-    if (!gender) {
-      await send.buttons('Please choose one of the options below:', ['Male', 'Female', 'Other']);
-      return;
-    }
-    ctx.patient_gender = gender;
-    await send.buttons('📧 *Email Address* _(optional)_\n\nShare your email to receive a booking confirmation, or tap Skip to continue:', ['⏭ Skip']);
-    await updateSession(schema, phone, STATES.COLLECT_EMAIL, ctx);
-    return;
-  }
-  if (session.state === STATES.COLLECT_EMAIL) {
-    if (!/^skip$/i.test(input) && !/^btn_0/.test(buttonId || '') && input.length > 0) {
-      // Stricter email regex: requires valid local part, domain with at least one dot,
-      // and a TLD of 2+ chars. Rejects `test@.com`, `a@b.c`, consecutive dots in domain.
-      if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(input) && !/\.{2,}/.test(input)) {
-        ctx.patient_email = input.toLowerCase();
-      } else {
-        await send.buttons('Invalid email format. Please enter a valid email address, or tap Skip:', ['⏭ Skip']);
-        return;
-      }
-    }
+  // The gender and email questions were removed from the flow: nothing in the
+  // product ever branched on gender, and the patient email only fed a
+  // confirmation email that does not send at all without RESEND_API_KEY. Both
+  // columns remain, and staff still set them from the dashboard.
+  //
+  // These two states are kept ONLY to drain sessions that were already parked in
+  // them when this shipped — they accept anything and move the patient on rather
+  // than stranding a half-finished booking. bot_sessions are cleared after 4
+  // hours, so both branches can be deleted a day after deploy.
+  if (session.state === STATES.COLLECT_GENDER || session.state === STATES.COLLECT_EMAIL) {
     return askChiefComplaint(phone, schema, send, ctx);
   }
   if (session.state === STATES.COLLECT_CHIEF_COMPLAINT) {
-    return handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSession);
+    return handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSession, tenant);
   }
   if (session.state === STATES.CONFIRM_BOOKING) {
     // Which button, if any, the patient actually tapped on the summary above.
@@ -579,16 +642,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       await updateSession(schema, phone, STATES.CANCEL_SELECT, ctx);
       return;
     }
-    const patient = await getPatient(schema, phone);
-    const firstName = patient?.name ? `, ${patient.name.split(' ')[0]}` : '';
-    const isReturning = !!patient?.name;
-    const subtitle = isReturning
-      ? 'How can I help you today?'
-      : 'I can help you book appointments, check your status, or manage existing bookings.';
-    await send.buttons(
-      `👋 Welcome${firstName} to *${tenant.name}*!\n\n${subtitle}`,
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']
-    );
+    await sendMainMenu(send, tenant, await getPatient(schema, phone).catch(() => null));
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }

@@ -64,6 +64,11 @@ export default function SuperAdminPage() {
     try { await api.post('/auth/logout'); } catch (_) {}
     clearSessionTimers();
     localStorage.clear();
+    // The request interceptor only sets Authorization when localStorage has a
+    // token, so without this axios falls back to the default header set at
+    // login — and every request from the login page then carried the token we
+    // just revoked. The dashboard's logout already does this.
+    delete api.defaults.headers.common.Authorization;
     router.push('/login');
   }
 

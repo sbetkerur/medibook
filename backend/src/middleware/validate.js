@@ -62,6 +62,9 @@ const schemas = {
     specialization: Joi.string().max(255).optional().allow('', null),
     qualification: Joi.string().max(255).optional().allow('', null),
     department_id: Joi.string().uuid().optional().allow('', null),
+    // Full bookable treatment set. department_id stays the PRIMARY (first entry
+    // wins when only this is sent) — see utils/doctorDepartments.js.
+    department_ids: Joi.array().items(Joi.string().uuid()).max(25).optional(),
     hospital_id: Joi.string().uuid().required(),
     consultation_fee: Joi.number().min(0).max(999999).optional().default(0),
     slot_duration_minutes: Joi.number().integer().min(5).max(480).optional().default(30),
@@ -159,6 +162,9 @@ const schemas = {
     patient_name: Joi.string().min(1).max(255).optional().allow('', null),
     doctor_id: Joi.string().uuid().required(),
     hospital_id: Joi.string().uuid().required(),
+    // Treatment booked for. Optional — falls back to the doctor's primary
+    // department, which is all a walk-in desk normally knows.
+    department_id: Joi.string().uuid().optional().allow('', null),
     slot_id: Joi.string().uuid().optional().allow('', null),
     appointment_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required()
       .messages({ 'string.pattern.base': 'appointment_date must be YYYY-MM-DD' })

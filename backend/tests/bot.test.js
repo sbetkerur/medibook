@@ -71,7 +71,7 @@ async function runTests() {
     await resetSession();
     const r = await sendMsg('Hi');
     if (!r.length) throw new Error('No response received');
-    if (!r[0].text?.includes('Welcome')) throw new Error(`Missing "Welcome" in response: "${r[0].text?.slice(0, 100)}"`);
+    if (!/how can we help|Book an appointment/.test(r[0].text || '')) throw new Error(`Missing "Welcome" in response: "${r[0].text?.slice(0, 100)}"`);
     if (!r[0].buttons?.some(b => String(b).includes('Book'))) throw new Error('Missing Book button');
   });
 
@@ -112,7 +112,7 @@ async function runTests() {
       `UPDATE bot_sessions SET state='select_doctor', context='{}' WHERE phone=$1`, [TEST_PHONE]);
     const r = await sendMsg('Hi');
     if (!r.length) throw new Error('No response');
-    if (!r[0].text?.includes('Welcome')) throw new Error(`Expected welcome, got: "${r[0].text?.slice(0, 100)}"`);
+    if (!/how can we help|Book an appointment/.test(r[0].text || '')) throw new Error(`Expected welcome, got: "${r[0].text?.slice(0, 100)}"`);
   });
 
   // ── TEST 6: Session created automatically ───────────────────

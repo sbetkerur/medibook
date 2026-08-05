@@ -179,7 +179,10 @@ export default function DoctorPage() {
         <div className="p-5 border-b border-gray-100">
           <div className="flex items-center justify-between gap-2 mb-1">
             <h1 className="text-lg font-bold text-gray-900 min-w-0 truncate">{headerName}</h1>
-            <a href="/dashboard" className="shrink-0 text-xs text-blue-500 hover:underline">Dashboard</a>
+            {/* Bare inline text at 58x16 — the only way back out of the portal
+                on a phone, so it gets a thumb-sized row. Negative margins keep
+                the header's height unchanged. */}
+            <a href="/dashboard" className="shrink-0 inline-flex items-center px-2 py-3 -my-2 -mr-2 sm:p-0 sm:m-0 text-xs text-blue-500 hover:underline">Dashboard</a>
           </div>
           <p className="text-sm text-gray-500">Today&apos;s Schedule — {todayDisplay}</p>
 

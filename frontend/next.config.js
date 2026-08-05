@@ -8,10 +8,20 @@ const nextConfig = {
     config.resolve.alias['@'] = path.join(__dirname, 'src');
     return config;
   },
-  // Proxy all /api/proxy/* calls to the backend at runtime.
-  // BACKEND_URL is a server-side env var (no NEXT_PUBLIC_ prefix) so it is
-  // read at request time, not baked into the bundle at build time.
-  // Set BACKEND_URL=https://your-backend.up.railway.app in Railway env vars.
+  // Proxy all /api/proxy/* calls to the backend.
+  //
+  // BACKEND_URL has no NEXT_PUBLIC_ prefix, so it never reaches the browser
+  // bundle — but it IS resolved at BUILD time, not per request: `next build`
+  // invokes this rewrites() function and writes the result into
+  // .next/routes-manifest.json, which is what `next start` serves from. This
+  // comment used to claim the opposite ("read at request time"), directly
+  // contradicting Dockerfile:12, which has it right.
+  //
+  // The practical consequence of the wrong reading: changing the Railway
+  // variable and restarting WITHOUT a rebuild silently keeps proxying to the
+  // old backend. The Dockerfile passes it as a build ARG for exactly this
+  // reason. Set BACKEND_URL in the Railway service variables (Railway forwards
+  // service variables as Docker build args) and redeploy to change it.
   async rewrites() {
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
     return [

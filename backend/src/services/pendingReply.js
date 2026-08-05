@@ -21,8 +21,10 @@ const { query } = require('../db');
 const logger = require('../utils/logger');
 
 const KINDS = {
-  CONFIRMATION: 'confirmation', // reply to a 24h reminder: yes / no
+  CONFIRMATION: 'confirmation', // reply to a 24h/2h reminder: yes / no
   FEEDBACK: 'feedback',         // reply to a feedback request: 1–5
+  TREATMENT: 'treatment',       // reply to "book your next sitting": treatment / book
+  RECALL: 'recall',             // reply to a six-month check-up recall: menu / book
 };
 
 /**

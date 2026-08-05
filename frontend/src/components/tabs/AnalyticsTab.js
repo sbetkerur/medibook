@@ -9,14 +9,24 @@ import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContai
 // analytics breakdown and revenue sections.
 export default function AnalyticsTab() {
   const [analytics, setAnalytics] = useState(null);
+  const [analyticsFailed, setAnalyticsFailed] = useState(false);
   const [revenueData, setRevenueData] = useState(null);
   const [revenueMonths, setRevenueMonths] = useState(6);
 
+  // A failure used to leave `analytics` at null, which renders "Loading
+  // analytics..." forever. The toast is gone in four seconds, after which a
+  // broken tab is indistinguishable from a slow one — and there was no way to
+  // retry short of knowing to switch tabs away and back to remount. Track the
+  // failure and offer the retry.
   const fetchAnalytics = useCallback(async () => {
     try {
       const { data } = await api.get('/admin/analytics');
       setAnalytics(data);
-    } catch { toast.error('Failed to load analytics'); }
+      setAnalyticsFailed(false);
+    } catch {
+      setAnalyticsFailed(true);
+      toast.error('Failed to load analytics');
+    }
   }, []);
 
   useEffect(() => {
@@ -111,6 +121,14 @@ export default function AnalyticsTab() {
             </div>
           )}
         </>
+      ) : analyticsFailed ? (
+        <div className="text-center py-12">
+          <p className="text-gray-500 mb-3">Analytics could not be loaded.</p>
+          <button onClick={fetchAnalytics}
+            className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
+            Retry
+          </button>
+        </div>
       ) : (
         <div className="text-center text-gray-400 py-12">Loading analytics...</div>
       )}

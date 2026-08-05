@@ -136,16 +136,14 @@ async function migrate() {
       UPDATE tenants SET city = settings->>'city' WHERE city IS NULL AND settings->>'city' IS NOT NULL;
     `);
 
-    // ── GLOBAL BOT SESSIONS: pending branch ───────────────────
-    // Which BRANCH the patient tapped at the "clinics near me" city step, so
-    // booking doesn't ask again. It lives here rather than in the tenant's
-    // bot_sessions context because selecting a clinic hands the engine a
-    // synthesised "Hi", and a greeting resets that context to empty — anything
-    // parked there would be wiped before booking could read it. Consumed
-    // one-shot by bookingFlow.startBooking and cleared on every clinic reset.
-    await client.query(`
-      ALTER TABLE global_bot_sessions ADD COLUMN IF NOT EXISTS pending_hospital_id UUID;
-    `);
+    // NOTE: global_bot_sessions.pending_hospital_id is added by VERSION 25,
+    // below. It cannot live here: this block runs unconditionally on every
+    // boot, but the table itself is created by version 16 several hundred
+    // lines further down, so on a FRESH database the ALTER hit
+    // "42P01 relation global_bot_sessions does not exist", migrate() exited 1,
+    // and `set -e` in entrypoint.sh aborted the container before seed and
+    // before index.js — with the public schema truncated at this point. Any
+    // DDL that depends on a versioned table must itself be versioned.
 
     // ── ADMIN ACCESS LOGS ─────────────────────────────────────
     await client.query(`
@@ -192,6 +190,12 @@ async function migrate() {
         last_error TEXT
       );
 
+      -- Every job that writes its outcome back to this table needs a row here,
+      -- or the UPDATE matches zero rows and fails SILENTLY: /health's
+      -- cron_alerts query can then never report that job as failing. 'recalls'
+      -- and 'treatment_nudges' were missing, so the two crons whose whole
+      -- purpose is unattended revenue recovery were also the two nobody would
+      -- have noticed dying.
       INSERT INTO cron_jobs (job_name) VALUES
         ('slot_generator'),
         ('reminders'),
@@ -199,7 +203,9 @@ async function migrate() {
         ('backup'),
         ('weekly_backup'),
         ('weekly_digest'),
-        ('webhook_retry')
+        ('webhook_retry'),
+        ('recalls'),
+        ('treatment_nudges')
       ON CONFLICT (job_name) DO NOTHING;
     `);
 
@@ -280,7 +286,10 @@ async function migrate() {
       await client.query(`
         CREATE TABLE IF NOT EXISTS tenant_stats_cache (
           tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
-          stat_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          -- IST, not CURRENT_DATE: servers run UTC, so between 00:00 and 05:30
+          -- IST a bare CURRENT_DATE stamps the cache row with YESTERDAY's date
+          -- and the day's first writes land on the wrong key.
+          stat_date DATE NOT NULL DEFAULT (NOW() AT TIME ZONE 'Asia/Kolkata')::date,
           appointments_today INTEGER DEFAULT 0,
           appointments_month INTEGER DEFAULT 0,
           patients_total INTEGER DEFAULT 0,
@@ -662,6 +671,20 @@ async function migrate() {
         ALTER TABLE tenants ADD COLUMN IF NOT EXISTS terms_version VARCHAR(20);
         ALTER TABLE tenants ADD COLUMN IF NOT EXISTS terms_accepted_ip VARCHAR(45);
         ALTER TABLE tenants ADD COLUMN IF NOT EXISTS terms_accepted_by VARCHAR(255);
+      `);
+    });
+
+    // Version 25: which BRANCH the patient tapped at the "clinics near me" city
+    // step, so booking doesn't ask again. It lives on the global session rather
+    // than in the tenant's bot_sessions context because selecting a clinic hands
+    // the engine a synthesised "Hi", and a greeting resets that context to empty
+    // — anything parked there would be wiped before booking could read it.
+    // Consumed one-shot by bookingFlow.startBooking and cleared on every clinic
+    // reset. Versioned, and placed after 16, because global_bot_sessions does
+    // not exist until 16 has run.
+    await runMigration(client, 25, 'global_session_pending_hospital', async () => {
+      await client.query(`
+        ALTER TABLE global_bot_sessions ADD COLUMN IF NOT EXISTS pending_hospital_id UUID;
       `);
     });
 

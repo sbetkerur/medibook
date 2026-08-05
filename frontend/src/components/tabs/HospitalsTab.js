@@ -37,8 +37,13 @@ export default function HospitalsTab({
           <div className="text-5xl mb-3">🏥</div>
           <p className="text-gray-500 font-medium">No hospitals yet</p>
           <p className="text-gray-400 text-sm mt-1">Add your first hospital to get started</p>
+          {/* The button below resets editingHospital and the form, exactly like
+              the header button. Without that reset it opened a modal titled
+              "Add New Hospital" pre-filled with whatever was last edited —
+              neither Cancel nor the modal's onClose clears hospitalForm —
+              leaving the operator one click from creating a duplicate branch. */}
           {isAdmin && (
-          <button onClick={() => setShowHospitalModal(true)}
+          <button onClick={() => { setEditingHospital(null); setHospitalForm({ name: '', address: '', city: '', phone: '' }); setShowHospitalModal(true); }}
             className="mt-4 px-5 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
             + Add Hospital
           </button>
@@ -73,8 +78,10 @@ export default function HospitalsTab({
                       className="px-3 py-1.5 text-xs font-medium bg-green-50 text-green-600 border border-green-200 rounded-lg hover:bg-green-100 transition">
                       + Dept
                     </button>
-                    <button onClick={() => deleteHospital(h)}
-                      className="px-3 py-1.5 text-xs font-medium bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition">
+                    {/* Deleting a whole branch: icon-only, so give it a real
+                        target rather than a 34x30 sliver next to "+ Dept". */}
+                    <button onClick={() => deleteHospital(h)} aria-label={`Delete ${h.name}`}
+                      className="w-10 h-10 flex items-center justify-center shrink-0 text-xs font-medium bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition md:w-auto md:h-auto md:px-3 md:py-1.5">
                       🗑
                     </button>
                   </div>
@@ -97,10 +104,14 @@ export default function HospitalsTab({
                               fires hover, so on a phone these were permanently
                               invisible and departments could not be edited at all. */}
                           {isAdmin && (<>
-                          <button onClick={() => openEditDept(d, h)}
-                            className="ml-1 text-blue-400 hover:text-blue-600 px-2 py-1 md:px-0 md:py-0 md:opacity-0 md:group-hover:opacity-100 transition-opacity text-xs">✏️</button>
-                          <button onClick={() => deleteDept(d, h)}
-                            className="text-red-400 hover:text-red-600 px-2 py-1 md:px-0 md:py-0 md:opacity-0 md:group-hover:opacity-100 transition-opacity text-xs">✕</button>
+                          {/* Icon-only and side by side, so on touch they get
+                              real 36px targets — at px-2 py-1 they were 32x24
+                              and 26x24, close enough together to mis-tap
+                              DELETE when reaching for edit. */}
+                          <button onClick={() => openEditDept(d, h)} aria-label={`Edit ${d.name}`}
+                            className="ml-1 shrink-0 w-9 h-9 -my-2 flex items-center justify-center text-blue-400 hover:text-blue-600 md:w-auto md:h-auto md:my-0 md:px-0 md:py-0 md:opacity-0 md:group-hover:opacity-100 transition-opacity text-xs">✏️</button>
+                          <button onClick={() => deleteDept(d, h)} aria-label={`Delete ${d.name}`}
+                            className="shrink-0 w-9 h-9 -my-2 flex items-center justify-center text-red-400 hover:text-red-600 md:w-auto md:h-auto md:my-0 md:px-0 md:py-0 md:opacity-0 md:group-hover:opacity-100 transition-opacity text-xs">✕</button>
                           </>)}
                         </div>
                       ))}

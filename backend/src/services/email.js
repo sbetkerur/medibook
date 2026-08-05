@@ -54,19 +54,6 @@ async function releaseEmailClaim(hash) {
   } catch (_) { /* best-effort */ }
 }
 
-// ── DB-STORED TEMPLATE SUPPORT ────────────────────────────────
-async function getTemplate(schemaName, templateId) {
-  if (!schemaName) return null;
-  try {
-    const { tenantQuery } = require('../db');
-    const r = await tenantQuery(schemaName,
-      `SELECT subject, html_body FROM email_templates WHERE id=$1`, [templateId]);
-    return r.rows[0] || null;
-  } catch (_) {
-    return null; // table may not exist in older schemas
-  }
-}
-
 // ── UNSUBSCRIBE TOKEN ─────────────────────────────────────────
 async function generateUnsubscribeUrl(schemaName, patientId) {
   if (!schemaName || !patientId) return null;
@@ -137,17 +124,6 @@ async function isSuppressed(schemaName, patientId, toEmail) {
 // above and is still the name that reads best at a call site asking only about
 // the opt-out link.
 const isUnsubscribed = (schemaName, patientId) => isSuppressed(schemaName, patientId, null);
-
-// ── OPEN TRACKING ─────────────────────────────────────────────
-async function trackEmailOpen(contentHash) {
-  try {
-    const { query: dbQuery } = require('../db');
-    await dbQuery(
-      `UPDATE email_sent_log SET open_count = open_count + 1 WHERE content_hash = $1`,
-      [contentHash]
-    );
-  } catch (_) {}
-}
 
 // NOTE: the bounce handler that used to live here was removed. It was exported
 // and called by nothing — index.js's Resend webhook route carries the only live
@@ -465,5 +441,5 @@ async function sendWeeklyDigest(toEmail, tenantName, stats) {
 module.exports = {
   sendBookingConfirmation, sendReminderEmail, sendAdminBookingAlert,
   sendPasswordReset, sendWeeklyDigest, setEmailQueue, queueEmail,
-  getTemplate, generateUnsubscribeUrl, isSuppressed, isUnsubscribed, trackEmailOpen,
+  generateUnsubscribeUrl, isSuppressed, isUnsubscribed,
 };

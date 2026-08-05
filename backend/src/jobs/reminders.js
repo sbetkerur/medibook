@@ -9,7 +9,7 @@ const { FEEDBACK_BATCH_LIMIT } = require('../utils/errors');
 const emailService = require('../services/email');
 // Cron sends go through these so they land in the tenant's message history —
 // wa.sendText/sendTemplate on their own do not record anything.
-const { sendPatientText, sendPatientTemplate } = require('../services/outbound');
+const { sendPatientText, sendPatientTemplate, sendPatientMessage } = require('../services/outbound');
 // Every message below asks the patient a question. On a shared WhatsApp number
 // the answer routes to whichever clinic the patient last selected, so record
 // who is actually waiting for it (see services/pendingReply.js).
@@ -50,12 +50,14 @@ async function sendReminders() {
         SELECT a.id, a.booking_id, a.appointment_date, a.appointment_time,
                p.phone, p.name as patient_name,
                d.name as doctor_name, h.name as hospital_name,
-               dep.pre_visit_checklist
+               dep.pre_visit_checklist,
+               tp.title AS treatment_title, tp.total_visits, a.visit_number
         FROM appointments a
         JOIN patients p ON p.id=a.patient_id
         JOIN doctors d ON d.id=a.doctor_id
         JOIN hospitals h ON h.id=a.hospital_id
-        LEFT JOIN departments dep ON dep.id=d.department_id
+        LEFT JOIN treatment_plans tp ON tp.id=a.treatment_plan_id
+        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         WHERE a.status='confirmed'
           AND a.reminder_24h_sent=false
           AND a.appointment_date > (NOW() AT TIME ZONE $2)::date
@@ -74,14 +76,34 @@ async function sendReminders() {
             ? `\n\n📋 *Checklist for your visit:*\n${appt.pre_visit_checklist}`
             : '';
 
+          // A treatment sitting is not an interchangeable appointment — "visit 2
+          // of 3 for your root canal" is what makes a patient keep it, and what
+          // stops them cancelling it as a duplicate of the one they remember.
+          const treatmentLine = appt.treatment_title
+            ? `🦷 *${appt.treatment_title}*` +
+              (appt.visit_number && appt.total_visits ? ` — visit ${appt.visit_number} of ${appt.total_visits}` : '') + `\n`
+            : '';
+
+          // Kept word-for-word in step with the `appointment_reminder_24h`
+          // template (docs/whatsapp-templates.md). This is the text a patient
+          // gets whenever the template is not approved — which is every clinic
+          // until their WhatsApp account is set up — so the two drifting apart
+          // means half the patients get the polished version and half don't.
+          //
+          // The old wall of generic advice ("bring X-rays, tell us about
+          // medications, don't eat beforehand") is gone: sent identically to
+          // everyone, every time, it is what trains people to stop reading.
+          // The per-treatment checklist below is the part that is actually
+          // specific, and it survives.
           const reminderText =
-            `🔔 *Dental Appointment Reminder*\n\nYou have an appointment tomorrow!\n\n` +
-            `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
-            `📅 ${dt} at ${(appt.appointment_time || '').slice(0, 5)}\n` +
-            `🦷 ${appt.hospital_name}` +
-            `\n\n📋 *Before your visit:*\n• Arrive 10 minutes early\n• Bring any previous dental X-rays or records\n• Inform us of any medications or allergies\n• Avoid eating 1 hour before your appointment` +
+            `🔔 *Your appointment is tomorrow*\n\n` +
+            treatmentLine +
+            `🦷 *${dt} at ${(appt.appointment_time || '').slice(0, 5)}*\n` +
+            `with Dr. ${appt.doctor_name}\n\n` +
+            `📍 ${appt.hospital_name}` +
             `${departmentChecklist}\n\n` +
-            `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`;
+            `Arriving 10 minutes early helps us start on time. If you can't make it, tell us now and we'll offer the slot to someone who's waiting.\n\n` +
+            `Reply *Yes* to confirm, or *Reschedule* / *Cancel Appointment*.`;
 
           try {
             await sendPatientTemplate(
@@ -97,7 +119,10 @@ async function sendReminders() {
                   { type: 'text', text: appt.hospital_name },
                 ]
               }],
-              reminderText
+              reminderText,
+              // Index-aligned with the template's three quick replies. The
+              // labels read like sentences; these are what the engine matches.
+              ['Yes', 'Reschedule', 'Cancel appointment']
             );
           } catch (_templateErr) {
             await sendPatientText(tenant.schema_name, appt.phone, reminderText);
@@ -133,11 +158,13 @@ async function sendReminders() {
       const r2 = await tenantQuery(tenant.schema_name, `
         SELECT a.id, a.booking_id, a.appointment_date::text as appointment_date, a.appointment_time,
                p.phone, p.name as patient_name, d.name as doctor_name,
-               dep.pre_visit_checklist
+               dep.pre_visit_checklist,
+               tp.title AS treatment_title, tp.total_visits, a.visit_number
         FROM appointments a
         JOIN patients p ON p.id=a.patient_id
         JOIN doctors d ON d.id=a.doctor_id
-        LEFT JOIN departments dep ON dep.id=d.department_id
+        LEFT JOIN treatment_plans tp ON tp.id=a.treatment_plan_id
+        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         WHERE a.status='confirmed'
           AND a.reminder_2h_sent=false
           AND timezone($1, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '00:00:00'))::timestamp)
@@ -158,13 +185,20 @@ async function sendReminders() {
             : '';
           // The hourly cron fires this anywhere within the next ${hours2}h window,
           // so state the exact time rather than an imprecise "in N hours".
+          const treatmentLine = appt.treatment_title
+            ? `🦷 *${appt.treatment_title}*` +
+              (appt.visit_number && appt.total_visits ? ` — visit ${appt.visit_number} of ${appt.total_visits}` : '') + `\n`
+            : '';
+          // In step with the `appointment_reminder_2h` template. Two hours out
+          // there is nothing useful left to instruct — the patient is already
+          // on their way — so this says the time and gets out of the way.
           const reminderText =
-            `⏰ *Reminder: your dental appointment is coming up!*\n\n` +
-            `👨‍⚕️ Dr. ${appt.doctor_name}\n` +
-            `🕐 ${dayLabel} at ${(appt.appointment_time || '').slice(0, 5)}\n\n` +
-            `🦷 *Quick reminders:*\n• Please arrive 10 minutes early\n• Bring any dental X-rays or records\n• Avoid eating 1 hour before your appointment` +
+            `⏰ *Later today*\n\n` +
+            treatmentLine +
+            `Your appointment with Dr. ${appt.doctor_name} is at *${(appt.appointment_time || '').slice(0, 5)}*` +
+            (dayLabel === 'Tomorrow' ? ' tomorrow' : '') + `.` +
             `${departmentChecklist}\n\n` +
-            `Need to make changes? Reply *Reschedule* or *Cancel Appointment*.`;
+            `See you shortly — we're ready for you.`;
 
           // Try template first, fall back to plain text with pre-visit checklist
           try {
@@ -179,7 +213,10 @@ async function sendReminders() {
                   { type: 'text', text: (appt.appointment_time || '').slice(0, 5) },
                 ]
               }],
-              reminderText
+              reminderText,
+              // Index-aligned with the template's three quick replies. The
+              // labels read like sentences; these are what the engine matches.
+              ['Yes', 'Reschedule', 'Cancel appointment']
             );
           } catch (_templateErr) {
             await sendPatientText(tenant.schema_name, appt.phone, reminderText);
@@ -187,6 +224,31 @@ async function sendReminders() {
           await tenantQuery(tenant.schema_name,
             `UPDATE appointments SET reminder_2h_sent=true WHERE id=$1`, [appt.id]);
           logger.info(`2h reminder sent: ${appt.booking_id}`);
+
+          // The same two records the 24h path writes. This message offers
+          // "Yes / Reschedule / Cancel appointment", so it is a clinic-initiated
+          // QUESTION and needs both, or the answer has nowhere to land:
+          //
+          //  - without reminder_confirmations, handleReminderConfirmation finds
+          //    no open row and drops the "yes" even in the right clinic. That
+          //    is not an edge case: a SAME-DAY booking never gets a 24h
+          //    reminder (its query is gated on appointment_date > today), so
+          //    for those patients this is the only message they receive;
+          //  - without recordPendingReply, a patient who has since searched for
+          //    another clinic on the shared number has their reply resolved
+          //    against that clinic's schema and silently lost.
+          //
+          // ON CONFLICT DO NOTHING: when a 24h reminder did go out, its row is
+          // already here and still open.
+          await tenantQuery(tenant.schema_name, `
+            INSERT INTO reminder_confirmations (appointment_id, phone)
+            VALUES ($1, $2)
+            ON CONFLICT (appointment_id) DO NOTHING
+          `, [appt.id, appt.phone]).catch(e => logger.warn('Failed to insert reminder confirmation record', { appointment_id: appt.id, error: e.message }));
+
+          // Shorter than the 24h path's 48h: this fires ~2h out, so anything
+          // still unanswered a day later is not an answer to this question.
+          await recordPendingReply(appt.phone, tenant.id, KINDS.CONFIRMATION, 24);
         } catch (err) {
           logger.error(`2h reminder failed for ${appt.booking_id}`, { error: err.message });
         }
@@ -271,11 +333,29 @@ async function sendPostAppointmentFollowup() {
     for (const appt of appts.rows) {
       try {
         const firstName = appt.patient_name ? appt.patient_name.split(' ')[0] : 'there';
-        await sendPatientText(tenant.schema_name, appt.phone,
-          `😊 Hi ${firstName}! How did your visit with Dr. ${appt.doctor_name} go?\n\n` +
-          `We'd love your feedback! Rate your experience:\n` +
-          `⭐ 1 — Poor\n⭐⭐ 2 — Below Average\n⭐⭐⭐ 3 — Average\n⭐⭐⭐⭐ 4 — Good\n⭐⭐⭐⭐⭐ 5 — Excellent\n\n` +
-          `Just reply with a number 1–5!`);
+        // Template-first: a feedback request goes out the day AFTER the visit,
+        // by which point the patient is outside Meta's 24-hour window and a
+        // plain text send is rejected. Same reasoning as the reminders above,
+        // which have always done this.
+        await sendPatientMessage(tenant.schema_name, appt.phone, {
+          template: 'appointment_feedback_request',
+          buttonPayloads: ['5', '3', '1'],
+          components: [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: firstName },
+              { type: 'text', text: appt.doctor_name },
+            ],
+          }],
+          // In step with the `appointment_feedback_request` template. The full
+          // 1–5 legend is dropped: five labelled lines to ask one question is
+          // the definition of a message people scroll past. The scale still
+          // accepts 1–5; it just isn't recited.
+          text:
+            `⭐ *How did we do?*\n\n` +
+            `Hi ${firstName}, we hope Dr. ${appt.doctor_name} took good care of you yesterday.\n\n` +
+            `Reply with a number from *1* (poor) to *5* (excellent) — it takes a second and helps us look after everyone a little better.`,
+        });
         // Trigger feedback state in bot session.
         // Use the appointment's OWN patient_id. This used to re-look-up by phone
         // (`SELECT id FROM patients WHERE phone=$1`), but patients.phone is
@@ -368,19 +448,32 @@ async function sendFeedbackRequests() {
         try { visitLabel = 'on ' + format(parseISO(appt.appointment_date), 'EEE, d MMM'); } catch {}
         // no_show patients didn't have a visit — a "how was your visit?" message
         // would be tone-deaf. Nudge them to rebook instead.
+        // In step with `appointment_missed_rebook` / `appointment_feedback_request`.
+        // No scolding in the no-show branch: a patient who missed an appointment
+        // is usually embarrassed already, and the message that opens by naming
+        // their failure is the one they don't answer. The discomfort line
+        // supplies the urgency instead.
         const message = appt.status === 'no_show'
-          ? `🦷 Hi ${firstName}, we missed you at your appointment with Dr. ${appt.doctor_name} ${visitLabel}.\n\n` +
-            `No worries — these things happen! Reply *Menu* to book a new appointment whenever you're ready. 😊`
-          : `⭐ *How was your dental visit, ${firstName}?*\n\n` +
-            `We hope Dr. ${appt.doctor_name} took great care of your smile! 🦷\n\n` +
-            `Rate your experience:\n` +
-            `1 ⭐ — Poor\n` +
-            `2 ⭐⭐ — Below average\n` +
-            `3 ⭐⭐⭐ — Average\n` +
-            `4 ⭐⭐⭐⭐ — Good\n` +
-            `5 ⭐⭐⭐⭐⭐ — Excellent\n\n` +
-            `Just reply with a number *1–5*. Takes 5 seconds! 🙏`;
-        await sendPatientText(tenant.schema_name, appt.phone, message);
+          ? `Hi ${firstName}, you weren't able to make your appointment with Dr. ${appt.doctor_name} ${visitLabel} — that's alright, it happens.\n\n` +
+            `Whenever you're ready we'll find you another time. Sooner is better if you were in any discomfort.\n\n` +
+            `Reply *Menu* to book.`
+          : `⭐ *How did we do?*\n\n` +
+            `Hi ${firstName}, we hope Dr. ${appt.doctor_name} took good care of you.\n\n` +
+            `Reply with a number from *1* (poor) to *5* (excellent) — it takes a second and helps us look after everyone a little better.`;
+        // Template-first for the same reason as the feedback job: this runs
+        // days after the visit, well outside the 24-hour window.
+        await sendPatientMessage(tenant.schema_name, appt.phone, {
+          template: appt.status === 'no_show' ? 'appointment_missed_rebook' : 'appointment_feedback_request',
+          buttonPayloads: appt.status === 'no_show' ? ['Menu'] : ['5', '3', '1'],
+          components: [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: firstName },
+              { type: 'text', text: appt.doctor_name },
+            ],
+          }],
+          text: message,
+        });
         // Only arm the rating flow for completed visits — no_show patients got
         // a rebook nudge, not a rating request.
         if (appt.status !== 'no_show') {

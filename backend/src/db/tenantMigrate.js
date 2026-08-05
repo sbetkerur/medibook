@@ -708,6 +708,234 @@ async function runTenantMigrations(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_doctor_hospitals_hospital ON doctor_hospitals(hospital_id);
     `);
 
+    // Multi-department doctors. In Indian dental practice a GP routinely renders
+    // treatments that also have a specialist on staff (simple RCTs, extractions),
+    // so "which dentists can a patient book for this treatment?" is many-to-many.
+    // doctors.department_id is KEPT as the doctor's PRIMARY department — every
+    // display join (receipts, reminders, analytics "by treatment") still reads it
+    // and is unaffected. This table is the BOOKABLE set, and the primary is always
+    // mirrored into it (see utils/doctorDepartments.js), which is what makes the
+    // backfill below a no-op on every boot after the first.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS doctor_departments (
+        doctor_id UUID REFERENCES doctors(id) ON DELETE CASCADE,
+        department_id UUID REFERENCES departments(id) ON DELETE CASCADE,
+        PRIMARY KEY (doctor_id, department_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_doctor_departments_dept ON doctor_departments(department_id);
+      INSERT INTO doctor_departments (doctor_id, department_id)
+        SELECT id, department_id FROM doctors WHERE department_id IS NOT NULL
+        ON CONFLICT DO NOTHING;
+    `);
+
+    // The treatment an appointment was booked FOR. Previously derived from the
+    // doctor's single department, which stops being true the moment a doctor sits
+    // in more than one: a root canal booked with a GP would print "General
+    // Dentistry" on the receipt. Booked-for wins; the doctor's primary department
+    // is only the fallback for rows predating this column.
+    // Recorded once in seed_markers so the backfill runs on ONE boot, not every
+    // boot. The previous guard probed for `department_id IS NULL` and claimed
+    // that made the scan one-shot — it did not. doctors.department_id is
+    // nullable (the dashboard sends '' / null for "no department"), so any
+    // tenant with a single department-less dentist keeps appointments the
+    // backfill cannot fill, the probe stays true forever, and the full
+    // `UPDATE … FROM doctors` join re-ran on every deploy under
+    // statement_timeout = 0, updating zero rows. Harmless to the data —
+    // insertAppointmentWithRetry already COALESCEs to the doctor's primary —
+    // but a seq-scan join over appointments per tenant per deploy, and a
+    // comment asserting a guarantee the code did not provide.
+    await client.query(`
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS department_id UUID REFERENCES departments(id);
+    `);
+    // seed_markers already exists by this point — created twice above, well
+    // before here, precisely so later blocks can rely on it.
+    await client.query(`
+      DO $mig$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM seed_markers WHERE key = 'backfill_appt_department_v1') THEN
+          UPDATE appointments a SET department_id = d.department_id
+          FROM doctors d
+          WHERE d.id = a.doctor_id AND a.department_id IS NULL AND d.department_id IS NOT NULL;
+          INSERT INTO seed_markers (key) VALUES ('backfill_appt_department_v1')
+            ON CONFLICT (key) DO NOTHING;
+        END IF;
+      END $mig$;
+    `);
+
+    // Multi-visit treatments. A root canal is 2–3 visits, an implant is several
+    // months of them — and the visits can be rendered by a different dentist than
+    // the one who diagnosed (the GP refers the hard case to the endodontist on
+    // staff). appointments.follow_up_appointment_id chains one visit to the next
+    // but has no head, so nothing could answer "what treatment is outstanding for
+    // this patient" or "what did we advise and never book" — which is where a
+    // clinic's revenue actually leaks.
+    //
+    // Deliberately NOT stored: visit counters. visits done/booked are derived
+    // from the linked appointments, so a cancelled visit can't leave the plan
+    // claiming progress it doesn't have.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS treatment_plans (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        patient_id UUID REFERENCES patients(id) ON DELETE CASCADE,
+        hospital_id UUID REFERENCES hospitals(id),
+        department_id UUID REFERENCES departments(id),
+        service_id UUID REFERENCES clinic_services(id),
+        origin_appointment_id UUID REFERENCES appointments(id),
+        advised_by_doctor_id UUID REFERENCES doctors(id),
+        treating_doctor_id UUID REFERENCES doctors(id),
+        title VARCHAR(255) NOT NULL,
+        tooth_ref VARCHAR(50),
+        total_visits INTEGER NOT NULL DEFAULT 1 CHECK (total_visits BETWEEN 1 AND 30),
+        estimated_cost INTEGER DEFAULT 0,
+        status VARCHAR(20) NOT NULL DEFAULT 'proposed'
+          CHECK (status IN ('proposed','in_progress','completed','declined','cancelled')),
+        notes TEXT,
+        created_by_user_id UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_treatment_plans_patient ON treatment_plans(patient_id);
+      -- The "advised but not booked" queue reads this every time the tab opens.
+      CREATE INDEX IF NOT EXISTS idx_treatment_plans_open ON treatment_plans(status)
+        WHERE status IN ('proposed','in_progress');
+
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS treatment_plan_id UUID REFERENCES treatment_plans(id);
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS visit_number INTEGER;
+      CREATE INDEX IF NOT EXISTS idx_appt_treatment_plan ON appointments(treatment_plan_id)
+        WHERE treatment_plan_id IS NOT NULL;
+
+      -- One LIVE appointment per ordinal within a course. Cancelled visits are
+      -- excluded so their number can be reused by the sitting that replaces
+      -- them. Without this, nothing stopped two rows both claiming "visit 3 of
+      -- 3" — which is what the count-based nextVisitNumber produced after any
+      -- cancellation. The application now fills the lowest free number; this is
+      -- the backstop that keeps a future writer honest.
+      DO $mig$
+      BEGIN
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_appt_plan_visit_no
+          ON appointments(treatment_plan_id, visit_number)
+          WHERE treatment_plan_id IS NOT NULL
+            AND visit_number IS NOT NULL
+            AND status <> 'cancelled';
+      EXCEPTION WHEN unique_violation THEN
+        -- A tenant that already collected duplicates under the old arithmetic.
+        -- Boot must not fail over a reporting label: log it and carry on; the
+        -- application-side fix stops new ones, and the existing rows can be
+        -- renumbered by hand.
+        RAISE WARNING 'duplicate treatment plan visit_numbers present — idx_appt_plan_visit_no not created';
+      END
+      $mig$;
+
+      -- The nudge cron asks the patient to book their next sitting themselves.
+      -- Recorded on the plan so a patient who ignores one is asked again later
+      -- but never twice in the same week, and never forever.
+      ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS last_nudge_at TIMESTAMPTZ;
+      ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS nudge_count INTEGER DEFAULT 0;
+    `);
+
+    // Visiting specialists. In Indian practice the specialist is very often a
+    // visiting consultant: at this branch on Tuesdays, at another on Thursdays,
+    // and frequently only on some weeks of the month.
+    //
+    // week_of_month expresses the second half of that. NULL or empty = every
+    // week (the existing behaviour, and what every current row means). {1,3} =
+    // the 1st and 3rd occurrence of that weekday in the month, which is the
+    // common arrangement; alternate weeks are written {1,3,5}.
+    //
+    // WHICH BRANCH on a given weekday lives in doctor_hospitals, which already
+    // had exactly the right shape and — until now — was written by the API and
+    // read by nothing, so every slot was stamped with doctors.hospital_id.
+    await client.query(`
+      ALTER TABLE doctor_schedules ADD COLUMN IF NOT EXISTS week_of_month INTEGER[];
+      ALTER TABLE doctors ADD COLUMN IF NOT EXISTS is_visiting BOOLEAN DEFAULT false;
+    `);
+
+    // Money against a course of treatment. Indian dental work is paid in
+    // instalments across sittings — "₹2,000 today, balance next visit" — so the
+    // first question an owner asks about a 3-sitting root canal is how much has
+    // been collected. treatment_plans.estimated_cost alone could not answer it.
+    //
+    // Deliberately separate from appointments.effective_fee / payment_status,
+    // which are the per-VISIT consultation fee. A course is billed as a whole
+    // and paid against the plan; conflating the two would double-count revenue.
+    //
+    // Amount is in whole rupees (INTEGER), matching every other money column
+    // here. Balance is derived, never stored — a stored balance drifts the first
+    // time a payment is corrected.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS treatment_payments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        treatment_plan_id UUID NOT NULL REFERENCES treatment_plans(id) ON DELETE CASCADE,
+        appointment_id UUID REFERENCES appointments(id),
+        amount INTEGER NOT NULL CHECK (amount > 0),
+        method VARCHAR(20) NOT NULL DEFAULT 'cash'
+          CHECK (method IN ('cash','card','upi','bank_transfer','cheque','other')),
+        note TEXT,
+        collected_by_user_id UUID,
+        collected_at TIMESTAMPTZ DEFAULT NOW(),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_treatment_payments_plan ON treatment_payments(treatment_plan_id);
+    `);
+
+    // Lab work. Crowns, dentures and aligners go out to a lab and come back,
+    // and the next sitting cannot happen until they do — booking it purely on
+    // slot availability is how a patient arrives to find their crown isn't in.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS lab_works (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        treatment_plan_id UUID REFERENCES treatment_plans(id) ON DELETE CASCADE,
+        patient_id UUID REFERENCES patients(id) ON DELETE CASCADE,
+        lab_name VARCHAR(255),
+        item VARCHAR(255) NOT NULL,
+        sent_date DATE,
+        expected_date DATE,
+        received_date DATE,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending','sent','received','fitted','cancelled')),
+        cost INTEGER DEFAULT 0,
+        notes TEXT,
+        created_by_user_id UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_lab_works_plan ON lab_works(treatment_plan_id);
+      -- The "what is overdue from the lab" view, which is the only one staff open.
+      CREATE INDEX IF NOT EXISTS idx_lab_works_open ON lab_works(status, expected_date)
+        WHERE status IN ('pending','sent');
+    `);
+
+    // Recall / recare — the six-month check-up loop. The cheapest revenue a
+    // clinic has and the one thing none of the existing crons cover: reminders
+    // are for booked appointments, feedback is about a past visit, and the
+    // treatment nudge only fires for a course already advised. Nothing brought
+    // a healthy patient back next year.
+    //
+    // A table rather than a column on patients, because a patient can be due
+    // for more than one thing (a routine check-up AND an implant review).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patient_recalls (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        patient_id UUID NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        origin_appointment_id UUID REFERENCES appointments(id),
+        hospital_id UUID REFERENCES hospitals(id),
+        reason VARCHAR(255) NOT NULL DEFAULT 'Routine check-up',
+        due_date DATE NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'due'
+          CHECK (status IN ('due','booked','done','dismissed')),
+        last_sent_at TIMESTAMPTZ,
+        send_count INTEGER DEFAULT 0,
+        booked_appointment_id UUID REFERENCES appointments(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_recalls_due ON patient_recalls(due_date) WHERE status='due';
+      CREATE INDEX IF NOT EXISTS idx_recalls_patient ON patient_recalls(patient_id);
+      -- One open recall per patient per reason: completing three visits in a
+      -- month must not queue three identical check-up reminders.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_recalls_one_open
+        ON patient_recalls(patient_id, reason) WHERE status='due';
+    `);
+
     // Reminder confirmations (patient YES/NO replies)
     await client.query(`
       CREATE TABLE IF NOT EXISTS reminder_confirmations (

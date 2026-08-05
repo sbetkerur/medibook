@@ -6,6 +6,8 @@ const { VALID_APPOINTMENT_STATUSES, APPOINTMENT_TRANSITIONS, UUID_RE, validateUU
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
 const { setTenantId } = require('../utils/requestContext');
+const { derivePlanStatus } = require('../utils/treatmentPlan');
+const { IST_TODAY_SQL } = require('../utils/dateTz');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -21,6 +23,86 @@ router.use((req, res, next) => {
   if (req.tenant?.id) setTenantId(req.tenant.id);
   next();
 });
+
+/**
+ * Keep parent treatment plans in step with their visits.
+ *
+ * Shared by the single-appointment PATCH and the BULK one. The bulk route used
+ * to do neither this nor the recall below, so the same clinical event produced
+ * different data depending on whether the receptionist ticked appointments one
+ * at a time or used the "Mark completed" button on the day's list — and the
+ * button is the normal end-of-day workflow.
+ *
+ * Runs on cancel too: cancelling the last outstanding visit drops the plan back
+ * out of "all booked" and into the outstanding queue where it belongs. Derived,
+ * never incremented — see utils/treatmentPlan.js. Best-effort throughout: a
+ * failure here must not fail the status change the front desk just made.
+ */
+async function syncTreatmentPlans(schema, planIds) {
+  const ids = [...new Set((planIds || []).filter(Boolean))];
+  for (const planId of ids) {
+    try {
+      await tenantTransaction(schema, async (client) => {
+        const lockedPlan = await client.query(
+          `SELECT id, status, total_visits FROM treatment_plans WHERE id=$1 FOR UPDATE`, [planId]);
+        if (!lockedPlan.rows[0]) return;
+        const counts = await client.query(`
+          SELECT COUNT(*) FILTER (WHERE status = 'completed')::int AS completed_visits,
+                 COUNT(*) FILTER (WHERE status <> 'cancelled')::int AS booked_visits
+          FROM appointments WHERE treatment_plan_id = $1
+        `, [planId]);
+        const next = derivePlanStatus(lockedPlan.rows[0].status, {
+          totalVisits: lockedPlan.rows[0].total_visits,
+          completedVisits: counts.rows[0].completed_visits,
+          bookedVisits: counts.rows[0].booked_visits,
+        });
+        if (next !== lockedPlan.rows[0].status) {
+          await client.query(`UPDATE treatment_plans SET status=$1, updated_at=NOW() WHERE id=$2`, [next, planId]);
+        }
+      });
+    } catch (planErr) {
+      logger.warn('Treatment plan status sync failed', { plan: planId, error: planErr.message });
+    }
+  }
+}
+
+/**
+ * Schedule the next check-up for appointments just marked completed.
+ *
+ * Done at completion because that is the only moment the clinic reliably knows
+ * a patient is between courses of treatment — asking staff to remember to set a
+ * recall is asking for it never to happen. The partial unique index keeps three
+ * completed visits in a month from queueing three identical reminders, and
+ * ON CONFLICT just moves the date. Best-effort: a recall must never be the
+ * reason a status change fails.
+ *
+ * One statement for the whole batch rather than one per appointment: a bulk
+ * complete is routinely 30-50 rows, and ON CONFLICT collapses the duplicates
+ * that a single patient with two finished visits would otherwise produce.
+ */
+async function scheduleRecalls(schema, tenant, appointmentIds) {
+  const ids = [...new Set((appointmentIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  const months = parseInt(tenant.settings?.recall_interval_months ?? 6, 10);
+  if (!Number.isInteger(months) || months <= 0 || months > 60) return;
+  try {
+    await tenantQuery(schema, `
+      INSERT INTO patient_recalls (patient_id, origin_appointment_id, hospital_id, due_date, reason)
+      SELECT DISTINCT ON (a.patient_id)
+             a.patient_id, a.id, a.hospital_id,
+             (${IST_TODAY_SQL} + make_interval(months => $2::int))::date,
+             'Routine check-up'
+      FROM appointments a
+      WHERE a.id = ANY($1::uuid[]) AND a.patient_id IS NOT NULL
+      ORDER BY a.patient_id, a.appointment_date DESC, a.appointment_time DESC
+      ON CONFLICT (patient_id, reason) WHERE status='due'
+      DO UPDATE SET due_date = EXCLUDED.due_date, origin_appointment_id = EXCLUDED.origin_appointment_id,
+                    updated_at = NOW()
+    `, [ids, months]);
+  } catch (recallErr) {
+    logger.warn('Recall scheduling failed', { appointments: ids.length, error: recallErr.message });
+  }
+}
 
 // ── LIST APPOINTMENTS ─────────────────────────────────────────
 router.get('/appointments', async (req, res) => {
@@ -66,7 +148,7 @@ router.get('/appointments', async (req, res) => {
         FROM appointments a
         JOIN patients p ON p.id=a.patient_id
         JOIN doctors d ON d.id=a.doctor_id
-        LEFT JOIN departments dep ON dep.id=d.department_id
+        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         JOIN hospitals h ON h.id=a.hospital_id
         WHERE ${where.join(' AND ')}
         ORDER BY a.appointment_date DESC, a.appointment_time DESC
@@ -95,7 +177,7 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
       JOIN patients p ON p.id=a.patient_id
       JOIN doctors d ON d.id=a.doctor_id
       JOIN hospitals h ON h.id=a.hospital_id
-      LEFT JOIN departments dep ON dep.id=d.department_id
+      LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
       WHERE a.id=$1
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
@@ -150,7 +232,8 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
         const r = await client.query(`
           UPDATE appointments SET status=$${statusParam}, updated_at=NOW(),
             cancellation_reason=$${statusParam + 1}, cancelled_at=NOW(), cancelled_by_user_id=$${statusParam + 2}
-          WHERE id IN (${placeholders}) AND status = ANY($${statusParam + 3}) RETURNING id, slot_id, doctor_id
+          WHERE id IN (${placeholders}) AND status = ANY($${statusParam + 3})
+          RETURNING id, slot_id, doctor_id, treatment_plan_id
         `, [...ids, status, cancellation_reason, req.user.id, cancellableSources]);
 
         const slotIds = r.rows.map(a => a.slot_id).filter(Boolean);
@@ -179,8 +262,18 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
       updated = await tenantQuery(s, `
         UPDATE appointments SET status=$${statusParam}, updated_at=NOW()
         WHERE id IN (${placeholders}) AND status = ANY($${ids.length + 2})
-        RETURNING id, slot_id, doctor_id
+        RETURNING id, slot_id, doctor_id, treatment_plan_id
       `, [...ids, status, allowedSources]);
+    }
+
+    // The same two follow-ups the single-appointment PATCH performs. Omitting
+    // them here meant a clinic that ticks the day's finished appointments and
+    // hits "Mark completed" — the normal end-of-day workflow — generated NO
+    // recalls at all, and left the final sitting of a course showing as still
+    // in progress. Same clinical event, silently different data.
+    await syncTreatmentPlans(s, updated.rows.map(a => a.treatment_plan_id));
+    if (status === 'completed') {
+      await scheduleRecalls(s, req.tenant, updated.rows.map(a => a.id));
     }
 
     await writeAuditLog(s, req.user.id, req.user.role, 'BULK_UPDATE_APPOINTMENTS', 'appointment', null,
@@ -301,6 +394,13 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       }
     }
 
+    if (status && r.rows[0]?.treatment_plan_id) {
+      await syncTreatmentPlans(s, [r.rows[0].treatment_plan_id]);
+    }
+    if (status === 'completed') {
+      await scheduleRecalls(s, req.tenant, [req.params.id]);
+    }
+
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_APPOINTMENT', 'appointment', req.params.id,
       { status: oldR.rows[0].status }, { status, cancellation_reason }, req.ip);
     res.json({ appointment: r.rows[0] });
@@ -352,7 +452,7 @@ router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
       FROM appointments a
       JOIN patients p ON p.id=a.patient_id
       JOIN doctors d ON d.id=a.doctor_id
-      LEFT JOIN departments dep ON dep.id=d.department_id
+      LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
       JOIN hospitals h ON h.id=a.hospital_id
       WHERE a.id=$1
     `, [req.params.id]);
@@ -425,7 +525,7 @@ router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
 // ── CREATE APPOINTMENT (walk-in) ──────────────────────────────
 router.post('/appointments', adminOnly, validate(schemas.createAppointment), async (req, res) => {
   try {
-    const { patient_phone: rawPhone, patient_name, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes } = req.body;
+    const { patient_phone: rawPhone, patient_name, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, department_id } = req.body;
     // Strip leading '+' to match DB CHECK constraint: phone ~ '^[0-9]{7,20}$'
     const patient_phone = rawPhone.replace(/^\+/, '');
     const s = req.tenant.schema_name;
@@ -444,6 +544,29 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
       [doctor_id, hospital_id]);
     if (!doctorCheck.rows[0]) {
       return res.status(400).json({ error: 'Doctor not found or does not belong to the specified hospital' });
+    }
+
+    // Optional: which treatment this visit is for. Must be one the doctor actually
+    // renders — booking a walk-in for a treatment the dentist isn't listed under
+    // would mislabel the receipt and the "by treatment" analytics. Omitted, it
+    // falls back to the doctor's primary department inside insertAppointmentWithRetry.
+    if (department_id) {
+      // Checked against the department's BRANCH as well as the join row.
+      // Departments are per-branch, so a stale doctor_departments row pointing
+      // at the old branch's department (left behind by a hospital-only PATCH
+      // /doctors/:id) let a walk-in be booked for a treatment belonging to a
+      // different branch — mislabelling the receipt and the "by treatment"
+      // analytics, which is the very thing the join check exists to prevent.
+      const deptCheck = await tenantQuery(s,
+        `SELECT 1 FROM doctor_departments dd
+         JOIN departments dep ON dep.id = dd.department_id
+         JOIN doctors doc ON doc.id = dd.doctor_id
+         WHERE dd.doctor_id=$1 AND dd.department_id=$2
+           AND dep.hospital_id = doc.hospital_id`,
+        [doctor_id, department_id]);
+      if (!deptCheck.rows[0]) {
+        return res.status(400).json({ error: 'This dentist is not available for the selected treatment' });
+      }
     }
 
     // Plan quota: block walk-in creation once the monthly allowance is used up
@@ -521,6 +644,7 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
           appointmentTime: appointment_time,
           visitType: visit_type || 'in_person',
           notes: notes || null,
+          departmentId: department_id || null,
         });
       });
     } catch (txErr) {
@@ -562,8 +686,13 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
 router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req, res) => {
   try {
     const { follow_up_days = 14, doctor_id, notes } = req.body;
-    if (follow_up_days < 1 || follow_up_days > 365) {
-      return res.status(400).json({ error: 'follow_up_days must be between 1 and 365' });
+    // Type-checked, not just range-checked. Both comparisons below are FALSE
+    // for NaN, so "abc" passed the range test, reached addDays() as a non-number
+    // and produced an Invalid Date that made format() throw a RangeError — a
+    // 500 for what is plainly a 400.
+    const followUpDays = parseInt(follow_up_days, 10);
+    if (!Number.isInteger(followUpDays) || followUpDays < 1 || followUpDays > 365) {
+      return res.status(400).json({ error: 'follow_up_days must be an integer between 1 and 365' });
     }
     if (doctor_id && !UUID_RE.test(doctor_id)) {
       return res.status(400).json({ error: 'Invalid doctor_id format' });
@@ -597,7 +726,7 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     // midnight while format() renders in server-local time — off by one day on
     // any host that isn't UTC. Every other date site in the codebase uses parseISO.
     const { addDays, format, parseISO } = require('date-fns');
-    const followUpDate = format(addDays(parseISO(String(orig.appointment_date).slice(0, 10)), follow_up_days), 'yyyy-MM-dd');
+    const followUpDate = format(addDays(parseISO(String(orig.appointment_date).slice(0, 10)), followUpDays), 'yyyy-MM-dd');
 
     // Plan quota: the walk-in route enforces this before creating an appointment —
     // without the same check here, "schedule follow-up" was an unmetered back door
@@ -685,7 +814,7 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
         // Link back to original
         await client.query(
           `UPDATE appointments SET follow_up_appointment_id=$1, follow_up_days=$2 WHERE id=$3`,
-          [row.id, follow_up_days, req.params.id]);
+          [row.id, followUpDays, req.params.id]);
 
         return { bookingId, row, slot };
       });
@@ -703,7 +832,7 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
     }
 
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_FOLLOWUP', 'appointment', followUp.row.id,
-      null, { original_id: req.params.id, follow_up_days, booking_id: followUp.bookingId }, req.ip);
+      null, { original_id: req.params.id, follow_up_days: followUpDays, booking_id: followUp.bookingId }, req.ip);
 
     res.json({
       follow_up_appointment: followUp.row,

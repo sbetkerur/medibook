@@ -11,7 +11,7 @@
  *
  * Run: node tests/slotPlanner.unit.test.js
  */
-const { planDoctorSlots, computeDaySlotTimes } = require('../src/jobs/slotGenerator');
+const { planDoctorSlots, computeDaySlotTimes, weekOfMonth, matchesWeekOfMonth } = require('../src/jobs/slotGenerator');
 
 let passed = 0, failed = 0;
 function check(name, actual, expected) {
@@ -72,6 +72,61 @@ check('non-working day produces no slots',
 check('lunch window is skipped',
   computeDaySlotTimes('10:00', '14:00', 60, '12:00', '13:00').map(s => s.st),
   ['10:00', '11:00', '13:00']);
+
+// ── Visiting consultants ─────────────────────────────────────
+// The specialist who comes on the 1st and 3rd Saturday, or does Monday at one
+// branch and Wednesday at another. Both are the norm in Indian dental practice.
+
+// March 2026: Saturdays fall on the 7th (1st), 14th (2nd), 21st (3rd), 28th (4th).
+check('the 7th is the 1st Saturday of the month', weekOfMonth(new Date('2026-03-07T00:00:00')), 1);
+check('the 21st is the 3rd Saturday', weekOfMonth(new Date('2026-03-21T00:00:00')), 3);
+check('the 1st of a month is always week 1', weekOfMonth(new Date('2026-03-01T00:00:00')), 1);
+check('the 29th is week 5', weekOfMonth(new Date('2026-03-29T00:00:00')), 5);
+
+// FAIL OPEN. Every schedule row that predates this column has no restriction,
+// and reading "no restriction" as "no weeks" would silently erase the calendar
+// of every dentist in every clinic.
+check('no restriction means every week (null)', matchesWeekOfMonth(null, new Date('2026-03-14T00:00:00')), true);
+check('no restriction means every week (empty array)', matchesWeekOfMonth([], new Date('2026-03-14T00:00:00')), true);
+check('malformed value does not blank the calendar', matchesWeekOfMonth('1,3', new Date('2026-03-14T00:00:00')), true);
+
+const alternateSaturdays = {
+  ...doc,
+  schedules: [{ dow: 6, start: '10:00', end: '13:00', lunchStart: null, lunchEnd: null, weeksOfMonth: [1, 3] }],
+};
+check('a 1st-and-3rd-Saturday consultant generates only those Saturdays',
+  // From Tue 10 Mar over 25 days: Saturdays 14th (2nd), 21st (3rd), 4th Apr (1st).
+  [...new Set(planDoctorSlots(alternateSaturdays, at('07:00'), 25, never).map(p => p.dateStr))],
+  ['2026-03-21', '2026-04-04']);
+
+const everySaturday = {
+  ...doc,
+  schedules: [{ dow: 6, start: '10:00', end: '13:00', lunchStart: null, lunchEnd: null }],
+};
+check('without the restriction the same doctor gets EVERY Saturday',
+  [...new Set(planDoctorSlots(everySaturday, at('07:00'), 25, never).map(p => p.dateStr))],
+  ['2026-03-14', '2026-03-21', '2026-03-28', '2026-04-04']);
+
+// ── Per-day branch ───────────────────────────────────────────
+const twoBranches = {
+  hospital_id: 'h1',
+  duration: 60,
+  schedules: [
+    { dow: 1, start: '10:00', end: '11:00', lunchStart: null, lunchEnd: null, hospitalId: 'h2' },
+    { dow: 3, start: '10:00', end: '11:00', lunchStart: null, lunchEnd: null }, // primary
+  ],
+};
+const planned = planDoctorSlots(twoBranches, at('07:00'), 7, never);
+check('Monday is stamped with the visiting branch',
+  planned.filter(p => p.dateStr === '2026-03-16').map(p => p.hospitalId), ['h2']);
+check('Wednesday falls back to the primary branch',
+  planned.filter(p => p.dateStr === '2026-03-11').map(p => p.hospitalId), ['h1']);
+
+// A holiday at one branch must not close the day the doctor spends at the other.
+const h2Closed = (dateStr, hospitalId) => hospitalId === 'h2';
+const afterHoliday = planDoctorSlots(twoBranches, at('07:00'), 7, h2Closed);
+check('a holiday at the visiting branch blocks only that day',
+  [...new Set(afterHoliday.map(p => p.dateStr))], ['2026-03-11']);
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

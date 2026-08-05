@@ -31,6 +31,8 @@ cd backend && node tests/clinicNearbyFlow.test.js    # entry routing e2e (needs 
 cd backend && node tests/slotPlanner.unit.test.js
 cd backend && node tests/restartGreeting.unit.test.js
 cd backend && node tests/billingDrift.unit.test.js   # per-branch billing staleness
+cd backend && node tests/doctorDepartments.unit.test.js  # multi-department doctors
+cd backend && node tests/treatmentPlan.unit.test.js      # multi-visit treatment courses
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -142,11 +144,33 @@ redirects just that message back to the asker, only when the current clinic's
 session is idle AND the asking clinic is verifiably still waiting. Any new
 clinic-initiated question needs the same `recordPendingReply` call.
 
-**Cron sends must be logged.** Patient-facing messages sent outside botEngine
-go through `services/outbound.js` (`sendPatientText` / `sendPatientTemplate`),
-which writes to `wa_messages`. `wa.sendText`/`sendTemplate` on their own record
-nothing, so anything using them directly is invisible in clinic history and has
-no row for delivery receipts to attach to.
+**Cron sends must be logged, AND template-first.** Patient-facing messages sent
+outside botEngine go through `services/outbound.js`, which writes to
+`wa_messages`. `wa.sendText`/`sendTemplate` on their own record nothing, so
+anything using them directly is invisible in clinic history and has no row for
+delivery receipts to attach to. Beyond that: Meta only allows free-form text
+inside the 24-hour customer service window, and every cron here messages
+patients who by definition have NOT written recently — so a clinic-initiated
+send must use `sendPatientMessage` (template, falling back to text), never
+`sendPatientText` alone. The reminders always did this inline; the feedback,
+post-visit and treatment-nudge crons did not and would have gone silent in
+production while logging a per-patient error. Any retry bookkeeping around such
+a send must advance on the ATTEMPT, not on success — counting only successes
+turns a permanently-failing send into an unbounded daily retry that never
+reaches its own cap (`jobs/treatmentNudges.js`).
+
+**Conversation design.** Interactive messages use WhatsApp's real `header` and
+`footer` slots (`wa.sendButtons`/`sendList` take a 6th `{header, footer}` arg,
+both capped at 60 chars by Meta). The step title goes in the header, the
+"Step N of 5 · Reply Menu" hint in the footer, and the body carries only
+information — previously all three were crammed into one bold-text block, which
+is what made every message look identical. Copy is a question, not a form label
+("And your date of birth?" not "🎂 *Date of Birth*\n\nEnter your DOB…"), one
+glyph per message at most, and the confirmation leads with WHEN and WHO because
+that is what a patient scrolls back to check. Tests must assert against the
+message's meaning, not its wording — botFlow's mock exposes `m.all`
+(header+body+footer) for exactly this, so moving copy between slots doesn't
+break a suite.
 
 **Bot engine.** `services/botEngine.js` is a state machine over
 `bot_sessions.state` with context stored ENCRYPTED (`{_enc: ...}`, AES-256-GCM
@@ -167,6 +191,113 @@ returns null when input is under 3 chars or matches more than one item — it
 must never resolve ambiguity by list order, since that picks the dentist a
 patient is booked with. Callers re-prompt on null; they must not cancel the
 booking (see `tests/fuzzyFind.unit.test.js`).
+
+**A dentist belongs to several treatments.** `departments` are treatment
+categories, and the bookable pairing is many-to-many via `doctor_departments` —
+an Indian GP routinely renders simple root canals and extractions alongside
+general dentistry, with the specialist on staff taking the hard cases.
+`doctors.department_id` remains the PRIMARY department and is ALWAYS mirrored
+into the join table (`utils/doctorDepartments.js` — `normalizeDepartmentIds`
+puts it first); that invariant is what makes the boot-time backfill in
+`tenantMigrate.js` a permanent no-op instead of something that resurrects a
+department an admin removed. The bot lists treatments and dentists through the
+join table only (`bot/bookingFlow.js`), so any path that creates a doctor must
+write the join row in the SAME statement/transaction — migrate runs before seed
+on boot, so a doctor created without one is unbookable over WhatsApp until the
+next restart (`POST /doctors`, the CSV import and `seed.js` all do this).
+Departments are per-branch, so a doctor's set is validated against their own
+`hospital_id`. Consequence: the treatment can no longer be derived from the
+doctor, so `appointments.department_id` records what was booked FOR, and every
+display join reads `COALESCE(a.department_id, d.department_id)` — receipts,
+reminder checklists and "by treatment" analytics. Pass `departmentId` to
+`bookingCore.insertAppointmentWithRetry` wherever the patient chose a treatment;
+it falls back to the doctor's primary otherwise (the walk-in desk).
+
+**The clinical flow.** A patient books a CONSULTATION with the clinic — any
+dentist, no treatment named, because only the dentist can name it. The treatment
+picker therefore leads with `GENERAL_CONSULT` ("not sure"), a sentinel that
+matches no department and lists every dentist at the branch; the named
+treatments stay for patients who do know. The dentist then advises a treatment,
+which may be done in the same sitting or over several, by them or by a
+specialist on staff. The FIRST sitting is booked at the desk; every one after it
+is the patient's own — they get a nudge and reply *Treatment*
+(`services/bot/treatmentFlow.js`), which pre-fills branch/treatment/dentist from
+the plan and hands over to `bookingFlow.handleSelectDoctor` so dates, slots and
+the slot lock stay in one place. `jobs/treatmentNudges.js` sends the nudge
+(daily 10:30 IST, throttled: never within 7 days, never more than 3 times, never
+when a sitting is already on the calendar or one happened in the last 3 days).
+It is clinic-initiated, so it calls `recordPendingReply(KINDS.TREATMENT)` and
+`resolveAskingTenant` re-checks that the asking clinic still has an open course;
+`TREATMENT_REPLY_RE` there and `TREATMENT_KEYWORD_RE` in botEngine must stay
+identical or the redirect lands somewhere the engine won't act on it.
+
+**Treatments run over several visits.** A root canal is 2–3 appointments and an
+implant is months of them, rendered by the diagnosing dentist OR by a specialist
+on staff. `treatment_plans` is the head of that course; each visit is an
+ordinary appointment carrying `treatment_plan_id` + `visit_number`
+(`routes/treatmentPlans.js`). A plan's `department_id` is what labels every
+sitting's receipt: explicit value first, then the TREATING dentist's specialty,
+and only then the originating visit — inheriting the origin first made every
+sitting of a root canal diagnosed at a general consultation read "General
+Dentistry". Progress is **derived** from those appointments
+(`utils/treatmentPlan.js` — `planProgress`, `derivePlanStatus`), never stored as
+a counter: a cancelled visit must put the work straight back on the "advised but
+not booked" queue (`GET /treatment-plans?outstanding=true`), which a stored
+count silently gets wrong. `derivePlanStatus` refuses to move a terminal plan,
+so a late completion can't reopen a cancelled course; it runs both when a visit
+is booked and from the appointment status PATCH. Booking a visit re-counts under
+`SELECT … FOR UPDATE` on the plan — locks go **plan → slot** in BOTH writers
+(the admin route and `bookingFlow.completeBooking`), since a receptionist and
+the patient can be booking the same sitting at once — and goes through the
+shared `insertAppointmentWithRetry` +
+atomic slot lock + `checkMonthlyQuota` — a 3-visit course is 3 appointments, not
+a back door around the cap. The patient confirmation goes through
+`services/outbound.js`; it is a STATEMENT, so it needs no `recordPendingReply` —
+add one if a clinic-initiated *question* is ever sent from here.
+
+**Visiting consultants.** The specialist is usually a visiting doctor: at one
+branch on Tuesdays, another on Thursdays, and often only on some weeks of the
+month. Three pieces carry this. (1) `doctor_hospitals(doctor_id, hospital_id,
+day_of_week, …)` decides WHICH BRANCH a weekday belongs to — it existed for a
+long time written by the API and read by nothing, so every slot was stamped with
+`doctors.hospital_id`; both `slotGenerator` paths now LEFT JOIN it and
+`planDoctorSlots` emits `hospitalId` per slot. A doctor without those rows
+behaves exactly as before. (2) `doctor_schedules.week_of_month INTEGER[]` is the
+cadence: `{1,3}` = the 1st and 3rd occurrence of that weekday in the month,
+alternate weeks are `{1,3,5}`, and NULL/empty means every week —
+`matchesWeekOfMonth` FAILS OPEN on anything empty or malformed, because reading
+"no restriction" as "no weeks" would erase a dentist's whole calendar.
+(3) `isBlockedDay(dateStr, hospitalId)` takes the branch, so a holiday at one
+branch can't close the day the doctor spends at the other. `POST
+/doctors/:id/schedule` writes both tables together and is the only UI for
+either; `seed.js` clears both so a re-seed is a true reset. The
+`(doctor_id, slot_date, start_time)` unique index also means a visiting doctor
+can never hold slots at two branches at the same moment.
+
+Consequence for the bot: a doctor's next clinic is routinely more than
+`SLOT_LOOKAHEAD_DAYS` (14) away. `handleSelectDoctor` therefore falls back to
+`CRON_LOOKAHEAD_DAYS` when the two-week window is empty and says so, rather than
+dead-ending — which for a treatment sitting was a hard dead end, since the
+dentist list holds exactly one entry and there is no alternative to offer.
+
+**Money, lab work and recare hang off the treatment plan.** `treatment_payments`
+is the course billed as a WHOLE — deliberately separate from
+`appointments.effective_fee`/`payment_status`, which is the per-visit
+consultation fee; conflating them double-counts revenue. Balance is derived
+(`estimated_cost − SUM(amount)`), clamped at 0, with `overpaid` surfaced rather
+than hidden — it usually means a stale estimate. Recording a payment is open to
+the front desk; DELETING one is `adminOnly` and audited, since it is the only
+operation that reduces recorded revenue. `lab_works` tracks crowns and dentures
+out at the lab, because a sitting that depends on one cannot be booked on slot
+availability alone. `patient_recalls` is the six-month check-up loop, created
+automatically when a visit is marked completed (the only moment the clinic
+reliably knows a patient is between courses) with a partial unique index on
+`(patient_id, reason) WHERE status='due'` so three visits in a month cannot
+queue three identical reminders; `jobs/recalls.js` closes any recall the patient
+has already acted on BEFORE sending, or it chases people who have booked. A
+plan is `stalled` when work has started, nothing is booked, and the last sitting
+was ≥30 days ago — different from "advised yesterday", and usually the case with
+money outstanding.
 
 **Booking integrity.** Slot locking is the atomic
 `UPDATE time_slots SET status='booked' WHERE ... AND status='available'`

@@ -86,8 +86,14 @@ router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
       UPDATE patients SET
         name=COALESCE($1,name), email=COALESCE($2,email),
         gender=COALESCE($3,gender), date_of_birth=COALESCE($4::date,date_of_birth), updated_at=NOW()
-      WHERE id=$5 RETURNING id, name, phone, email, gender, date_of_birth, visit_count
+      WHERE id=$5 AND deleted_at IS NULL
+      RETURNING id, name, phone, email, gender, date_of_birth, visit_count
     `, [name || null, email || null, gender || null, date_of_birth || null, req.params.id]);
+    // deleted_at IS NULL, matching every other read in this file. Without it a
+    // PATCH wrote name/email/DOB/gender straight back onto a row that DELETE
+    // /patients/:id had anonymised — the record stayed hidden from the list
+    // (deleted_at is still set) while carrying live PII again, which is the
+    // worst of both states for something the clinic has attested is erased.
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_PATIENT', 'patient', req.params.id,
       null, { name, email, gender }, req.ip);
@@ -120,6 +126,23 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
       WHERE id=$1 RETURNING id
     `, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
+
+    // Free-text clinical notes about this person live outside the patients row
+    // too — treatment plans carry a diagnosis and what was explained at the
+    // chair, and can name relatives. Scrubbed for the same reason
+    // dental_history is above. The structural record (what treatment, how many
+    // sittings, what was paid) is deliberately KEPT: it is the clinic's medical
+    // and financial record, which they are required to retain, and it no longer
+    // identifies anyone once the patient row is anonymised.
+    await tenantQuery(s,
+      `UPDATE treatment_plans SET notes=NULL, updated_at=NOW() WHERE patient_id=$1 AND notes IS NOT NULL`,
+      [req.params.id]).catch(err =>
+        logger.warn('Treatment plan notes scrub failed during anonymisation',
+          { patient: req.params.id, error: err.message }));
+    await tenantQuery(s,
+      `UPDATE lab_works SET notes=NULL, updated_at=NOW() WHERE patient_id=$1 AND notes IS NOT NULL`,
+      [req.params.id]).catch(() => {});
+
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_PATIENT', 'patient', req.params.id, null, null, req.ip);
     res.json({ success: true, message: 'Patient record anonymised (GDPR)' });
   } catch (err) { handleError(res, err); }

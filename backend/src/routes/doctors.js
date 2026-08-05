@@ -7,6 +7,7 @@ const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
+const { normalizeDepartmentIds, syncDoctorDepartments, MAX_DEPARTMENTS_PER_DOCTOR } = require('../utils/doctorDepartments');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -71,11 +72,18 @@ router.get('/doctors', async (req, res) => {
     const [r, countR] = await Promise.all([
       tenantQuery(schema, `
         SELECT d.*, dep.name as department_name, h.name as hospital_name,
+               COALESCE(dept_agg.departments, '[]'::json) as departments,
                COALESCE(appt_agg.total, 0)::int as total_appointments,
                COALESCE(slot_agg.available, 0)::int as available_slots
         FROM doctors d
         LEFT JOIN departments dep ON dep.id=d.department_id
         LEFT JOIN hospitals h ON h.id=d.hospital_id
+        LEFT JOIN (
+          SELECT dd.doctor_id,
+                 json_agg(json_build_object('id', dp.id, 'name', dp.name) ORDER BY dp.name) as departments
+          FROM doctor_departments dd JOIN departments dp ON dp.id=dd.department_id
+          GROUP BY dd.doctor_id
+        ) dept_agg ON dept_agg.doctor_id=d.id
         LEFT JOIN (
           SELECT doctor_id, COUNT(*) as total
           FROM appointments WHERE status='confirmed' GROUP BY doctor_id
@@ -98,16 +106,27 @@ router.get('/doctors', async (req, res) => {
 
 router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, res) => {
   try {
-    const { name, specialization, qualification, department_id, hospital_id, consultation_fee, slot_duration_minutes } = req.body;
+    const { name, specialization, qualification, department_id, department_ids, hospital_id, consultation_fee, slot_duration_minutes } = req.body;
     const s = req.tenant.schema_name;
 
     // Pre-validate FK references before entering the transaction
     const hospCheck = await tenantQuery(s, `SELECT id FROM hospitals WHERE id=$1 AND is_active=true AND deleted_at IS NULL`, [hospital_id]);
     if (!hospCheck.rows[0]) return res.status(400).json({ error: 'Hospital not found' });
-    if (department_id) {
-      const deptCheck = await tenantQuery(s, `SELECT id FROM departments WHERE id=$1 AND hospital_id=$2`, [department_id, hospital_id]);
-      if (!deptCheck.rows[0]) return res.status(400).json({ error: 'Department not found or does not belong to this hospital' });
+
+    const { ids: deptIds, invalid, tooMany } = normalizeDepartmentIds(department_id, department_ids);
+    if (invalid.length) return res.status(400).json({ error: 'Invalid department_id format' });
+    if (tooMany) return res.status(400).json({ error: `A doctor can belong to at most ${MAX_DEPARTMENTS_PER_DOCTOR} departments` });
+    if (deptIds.length) {
+      const deptCheck = await tenantQuery(s,
+        `SELECT id FROM departments WHERE id = ANY($1::uuid[]) AND hospital_id=$2`, [deptIds, hospital_id]);
+      if (deptCheck.rows.length !== deptIds.length) {
+        return res.status(400).json({ error: 'Department not found or does not belong to this hospital' });
+      }
     }
+    // normalizeDepartmentIds puts the primary first, so this also covers the case
+    // where only department_ids was sent: the first one becomes the primary that
+    // receipts and analytics read.
+    const primaryDeptId = deptIds[0] || null;
 
     const planR = await query(`SELECT max_doctors FROM plans WHERE id=$1`, [req.tenant.plan]);
     const planLimit = planR.rows[0]?.max_doctors ?? null;
@@ -130,13 +149,15 @@ router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, r
         }
       }
 
-      return client.query(`
+      const inserted = await client.query(`
         INSERT INTO doctors (name, specialization, qualification, department_id, hospital_id, consultation_fee, slot_duration_minutes)
         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-      `, [name, specialization, qualification, department_id, hospital_id, consultation_fee || 0, slot_duration_minutes || 30]);
+      `, [name, specialization, qualification, primaryDeptId, hospital_id, consultation_fee || 0, slot_duration_minutes || 30]);
+      await syncDoctorDepartments(client, inserted.rows[0].id, deptIds);
+      return inserted;
     });
 
-    res.json({ doctor: r.rows[0] });
+    res.json({ doctor: { ...r.rows[0], department_ids: deptIds } });
   } catch (err) {
     if (err.isQuota) {
       const [cur, max] = err.message.replace('QUOTA:', '').split('/');
@@ -153,11 +174,18 @@ router.get('/doctors/:id', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name, `
       SELECT d.*, dep.name as department_name, h.name as hospital_name,
+             COALESCE(dept_agg.departments, '[]'::json) as departments,
              COALESCE(appt_agg.total, 0)::int as total_appointments,
              COALESCE(slot_agg.available, 0)::int as available_slots
       FROM doctors d
       LEFT JOIN departments dep ON dep.id=d.department_id
       LEFT JOIN hospitals h ON h.id=d.hospital_id
+      LEFT JOIN (
+        SELECT dd.doctor_id,
+               json_agg(json_build_object('id', dp.id, 'name', dp.name) ORDER BY dp.name) as departments
+        FROM doctor_departments dd JOIN departments dp ON dp.id=dd.department_id
+        GROUP BY dd.doctor_id
+      ) dept_agg ON dept_agg.doctor_id=d.id
       LEFT JOIN (SELECT doctor_id, COUNT(*) as total FROM appointments WHERE status='confirmed' GROUP BY doctor_id) appt_agg ON appt_agg.doctor_id=d.id
       LEFT JOIN (SELECT doctor_id, COUNT(*) as available FROM time_slots WHERE slot_date>=${IST_TODAY_SQL} AND status='available' GROUP BY doctor_id) slot_agg ON slot_agg.doctor_id=d.id
       WHERE d.id=$1
@@ -169,34 +197,92 @@ router.get('/doctors/:id', validateUUID(), async (req, res) => {
 
 router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
-    const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, hospital_id, pricing_rules } = req.body;
+    const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, department_ids, hospital_id, pricing_rules, is_visiting } = req.body;
     const s = req.tenant.schema_name;
     // Validate UUID fields early — PostgreSQL's ::uuid cast would otherwise return 500
     if (hospital_id && !UUID_RE.test(hospital_id)) {
       return res.status(400).json({ error: 'Invalid hospital_id format' });
     }
-    if (department_id && !UUID_RE.test(department_id)) {
-      return res.status(400).json({ error: 'Invalid department_id format' });
+    if (department_ids !== undefined && department_ids !== null && !Array.isArray(department_ids)) {
+      return res.status(400).json({ error: 'department_ids must be an array' });
     }
-    const oldR = await tenantQuery(s, `SELECT name, is_active, hospital_id FROM doctors WHERE id=$1`, [req.params.id]);
+    const oldR = await tenantQuery(s, `SELECT name, is_active, hospital_id, department_id FROM doctors WHERE id=$1`, [req.params.id]);
     if (!oldR.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
-    if (department_id) {
-      const effectiveHospitalId = hospital_id || oldR.rows[0].hospital_id;
-      const deptCheck = await tenantQuery(s, `SELECT id FROM departments WHERE id=$1 AND hospital_id=$2`, [department_id, effectiveHospitalId]);
-      if (!deptCheck.rows[0]) return res.status(400).json({ error: 'Department not found or does not belong to this hospital' });
+
+    // Deactivating through this route must clear the same bar DELETE /doctors/:id
+    // does. It didn't: is_active went straight through COALESCE below, so an
+    // admin who flipped the toggle on the edit form instead of using Deactivate
+    // stranded every patient already booked with that dentist — the bot's
+    // department and dentist lists all filter is_active=true, so those patients
+    // could no longer see or reschedule their own appointment, and the guard
+    // written to prevent exactly that never ran.
+    if (is_active === false && oldR.rows[0].is_active === true) {
+      const upcoming = await tenantQuery(s,
+        `SELECT COUNT(*)::int AS n FROM appointments
+         WHERE doctor_id=$1 AND status='confirmed' AND appointment_date >= ${IST_TODAY_SQL}`,
+        [req.params.id]);
+      const cnt = upcoming.rows[0].n;
+      if (cnt > 0) {
+        return res.status(409).json({
+          error: `Cannot deactivate doctor — ${cnt} upcoming appointment(s) exist.`,
+          upcoming_appointments: cnt,
+        });
+      }
     }
+
+    // Two shapes, deliberately different:
+    //   department_ids present → REPLACE the bookable set outright.
+    //   department_id alone    → change the primary and ADD it to the set, leaving
+    //                            the doctor's other treatments in place (otherwise
+    //                            an unrelated PATCH from an older client would
+    //                            silently strip them).
+    const replacingSet = Array.isArray(department_ids);
+    const { ids: deptIds, invalid, tooMany } = normalizeDepartmentIds(department_id, department_ids);
+    if (invalid.length) return res.status(400).json({ error: 'Invalid department_id format' });
+    if (tooMany) return res.status(400).json({ error: `A doctor can belong to at most ${MAX_DEPARTMENTS_PER_DOCTOR} departments` });
+
+    const effectiveHospitalId = hospital_id || oldR.rows[0].hospital_id;
+    if (deptIds.length) {
+      const deptCheck = await tenantQuery(s,
+        `SELECT id FROM departments WHERE id = ANY($1::uuid[]) AND hospital_id=$2`, [deptIds, effectiveHospitalId]);
+      if (deptCheck.rows.length !== deptIds.length) {
+        return res.status(400).json({ error: 'Department not found or does not belong to this hospital' });
+      }
+    }
+    // Clearing the set clears the primary too, or doctors.department_id would
+    // point at a department the doctor is no longer bookable for.
+    const primaryDeptId = deptIds[0] || (replacingSet ? null : department_id || null);
+    const clearingPrimary = replacingSet && !deptIds.length;
+
     const pricingRulesVal = pricing_rules && typeof pricing_rules === 'object' ? JSON.stringify(pricing_rules) : null;
-    const r = await tenantQuery(s, `
-      UPDATE doctors SET
-        name=COALESCE($1,name), specialization=COALESCE($2,specialization),
-        qualification=COALESCE($3,qualification), consultation_fee=COALESCE($4,consultation_fee),
-        slot_duration_minutes=COALESCE($5,slot_duration_minutes), is_active=COALESCE($6,is_active),
-        department_id=COALESCE($7::uuid,department_id), hospital_id=COALESCE($8::uuid,hospital_id),
-        pricing_rules=COALESCE($10::jsonb,pricing_rules)
-      WHERE id=$9 RETURNING *
-    `, [name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id || null, hospital_id || null, req.params.id, pricingRulesVal]);
+    // One transaction: the primary department and the bookable set must not be
+    // able to disagree, which is what syncDoctorDepartments' invariant rests on.
+    const r = await tenantTransaction(s, async (client) => {
+      const updated = await client.query(`
+        UPDATE doctors SET
+          name=COALESCE($1,name), specialization=COALESCE($2,specialization),
+          qualification=COALESCE($3,qualification), consultation_fee=COALESCE($4,consultation_fee),
+          slot_duration_minutes=COALESCE($5,slot_duration_minutes), is_active=COALESCE($6,is_active),
+          department_id=CASE WHEN $11::boolean THEN NULL ELSE COALESCE($7::uuid,department_id) END,
+          hospital_id=COALESCE($8::uuid,hospital_id),
+          pricing_rules=COALESCE($10::jsonb,pricing_rules),
+          is_visiting=COALESCE($12::boolean,is_visiting)
+        WHERE id=$9 RETURNING *
+      `, [name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active,
+          primaryDeptId, hospital_id || null, req.params.id, pricingRulesVal, clearingPrimary,
+          typeof is_visiting === 'boolean' ? is_visiting : null]);
+
+      if (replacingSet) {
+        await syncDoctorDepartments(client, req.params.id, deptIds);
+      } else if (primaryDeptId) {
+        await client.query(
+          `INSERT INTO doctor_departments (doctor_id, department_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [req.params.id, primaryDeptId]);
+      }
+      return updated;
+    });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_DOCTOR', 'doctor', req.params.id,
-      oldR.rows[0], { name, is_active }, req.ip);
+      oldR.rows[0], { name, is_active, department_ids: replacingSet ? deptIds : undefined }, req.ip);
     res.json({ doctor: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
@@ -228,8 +314,15 @@ router.delete('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
 // ── DOCTOR SCHEDULE ───────────────────────────────────────────
 router.get('/doctors/:id/schedule', validateUUID(), async (req, res) => {
   try {
+    // hospital_id comes from doctor_hospitals — the branch this doctor is at on
+    // that weekday. NULL means their primary branch, which is every doctor who
+    // isn't a visiting consultant.
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT * FROM doctor_schedules WHERE doctor_id=$1 ORDER BY day_of_week`, [req.params.id]);
+      `SELECT s.*, dh.hospital_id
+       FROM doctor_schedules s
+       LEFT JOIN doctor_hospitals dh
+         ON dh.doctor_id = s.doctor_id AND dh.day_of_week = s.day_of_week
+       WHERE s.doctor_id=$1 ORDER BY s.day_of_week`, [req.params.id]);
     res.json({ schedule: r.rows });
   } catch (err) { handleError(res, err); }
 });
@@ -268,42 +361,133 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
             return res.status(400).json({ error: `Day ${dow}: lunch window must fall within working hours` });
           }
         }
+        // Visiting consultants: which weeks of the month they attend. Empty or
+        // absent means every week — the meaning of every row that predates this.
+        if (s.week_of_month !== undefined && s.week_of_month !== null) {
+          if (!Array.isArray(s.week_of_month)) {
+            return res.status(400).json({ error: `Day ${dow}: week_of_month must be an array` });
+          }
+          if (!s.week_of_month.every(w => Number.isInteger(w) && w >= 1 && w <= 5)) {
+            return res.status(400).json({ error: `Day ${dow}: week_of_month values must be 1-5 (1 = first occurrence of that weekday in the month)` });
+          }
+        }
+        if (s.hospital_id && !UUID_RE.test(s.hospital_id)) {
+          return res.status(400).json({ error: `Day ${dow}: invalid hospital_id format` });
+        }
       }
     }
     const s = req.tenant.schema_name;
+
+    // Per-day branches must belong to this tenant and be live, or slots would be
+    // generated against a deleted branch and become invisible to every patient.
+    const dayHospitalIds = [...new Set(schedules.map(x => x.hospital_id).filter(Boolean))];
+    if (dayHospitalIds.length) {
+      const hospCheck = await tenantQuery(s,
+        `SELECT id FROM hospitals WHERE id = ANY($1::uuid[]) AND is_active=true AND deleted_at IS NULL`,
+        [dayHospitalIds]);
+      if (hospCheck.rows.length !== dayHospitalIds.length) {
+        return res.status(400).json({ error: 'One or more branches were not found' });
+      }
+    }
     await tenantTransaction(s, async (client) => {
       for (const sched of schedules) {
+        const weeks = Array.isArray(sched.week_of_month) && sched.week_of_month.length
+          ? [...new Set(sched.week_of_month)].sort((a, b) => a - b)
+          : null; // null = every week
         await client.query(`
-          INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working, lunch_start_time, lunch_end_time)
-          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working, lunch_start_time, lunch_end_time, week_of_month)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
           ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
             start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time,
             is_working=EXCLUDED.is_working,
             lunch_start_time=EXCLUDED.lunch_start_time,
-            lunch_end_time=EXCLUDED.lunch_end_time
-        `, [req.params.id, sched.day_of_week, sched.start_time, sched.end_time, sched.is_working !== false, sched.lunch_start_time || null, sched.lunch_end_time || null]);
+            lunch_end_time=EXCLUDED.lunch_end_time,
+            week_of_month=EXCLUDED.week_of_month
+        `, [req.params.id, sched.day_of_week, sched.start_time, sched.end_time, sched.is_working !== false, sched.lunch_start_time || null, sched.lunch_end_time || null, weeks]);
+
+        // The branch worked THAT day. Written to doctor_hospitals, which
+        // slotGenerator reads to stamp each slot — the two must be kept in step
+        // here, since this is the only UI that sets either. Hours are mirrored
+        // for the /locations API's benefit; doctor_schedules stays authoritative.
+        if (sched.hospital_id && sched.is_working !== false) {
+          await client.query(`
+            INSERT INTO doctor_hospitals (doctor_id, hospital_id, day_of_week, start_time, end_time)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (doctor_id, hospital_id, day_of_week) DO UPDATE
+              SET start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time
+          `, [req.params.id, sched.hospital_id, sched.day_of_week, sched.start_time, sched.end_time]);
+          // Clearing the day of any OTHER branch: a doctor is at one place on a
+          // given weekday, and a stale row would leave two branches generating
+          // slots for the same hours.
+          await client.query(
+            `DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND day_of_week=$2 AND hospital_id<>$3`,
+            [req.params.id, sched.day_of_week, sched.hospital_id]);
+        } else {
+          // Blank (or not working) means "primary branch" — drop any override.
+          await client.query(
+            `DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND day_of_week=$2`,
+            [req.params.id, sched.day_of_week]);
+        }
       }
     });
 
-    // Regenerate future slots to reflect the new schedule.
-    // Delete all future available slots for this doctor first, then re-create.
+    // Regenerate future slots to reflect the new schedule: delete this doctor's
+    // future available slots, then re-create them from the saved schedule.
+    //
+    // The DELETE is unbounded (the whole CRON_LOOKAHEAD_DAYS horizon) and used
+    // to run unconditionally, with the rebuild that follows it inside the same
+    // swallowing catch. A delete that committed followed by a generate that
+    // threw wiped the doctor's entire 60-day availability and still answered
+    // 200 {success:true}: the admin saw a saved schedule while the bot told
+    // every patient "no slots available" for that dentist until the 23:30 IST
+    // sweep repaired it, up to a day later.
+    //
+    // The two cannot share a transaction without threading a client through
+    // generateSlotsForDoctor and everything it calls. So the plan is computed
+    // FIRST, as a dry run: it exercises the same schedule read and the same
+    // day loop that the real generation does, so the realistic failures (bad
+    // schedule rows, a query error, a doctor with nothing to generate) surface
+    // while the existing grid is still untouched. Only a dry run that both
+    // succeeded and produced slots earns the right to delete.
     let slotsGenerated = 0;
+    let regenError = null;
     try {
-      // Also skip slots referenced by appointments — a cancelled appointment
-      // keeps its slot_id, so deleting the released slot violates the
-      // appointments FK and aborts the regeneration.
-      await deleteFutureUnreferencedSlots(s, req.params.id);
       const { generateSlotsForDoctor } = require('../jobs/slotGenerator');
-      slotsGenerated = await generateSlotsForDoctor(s, req.params.id);
-      if (slotsGenerated > 0) {
+      const preview = await generateSlotsForDoctor(s, req.params.id, true);
+      const wouldGenerate = preview?.would_generate ?? 0;
+      if (wouldGenerate > 0) {
+        // Skip slots referenced by appointments — a cancelled appointment keeps
+        // its slot_id, so deleting the released slot violates the appointments
+        // FK and aborts the regeneration.
+        await deleteFutureUnreferencedSlots(s, req.params.id);
+        slotsGenerated = await generateSlotsForDoctor(s, req.params.id);
         logger.info(`Slots regenerated after schedule update for doctor ${req.params.id}: ${slotsGenerated} slots`);
+      } else {
+        // Nothing to rebuild — an inactive doctor, or every day set non-working.
+        // Clearing the grid is still correct here: the schedule now says the
+        // dentist works nowhere, so their remaining slots must not stay bookable.
+        await deleteFutureUnreferencedSlots(s, req.params.id);
+        logger.info(`Schedule for doctor ${req.params.id} generates no slots — future availability cleared`);
       }
     } catch (regenErr) {
-      // Non-fatal: schedule saved, slot regeneration is best-effort
-      logger.warn(`Slot regeneration failed after schedule update for doctor ${req.params.id}`, { error: regenErr.message });
+      // The schedule itself is saved (its own transaction, already committed).
+      // Whether the grid survived depends on where this threw, so say that
+      // plainly — "success: true, slots_regenerated: 0" was indistinguishable
+      // from the legitimate "nothing to add" case.
+      slotsGenerated = 0;
+      regenError = regenErr.message;
+      logger.error(`Slot regeneration failed after schedule update for doctor ${req.params.id}`, { error: regenErr.message });
     }
 
-    res.json({ success: true, updated: schedules.length, slots_regenerated: slotsGenerated });
+    res.json({
+      success: true,
+      updated: schedules.length,
+      slots_regenerated: slotsGenerated,
+      ...(regenError ? {
+        slots_regenerated_ok: false,
+        warning: 'Schedule saved, but slots could not be regenerated. Retry, or wait for the nightly slot sweep.',
+      } : {}),
+    });
   } catch (err) { handleError(res, err); }
 });
 
@@ -625,9 +809,19 @@ router.post('/doctors/import', adminOnly, async (req, res) => {
           continue;
         }
 
+        // The bookable-department row goes in with the doctor: the bot lists
+        // dentists through doctor_departments, so an imported doctor without one
+        // is invisible on WhatsApp until the next boot's backfill runs.
+        // A CSV names one department per row; extras are ticked in the UI after.
         await tenantQuery(s, `
-          INSERT INTO doctors (name, specialization, qualification, hospital_id, department_id, consultation_fee, slot_duration_minutes)
-          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          WITH new_doctor AS (
+            INSERT INTO doctors (name, specialization, qualification, hospital_id, department_id, consultation_fee, slot_duration_minutes)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            RETURNING id, department_id
+          )
+          INSERT INTO doctor_departments (doctor_id, department_id)
+          SELECT id, department_id FROM new_doctor WHERE department_id IS NOT NULL
+          ON CONFLICT DO NOTHING
         `, [name, spec, qual, hospitalId, deptId, fee, Math.max(5, Math.min(480, duration))]);
         existingDoctorKeys.add(dupKey);
         activeCount++;
@@ -732,12 +926,26 @@ router.post('/doctors/:id/locations', adminOnly, validateUUID(), async (req, res
       return res.status(400).json({ error: 'start_time must be before end_time' });
     }
     const s = req.tenant.schema_name;
-    await tenantQuery(s, `
-      INSERT INTO doctor_hospitals (doctor_id, hospital_id, day_of_week, start_time, end_time)
-      VALUES ($1,$2,$3,$4,$5)
-      ON CONFLICT (doctor_id, hospital_id, day_of_week) DO UPDATE
-        SET start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time
-    `, [req.params.id, hospital_id, day_of_week, start_time, end_time]);
+    // A doctor is at ONE branch on a given weekday. The unique key is
+    // (doctor_id, hospital_id, day_of_week), so two rows for the same weekday at
+    // DIFFERENT branches are perfectly legal to the schema — and both then feed
+    // slotGenerator's LEFT JOIN, which resolves the branch with .find() over an
+    // unordered result set. Tuesday's slots got whichever row Postgres returned
+    // first, and it could change between runs: patients who chose one branch
+    // were sent to the other. POST /doctors/:id/schedule has always deleted the
+    // conflicting row; this route did not, so the same clinic state was
+    // reachable through the API but not the dashboard.
+    await tenantTransaction(s, async (client) => {
+      await client.query(
+        `DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND day_of_week=$2 AND hospital_id<>$3`,
+        [req.params.id, day_of_week, hospital_id]);
+      await client.query(`
+        INSERT INTO doctor_hospitals (doctor_id, hospital_id, day_of_week, start_time, end_time)
+        VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (doctor_id, hospital_id, day_of_week) DO UPDATE
+          SET start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time
+      `, [req.params.id, hospital_id, day_of_week, start_time, end_time]);
+    });
     res.json({ success: true });
   } catch (err) { handleError(res, err, 'POST /doctors/:id/locations'); }
 });

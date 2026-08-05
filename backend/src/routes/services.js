@@ -72,8 +72,12 @@ router.patch('/services/:id', adminOnly, validateUUID(), async (req, res) => {
 
 router.delete('/services/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
-    await tenantQuery(req.tenant.schema_name,
+    // rowCount checked, like every sibling delete in the codebase. Returning
+    // {success:true} for an id that doesn't exist tells the operator the
+    // service was deactivated when nothing happened.
+    const r = await tenantQuery(req.tenant.schema_name,
       `UPDATE clinic_services SET is_active=false WHERE id=$1`, [req.params.id]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Service not found' });
     res.json({ success: true });
   } catch (err) { handleError(res, err); }
 });

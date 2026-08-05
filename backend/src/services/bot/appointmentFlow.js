@@ -73,12 +73,15 @@ async function showMyAppointments(phone, schema, tenant, send) {
     const upcomingList = upcomingR.rows.map((a, i) => {
       let dt = a.appointment_date;
       try { dt = format(parseISO(a.appointment_date), 'EEE, d MMM'); } catch {}
-      const patientLine = multiplePatients && a.patient_name ? `\n   👤 ${a.patient_name}` : '';
-      return `${i + 1}. *${a.booking_id}*\n   👨‍⚕️ Dr. ${a.doctor_name}\n   📅 ${dt} at ${(a.appointment_time || '').slice(0, 5)}\n   ${statusLabel(a.status)}${patientLine}`;
+      // Same shape as the confirmation: WHEN leads, the supporting detail sits
+      // under it. Four emoji-prefixed lines per appointment read as an alert,
+      // not a list — and the title is now a real header, not bold body text.
+      const patientLine = multiplePatients && a.patient_name ? `\n   for ${a.patient_name}` : '';
+      return `${i + 1}. *${dt} at ${(a.appointment_time || '').slice(0, 5)}*\n   Dr. ${a.doctor_name} · ${a.booking_id}${patientLine}`;
     }).join('\n\n');
-    bodyText += `📅 *Upcoming Appointments*\n\n${upcomingList}`;
+    bodyText += upcomingList;
   } else {
-    bodyText += '📅 No upcoming appointments.';
+    bodyText += 'You have no upcoming appointments.';
   }
 
   if (pastR.rows.length) {
@@ -88,15 +91,19 @@ async function showMyAppointments(phone, schema, tenant, send) {
       const patientSuffix = multiplePatients && a.patient_name ? ` · ${a.patient_name}` : '';
       return `• *${a.booking_id}* — Dr. ${a.doctor_name}, ${dt} — ${statusLabel(a.status)}${patientSuffix}`;
     }).join('\n');
-    bodyText += `\n\n📜 *Past Appointments*\n${pastList}`;
+    bodyText += `\n\n_Past visits_\n${pastList}`;
   }
 
-  bodyText += '\n\nWhat would you like to do?';
+  // "What would you like to do?" is deleted, not moved: the buttons below ARE
+  // the question, and restating it is the filler that makes a bot sound like one.
 
   const buttons = upcomingR.rows.length
     ? ['🔄 Reschedule', '❌ Cancel Appointment', '🏠 Main Menu']
     : ['🏠 Main Menu'];
-  await send.buttons(bodyText, buttons);
+  await send.buttons(bodyText, buttons, {
+    header: upcomingR.rows.length ? 'Your appointments' : 'Nothing booked',
+    footer: 'Reply Menu to start over',
+  });
   // Store only the booking ids, not the joined rows. The single consumer
   // (botEngine's MY_APPOINTMENTS branch) asks whether the list is non-empty, and
   // ctx is size-capped: five rows of doctor/hospital/patient names and dates is
@@ -141,10 +148,15 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
   const startStr = format(addDays(today, 1), 'yyyy-MM-dd');
   const endStr = format(addDays(today, SLOT_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
 
+  // Scoped to the appointment's own BRANCH, and the holiday check correlated on
+  // the slot's branch — a visiting consultant's slots carry the branch that
+  // weekday belongs to, so a doctor-only filter offers dates at the other
+  // branch and a reschedule silently relocates the patient's appointment.
   const datesResult = await tenantQuery(schema, `
     SELECT slot_date::text AS date, COUNT(*) AS slots
     FROM time_slots
     WHERE doctor_id = $1
+      AND hospital_id = $5
       AND slot_date BETWEEN $2 AND $3
       AND slot_date != $4
       AND status = 'available'
@@ -152,7 +164,8 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
         SELECT 1 FROM doctor_leaves dl WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
       )
       AND NOT EXISTS (
-        SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date AND (ch.hospital_id = $5 OR ch.hospital_id IS NULL)
+        SELECT 1 FROM clinic_holidays ch WHERE ch.holiday_date = slot_date
+          AND (ch.hospital_id IS NULL OR ch.hospital_id = time_slots.hospital_id)
       )
     GROUP BY slot_date
     ORDER BY slot_date
@@ -173,6 +186,10 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
   ctx.reschedule_appt_id = a.id;
   ctx.reschedule_old_slot_id = a.slot_id;
   ctx.reschedule_doctor_id = a.doctor_id;
+  // Carried so the slot query below can scope to the same BRANCH. Without it a
+  // visiting consultant's other-branch slots were offered as reschedule options
+  // and the appointment's real address changed without anyone saying so.
+  ctx.reschedule_hospital_id = a.hospital_id;
   ctx.reschedule_doctor_name = a.doctor_name;
   ctx.reschedule_booking_id = a.booking_id;
   ctx.reschedule_old_date = a.appointment_date;
@@ -181,13 +198,20 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
 
   const sections = [{
     title: 'Available Dates',
-    rows: dates.map(d => ({ id: d.date, title: d.label, description: `${d.slots} slots available` }))
+    // Same as the booking date list: a count on every row is noise, and only
+    // matters when it is low enough to create urgency.
+    rows: dates.map(d => ({
+      id: d.date,
+      title: d.label,
+      ...(d.slots <= 3 ? { description: `Only ${d.slots} left` } : {}),
+    }))
   }];
   let oldDate = a.appointment_date;
   try { oldDate = format(parseISO(a.appointment_date), 'd MMM'); } catch {}
   await send.list(
-    `🔄 *Reschedule — ${a.booking_id}*\n\nCurrently: Dr. ${a.doctor_name} on ${oldDate} at ${(a.appointment_time || '').slice(0, 5)}\n\nPick a *new date*:`,
-    'Choose New Date', sections
+    `Currently *${oldDate} at ${(a.appointment_time || '').slice(0, 5)}* with Dr. ${a.doctor_name}.`,
+    'Pick a new day', sections,
+    { header: 'Move your appointment', footer: `${a.booking_id} · Reply Menu to keep it` }
   );
   await updateSession(schema, phone, STATES.RESCHEDULE_DATE, ctx);
 }
@@ -226,15 +250,19 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
   // them when it was BUILT; a holiday declared after that does not edit the rows
   // cached in `_reschedule_dates`, and sessions can sit for days.
   const { SLOT_DAY_OPEN_SQL } = require('../bookingCore');
+  // hospital_id is optional here only for sessions started before it was
+  // carried; a null falls back to the doctor-wide behaviour rather than
+  // matching nothing and dead-ending a reschedule already in progress.
   const slots = await tenantQuery(schema,
     `SELECT id, start_time, end_time FROM time_slots
      WHERE doctor_id=$1 AND slot_date=$2 AND status='available'
+       AND ($3::uuid IS NULL OR hospital_id=$3)
        AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
             OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                 AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
        AND ${SLOT_DAY_OPEN_SQL}
      ORDER BY start_time`,
-    [ctx.reschedule_doctor_id, resolvedDate]);
+    [ctx.reschedule_doctor_id, resolvedDate, ctx.reschedule_hospital_id || null]);
   if (!slots.rows.length) {
     await send.text('No slots available for that date. Please pick another.\n\nReply *Menu* to start over.');
     return;
@@ -251,7 +279,8 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
       title: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`,
     }))
   }];
-  await send.list(`⏰ *Select New Time*\n\nSlots on ${dateLabel}:`, 'Choose Time', sections);
+  await send.list(`${dateLabel} — pick whichever suits you.`, 'Pick a time', sections,
+    { header: 'What time?', footer: 'Reply Menu to keep your original time' });
   await updateSession(schema, phone, STATES.RESCHEDULE_SLOT, ctx);
 }
 
@@ -278,13 +307,13 @@ async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, in
   // sendConfirmButtons, not send.buttons: this prompt moves a real appointment,
   // so the reply must be provably a tap on THESE buttons and not on any of the
   // ones still sitting in the patient's chat history (see bot/utils.js).
+  // Old struck through, new in bold: the change is the message, so it leads.
   await sendConfirmButtons(send, ctx,
-    `🔄 *Confirm Reschedule*\n\n` +
-    `Dr. ${ctx.reschedule_doctor_name}\n\n` +
-    `❌ Old: ${oldDate} at ${(ctx.reschedule_old_time || '').slice(0, 5)}\n` +
-    `✅ New: ${newDate} at ${slot.start_time.slice(0, 5)}\n\n` +
-    `Confirm the change?`,
-    ['✅ Yes, Reschedule', '❌ No, Keep Original']
+    `~${oldDate} at ${(ctx.reschedule_old_time || '').slice(0, 5)}~\n` +
+    `*${newDate} at ${slot.start_time.slice(0, 5)}*\n\n` +
+    `with Dr. ${ctx.reschedule_doctor_name}`,
+    ['✅ Yes, Reschedule', '❌ No, Keep Original'],
+    { header: 'Move it to here?', footer: 'Your original time is held until you confirm' }
   );
   await updateSession(schema, phone, STATES.RESCHEDULE_CONFIRM, ctx);
 }
@@ -368,14 +397,14 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
 
     let newDate = ctx.reschedule_new_date;
     try { newDate = format(parseISO(newDate), 'EEE, d MMM yyyy'); } catch {}
+    // Same shape as the booking confirmation — this replaces it in the
+    // patient's chat as the message they scroll back to.
     await send.text(
-      `✅ *Appointment Rescheduled!*\n\n` +
-      `Your booking has been moved successfully.\n\n` +
-      `🪪 Booking ID: *${ctx.reschedule_booking_id}*\n` +
-      `👨‍⚕️ Dr. ${ctx.reschedule_doctor_name}\n` +
-      `📅 ${newDate}\n` +
-      `⏰ ${(ctx.reschedule_new_time || '').slice(0, 5)}\n\n` +
-      `We'll send you a fresh reminder 24 hours before. See you then! 😊`
+      `✅ *Moved*\n\n` +
+      `*${newDate}*\n` +
+      `*${(ctx.reschedule_new_time || '').slice(0, 5)}* with Dr. ${ctx.reschedule_doctor_name}\n\n` +
+      `Booking ID *${ctx.reschedule_booking_id}*\n\n` +
+      `We'll remind you the day before.`
     );
     // Masked: logs/combined.log is persistent, and the booking id already
     // identifies the appointment for anyone who needs to look it up.
@@ -394,7 +423,7 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       );
     })().catch(() => {});
   } else {
-    await send.text('No changes made — your original appointment is kept. ✅\n\nReply *Menu* for the main menu.');
+    await send.text('Kept as it was — nothing has changed.\n\nReply *Menu* for anything else.');
   }
   await updateSession(schema, phone, STATES.IDLE, {});
 }
@@ -436,12 +465,10 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
   let cancelDateLabel = a.appointment_date;
   try { cancelDateLabel = format(parseISO(a.appointment_date), 'EEE, d MMM'); } catch {}
   await send.buttons(
-    `❌ *Cancel Appointment*\n\n` +
-    `Booking: *${a.booking_id}*\n` +
-    `👨‍⚕️ Dr. ${a.doctor_name}\n` +
-    `📅 ${cancelDateLabel} at ${(a.appointment_time || '').slice(0, 5)}\n\n` +
-    `Before we cancel — could you tell us why?`,
-    ['Doctor not available', 'Schedule conflict', 'Other reason']
+    `*${cancelDateLabel} at ${(a.appointment_time || '').slice(0, 5)}* with Dr. ${a.doctor_name}\n\n` +
+    `Before we cancel — what changed?`,
+    ['Doctor not available', 'Schedule conflict', 'Other reason'],
+    { header: 'Cancelling this one?', footer: `${a.booking_id} · Reply Menu to keep it` }
   );
   await updateSession(schema, phone, STATES.CANCEL_REASON, ctx);
 }
@@ -456,13 +483,10 @@ async function handleCancelReason(phone, schema, tenant, send, ctx, input, butto
   // sendConfirmButtons, not send.buttons — "this cannot be undone" must only be
   // answerable by the buttons on THIS message (see bot/utils.js).
   await sendConfirmButtons(send, ctx,
-    `❌ *Confirm Cancellation*\n\n` +
-    `Booking: *${ctx.cancel_booking_id}*\n` +
-    `👨‍⚕️ Dr. ${ctx.cancel_doctor_name}\n` +
-    `📅 ${confirmDateLabel} at ${(ctx.cancel_time || '').slice(0, 5)}\n` +
-    `📝 Reason: ${ctx.cancel_reason}\n\n` +
-    `This cannot be undone. Are you sure?`,
-    ['Yes, Cancel It', 'No, Keep It']
+    `*${confirmDateLabel} at ${(ctx.cancel_time || '').slice(0, 5)}* with Dr. ${ctx.cancel_doctor_name}\n\n` +
+    `_${ctx.cancel_reason}_`,
+    ['Yes, Cancel It', 'No, Keep It'],
+    { header: 'This cannot be undone', footer: `${ctx.cancel_booking_id} · Nothing changes until you tap` }
   );
   await updateSession(schema, phone, STATES.CANCEL_CONFIRM, ctx);
 }
@@ -508,9 +532,9 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
       return;
     }
     await send.text(
-      '✅ *Appointment Cancelled*\n\n' +
-      'Your appointment has been cancelled and the slot released.\n\n' +
-      'We hope everything is okay. Whenever you\'re ready, reply *Menu* to book again. 🙏'
+      '✅ *Cancelled*\n\n' +
+      'That slot is free again, so someone else can take it.\n\n' +
+      'Reply *Menu* whenever you want to book another time.'
     );
     // Notify clinic admin via WhatsApp
     (async () => {
@@ -526,7 +550,7 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
       );
     })().catch(() => {});
   } else {
-    await send.text('No worries, your appointment is still on! ✅\n\nReply *Menu* for the main menu.');
+    await send.text('Still on — nothing has changed.\n\nReply *Menu* for anything else.');
   }
   await updateSession(schema, phone, STATES.IDLE, {});
 }

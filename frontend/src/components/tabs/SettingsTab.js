@@ -6,7 +6,7 @@ import toast from 'react-hot-toast';
 // `settings` is shared (also read by DoctorsTab) and stays owned by the parent,
 // which self-fetches it on tab select and passes it (plus `fetchSettings` to
 // refresh after a save) down here. The editable form is derived from `settings`.
-export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
+export default function SettingsTab({ settings, fetchSettings, settingsFailed, isAdmin }) {
   const [settingsForm, setSettingsForm] = useState({
     notify_phone: '',
     name: '', notification_prefs: {}
@@ -74,7 +74,15 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
     <div className="max-w-2xl space-y-6">
       <div className="bg-white rounded-xl p-4 sm:p-6 shadow-sm">
         <h2 className="font-semibold text-gray-800 mb-5">Clinic Settings</h2>
-        {settings === null ? (
+        {settings === null && settingsFailed ? (
+          <div className="py-8 text-center">
+            <p className="text-gray-500 mb-3">Settings could not be loaded.</p>
+            <button onClick={fetchSettings}
+              className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition">
+              Retry
+            </button>
+          </div>
+        ) : settings === null ? (
           <div className="text-gray-400 py-8 text-center">Loading settings...</div>
         ) : (
           <form onSubmit={saveSettings} className="space-y-4">
@@ -94,7 +102,8 @@ export default function SettingsTab({ settings, fetchSettings, isAdmin }) {
             <div className="pt-3 border-t border-gray-100">
               <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Notifications</h3>
               <div className="space-y-3">
-                <label className="flex items-center gap-3 cursor-pointer select-none">
+                {/* The label is the hit area and the switch is only 20px tall. */}
+                <label className="flex items-center gap-3 cursor-pointer select-none py-2.5 -my-2.5">
                   <div className="relative">
                     <input type="checkbox" className="sr-only"
                       checked={settingsForm.notification_prefs?.email_on_booking !== false}

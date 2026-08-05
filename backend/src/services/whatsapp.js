@@ -140,7 +140,32 @@ async function sendText(to, text, accessToken, phoneNumberId) {
   }
 }
 
-async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId) {
+/**
+ * Build the optional header/footer slots of an interactive message.
+ *
+ * WhatsApp renders a `header` as its own emphasised line and a `footer` as small
+ * grey text under the buttons — both distinct from the body. We faked the header
+ * with bold text inside the body and stuffed helper hints ("Reply *Menu* to go
+ * back") into the body too, which is why every message read as one undifferen-
+ * tiated block. Using the real slots is what makes a flow look native rather
+ * than typed out.
+ *
+ * Meta caps both at 60 characters and rejects the whole message if either is
+ * longer, so they are truncated rather than trusted.
+ */
+function _headerFooter({ header, footer } = {}) {
+  const out = {};
+  if (header) out.header = { type: 'text', text: String(header).slice(0, 60) };
+  if (footer) out.footer = { text: String(footer).slice(0, 60) };
+  return out;
+}
+
+/** The header/footer as plain text, for the no-interactive-message fallback. */
+function _flatten(bodyText, { header, footer } = {}) {
+  return [header ? `*${header}*` : null, bodyText, footer || null].filter(Boolean).join('\n\n');
+}
+
+async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId, opts = {}) {
   const btns = buttons.slice(0, 3);
   try {
     const res = await _send({
@@ -149,6 +174,7 @@ async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId) {
       type: 'interactive',
       interactive: {
         type: 'button',
+        ..._headerFooter(opts),
         body: { text: String(bodyText).slice(0, 1024) },
         action: {
           buttons: btns.map((b, i) => ({
@@ -164,11 +190,11 @@ async function sendButtons(to, bodyText, buttons, accessToken, phoneNumberId) {
     // is the message the patient actually received, so it is the one whose
     // delivery receipts must find a row.
     const numbered = buttons.map((b, i) => `${i + 1}. ${b}`).join('\n');
-    return await sendText(to, `${bodyText}\n\n${numbered}\n\nReply with number to choose.`, accessToken, phoneNumberId);
+    return await sendText(to, `${_flatten(bodyText, opts)}\n\n${numbered}\n\nReply with number to choose.`, accessToken, phoneNumberId);
   }
 }
 
-async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneNumberId) {
+async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneNumberId, opts = {}) {
   // WhatsApp limits: section title ≤ 24, row title ≤ 24, row description ≤ 72,
   // and ≤ 10 rows TOTAL per list message — an 11-row list is rejected outright
   // (Meta #131009), so without the cap every send from a tenant with 11+
@@ -190,6 +216,7 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
       type: 'interactive',
       interactive: {
         type: 'list',
+        ..._headerFooter(opts),
         body: { text: String(bodyText).slice(0, 1024) },
         action: { button: String(buttonLabel).slice(0, 20), sections: sanitizedSections },
       },
@@ -208,7 +235,7 @@ async function sendList(to, bodyText, buttonLabel, sections, accessToken, phoneN
     );
     // As in sendButtons: the fallback text is what was really delivered, so its
     // id is the one the caller must record.
-    return await sendText(to, `${bodyText}\n\n${lines.join('\n')}\n\nReply with the number of your choice.`, accessToken, phoneNumberId);
+    return await sendText(to, `${_flatten(bodyText, opts)}\n\n${lines.join('\n')}\n\nReply with the number of your choice.`, accessToken, phoneNumberId);
   }
 }
 
@@ -222,49 +249,6 @@ async function sendTemplate(to, templateName, components = [], accessToken, phon
     return _messageId(res);
   } catch (err) {
     logger.error('sendTemplate failed', { to, templateName, error: err.response?.data || err.message });
-    throw err;
-  }
-}
-
-async function sendImage(to, imageUrl, caption, accessToken, phoneNumberId) {
-  try {
-    const res = await _send({
-      recipient_type: 'individual',
-      to,
-      type: 'image',
-      image: { link: imageUrl, caption: caption ? String(caption).slice(0, 1024) : '' },
-    }, accessToken, phoneNumberId);
-    return _messageId(res);
-  } catch (err) {
-    logger.error('sendImage failed', { to, error: err.response?.data || err.message });
-    throw err;
-  }
-}
-
-async function sendReaction(to, messageId, emoji, accessToken, phoneNumberId) {
-  try {
-    await _send({
-      to,
-      type: 'reaction',
-      reaction: { message_id: messageId, emoji },
-    }, accessToken, phoneNumberId);
-  } catch (err) {
-    logger.warn('sendReaction failed (non-critical)', { to, error: err.response?.data || err.message });
-    // non-critical — don't re-throw
-  }
-}
-
-async function sendDocument(to, documentUrl, filename, caption, accessToken, phoneNumberId) {
-  try {
-    const res = await _send({
-      recipient_type: 'individual',
-      to,
-      type: 'document',
-      document: { link: documentUrl, filename: filename || 'document', caption: caption || '' },
-    }, accessToken, phoneNumberId);
-    return _messageId(res);
-  } catch (err) {
-    logger.error('sendDocument failed', { to, error: err.response?.data || err.message });
     throw err;
   }
 }
@@ -297,31 +281,24 @@ async function updateMessageStatus(schemaName, waMessageId, status) {
 
 // ── Template convenience wrappers ─────────────────────────────────────────────
 async function sendBookingConfirmationTemplate(to, { bookingId, doctorName, hospitalName, date, time }, accessToken, phoneNumberId) {
-  return await sendTemplate(to, 'appointment_confirmed', [{
-    type: 'body',
-    parameters: [
-      { type: 'text', text: String(bookingId) },
-      { type: 'text', text: String(doctorName) },
-      { type: 'text', text: String(hospitalName) },
-      { type: 'text', text: String(date) },
-      { type: 'text', text: String(time) },
-    ],
-  }], accessToken, phoneNumberId);
+  return await sendTemplate(to, 'appointment_confirmed', [
+    {
+      type: 'body',
+      parameters: [
+        { type: 'text', text: String(bookingId) },
+        { type: 'text', text: String(doctorName) },
+        { type: 'text', text: String(hospitalName) },
+        { type: 'text', text: String(date) },
+        { type: 'text', text: String(time) },
+      ],
+    },
+    // Quick-reply payloads, index-aligned with the template's two buttons. The
+    // create-template form has no payload field — it is set here, at send time.
+    { type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: 'Reschedule' }] },
+    { type: 'button', sub_type: 'quick_reply', index: '1', parameters: [{ type: 'payload', payload: 'Cancel appointment' }] },
+  ], accessToken, phoneNumberId);
 }
 
-// Parameter order MUST match jobs/reminders.js (the live sender for this
-// template): {{1}} doctor, {{2}} date, {{3}} time, {{4}} hospital.
-async function sendReminderTemplate(to, { doctorName, hospitalName, date, time }, accessToken, phoneNumberId) {
-  return await sendTemplate(to, 'appointment_reminder_24h', [{
-    type: 'body',
-    parameters: [
-      { type: 'text', text: String(doctorName) },
-      { type: 'text', text: String(date) },
-      { type: 'text', text: String(time) },
-      { type: 'text', text: String(hospitalName) },
-    ],
-  }], accessToken, phoneNumberId);
-}
 
 function resetCircuit(phoneId) {
   const id = phoneId || process.env.META_PHONE_NUMBER_ID;
@@ -337,8 +314,8 @@ function resetCircuit(phoneId) {
 
 module.exports = {
   sendText, sendButtons, sendList, sendTemplate, markRead,
-  sendDocument, sendImage, sendReaction, updateMessageStatus,
-  sendBookingConfirmationTemplate, sendReminderTemplate,
+  updateMessageStatus,
+  sendBookingConfirmationTemplate,
   getAxiosInstance, // exported for testing
   resetCircuit,
 };
