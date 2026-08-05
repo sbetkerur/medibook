@@ -1,0 +1,9 @@
+slug,name,city,entry_code,link,status
+"testclinic-aster","Aster Dental Care","Bengaluru","ADTPSN","https://wa.me/917795676142?text=Hi%20Aster%20Dental%20Care%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23ADTPSN","active"
+"testclinic-cityline","Cityline Dental","New Delhi","F48F8V","https://wa.me/917795676142?text=Hi%20Cityline%20Dental%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23F48F8V","active"
+"testclinic-coastal","Coastal Dental Clinic","Chennai","KDDYNR","https://wa.me/917795676142?text=Hi%20Coastal%20Dental%20Clinic%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23KDDYNR","active"
+"testclinic-ganga","Ganga Dental Care","Kolkata","EGYAF7","https://wa.me/917795676142?text=Hi%20Ganga%20Dental%20Care%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23EGYAF7","active"
+"testclinic-nova","Nova Smile Studio","Bengaluru","X73PM2","https://wa.me/917795676142?text=Hi%20Nova%20Smile%20Studio%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23X73PM2","active"
+"testclinic-pearl","Pearl Dental Hospital","Mumbai","C6NTY2","https://wa.me/917795676142?text=Hi%20Pearl%20Dental%20Hospital%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23C6NTY2","active"
+"testclinic-prime","Prime Dental","Pune","M2A57V","https://wa.me/917795676142?text=Hi%20Prime%20Dental%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23M2A57V","active"
+"demo-clinic","Smile Dental Clinic","Hyderabad","TPZ2QB","https://wa.me/917795676142?text=Hi%20Smile%20Dental%20Clinic%2C%20I'd%20like%20to%20book%20an%20appointment.%20%23TPZ2QB","active"
