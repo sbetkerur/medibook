@@ -210,8 +210,8 @@ async function updateSession(schemaName, phone, state, context) {
     try {
       const { sendPatientText } = require('../outbound');
       await sendPatientText(schemaName, phone,
-        '⚠️ Sorry — this conversation grew too long for me to keep track of and I had to reset it.\n\n' +
-        'Nothing was booked. Reply *Menu* to start again.');
+        'This conversation got too long for me to follow, so I have started it fresh.\n\n' +
+        'Nothing was booked. Reply *Menu* to pick up again.');
     } catch (err) {
       logger.warn('Session-reset notice failed to send', { phone: maskPhone(phone), error: err.message });
     }
@@ -312,9 +312,26 @@ async function logMessage(schemaName, phone, direction, type, content, waMessage
   }
 }
 
+// The staff-facing template. See docs/whatsapp-templates.md.
+const STAFF_ALERT_TEMPLATE = 'clinic_staff_alert';
+
 /**
  * Send a WhatsApp alert to all admin users who have notify_phone set.
- * Uses the tenant's own WhatsApp credentials. Never throws — logs warnings on failure.
+ *
+ * TEMPLATE-FIRST, and this is not optional here. Meta only allows free-form
+ * text inside the 24-hour customer service window, and a clinic owner NEVER
+ * messages the shared number — that is the entire point of the QR entry. So an
+ * owner is permanently outside the window, and the plain `wa.sendText` this
+ * used to be failed 100% of the time in production: every "new booking" alert,
+ * and every Monday summary, silently rejected while the log recorded a
+ * per-admin warning nobody reads.
+ *
+ * The template carries the whole alert body in one variable. That is unusual,
+ * and deliberate: these messages are genuinely free-form (a booking, a
+ * cancellation, a weekly summary) and inventing a template per alert type would
+ * mean a Meta re-approval every time the wording changed.
+ *
+ * Never throws — logs warnings on failure.
  */
 async function notifyAdminWhatsApp(schema, tenant, message) {
   try {
@@ -323,21 +340,86 @@ async function notifyAdminWhatsApp(schema, tenant, message) {
     if (!adminUsers.rows.length) return;
     // Shared phone — use global META_* env vars
     const wa = require('../whatsapp');
+    const clinicName = String(tenant?.name || 'your clinic').slice(0, 60);
+
     for (const admin of adminUsers.rows) {
+      let waMessageId = null;
       try {
-        const waMessageId = await wa.sendText(admin.notify_phone, message, null, null);
-        // Recorded like any other outbound message, but under its own type so a
-        // conversation view can keep staff alerts out of patient threads. The
-        // Meta id is what delivery receipts key on — without it the row can
-        // never move past status NULL.
-        await logMessage(schema, admin.notify_phone, 'out', 'admin_alert', message, waMessageId);
-      } catch (err) {
-        logger.warn('Admin WhatsApp alert failed', { error: err.message });
+        waMessageId = await wa.sendTemplate(admin.notify_phone, STAFF_ALERT_TEMPLATE, [{
+          type: 'body',
+          parameters: [
+            { type: 'text', text: clinicName },
+            // Meta rejects newlines in a template parameter, so the body is
+            // flattened. The alert stays readable — it is a short list of
+            // facts, not prose — and the dashboard has the full detail.
+            { type: 'text', text: String(message).replace(/\s*\n+\s*/g, ' · ').slice(0, 900) },
+          ],
+        }], null, null);
+      } catch (_templateErr) {
+        // Falls back to text, which still works for the minority of staff who
+        // HAVE messaged the number recently (during onboarding, say). Better a
+        // best-effort send than none while the template awaits approval.
+        try {
+          waMessageId = await wa.sendText(admin.notify_phone, message, null, null);
+        } catch (err) {
+          logger.warn('Admin WhatsApp alert failed', { error: err.message });
+          continue;
+        }
       }
+      // Recorded like any other outbound message, but under its own type so a
+      // conversation view can keep staff alerts out of patient threads — and so
+      // services/messageBudget.js never counts a staff alert against a
+      // PATIENT's budget, which matters when a staff member is also a patient.
+      // The Meta id is what delivery receipts key on.
+      await logMessage(schema, admin.notify_phone, 'out', 'admin_alert', message, waMessageId)
+        .catch(() => {});
     }
   } catch (err) {
     logger.warn('notifyAdminWhatsApp failed', { error: err.message });
   }
+}
+
+/**
+ * The clinic's phone number, for the messages that tell a patient to ring.
+ *
+ * The bot says "please call the clinic" in half a dozen places — including the
+ * emergency reply, where it is the ONLY useful instruction — and used to give
+ * no number at all, leaving someone in pain to go and find it. `hospitals.phone`
+ * has been in the schema the whole time and was never read.
+ *
+ * Prefers the branch the patient is dealing with; falls back to any active
+ * branch that has a number, because a patient who has not chosen a branch yet
+ * still needs someone to ring. Returns null when the clinic has stored no
+ * number anywhere, so callers can omit the line rather than print an empty one.
+ */
+async function clinicPhone(schemaName, hospitalId) {
+  try {
+    if (hospitalId) {
+      const r = await tenantQuery(schemaName,
+        `SELECT phone FROM hospitals WHERE id=$1 AND is_active=true AND deleted_at IS NULL`, [hospitalId]);
+      const p = r.rows[0]?.phone?.trim();
+      if (p) return p;
+    }
+    const any = await tenantQuery(schemaName,
+      `SELECT phone FROM hospitals
+        WHERE is_active=true AND deleted_at IS NULL AND phone IS NOT NULL AND btrim(phone) <> ''
+        ORDER BY created_at LIMIT 1`);
+    return any.rows[0]?.phone?.trim() || null;
+  } catch (err) {
+    // Never fatal: a missing phone line must not break the message it was
+    // meant to improve.
+    logger.warn('clinicPhone lookup failed', { error: err.message });
+    return null;
+  }
+}
+
+/**
+ * A ready-to-append "call us on X" line, or '' when no number is stored.
+ * Leading newlines included so callers can concatenate unconditionally.
+ */
+async function clinicPhoneLine(schemaName, hospitalId) {
+  const phone = await clinicPhone(schemaName, hospitalId);
+  return phone ? `\n\n📞 *${phone}*` : '';
 }
 
 module.exports = {
@@ -357,4 +439,6 @@ module.exports = {
   getPatients,
   logMessage,
   notifyAdminWhatsApp,
+  clinicPhone,
+  clinicPhoneLine,
 };

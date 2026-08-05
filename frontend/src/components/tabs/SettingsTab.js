@@ -2,6 +2,7 @@
 import { useState, useEffect } from 'react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
+import ClinicQRCard from '@/components/ClinicQRCard';
 
 // `settings` is shared (also read by DoctorsTab) and stays owned by the parent,
 // which self-fetches it on tab select and passes it (plus `fetchSettings` to
@@ -23,9 +24,9 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
     setSettingsForm({
       name: settings.clinic_name || '',
       notification_prefs: {
-        email_on_booking: settings.settings?.email_on_booking,
         reminder_24h_enabled: settings.settings?.reminder_24h_enabled,
         reminder_2h_enabled: settings.settings?.reminder_2h_enabled,
+        show_consultation_fee: settings.settings?.show_consultation_fee,
       },
       notify_phone: settings.notify_phone || '',
     });
@@ -72,6 +73,12 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
 
   return (
     <div className="max-w-2xl space-y-6">
+      {/* First on the page deliberately: it is the only route a patient has to
+          this clinic, and a QR sitting unprinted in a settings tab reaches
+          nobody. Self-fetching rather than fed from `settings`, which is shared
+          with DoctorsTab and has no reason to carry a rendered QR image. */}
+      <ClinicQRCard isAdmin={isAdmin} />
+
       <div className="bg-white rounded-xl p-4 sm:p-6 shadow-sm">
         <h2 className="font-semibold text-gray-800 mb-5">Clinic Settings</h2>
         {settings === null && settingsFailed ? (
@@ -100,23 +107,33 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
               </p>
             </div>
             <div className="pt-3 border-t border-gray-100">
+              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Patient booking</h3>
+              {/* Off by choice, not by default: clinics that waive the
+                  consultation when treatment is taken, or negotiate it, do not
+                  want a firm number quoted in WhatsApp and then not charged at
+                  the desk. Defaults to on, which is what every clinic already
+                  shows today. */}
+              <label className="flex items-center gap-3 cursor-pointer select-none py-2.5 -my-2.5">
+                <div className="relative">
+                  <input type="checkbox" className="sr-only"
+                    checked={settingsForm.notification_prefs?.show_consultation_fee !== false}
+                    onChange={e => setSettingsForm(f => ({ ...f, notification_prefs: { ...f.notification_prefs, show_consultation_fee: e.target.checked } }))} />
+                  <div className={`w-10 h-5 rounded-full transition-colors ${settingsForm.notification_prefs?.show_consultation_fee !== false ? 'bg-blue-500' : 'bg-gray-300'}`} />
+                  <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${settingsForm.notification_prefs?.show_consultation_fee !== false ? 'translate-x-5' : ''}`} />
+                </div>
+                <span className="text-sm text-gray-700">Show consultation fee to patients</span>
+              </label>
+              <p className="text-xs text-gray-400 mt-1 mb-3">
+                Turn this off if you waive or negotiate the consultation fee — patients will see no amount until they are at the clinic.
+              </p>
+            </div>
+            <div className="pt-3 border-t border-gray-100">
               <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Notifications</h3>
               <div className="space-y-3">
-                {/* The label is the hit area and the switch is only 20px tall. */}
-                <label className="flex items-center gap-3 cursor-pointer select-none py-2.5 -my-2.5">
-                  <div className="relative">
-                    <input type="checkbox" className="sr-only"
-                      checked={settingsForm.notification_prefs?.email_on_booking !== false}
-                      onChange={e => setSettingsForm(f => ({ ...f, notification_prefs: { ...f.notification_prefs, email_on_booking: e.target.checked } }))} />
-                    <div className={`w-10 h-5 rounded-full transition-colors ${settingsForm.notification_prefs?.email_on_booking !== false ? 'bg-blue-500' : 'bg-gray-300'}`} />
-                    <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${settingsForm.notification_prefs?.email_on_booking !== false ? 'translate-x-5' : ''}`} />
-                  </div>
-                  <span className="text-sm text-gray-700">Email notification on new booking</span>
-                </label>
                 <div>
                   <label className="block text-xs font-medium text-gray-700 mb-1">
-                    SMS notification number
-                    <span className="text-gray-400 font-normal ml-1">(optional — requires Twilio)</span>
+                    WhatsApp alerts to
+                    <span className="text-gray-400 font-normal ml-1">(optional)</span>
                   </label>
                   <input
                     type="tel"
@@ -125,7 +142,7 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
                     placeholder="e.g. 917795676142"
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
-                  <p className="text-xs text-gray-400 mt-1">An SMS will be sent to this number each time an appointment is booked via the WhatsApp bot.</p>
+                  <p className="text-xs text-gray-400 mt-1">This number gets a WhatsApp message each time a patient books, cancels or reschedules.</p>
                 </div>
               </div>
             </div>

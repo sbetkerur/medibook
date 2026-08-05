@@ -16,6 +16,7 @@ const { IST_TODAY_SQL } = require('../utils/dateTz');
 // Clinic-initiated and months after the last visit, so far outside Meta's
 // 24-hour window: template-first or it does not arrive. See services/outbound.js.
 const { sendPatientMessage } = require('../services/outbound');
+const { canSendDiscretionary, budgetFor } = require('../services/messageBudget');
 const { recordPendingReply, KINDS } = require('../services/pendingReply');
 const { maskPhone } = require('../services/bot/utils');
 const logger = require('../utils/logger');
@@ -76,6 +77,9 @@ async function sendRecalls() {
           `Hi ${firstName}, it's been a while since we saw you${rec.hospital_name ? ` at ${rec.hospital_name}` : ''}.\n\n` +
           `A check-up takes about twenty minutes and catches small problems while they're still small — and still cheap to fix.\n\n` +
           `Reply *Menu* to find a time that suits you.`;
+
+        // Six months have passed already; another week costs nothing.
+        if (!await canSendDiscretionary(tenant.schema_name, rec.phone, budgetFor(tenant))) continue;
 
         await sendPatientMessage(tenant.schema_name, rec.phone, {
           template: RECALL_TEMPLATE,

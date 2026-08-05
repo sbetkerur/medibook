@@ -262,14 +262,22 @@ router.get('/analytics/cohorts', makeAnalyticsLimiter(), async (req, res) => {
 
 // ── DATA EXPORT ───────────────────────────────────────────────
 // adminOnly: this is a bulk PHI extract — up to 10,000 rows of patient name,
-// phone, email, gender and date of birth in a single request. Every other bulk
+// phone, gender and date of birth in a single request. Every other bulk
 // or sensitive endpoint is admin-gated (audit logs, access logs, patient import,
 // patient edit); this one was reachable by any 'staff' or 'doctor' login.
 router.get('/analytics/export', adminOnly, makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const { format = 'csv', type = 'appointments', days = 30 } = req.query;
-    const d = Math.min(Math.max(parseInt(days) || 30, 1), 365);
+    // `days=all` lifts the window entirely. It exists for continuity, not
+    // analysis: WhatsApp is the only channel this product has, so a clinic must
+    // be able to walk away with its whole appointment book — not just the last
+    // year of it — without asking us for a database dump.
+    const allTime = String(days).toLowerCase() === 'all';
+    const d = allTime ? null : Math.min(Math.max(parseInt(days) || 30, 1), 365);
+    // Raised from 10,000 for the same reason. Still bounded: an unbounded
+    // export is a way to take the API down with one request.
+    const ROW_CAP = 50000;
 
     let rows = [];
     let headers = [];
@@ -287,30 +295,54 @@ router.get('/analytics/export', adminOnly, makeAnalyticsLimiter(), async (req, r
         JOIN patients p ON p.id = a.patient_id
         JOIN doctors d ON d.id = a.doctor_id
         JOIN hospitals h ON h.id = a.hospital_id
-        WHERE a.created_at >= NOW() - ($1::text || ' days')::INTERVAL
+        ${allTime ? '' : "WHERE a.created_at >= NOW() - ($1::text || ' days')::INTERVAL"}
         ORDER BY a.appointment_date DESC, a.appointment_time DESC
-        LIMIT 10000
-      `, [d]);
+        LIMIT ${ROW_CAP}
+      `, allTime ? [] : [d]);
       rows = r.rows;
       headers = ['Booking ID','Patient','Phone','Doctor','Hospital','Date','Time','Status','Type','Fee','Payment Status','Created At'];
       keys = ['booking_id','patient_name','patient_phone','doctor_name','hospital_name','appointment_date','appointment_time','status','visit_type','effective_fee','payment_status','created_at'];
-      filename = `appointments_${d}d`;
+      filename = allTime ? 'appointments_all' : `appointments_${d}d`;
     } else if (type === 'patients') {
       const r = await tenantQuery(s, `
-        SELECT p.name, p.phone, p.email, p.gender,
+        SELECT p.name, p.phone, p.gender,
                p.date_of_birth::text, p.visit_count,
                p.patient_type, p.created_at::text
         FROM patients p
         WHERE p.deleted_at IS NULL
         ORDER BY p.created_at DESC
-        LIMIT 10000
+        LIMIT ${ROW_CAP}
       `);
       rows = r.rows;
-      headers = ['Name','Phone','Email','Gender','Date of Birth','Total Visits','Type','Joined'];
-      keys = ['name','phone','email','gender','date_of_birth','visit_count','patient_type','created_at'];
+      headers = ['Name','Phone','Gender','Date of Birth','Total Visits','Type','Joined'];
+      keys = ['name','phone','gender','date_of_birth','visit_count','patient_type','created_at'];
       filename = `patients`;
+    } else if (type === 'treatments') {
+      const r = await tenantQuery(s, `
+        SELECT tp.title, tp.tooth_ref, p.name AS patient_name, p.phone AS patient_phone,
+               -- The TREATING dentist, falling back to whoever advised it: the
+               -- course is often handed to a visiting specialist, and it is the
+               -- person doing the work the clinic needs on this list.
+               COALESCE(dt.name, da.name) AS doctor_name,
+               tp.status, tp.total_visits,
+               COUNT(a.id) FILTER (WHERE a.status <> 'cancelled')::int AS booked_visits,
+               COUNT(a.id) FILTER (WHERE a.status = 'completed')::int AS completed_visits,
+               tp.estimated_cost, tp.created_at::text
+        FROM treatment_plans tp
+        JOIN patients p ON p.id = tp.patient_id
+        LEFT JOIN doctors dt ON dt.id = tp.treating_doctor_id
+        LEFT JOIN doctors da ON da.id = tp.advised_by_doctor_id
+        LEFT JOIN appointments a ON a.treatment_plan_id = tp.id
+        GROUP BY tp.id, p.name, p.phone, dt.name, da.name
+        ORDER BY tp.created_at DESC
+        LIMIT ${ROW_CAP}
+      `);
+      rows = r.rows;
+      headers = ['Treatment','Tooth','Patient','Phone','Dentist','Status','Total Visits','Booked','Completed','Estimated Cost','Started'];
+      keys = ['title','tooth_ref','patient_name','patient_phone','doctor_name','status','total_visits','booked_visits','completed_visits','estimated_cost','created_at'];
+      filename = 'treatment_plans';
     } else {
-      return res.status(400).json({ error: 'Invalid type. Use: appointments, patients' });
+      return res.status(400).json({ error: 'Invalid type. Use: appointments, patients, treatments' });
     }
 
     if (format === 'csv') {

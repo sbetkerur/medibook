@@ -213,9 +213,9 @@ const botEngine = require('../src/services/botEngine');
 const tenant = { id: 'tenant-1', slug: 'demo', name: 'Demo Clinic', schema_name: 'tenant_demo', plan: 'starter', settings: {} };
 const PHONE = '919111111111';
 
-async function send(text, buttonId) {
+async function send(text, buttonId, welcome) {
   sent.length = 0;
-  await botEngine.handle({ phone: PHONE, text, buttonId, tenant });
+  await botEngine.handle({ phone: PHONE, text, buttonId, tenant, welcome });
   return sent.slice();
 }
 
@@ -234,6 +234,50 @@ async function run() {
     const r = await send('Hi');
     assert(r.some(m => m.type === 'buttons' && /how can we help|Book an appointment/.test(m.all)), 'no welcome buttons');
     assert.strictEqual(state(), 'main_menu');
+  });
+
+  // ── The arrival has to read as the CLINIC's own channel ──────
+  // The WhatsApp number is shared between every clinic, so the first message
+  // after a QR scan is the only thing distinguishing "my dentist's WhatsApp"
+  // from "some booking service". Asserted on `m.all` (header+body+footer) per
+  // the house rule, except where the point IS which slot the name landed in.
+  await test('a QR arrival welcomes the patient BY THE CLINIC NAME', async () => {
+    db.sessions.delete(PHONE);
+    const r = await send('Hi', null, true);
+    const menu = r.find(m => m.type === 'buttons');
+    assert(menu, 'no menu sent');
+    assert(/Welcome to \*Demo Clinic\*/.test(menu.text),
+      'the clinic name must be in the BODY, not only the header — the header is small and grey: ' + menu.text);
+    assert.strictEqual(state(), 'main_menu');
+  });
+
+  await test('a QR arrival is ONE message, not a handover then a menu', async () => {
+    db.sessions.delete(PHONE);
+    const r = await send('Hi', null, true);
+    // The old flow sent "✅ Connecting you to X…" first, which put a
+    // switchboard between the patient and the clinic.
+    assert(!r.some(m => /connecting you/i.test(m.all)), 'switchboard handover is back: ' + JSON.stringify(r));
+    assert.strictEqual(r.filter(m => m.type === 'buttons').length, 1, 'expected exactly one menu');
+  });
+
+  await test('an ordinary "Hi" later in the thread is NOT an arrival', async () => {
+    db.sessions.delete(PHONE);
+    const r = await send('Hi');
+    const menu = r.find(m => m.type === 'buttons');
+    assert(!/Welcome to \*Demo Clinic\*/.test(menu.text),
+      'the welcome must be reserved for a scan, or it fires on every greeting: ' + menu.text);
+  });
+
+  await test('no copy offers the patient a different clinic', async () => {
+    // The roster is invisible by design. Copy that says "choose a different
+    // clinic" both advertises competitors and is now simply untrue — nothing a
+    // patient types can detach them.
+    db.sessions.delete(PHONE);
+    for (const input of ['Hi', 'help', 'zzzz-unrecognised']) {
+      const r = await send(input);
+      assert(!r.some(m => /different clinic|another clinic|other clinics/i.test(m.all)),
+        `"${input}" offered a different clinic: ` + JSON.stringify(r));
+    }
   });
 
   await test('Tapping Book button starts booking (single hospital → what do you need)', async () => {
@@ -350,7 +394,7 @@ async function run() {
     // A stale non-menu button (e.g. an old "✅ Confirm") must not become the patient's name.
     // (Main-menu button titles are a deliberate escape hatch and are tested separately below.)
     const r = await send('✅ Confirm', 'btn_0_1700000000003');
-    assert(r.some(m => /type.*full name/i.test(m.text)), 'expected typed-name re-prompt: ' + JSON.stringify(r));
+    assert(r.some(m => /\*type\*/i.test(m.text)), 'expected typed-name re-prompt: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'collect_name');
   });
 
@@ -387,12 +431,12 @@ async function run() {
     // btn_0 of some older message (WhatsApp keeps every button tappable). It is
     // not consent to book, so nothing may be written.
     const r = await send('✅ Confirm', 'btn_0_1700000000099');
-    assert(r.some(m => /Please confirm your booking/.test(m.text)),
+    assert(r.some(m => /check the details/i.test(m.text)),
       'expected a re-prompt for the stale tap: ' + JSON.stringify(r));
     assert.strictEqual(db.appointments.length, 0, 'a stale tap booked an appointment');
     assert.strictEqual(state(), 'confirm_booking');
     // The re-prompt minted fresh buttons — tap those instead.
-    confirmBtnId = r.find(m => /Please confirm your booking/.test(m.text)).ids[0];
+    confirmBtnId = r.find(m => /check the details/i.test(m.text)).ids[0];
   });
 
   await test('REGRESSION: tapping ✅ Confirm completes the booking (not main-menu reset)', async () => {

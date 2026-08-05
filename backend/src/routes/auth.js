@@ -6,7 +6,6 @@ const rateLimit = require('express-rate-limit');
 const { query, tenantQuery } = require('../db');
 const { authMiddleware, tenantMiddleware } = require('../middleware/auth');
 const { validate, schemas } = require('../middleware/validate');
-const emailService = require('../services/email');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
 
@@ -28,42 +27,10 @@ const loginLimiter = rateLimit({
   skip: skipInDev,
 });
 
-// Strict limiters for unauthenticated sensitive endpoints
-const forgotPasswordLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 5,
-  message: { error: 'Too many password reset requests. Try again in an hour.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: skipInDev,
-});
-
-const resetPasswordLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 10,
-  message: { error: 'Too many reset attempts. Try again in an hour.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: skipInDev,
-});
-
 const changePasswordLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 10,
   message: { error: 'Too many password change attempts. Try again in an hour.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: skipInDev,
-});
-
-// Unsubscribe is unauthenticated AND its handler walks every active tenant
-// schema, so an unthrottled caller could turn one HTTP request into N database
-// round-trips across the whole platform. Kept deliberately tighter than the
-// global 500/min limiter; a real recipient clicks the link once.
-const unsubscribeLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 20,
-  message: { error: 'Too many unsubscribe attempts. Try again in an hour.' },
   standardHeaders: true,
   legacyHeaders: false,
   skip: skipInDev,
@@ -142,14 +109,13 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
   }
 });
 
-// Hash a token for storage (refresh tokens AND password-reset tokens) — a DB
-// leak must not yield usable credentials. The raw token is sent to the client
-// once and never stored.
+// Hash a refresh token for storage — a DB leak must not yield usable
+// credentials. The raw token is sent to the client once and never stored.
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-// Shared helper behind /auth/refresh and /auth/reset-password: both need to lock
+// Shared helper behind /auth/refresh: it needs to lock
 // a single-use token row (SELECT ... FOR UPDATE) inside a transaction so two
 // simultaneous requests can't both consume the same token, then let the caller
 // validate the row and any related state before deciding whether to commit.
@@ -292,73 +258,6 @@ router.post('/auth/logout', authMiddleware, async (req, res) => {
   }
 });
 
-// ── FORGOT PASSWORD ───────────────────────────────────────────
-// Public, unauthenticated capability probe. /auth/forgot-password deliberately
-// returns success regardless of whether the address exists (to prevent account
-// enumeration) — which means that with no email provider configured it also
-// reports success while delivering nothing. The login page uses this to hide
-// the "Forgot your password?" link rather than send users into that dead end.
-router.get('/auth/capabilities', (req, res) => {
-  res.json({ password_reset_enabled: !!process.env.RESEND_API_KEY });
-});
-
-router.post('/auth/forgot-password', forgotPasswordLimiter, validate(schemas.forgotPassword), async (req, res) => {
-  try {
-    const { email, tenant_slug } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email required' });
-
-    // Always return success to prevent email enumeration
-    res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
-
-    // Find user (either super admin or tenant user)
-    let foundEmail = null;
-    let tenantId = null;
-
-    try {
-      if (tenant_slug) {
-        const tenantR = await query(`SELECT * FROM tenants WHERE slug=$1 AND status='active'`, [tenant_slug]);
-        if (tenantR.rows[0]) {
-          const userR = await tenantQuery(tenantR.rows[0].schema_name,
-            `SELECT email FROM users WHERE email=$1 AND is_active=true`, [email.toLowerCase()]);
-          if (userR.rows[0]) {
-            foundEmail = userR.rows[0].email;
-            tenantId = tenantR.rows[0].id;
-          }
-        }
-      } else {
-        const adminR = await query(`SELECT email FROM super_admins WHERE email=$1`, [email.toLowerCase()]);
-        if (adminR.rows[0]) foundEmail = adminR.rows[0].email;
-      }
-
-      if (!foundEmail) return;
-
-      const token = crypto.randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
-
-      // Invalidate any existing unused tokens for this email/tenant before creating a new one
-      await query(
-        `UPDATE password_resets SET used=true WHERE email=$1 AND tenant_id IS NOT DISTINCT FROM $2 AND used=false`,
-        [foundEmail, tenantId]
-      );
-      // Store only the SHA-256 hash — the raw token goes into the email link once.
-      await query(
-        `INSERT INTO password_resets (email, tenant_id, token, expires_at)
-         VALUES ($1, $2, $3, $4)`,
-        [foundEmail, tenantId, hashToken(token), expiresAt]
-      );
-
-      // frontendBaseUrl(), not the raw env var: FRONTEND_URL may list several
-      // origins, and interpolating the whole list produces a reset link nobody
-      // can open — which locks every user out of password recovery.
-      const resetUrl = `${require('../utils/appUrls').frontendBaseUrl()}/reset-password?token=${token}`;
-      await emailService.sendPasswordReset(foundEmail, resetUrl);
-    } catch (err) {
-      logger.error('Forgot password background error', { error: err.message });
-    }
-  } catch (err) {
-    handleError(res, err);
-  }
-});
 
 // ── CHANGE PASSWORD (authenticated) ──────────────────────────
 router.post('/auth/change-password', changePasswordLimiter, authMiddleware, validate(schemas.changePassword), async (req, res) => {
@@ -413,124 +312,6 @@ router.post('/auth/change-password', changePasswordLimiter, authMiddleware, vali
   }
 });
 
-// ── RESET PASSWORD ────────────────────────────────────────────
-router.post('/auth/reset-password', resetPasswordLimiter, validate(schemas.resetPassword), async (req, res) => {
-  try {
-    const { token, password } = req.body;
 
-    // Use SELECT FOR UPDATE inside a transaction to prevent two simultaneous
-    // reset requests from both consuming the same token. Tenant validity is
-    // checked BEFORE marking the token used — otherwise a suspended-clinic
-    // user's only reset token would be burned by a failed attempt.
-    const outcome = await withRowLock(
-      // Lookup is HASH-ONLY — same rationale as /auth/refresh: a raw-value
-      // fallback would let a leaked stored hash be replayed as the token itself.
-      // Pre-hashing rows are converted by migration 18 (hash_plaintext_tokens).
-      `SELECT * FROM password_resets WHERE token=$1 AND used=false AND expires_at > NOW() FOR UPDATE`,
-      [hashToken(token)],
-      async (client, row) => {
-        if (!row) return { abort: true, status: 400, body: { error: 'Invalid or expired reset token' } };
-
-        let tenantSchema = null;
-        if (row.tenant_id) {
-          // Tenant user — verify tenant still exists and is active before consuming the token
-          const tenantR = await client.query(`SELECT schema_name, status FROM tenants WHERE id=$1`, [row.tenant_id]);
-          if (!tenantR.rows[0]) {
-            return { abort: true, status: 410, body: { error: 'This clinic no longer exists. Contact support.' } };
-          }
-          if (tenantR.rows[0].status !== 'active') {
-            return { abort: true, status: 403, body: { error: 'This clinic account is suspended. Contact support.' } };
-          }
-          tenantSchema = tenantR.rows[0].schema_name;
-        }
-
-        await client.query(`UPDATE password_resets SET used=true WHERE id=$1`, [row.id]);
-        return { value: { reset: row, tenantSchema } };
-      }
-    );
-    if (outcome.abort) return res.status(outcome.status).json(outcome.body);
-    const { reset, tenantSchema } = outcome.value;
-
-    const hash = await bcrypt.hash(password, 12);
-
-    let resetUserId = null;
-    if (tenantSchema) {
-      const upd = await tenantQuery(tenantSchema,
-        `UPDATE users SET password_hash=$1 WHERE email=$2 RETURNING id`, [hash, reset.email]);
-      resetUserId = upd.rows[0]?.id || null;
-    } else {
-      // Super admin
-      const upd = await query(`UPDATE super_admins SET password_hash=$1 WHERE email=$2 RETURNING id`, [hash, reset.email]);
-      resetUserId = upd.rows[0]?.id || null;
-    }
-
-    // Revoke all outstanding refresh tokens — resetting the password is the
-    // account-recovery path, so it must end any session an attacker holds.
-    if (resetUserId) {
-      await query(`UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`, [resetUserId])
-        .catch(e => logger.warn('Refresh-token revocation failed after password reset', { error: e.message }));
-    }
-
-    res.json({ success: true, message: 'Password updated successfully' });
-  } catch (err) {
-    handleError(res, err);
-  }
-});
-
-// ── EMAIL UNSUBSCRIBE ─────────────────────────────────────────
-// Public and unauthenticated: the only thing the caller holds is the token
-// embedded in the footer of a booking-confirmation / reminder email
-// (services/email.js → generateUnsubscribeUrl).
-//
-// `email_unsubscribes` is a PER-TENANT table and there is no tenant context on
-// an emailed link — no cookie, no JWT, no slug — so the token has to be looked
-// up by sweeping the active tenants, the same shape as the Resend bounce
-// handler in index.js. Every schema name is re-validated before use and all
-// tenant SQL goes through tenantQuery; a schema name is never interpolated.
-const UNSUB_TOKEN_RE = /^[a-f0-9]{64}$/;      // crypto.randomBytes(32).toString('hex')
-const UNSUB_SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
-
-router.post('/unsubscribe', unsubscribeLimiter, async (req, res) => {
-  try {
-    const token = typeof req.body?.token === 'string' ? req.body.token.trim().toLowerCase() : '';
-    // Shape check first: without it every stray querystring value would trigger
-    // a full sweep of every tenant schema, which is the expensive path.
-    if (!UNSUB_TOKEN_RE.test(token)) {
-      return res.status(400).json({ error: 'This unsubscribe link is invalid or incomplete.' });
-    }
-
-    const tenants = await query(`SELECT id, schema_name FROM tenants WHERE status='active'`);
-    for (const t of tenants.rows) {
-      if (!UNSUB_SCHEMA_RE.test(t.schema_name)) continue; // never touch an unvalidated schema name
-      try {
-        // COALESCE, not a bare NOW(): a second click (mail clients and security
-        // scanners routinely re-fetch links) must stay idempotent and keep the
-        // ORIGINAL opt-out timestamp rather than sliding it forward.
-        const upd = await tenantQuery(t.schema_name,
-          `UPDATE email_unsubscribes
-              SET unsubscribed_at = COALESCE(unsubscribed_at, NOW())
-            WHERE token = $1
-            RETURNING id`,
-          [token]);
-        if (upd.rows[0]) {
-          logger.info('Email unsubscribe recorded', { tenant_id: t.id });
-          break; // tokens are globally unique — first match is the only match
-        }
-      } catch (err) {
-        // One tenant schema failing (older schema without the table, a lock
-        // timeout) must not abort the sweep and strand the recipient's opt-out
-        // in a schema further down the list.
-        logger.warn('Unsubscribe lookup failed for a tenant schema', { tenant_id: t.id, error: err.message });
-      }
-    }
-
-    // Identical response whether or not the token matched — a "not found" here
-    // would make this endpoint an oracle for guessing valid unsubscribe tokens,
-    // each of which identifies a real patient at a real clinic.
-    res.json({ success: true, message: 'You have been unsubscribed from these emails.' });
-  } catch (err) {
-    handleError(res, err);
-  }
-});
 
 module.exports = router;

@@ -11,6 +11,7 @@ import Modal from '@/components/ui/Modal';
 import ConfirmModal from '@/components/ui/ConfirmModal';
 import Badge from '@/components/ui/Badge';
 import OverviewTab from '@/components/tabs/OverviewTab';
+import DayCloseTab from '@/components/tabs/DayCloseTab';
 import AppointmentsTab from '@/components/tabs/AppointmentsTab';
 import SlotsTab from '@/components/tabs/SlotsTab';
 import DoctorsTab from '@/components/tabs/DoctorsTab';
@@ -52,6 +53,7 @@ const WEEK_LABELS = ['1st', '2nd', '3rd', '4th', '5th'];
 
 const NAV = [
   { id: 'overview', label: 'Overview', icon: '📊' },
+  { id: 'dayclose', label: 'Day Close', icon: '🧾' },
   { id: 'appointments', label: 'Appointments', icon: '📅' },
   { id: 'treatments', label: 'Treatments', icon: '🩺' },
   { id: 'doctors', label: 'Dentists', icon: '🦷' },
@@ -239,6 +241,17 @@ export default function Dashboard() {
 
   // Walk-in appointment state
   const [showWalkinModal, setShowWalkinModal] = useState(false);
+  // Opening a walk-in is now reachable from the landing tab as well as the
+  // appointments list — roughly half of an Indian clinic's footfall walks in,
+  // so it cannot be two taps deep. One callback, so the two cannot prefill
+  // differently.
+  const openWalkinModal = useCallback(() => {
+    if (!hospitals.length) fetchHospitals();
+    if (!doctors.length) fetchDoctors();
+    setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
+    setWalkinSlots([]);
+    setShowWalkinModal(true);
+  }, [hospitals.length, doctors.length]);
   // Available slots for the walk-in modal. Without a slot_id the backend does
   // not lock anything (routes/appointments.js only locks `if (slot_id)`), so a
   // walk-in booked at 10:30 left that slot 'available' and the WhatsApp bot
@@ -711,6 +724,7 @@ export default function Dashboard() {
       email: patient.email || '',
       gender: patient.gender || '',
       date_of_birth: patient.date_of_birth ? patient.date_of_birth.slice(0, 10) : '',
+      referral_source: patient.referral_source || '',
     });
     setShowPatientEditModal(true);
   }
@@ -725,6 +739,7 @@ export default function Dashboard() {
       if (patientEditForm.email) payload.email = patientEditForm.email;
       if (patientEditForm.gender) payload.gender = patientEditForm.gender;
       if (patientEditForm.date_of_birth) payload.date_of_birth = patientEditForm.date_of_birth;
+      if (patientEditForm.referral_source) payload.referral_source = patientEditForm.referral_source;
       await api.patch(`/admin/patients/${editingPatient.id}`, payload);
       toast.success('Patient updated');
       setShowPatientEditModal(false);
@@ -1033,6 +1048,24 @@ export default function Dashboard() {
       toast.success(`Slot ${newStatus === 'blocked' ? 'blocked' : 'unblocked'}`);
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to update slot');
+    }
+  }
+
+  // Distinct from deactivating. A visiting orthodontist is very much active —
+  // they take referred cases, not walk-in toothache picked off a menu — and an
+  // owner usually wants new patients coming to them rather than to whichever
+  // associate has a gap. The desk can still book anyone, either way. No confirm
+  // dialog: it is reversible with the same tap.
+  async function toggleOnlineBookable(doc) {
+    const turningOff = doc.online_bookable !== false;
+    try {
+      await api.patch(`/admin/doctors/${doc.id}`, { online_bookable: !turningOff ? true : false });
+      toast.success(turningOff
+        ? `Dr. ${doc.name} is now desk-booking only`
+        : `Dr. ${doc.name} is bookable on WhatsApp`);
+      fetchDoctors();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Could not update the dentist');
     }
   }
 
@@ -1519,6 +1552,8 @@ export default function Dashboard() {
           <ErrorBoundary key={tab}>
 
           {/* ── OVERVIEW ── */}
+          {tab === 'dayclose' && <DayCloseTab />}
+
           {tab === 'overview' && (
             <OverviewTab
               loading={loading}
@@ -1529,6 +1564,7 @@ export default function Dashboard() {
               analyticsSummary={analyticsSummary}
               setTab={setTab}
               exportCSV={exportCSV}
+              onAddWalkin={openWalkinModal}
             />
           )}
 
@@ -1549,13 +1585,7 @@ export default function Dashboard() {
               printReceipt={printReceipt}
               waLink={waLink}
               onMessagePatient={(phone) => { setShowWaMessageModal(true); setWaMessagePhone(phone); setWaMessageText(''); }}
-              onAddWalkin={() => {
-                if (!hospitals.length) fetchHospitals();
-                if (!doctors.length) fetchDoctors();
-                setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
-                setWalkinSlots([]);
-                setShowWalkinModal(true);
-              }}
+              onAddWalkin={openWalkinModal}
               onEditNotes={(a) => { setEditingNotesId(a.id); setNotesText(a.notes || ''); }}
               onCancelAppt={(a) => { setCancellingAppt(a); setCancelReason(''); }}
               onRecordTreatment={(a) => setRecordTreatmentAppt(a)}
@@ -1577,6 +1607,7 @@ export default function Dashboard() {
               openSchedule={openSchedule}
               openSlotsViewer={openSlotsViewer}
               toggleDoctorStatus={toggleDoctorStatus}
+              toggleOnlineBookable={toggleOnlineBookable}
             />
           )}
 
@@ -2625,7 +2656,28 @@ export default function Dashboard() {
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
           </div>
-          <p className="text-xs text-gray-400">Phone number cannot be changed here as it is the patient's WhatsApp identity.</p>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">
+              How did they hear about us?
+              <span className="text-gray-400 font-normal ml-1">(ask once, on the first visit)</span>
+            </label>
+            <select value={patientEditForm.referral_source || ''}
+              onChange={e => setPatientEditForm(f => ({ ...f, referral_source: e.target.value }))}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              <option value="">— Not asked —</option>
+              <option value="walk_past">Walked past / saw the board</option>
+              <option value="google">Google or Maps</option>
+              <option value="friend">Friend or family</option>
+              <option value="doctor_referral">Referred by a doctor</option>
+              <option value="social">Instagram / Facebook</option>
+              <option value="returning">Returning patient</option>
+              <option value="other">Other</option>
+            </select>
+            <p className="text-xs text-gray-400 mt-1">
+              This is how you find out which board, listing or referral is actually bringing people in.
+            </p>
+          </div>
+          <p className="text-xs text-gray-400">Phone number cannot be changed here as it is the patient&apos;s WhatsApp identity.</p>
           <div className="flex gap-3 pt-2">
             <button type="button" onClick={() => { setShowPatientEditModal(false); setEditingPatient(null); }}
               className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">

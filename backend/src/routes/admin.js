@@ -22,6 +22,9 @@ const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { IST_TODAY_SQL, IST_MONTH_START_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const { CURRENT_TERMS_VERSION, hasAcceptedCurrentTerms } = require('../config/terms');
 const logger = require('../utils/logger');
+const QRCode = require('qrcode');
+const { generateEntryCode, buildEntryLink, buildEntryMessage,
+        publicWhatsAppNumber } = require('../utils/entryCode');
 
 // ── TERMS OF SERVICE ACCEPTANCE ───────────────────────────────
 // The evidence trail behind the click-wrap contract. See config/terms.js and
@@ -313,6 +316,58 @@ router.patch('/staff/:id', adminOnly, validateUUID(), validate(schemas.updateSta
   } catch (err) { handleError(res, err); }
 });
 
+// ── RESET A STAFF MEMBER'S PASSWORD ──────────────────────────
+// Self-service reset was delivered by email and is gone with it, which left the
+// SUPER admin as the only person who could unlock a locked-out account — a
+// Saturday-morning call to the vendor before the front desk can take bookings.
+// A clinic admin already controls every other aspect of their staff accounts;
+// this closes the gap without reintroducing a delivery channel.
+//
+// adminOnly, and never for yourself: /auth/change-password is the path for your
+// own password and it requires the current one. Allowing self-reset here would
+// turn any hijacked admin session into a permanent takeover with no need to
+// know the existing password.
+router.post('/staff/:id/reset-password', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const crypto = require('crypto');
+    const s = req.tenant.schema_name;
+
+    if (req.params.id === req.user.id) {
+      return res.status(400).json({
+        error: 'Use Change Password for your own account — it needs your current password.',
+      });
+    }
+
+    const password = req.body?.password || crypto.randomBytes(9).toString('base64url');
+    if (typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const hash = await bcrypt.hash(password, 12);
+    const upd = await tenantQuery(s,
+      `UPDATE users SET password_hash=$1 WHERE id=$2 AND is_active=true
+       RETURNING id, email, name, role`, [hash, req.params.id]);
+    if (!upd.rows[0]) return res.status(404).json({ error: 'Staff member not found' });
+    const user = upd.rows[0];
+
+    // Recovery must end any session still open on that account — otherwise the
+    // reason for the reset (a shared or leaked password) survives it.
+    await query(`UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`, [user.id])
+      .catch(e => logger.warn('Refresh-token revocation failed after staff reset', { error: e.message }));
+
+    await writeAuditLog(s, req.user.id, req.user.role,
+      'RESET_STAFF_PASSWORD', 'user', user.id, null, { email: user.email }, req.ip);
+
+    // Returned ONCE so it can be handed over in person. Never stored or logged.
+    res.json({
+      success: true,
+      user: { id: user.id, email: user.email, name: user.name, role: user.role },
+      password,
+      message: 'Password updated. Give it to them directly and ask them to change it.',
+    });
+  } catch (err) { handleError(res, err); }
+});
+
 router.delete('/staff/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
@@ -340,6 +395,91 @@ router.delete('/staff/:id', adminOnly, validateUUID(), async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// ── CLINIC QR CODE ────────────────────────────────────────────
+// The clinic's only patient-facing entry point. All tenants share one WhatsApp
+// number, so a scan is what tells the bot which clinic the patient means — see
+// utils/entryCode.js. Readable by any signed-in staff member: the receptionist
+// who needs to reprint the card is usually not an admin, and the code is
+// printed on a poster in a public waiting room, so it is not a secret.
+router.get('/clinic-qr', async (req, res) => {
+  try {
+    // Read fresh rather than trusting req.tenant, which is cached by the tenant
+    // middleware and would serve a stale code straight after a regenerate.
+    const r = await query(`SELECT name, entry_code FROM tenants WHERE id=$1`, [req.tenant.id]);
+    const row = r.rows[0];
+    if (!row) return res.status(404).json({ error: 'Clinic not found' });
+
+    const number = publicWhatsAppNumber();
+    const link = buildEntryLink(row.entry_code, row.name, number);
+
+    // Both shapes are reported rather than an error, so the dashboard can
+    // explain WHICH half is missing: a clinic with no code needs a regenerate,
+    // a deployment with no WHATSAPP_PUBLIC_NUMBER needs an env var, and telling
+    // a receptionist "QR unavailable" for either is useless.
+    if (!link) {
+      return res.json({
+        code: row.entry_code || null,
+        link: null,
+        configured: false,
+        reason: !row.entry_code ? 'no_entry_code' : 'no_public_number',
+      });
+    }
+
+    // 'Q' error correction (25%) rather than the default 'M': this gets printed
+    // on a card that lives on a reception counter, and a scuffed or partly
+    // covered code that still scans is worth the extra modules.
+    const [svg, png] = await Promise.all([
+      QRCode.toString(link, { type: 'svg', errorCorrectionLevel: 'Q', margin: 2 }),
+      QRCode.toDataURL(link, { errorCorrectionLevel: 'Q', margin: 2, width: 512 }),
+    ]);
+
+    res.json({
+      code: row.entry_code,
+      clinic_name: row.name,
+      link,
+      message: buildEntryMessage(row.entry_code, row.name),
+      whatsapp_number: number,
+      configured: true,
+      svg,
+      png,
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+// Mint a new code. adminOnly and audited because it is destructive in the
+// physical world: every card, poster and website link already carrying the old
+// code stops working the moment this succeeds, and the clinic will not find
+// out from the dashboard — it finds out when patients stop arriving. The old
+// code is recorded in the audit entry so a regenerate done by mistake can be
+// undone by hand.
+router.post('/clinic-qr/regenerate', adminOnly, async (req, res) => {
+  try {
+    const prev = await query(`SELECT entry_code FROM tenants WHERE id=$1`, [req.tenant.id]);
+    if (!prev.rows[0]) return res.status(404).json({ error: 'Clinic not found' });
+    const oldCode = prev.rows[0].entry_code;
+
+    // Retry against the unique index rather than pre-checking for a free code:
+    // a SELECT-then-UPDATE would race another clinic being created.
+    let code = null;
+    for (let attempt = 0; attempt < 5 && !code; attempt++) {
+      const candidate = generateEntryCode();
+      try {
+        await query(`UPDATE tenants SET entry_code=$1 WHERE id=$2`, [candidate, req.tenant.id]);
+        code = candidate;
+      } catch (e) {
+        if (e.code !== '23505') throw e;
+      }
+    }
+    if (!code) return res.status(503).json({ error: 'Could not allocate a new code. Please retry.' });
+
+    await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
+      'REGENERATE_CLINIC_QR', 'tenant', req.tenant.id, { entry_code: oldCode },
+      { entry_code: code }, req.ip);
+
+    res.json({ code, message: 'New code issued. Reprint any QR codes already on display.' });
+  } catch (err) { handleError(res, err); }
+});
+
 // ── SETTINGS ──────────────────────────────────────────────────
 // tenants.settings is a mixed jsonb blob: tenant-editable notification prefs
 // sit alongside SERVER-controlled keys. PATCH /settings deliberately allowlists
@@ -355,7 +495,7 @@ const PLATFORM_ONLY_SETTINGS_KEYS = ['rate_limits', 'alert_webhook_url'];
 // Non-admins get only what the dashboard actually consumes:
 // frontend/src/components/tabs/SettingsTab.js reads exactly these three from
 // `settings.settings` and nothing else (the toggles are admin-write anyway).
-const NON_ADMIN_SETTINGS_KEYS = ['email_on_booking', 'reminder_24h_enabled', 'reminder_2h_enabled'];
+const NON_ADMIN_SETTINGS_KEYS = ['reminder_24h_enabled', 'reminder_2h_enabled'];
 
 function visibleSettings(rawSettings, role) {
   const src = rawSettings || {};

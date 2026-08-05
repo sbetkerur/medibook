@@ -39,7 +39,7 @@ router.get('/patients', patientLimiter, async (req, res) => {
     params.push(25, (safePage - 1) * 25);
     const [r, countR] = await Promise.all([
       tenantQuery(s,
-        `SELECT id, name, phone, email, gender, date_of_birth, visit_count, created_at FROM patients${where} ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        `SELECT id, name, phone, email, gender, date_of_birth, visit_count, referral_source, created_at FROM patients${where} ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
         params),
       tenantQuery(s, `SELECT COUNT(*) FROM patients${where}`, countParams),
     ]);
@@ -52,7 +52,7 @@ router.get('/patients', patientLimiter, async (req, res) => {
 router.get('/patients/:id', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, dental_history as medical_history, created_at, updated_at FROM patients WHERE id=$1 AND deleted_at IS NULL`,
+      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, referral_source, dental_history as medical_history, created_at, updated_at FROM patients WHERE id=$1 AND deleted_at IS NULL`,
       [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     res.json({ patient: r.rows[0] });
@@ -74,8 +74,15 @@ router.get('/patients/:id/appointments', validateUUID(), async (req, res) => {
 // ── UPDATE PATIENT ────────────────────────────────────────────
 router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
-    const { name, email, gender, date_of_birth } = req.body;
+    const { name, email, gender, date_of_birth, referral_source } = req.body;
     const s = req.tenant.schema_name;
+    // Which board, referral or listing actually brought them in. Set at the
+    // DESK, not asked in the bot: the booking flow is long enough already, and
+    // the receptionist knows the answer better than the patient does.
+    const REFERRAL_SOURCES = ['walk_past', 'google', 'friend', 'doctor_referral', 'social', 'returning', 'other'];
+    if (referral_source && !REFERRAL_SOURCES.includes(referral_source)) {
+      return res.status(400).json({ error: `referral_source must be one of: ${REFERRAL_SOURCES.join(', ')}` });
+    }
     const DOB_RE = /^\d{4}-\d{2}-\d{2}$/;
     if (date_of_birth && !DOB_RE.test(date_of_birth)) return res.status(400).json({ error: 'date_of_birth must be YYYY-MM-DD' });
     const VALID_GENDERS = ['male', 'female', 'other'];
@@ -85,10 +92,12 @@ router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     const r = await tenantQuery(s, `
       UPDATE patients SET
         name=COALESCE($1,name), email=COALESCE($2,email),
-        gender=COALESCE($3,gender), date_of_birth=COALESCE($4::date,date_of_birth), updated_at=NOW()
+        gender=COALESCE($3,gender), date_of_birth=COALESCE($4::date,date_of_birth),
+        referral_source=COALESCE($6,referral_source), updated_at=NOW()
       WHERE id=$5 AND deleted_at IS NULL
-      RETURNING id, name, phone, email, gender, date_of_birth, visit_count
-    `, [name || null, email || null, gender || null, date_of_birth || null, req.params.id]);
+      RETURNING id, name, phone, email, gender, date_of_birth, visit_count, referral_source
+    `, [name || null, email || null, gender || null, date_of_birth || null, req.params.id,
+        referral_source || null]);
     // deleted_at IS NULL, matching every other read in this file. Without it a
     // PATCH wrote name/email/DOB/gender straight back onto a row that DELETE
     // /patients/:id had anonymised — the record stayed hidden from the list

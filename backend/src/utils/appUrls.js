@@ -8,13 +8,13 @@
  * BUILDS A LINK needs exactly one origin, and three callers were interpolating
  * the raw variable instead:
  *
- *   - the password-reset email  → "https://a.com,https://b.com/reset-password?token=…"
+ *   - the tenant login_url      → "https://a.com,https://b.com/login"
  *   - the unsubscribe link
  *   - the login_url handed back when a tenant is created
  *
  * With one origin configured those happen to work, which is why it went unseen;
  * the day a second origin is added, password reset breaks for everyone and the
- * email links stop resolving. Links use the FIRST origin — the canonical one.
+ * generated links stop resolving. Links use the FIRST origin — the canonical one.
  */
 
 function parseOrigins() {

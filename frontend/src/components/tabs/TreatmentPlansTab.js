@@ -55,6 +55,11 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
   const [bookingGap, setBookingGap] = useState('7');
   // Money and lab work for the plan currently open in the detail modal.
   const [payments, setPayments] = useState([]);
+  // Consent capture. Held here rather than in a modal: it is one field and a
+  // button, and a dentist recording it at the chair should not have to open
+  // anything.
+  const [consentNote, setConsentNote] = useState('');
+  const [savingConsent, setSavingConsent] = useState(false);
   const [labWorks, setLabWorks] = useState([]);
   const [payingPlan, setPayingPlan] = useState(null);
   const [labPlan, setLabPlan] = useState(null);
@@ -371,6 +376,59 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
                 {detail.treatment_plan.notes}
               </div>
             )}
+
+            {/* ── CONSENT ── */}
+            {/* Extractions and surgery need one, and it is what protects the
+                dentist. Records the FACT of consent — who took it, when, and
+                what was explained — not a signature, which is a different and
+                much larger thing. */}
+            <div className={`border rounded-lg p-3 ${detail.treatment_plan.consent_taken_at ? 'border-gray-100' : 'border-amber-200 bg-amber-50'}`}>
+              <h4 className="text-xs font-medium text-gray-500 mb-2">Consent</h4>
+              {detail.treatment_plan.consent_taken_at ? (
+                <div className="text-sm text-gray-700">
+                  <span className="text-green-700 font-medium">Recorded</span>
+                  <span className="text-gray-400 text-xs ml-2">
+                    {(() => { try { return format(parseISO(detail.treatment_plan.consent_taken_at), 'd MMM yyyy, HH:mm'); } catch { return ''; } })()}
+                  </span>
+                  {detail.treatment_plan.consent_note && (
+                    <p className="mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words">
+                      {detail.treatment_plan.consent_note}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-xs text-amber-800">
+                    Not recorded. Note what was explained and who agreed.
+                  </p>
+                  <textarea
+                    value={consentNote}
+                    onChange={e => setConsentNote(e.target.value)}
+                    rows={2}
+                    maxLength={2000}
+                    placeholder="e.g. Explained risk of nerve damage and alternatives; patient agreed."
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <button
+                    onClick={async () => {
+                      setSavingConsent(true);
+                      try {
+                        await api.post(`/admin/treatment-plans/${detail.treatment_plan.id}/consent`,
+                          { note: consentNote.trim() || null });
+                        toast.success('Consent recorded');
+                        setConsentNote('');
+                        openDetail(detail.treatment_plan.id);
+                      } catch (err) {
+                        toast.error(err.response?.data?.error || 'Could not record consent');
+                      } finally { setSavingConsent(false); }
+                    }}
+                    disabled={savingConsent}
+                    className="px-3 py-2 text-xs rounded-lg bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50">
+                    {savingConsent ? 'Recording…' : 'Record consent'}
+                  </button>
+                </div>
+              )}
+            </div>
 
             {/* ── MONEY ── */}
             {/* The first question an owner asks about a part-finished course. */}

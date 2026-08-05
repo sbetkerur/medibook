@@ -6,15 +6,16 @@ const { toZonedTime } = require('../../utils/dateTz');
 const logger = require('../../utils/logger');
 
 const IST = 'Asia/Kolkata';
-const emailService = require('../email');
 const wa = require('../whatsapp');
 const { SLOT_LOOKAHEAD_DAYS, CRON_LOOKAHEAD_DAYS } = require('../../utils/errors');
+const { offerRequest } = require('./requestFlow');
 const {
   STATES,
   fuzzyFind,
   parseChoiceNumber,
   maskPhone,
   sendConfirmButtons,
+  clinicPhoneLine,
   getPatient,
   getPatients,
   updateSession,
@@ -60,13 +61,34 @@ const BRANCH_STEP = { header: 'Which branch?', footer: 'Reply Menu to start over
  * distinction the patient is actually choosing on. WhatsApp truncates row
  * descriptions at 72 chars, so trim rather than let it cut mid-word server-side.
  */
-function doctorListRow(d) {
+function doctorListRow(d, showFees = true) {
   return {
     id: d.id,
     title: `Dr. ${d.name}`,
-    description: [d.specialization, d.qualification, d.consultation_fee ? '₹' + d.consultation_fee : '']
+    description: [d.specialization, d.qualification,
+      showFees && d.consultation_fee ? '₹' + d.consultation_fee : '']
       .filter(Boolean).join(' • ').slice(0, 72),
   };
+}
+
+/**
+ * Does this clinic want its consultation fee quoted to patients?
+ *
+ * Indian clinics routinely waive the consultation when the patient takes the
+ * treatment, and they negotiate. A firm number shown in WhatsApp and then not
+ * charged at the desk is an argument the receptionist has to have, so the
+ * clinic can switch it off. Defaults to TRUE — that is what every existing
+ * clinic already shows, and silently hiding a price they had been quoting
+ * would be its own surprise.
+ */
+async function showFeesEnabled(schema) {
+  try {
+    const r = await query(`SELECT settings FROM tenants WHERE schema_name=$1`, [schema]);
+    return r.rows[0]?.settings?.show_consultation_fee !== false;
+  } catch (err) {
+    logger.warn('Fee-display setting lookup failed — showing fee', { error: err.message });
+    return true;
+  }
 }
 
 /**
@@ -95,15 +117,21 @@ async function startBooking(phone, schema, tenant, send, ctx) {
     `SELECT id, name, city FROM hospitals WHERE is_active=true ORDER BY name`);
 
   if (!hospitals.rows.length) {
-    await send.text('No clinics available right now. Please try again later.');
+    await send.text('No branches are open for online booking at the moment.\n\nPlease call us, or reply *Menu* to try again later.'
+      + await clinicPhoneLine(schema));
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
 
-  // A branch chosen at the "clinics near me" city step — asking again would
-  // undo the whole point of picking by location. It lives on the GLOBAL session
-  // because the synthesised "Hi" that follows clinic selection resets this
-  // session's context, so it could not have been parked here.
+  // A branch the patient has ALREADY chosen before booking began, so the branch
+  // question can be skipped. It lives on the GLOBAL session because the
+  // synthesised "Hi" that follows clinic selection resets this session's
+  // context, so it could not have been parked here.
+  //
+  // Nothing writes it at present: an entry code identifies a CLINIC, and the
+  // city picker that used to write it is gone. Kept because it is exactly the
+  // hook a per-BRANCH QR code would need, and because the read is a no-op while
+  // the column stays NULL.
   //
   // Consumed one-shot: cleared whether or not it still resolves, so a branch
   // that has since been deactivated can't wedge every future booking, and a
@@ -155,7 +183,7 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
 
   // If the user tapped a stale main-menu button while already in SELECT_HOSPITAL,
   // re-send the branch picker rather than trying to match button titles as clinic names.
-  if (/book appointment|my appointments|check status/i.test(input)) {
+  if (/book appointment|my appointments|address & phone|check status/i.test(input)) {
     return _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows);
   }
 
@@ -183,7 +211,7 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
 
   if (!h) {
     // Re-prompt rather than cancelling — user may have mistyped
-    await send.text('❓ Branch not found. Please select from the list below:');
+    await send.text('I could not tell which branch you meant. Please pick one:');
     return _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows);
   }
 
@@ -224,11 +252,13 @@ async function showDepartments(phone, schema, tenant, send, ctx) {
      JOIN doctor_departments dd ON dd.department_id=d.id
      JOIN doctors doc ON doc.id=dd.doctor_id
      WHERE d.hospital_id=$1 AND d.is_active=true AND doc.is_active=true
+       AND doc.online_bookable=true
        AND doc.hospital_id=$1
      ORDER BY d.name`, [ctx.hospital_id]);
 
   if (!depts.rows.length) {
-    await send.text('No treatments available right now. Please contact the clinic directly.\n\nReply *Menu* to start over.');
+    await send.text('Nothing is set up for online booking yet.\n\nPlease call us to book. Reply *Menu* to go back.'
+      + await clinicPhoneLine(schema, ctx.hospital_id));
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
@@ -280,6 +310,7 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
        JOIN doctor_departments dd ON dd.department_id=d.id
        JOIN doctors doc ON doc.id=dd.doctor_id
        WHERE d.hospital_id=$1 AND d.is_active=true AND doc.is_active=true
+         AND doc.online_bookable=true
          AND doc.hospital_id=$1
        ORDER BY d.name`, [ctx.hospital_id]);
     depts = [GENERAL_CONSULT, ...r.rows];
@@ -307,15 +338,15 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
     // should re-ask, not discard the booking.
     if (depts.length) {
       await send.list(
-        `❓ I couldn't tell which treatment you meant.\n\nPlease pick one from the list:`,
+        `I could not tell which treatment you meant. Please pick one from the list:`,
         'View Treatments',
         [{ title: 'Treatments', rows: depts.map(d => ({ id: d.id, title: d.name })) }]
       );
       await updateSession(schema, phone, STATES.SELECT_DEPARTMENT, ctx);
       return;
     }
-    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
+    await send.buttons('Booking cancelled — nothing has been reserved.\n\nWhat would you like to do?',
+      ['📅 Book Appointment', '🗓 My Appointments', '📍 Address & Phone']);
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
@@ -356,7 +387,7 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
                 false AS is_primary
          FROM doctors d
          LEFT JOIN departments dep ON dep.id = d.department_id
-         WHERE d.hospital_id=$1 AND d.is_active=true
+         WHERE d.hospital_id=$1 AND d.is_active=true AND d.online_bookable=true
          ORDER BY (COALESCE(d.specialization,'') ILIKE '%general%'
                    OR COALESCE(dep.name,'') ILIKE 'general%') DESC,
                   d.consultation_fee ASC NULLS LAST,
@@ -367,12 +398,12 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
                 (d.department_id = $1) AS is_primary
          FROM doctors d
          JOIN doctor_departments dd ON dd.doctor_id=d.id AND dd.department_id=$1
-         WHERE d.hospital_id=$2 AND d.is_active=true
+         WHERE d.hospital_id=$2 AND d.is_active=true AND d.online_bookable=true
          ORDER BY is_primary DESC, d.name`,
         [dept.id, ctx.hospital_id]);
 
   if (!doctors.rows.length) {
-    await send.text(`No dentists available for ${dept.name}.\n\nReply *Menu* to choose another treatment.`);
+    await send.text(`No dentists are taking ${dept.name} bookings at the moment.\n\nReply *Menu* to choose another treatment.`);
     return;
   }
 
@@ -396,12 +427,13 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
   const doctorPrompt = isGeneralConsult
     ? 'Anyone available, or pick a name you know.'
     : `Everyone below treats ${dept.name.toLowerCase()}.`;
+  const feesOn = await showFeesEnabled(schema);
   if (doctors.rows.length <= 3) {
     await send.buttons(doctorPrompt, doctors.rows.map(d => `Dr. ${d.name}`), STEP('Choose a dentist'));
   } else {
     const sections = [{
       title: `${dept.name} Dentists`.slice(0, 24),
-      rows: doctors.rows.map(doctorListRow),
+      rows: doctors.rows.map(d => doctorListRow(d, feesOn)),
     }];
     await send.list(doctorPrompt, 'See dentists', sections, STEP('Choose a dentist'));
   }
@@ -420,16 +452,17 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     // throwing the patient back to the main menu made an ambiguous reply cost
     // them the whole booking flow.
     if (doctors.length) {
+      const feesOn = await showFeesEnabled(schema);
       await send.list(
-        `❓ I couldn't tell which dentist you meant.\n\nPlease pick one from the list:`,
+        `I could not tell which dentist you meant. Please pick one from the list:`,
         'View Dentists',
-        [{ title: 'Dentists', rows: doctors.map(doctorListRow) }]
+        [{ title: 'Dentists', rows: doctors.map(d => doctorListRow(d, feesOn)) }]
       );
       await updateSession(schema, phone, STATES.SELECT_DOCTOR, ctx);
       return;
     }
-    await send.buttons('❌ Booking cancelled.\n\nWhat would you like to do?',
-      ['📅 Book Appointment', '🗓 My Appointments', '📋 Check Status']);
+    await send.buttons('Booking cancelled — nothing has been reserved.\n\nWhat would you like to do?',
+      ['📅 Book Appointment', '🗓 My Appointments', '📍 Address & Phone']);
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
@@ -502,8 +535,8 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
   // Say so, rather than letting a date three weeks out look like an oversight.
   if (beyondUsualWindow) {
     await send.text(
-      `📅 Dr. ${doc.name} has no free slots in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\n` +
-      `Their next available date is *${dates[0].label.replace(/^Today \(|\)$/g, '')}*.`
+      `Dr. ${doc.name} has nothing free in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\n` +
+      `The next day they are in is *${dates[0].label.replace(/^Today \(|\)$/g, '')}*.`
     );
   }
 
@@ -512,26 +545,35 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     // restart the entire booking flow just to try a different doctor.
     const otherDoctors = doctors.filter(d => d.id !== doc.id);
     if (otherDoctors.length > 0) {
+      const feesOn = await showFeesEnabled(schema);
       // CRON_LOOKAHEAD_DAYS, not SLOT_LOOKAHEAD_DAYS: reaching here means the
       // widened search found nothing either, so quoting the two-week figure
       // would understate how far ahead we actually looked.
-      await send.text(`Dr. ${doc.name} has no available slots in the next ${CRON_LOOKAHEAD_DAYS} days. Here are other dentists available for ${ctx.department_name}:`);
+      await send.text(`Dr. ${doc.name} has nothing free in the next ${CRON_LOOKAHEAD_DAYS} days. These dentists also do ${ctx.department_name}:`);
       if (otherDoctors.length <= 3) {
-        await send.buttons('🦷 *Select Dentist*', otherDoctors.map(d => `Dr. ${d.name}`));
+        await send.buttons('Who would you like to see?', otherDoctors.map(d => `Dr. ${d.name}`), STEP('Choose a dentist'));
       } else {
         const sections = [{
           title: `${ctx.department_name} Dentists`,
-          rows: otherDoctors.map(doctorListRow),
+          rows: otherDoctors.map(d => doctorListRow(d, feesOn)),
         }];
-        await send.list('🦷 *Select Dentist*', 'View Dentists', sections);
+        await send.list('Who would you like to see?', 'See dentists', sections, STEP('Choose a dentist'));
       }
       await updateSession(schema, phone, STATES.SELECT_DOCTOR, { ...ctx, _doctors: otherDoctors });
     } else {
       // No other doctors in this department — guide user back to menu
       const deptLabel = ctx.department_name || 'this specialty';
       await send.text(
-        `Dr. ${doc.name} has no available slots in the next ${CRON_LOOKAHEAD_DAYS} days, and there are no other dentists available for ${deptLabel} right now.\n\nPlease try again later or contact the clinic directly.\n\nReply *Menu* to go back to the main menu.`
+        `Dr. ${doc.name} has nothing free in the next ${CRON_LOOKAHEAD_DAYS} days, and no one else is taking ${deptLabel} bookings just now.`
+        + await clinicPhoneLine(schema, ctx.hospital_id)
       );
+      // The grid is a guide, not the diary — an Indian clinic would have found
+      // this patient a time on the phone. Keep the context so the receptionist
+      // rings back knowing which dentist and treatment they wanted.
+      ctx.request_note = `Wanted Dr. ${doc.name} for ${deptLabel} — nothing free in ${CRON_LOOKAHEAD_DAYS} days`;
+      await updateSession(schema, phone, STATES.IDLE, ctx);
+      await offerRequest(send, 'That is a long wait.');
+      return;
       await updateSession(schema, phone, STATES.IDLE, {});
     }
     return;
@@ -593,7 +635,7 @@ async function _repromptDates(phone, schema, send, ctx, lead) {
   } else {
     // No cache to re-offer (session resumed after expiry, or a context write was
     // lost). Still don't cancel — "Menu" restarts the picker from the top.
-    await send.text(`${lead}\n\nI've lost track of the dates I offered. Reply *Menu* to start again.`);
+    await send.text(`${lead}\n\nI have lost track of the dates I offered. Reply *Menu* to start again.`);
   }
   await updateSession(schema, phone, STATES.SELECT_DATE, ctx);
 }
@@ -608,7 +650,7 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
       resolvedDate = cachedDates[n - 1].date;
     } else {
       return _repromptDates(phone, schema, send, ctx,
-        `❓ I couldn't tell which date you meant.`);
+        `I could not tell which date you meant.`);
     }
   }
   // Only accept dates from the offered list. The list query excludes doctor
@@ -680,9 +722,14 @@ async function handleSelectDate(phone, schema, tenant, send, ctx, choice) {
         try { label = format(parseISO(r.date), 'EEE, d MMM'); } catch {}
         return `• ${label} (${r.slots} slots)`;
       }).join('\n');
-      await send.text(`No slots available on that date.\n\n📅 *Next available dates for Dr. ${ctx.doctor_name}:*\n${suggestions}\n\nReply *Menu* to go back and choose a date.`);
+      await send.text(`Nothing left on that date.\n\nDr. ${ctx.doctor_name} is next free on:\n${suggestions}`);
+      ctx.request_preferred_date = ctx.appointment_date || null;
+      ctx.request_note = `Wanted ${ctx.appointment_date || 'that date'} with Dr. ${ctx.doctor_name}`;
+      await updateSession(schema, phone, STATES.IDLE, ctx);
+      await offerRequest(send, 'If none of those suit you, we can still help.');
+      return;
     } else {
-      await send.text('No slots left for that date. Please select another date.\n\nReply *Menu* to start over.');
+      await send.text('Nothing left on that date. Please pick another.\n\nReply *Menu* to start over.');
     }
     return;
   }
@@ -726,7 +773,7 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
     try { dateLabel = format(parseISO(ctx.appointment_date), 'EEE, d MMM'); } catch {}
     if (slots.length) {
       await send.list(
-        `❓ I couldn't tell which time you meant.\n\nPlease pick a slot on ${dateLabel}:`,
+        `I could not tell which time you meant. Please pick one on ${dateLabel}:`,
         'Choose Time',
         [{ title: `Slots on ${dateLabel}`.slice(0, 24), rows: slots.map(s => ({
           id: s.id, title: `${s.start_time.slice(0, 5)} – ${s.end_time.slice(0, 5)}`,
@@ -735,7 +782,7 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
     } else {
       // Nothing cached to re-offer (session resumed after expiry, or a lost
       // context write) — still not a reason to throw the booking away.
-      await send.text(`❓ I've lost track of the times I offered. Reply *Menu* to pick a slot again.`);
+      await send.text(`I have lost track of the times I offered. Reply *Menu* to pick a slot again.`);
     }
     await updateSession(schema, phone, STATES.SELECT_SLOT, ctx);
     return;
@@ -756,8 +803,9 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
   ctx._patients = patients;
   if (patients.length === 1) {
     await send.buttons(
-      `👤 *Who is this appointment for?*`,
-      [`👤 ${patients[0].name}`, '➕ Add new person']
+      'Who is this appointment for?',
+      [`👤 ${patients[0].name}`, '➕ Add new person'],
+      STEP('Who is it for?')
     );
   } else {
     const sections = [{
@@ -767,7 +815,7 @@ async function handleSelectSlot(phone, schema, tenant, send, ctx, choice, input)
         { id: 'new_patient', title: '➕ Add new person', description: 'Book for someone else' },
       ],
     }];
-    await send.list('👨‍👩‍👧 *Who is this appointment for?*\n\nSelect a family member or add a new person:', 'Select Patient', sections);
+    await send.list('Who is this appointment for?', 'Choose', sections, STEP('Who is it for?'));
   }
   await updateSession(schema, phone, STATES.SELECT_PATIENT, ctx);
 }
@@ -781,7 +829,7 @@ async function handleSelectPatient(phone, schema, send, ctx, choice, input) {
     /^➕|^add new|^new person|^new$/i.test(input) ||
     /^btn_1/i.test(choice)
   ) {
-    await send.text('What is the full name of the person you are booking for?');
+    await send.text('And their full name?');
     await updateSession(schema, phone, STATES.COLLECT_NAME, ctx);
     return;
   }
@@ -801,7 +849,7 @@ async function handleSelectPatient(phone, schema, send, ctx, choice, input) {
     fuzzyFind(patients, typedName);
 
   if (!selected) {
-    await send.text('Please select a person from the options, or tap *Add new person*.');
+    await send.text('Please pick someone from the list, or tap *Add new person*.');
     return;
   }
 
@@ -819,7 +867,7 @@ async function askChiefComplaint(phone, schema, send, ctx) {
     return showConfirmation(phone, schema, send, ctx, updateSession);
   }
   await send.buttons(
-    'It helps the dentist prepare — or type it in your own words.',
+    'In your own words — it helps the dentist prepare.',
     ['🚨 Pain / Emergency', '🔍 Checkup / Cleaning', '✨ Cosmetic / Other'],
     { header: 'What brings you in?' }
   );
@@ -849,23 +897,29 @@ async function showConfirmation(phone, schema, send, ctx, updateSessionFn) {
   try { dateLabel = format(parseISO(ctx.appointment_date), 'EEEE, d MMMM yyyy'); } catch {}
   const time = ctx.appointment_time?.slice(0, 5);
 
-  // Fetch consultation fee if we have a doctor ID
+  // Fetch consultation fee if we have a doctor ID and the clinic quotes it.
   let feeText = '';
-  if (ctx.doctor_id && ctx.hospital_name) {
+  if (ctx.doctor_id && ctx.hospital_name && await showFeesEnabled(schema)) {
     try {
       const feeR = await tenantQuery(schema,
         `SELECT consultation_fee FROM doctors WHERE id=$1`, [ctx.doctor_id]);
       const fee = feeR.rows[0]?.consultation_fee;
       // Just "Fee": on the consultation path the line above already reads
       // "Consultation · <name>", and "Consultation ₹300" under it said it twice.
-      if (fee > 0) feeText = `\nFee ₹${fee}`;
+      // "payable at the clinic" is doing real work — it stops the number
+      // reading as a prepayment, and leaves room for the waiver or discount the
+      // desk will actually apply.
+      if (fee > 0) feeText = `\nFee ₹${fee}, payable at the clinic`;
     } catch (_) {}
   }
 
   // Eight lines each opening with a different emoji read as clutter, not care.
   // The shape below leads with WHEN and WHO — the two things a patient checks —
   // then the supporting detail in one quiet block. One glyph, used once.
-  const complaintLine = ctx.chief_complaint ? `\n_${ctx.chief_complaint}_` : '';
+  // Quoted and attributed. "I think I need a root canal" typed by a patient is
+  // what they SAID, not something the clinic has assessed — and when they turn
+  // up with something else, an unattributed line is the one pointed at.
+  const complaintLine = ctx.chief_complaint ? `\nYou told us: _${ctx.chief_complaint}_` : '';
   const summary =
     `*${dateLabel}*\n` +
     `*${time}* with Dr. ${ctx.doctor_name}\n\n` +
@@ -891,7 +945,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
   // uses pool.connect() directly for a custom transaction, we must check here too.
   if (!schema || !/^tenant_[a-z0-9_]+$/.test(schema)) {
     logger.error(`completeBooking: invalid schema name "${schema}", aborting booking`);
-    await send.text('Something went wrong with your booking. Please try again.\n\nReply *Menu* to start over.');
+    await send.text('Something went wrong at our end and nothing was booked.\n\nReply *Menu* to try again.');
     return;
   }
 
@@ -903,7 +957,8 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
        WHERE p.phone=$1 AND a.status='confirmed' AND a.created_at >= NOW() - INTERVAL '1 hour'`,
       [phone]);
     if (parseInt(recentR.rows[0].count) >= LIMITS.MAX_BOOKINGS_PER_HOUR) {
-      await send.text(`⚠️ You've made ${LIMITS.MAX_BOOKINGS_PER_HOUR} bookings in the last hour. Please wait before booking again.\n\nReply *Menu* for the main menu.`);
+      await send.text(`That is ${LIMITS.MAX_BOOKINGS_PER_HOUR} bookings in an hour — please give it a little while before making another.\n\nIf you need something urgently, call us.`
+        + await clinicPhoneLine(schema, ctx.hospital_id));
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -916,10 +971,11 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       tenant: tenant.slug, used: quota.used, limit: quota.limit,
     });
     await send.text(
-      '⚠️ *Online booking temporarily unavailable*\n\n' +
-      'This clinic cannot accept more online bookings right now. ' +
-      'Please call the clinic directly to book your appointment.\n\n' +
-      'Reply *Menu* for the main menu.'
+      '*Online booking is paused*\n\n' +
+      'We are not taking more bookings through WhatsApp at the moment. ' +
+      'Please call us and we will book you in.\n\n' +
+      'Reply *Menu* to go back.'
+      + await clinicPhoneLine(schema, ctx.hospital_id)
     );
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
@@ -955,10 +1011,10 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     // Phone is no longer unique (family booking) so we use a plain INSERT for new profiles.
     if (!patientId) {
       const pr = await client.query(
-        `INSERT INTO patients (phone, name, date_of_birth, gender, email, visit_count)
-         VALUES ($1,$2,$3,$4,$5,1)
+        `INSERT INTO patients (phone, name, date_of_birth, gender, visit_count)
+         VALUES ($1,$2,$3,$4,1)
          RETURNING id`,
-        [phone, ctx.patient_name, ctx.patient_dob || null, ctx.patient_gender || null, ctx.patient_email || null]);
+        [phone, ctx.patient_name, ctx.patient_dob || null, ctx.patient_gender || null]);
       patientId = pr.rows[0].id;
     } else {
       await client.query(
@@ -1040,21 +1096,21 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       await client.query('ROLLBACK');
       if (existing.rows.length) {
         await send.text(
-          `✅ *Booking Already Confirmed*\n\n` +
-          `Looks like this appointment is already booked — no action needed!\n\n` +
-          `🪪 Booking ID: *${existing.rows[0].booking_id}*\n\n` +
-          `Reply *Menu* for the main menu, or *My Appointments* to view details.`
+          `*Already booked*\n\n` +
+          `This appointment is confirmed — there is nothing more to do.\n\n` +
+          `Booking ID *${existing.rows[0].booking_id}*\n\n` +
+          `Reply *My* to see the details.`
         );
         await updateSession(schema, phone, STATES.IDLE, {});
         return;
       }
       await send.text(dayClosed.rows.length
-        ? '⚠️ *That day is no longer open*\n\n' +
-          'The clinic has since closed that date. Please pick another day.\n\n' +
-          'Reply *Menu* to go back to the menu.'
-        : '⚠️ *Slot no longer available*\n\n' +
-          'Someone just booked that slot. Please choose a different time.\n\n' +
-          'Reply *Menu* to go back to the menu.'
+        ? '*That day has just been closed*\n\n' +
+          'The clinic is no longer open then. Please pick another day.\n\n' +
+          'Reply *Menu* to go back.'
+        : '*Someone just took that time*\n\n' +
+          'It went while you were deciding. Please choose another.\n\n' +
+          'Reply *Menu* to go back.'
       );
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
@@ -1115,18 +1171,18 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     if (err.code === 'PLAN_NOT_BOOKABLE') {
       logger.info('Treatment sitting no longer bookable', { plan: ctx.treatment_plan_id });
       await send.text(
-        'ℹ️ All sittings for this treatment are already booked.\n\n' +
-        'Reply *My* to see your appointments, or *Menu* for the main menu.'
+        'Every sitting for this treatment is already in the diary.\n\n' +
+        'Reply *My* to see them.'
       );
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
     logger.error('Booking transaction failed', { error: err.message });
     await send.text(
-      '⚠️ *Something went wrong*\n\n' +
-      'We were unable to complete your booking. Please try again.\n\n' +
-      'If this keeps happening, contact the clinic directly.\n\n' +
-      'Reply *Menu* to try again.'
+      '*Something went wrong at our end*\n\n' +
+      'Nothing was booked, so no time has been held for you.\n\n' +
+      'Reply *Menu* to try again — and please call us if it happens twice.'
+      + await clinicPhoneLine(schema, ctx.hospital_id)
     );
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
@@ -1164,7 +1220,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     `✅ *Booked*\n\n` +
     `*${dateLabel}*\n` +
     `*${(ctx.appointment_time || '').slice(0, 5)}* with Dr. ${ctx.doctor_name}\n\n` +
-    `${ctx.hospital_name}\n` +
+    `At ${ctx.hospital_name}\n` +
     `Booking ID *${bookingId}*\n\n` +
     `Please arrive 10 minutes early, and bring any previous X-rays or a list of your medicines.\n\n` +
     `We'll remind you the day before. Reply *Menu* to reschedule or cancel.`;
@@ -1192,68 +1248,14 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
       }
     })(),
     (async () => {
-      if (!patientId) return;
+      // Tell the clinic. WhatsApp is the only channel — the email and SMS
+      // fan-outs that used to sit here are gone with services/email.js and
+      // services/sms.js. notifyAdminWhatsApp already fans out to every admin
+      // with a notify_phone, so it is called ONCE; it used to be called inside
+      // a per-admin loop, which sent each admin N copies (N admins → N²).
       try {
-        const patientR = await tenantQuery(schema, `SELECT email FROM patients WHERE id=$1`, [patientId]);
-        const patientEmail = patientR.rows[0]?.email;
-        if (!patientEmail) return;
-        let dateLabel2 = ctx.appointment_date;
-        try { dateLabel2 = format(parseISO(ctx.appointment_date), 'EEE, d MMM yyyy'); } catch {}
-        await emailService.queueEmail('booking_confirmation', {
-          toEmail: patientEmail,
-          data: {
-            bookingId,
-            patientName: ctx.patient_name,
-            doctorName: ctx.doctor_name,
-            hospitalName: ctx.hospital_name,
-            date: dateLabel2,
-            time: ctx.appointment_time?.slice(0, 5),
-            visitType: ctx.visit_type || 'in_person',
-            patientId,
-            schemaName: schema,
-          },
-        });
-      } catch (emailErr) {
-        logger.error('Email confirmation failed', { error: emailErr.message });
-      }
-    })(),
-    (async () => {
-      // Notify clinic admins of new booking
-      try {
-        const adminUsers = await tenantQuery(schema,
-          `SELECT email, notify_phone FROM users WHERE role = 'admin' AND is_active = true LIMIT 3`);
         let dateLabel3 = ctx.appointment_date;
         try { dateLabel3 = format(parseISO(ctx.appointment_date), 'EEE, d MMM yyyy'); } catch {}
-        for (const admin of adminUsers.rows) {
-          await emailService.queueEmail('admin_booking_alert', {
-            toEmail: admin.email,
-            bookingId,
-            patientName: ctx.patient_name,
-            doctorName: ctx.doctor_name,
-            hospitalName: ctx.hospital_name,
-            date: dateLabel3,
-            time: ctx.appointment_time?.slice(0, 5),
-            visitType: ctx.visit_type || 'in_person',
-          });
-          if (admin.notify_phone) {
-            try {
-              const { sendAdminBookingAlertSMS } = require('../sms');
-              await sendAdminBookingAlertSMS(admin.notify_phone, {
-                bookingId,
-                patientName: ctx.patient_name,
-                doctorName: ctx.doctor_name,
-                hospitalName: ctx.hospital_name,
-                date: dateLabel3,
-                time: ctx.appointment_time?.slice(0, 5),
-              });
-            } catch (smsErr) {
-              logger.warn('Admin SMS alert failed', { error: smsErr.message });
-            }
-          }
-        }
-        // notifyAdminWhatsApp fans out to every admin with a notify_phone itself,
-        // so it must be called ONCE — calling it inside the per-admin loop above
-        // sent each admin N copies of the same alert (N admins → N² messages).
         try {
           await notifyAdminWhatsApp(schema, tenant,
             `🆕 *New Appointment Booked*\n\n` +

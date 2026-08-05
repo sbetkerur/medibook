@@ -240,36 +240,71 @@ async function run() {
     assert.strictEqual(db.appointments[0].status, 'confirmed');
   });
 
-  await test('the re-ask rebinds, so tapping ITS button then cancels', async () => {
+  await test('the re-ask rebinds, so tapping ITS cancel button then cancels', async () => {
     restoreAppointment();
     const ctx = await cancelCtx();
     reset();
     await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, STALE_BTN_0);
     const freshIds = lastButtonIds();
     reset();
-    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, freshIds[0]);
+    // [1], not [0]: the re-ask offers "Move it instead" first too.
+    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, freshIds[1]);
     assert.strictEqual(db.appointments[0].status, 'cancelled', 'fresh tap did not cancel: ' + texts());
     assert(/\*Cancelled\*/.test(texts()), texts());
   });
 
-  await test('tapping the real "Yes, Cancel It" button cancels', async () => {
-    restoreAppointment();
-    const ctx = await cancelCtx();
-    const ids = lastButtonIds();
-    reset();
-    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, ids[0]);
-    assert.strictEqual(db.appointments[0].status, 'cancelled', 'real tap did not cancel: ' + texts());
-    assert.strictEqual(db.slots.get('slot-9'), 'available', 'slot not released');
-  });
-
-  await test('tapping the real "No, Keep It" button keeps the appointment', async () => {
+  await test('tapping the real "Yes, cancel it" button cancels', async () => {
     restoreAppointment();
     const ctx = await cancelCtx();
     const ids = lastButtonIds();
     reset();
     await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, ids[1]);
+    assert.strictEqual(db.appointments[0].status, 'cancelled', 'real tap did not cancel: ' + texts());
+    assert.strictEqual(db.slots.get('slot-9'), 'available', 'slot not released');
+  });
+
+  await test('tapping the real "No, keep it" button keeps the appointment', async () => {
+    restoreAppointment();
+    const ctx = await cancelCtx();
+    const ids = lastButtonIds();
+    reset();
+    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, ids[2]);
     assert.strictEqual(db.appointments[0].status, 'confirmed');
     assert(/Still on/.test(texts()), texts());
+  });
+
+  // ── THE SAVE ───────────────────────────────────────────────
+  // A patient who rings to cancel is routinely offered another day and takes
+  // it. The bot used to automate only the losing half of that conversation:
+  // "Schedule conflict" was one of the reasons on the previous screen and
+  // still went straight to a red button.
+  await test('"Move it instead" does NOT cancel the appointment', async () => {
+    restoreAppointment();
+    const ctx = await cancelCtx();
+    const ids = lastButtonIds();
+    reset();
+    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, ids[0]);
+    assert.strictEqual(db.appointments[0].status, 'confirmed',
+      'the save path cancelled the appointment: ' + texts());
+  });
+
+  await test('typing "move" is the save too', async () => {
+    restoreAppointment();
+    const ctx = await cancelCtx();
+    reset();
+    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, 'move');
+    assert.strictEqual(db.appointments[0].status, 'confirmed', texts());
+  });
+
+  // A STALE btn_0 must not reach the save either — it is unverifiable, and the
+  // re-ask is the only correct answer to a tap we cannot attribute.
+  await test('a stale btn_0 re-asks rather than silently rescheduling', async () => {
+    restoreAppointment();
+    const ctx = await cancelCtx();
+    reset();
+    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, STALE_BTN_0);
+    assert(/older message/.test(texts()), 'expected a re-ask: ' + texts());
+    assert.strictEqual(db.appointments[0].status, 'confirmed');
   });
 
   await test('typed "yes" still cancels (unchanged)', async () => {
@@ -280,16 +315,16 @@ async function run() {
     assert.strictEqual(db.appointments[0].status, 'cancelled', texts());
   });
 
-  await test('typed "1" still cancels (numbered text fallback)', async () => {
+  await test('typed "2" cancels (numbered text fallback, shifted by the save)', async () => {
     restoreAppointment();
     const ctx = await cancelCtx();
     reset();
-    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, '1');
+    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, '2');
     assert.strictEqual(db.appointments[0].status, 'cancelled', texts());
   });
 
   await test('negative intent still wins over the word "cancel" it contains', async () => {
-    for (const reply of ['no', "no, don't cancel", 'keep it', 'nahi', '2']) {
+    for (const reply of ['no', "no, don't cancel", 'keep it', 'nahi', '3']) {
       restoreAppointment();
       const ctx = await cancelCtx();
       reset();
@@ -339,7 +374,7 @@ async function run() {
     reset();
     await handleSelectDate(PHONE, SCHEMA, tenant, send, ctx, 'tomorrow');
     assert(!/Booking cancelled/.test(texts()), 'booking was discarded: ' + texts());
-    assert(/couldn't tell which date/.test(texts()), texts());
+    assert(/tell which date/.test(texts()), texts());
     assert.strictEqual(db.sessions.get(PHONE).state, STATES.SELECT_DATE, 'left the date step');
   });
 
@@ -380,7 +415,7 @@ async function run() {
     reset();
     await handleSelectSlot(PHONE, SCHEMA, tenant, send, ctx, 'morning', 'morning');
     assert(!/Booking cancelled/.test(texts()), 'booking was discarded: ' + texts());
-    assert(/couldn't tell which time/.test(texts()), texts());
+    assert(/tell which time/.test(texts()), texts());
     assert.strictEqual(db.sessions.get(PHONE).state, STATES.SELECT_SLOT);
     assert.strictEqual(ctx.slot_id, undefined);
   });
@@ -398,7 +433,7 @@ async function run() {
     await updateSession(SCHEMA, PHONE, STATES.COLLECT_FEEDBACK_RATING, { feedback_appointment_id: 'appt-1' });
     reset();
     await botEngine.handle({ phone: PHONE, text: '3rd visit, staff were lovely', tenant });
-    assert(/1 to 5/.test(texts()), 'expected a re-prompt, got: ' + texts());
+    assert(/\*1\* to \*5\*/.test(texts()), 'expected a re-prompt, got: ' + texts());
     assert.strictEqual(db.sessions.get(PHONE).state, STATES.COLLECT_FEEDBACK_RATING,
       'a comment was accepted as a rating');
   });

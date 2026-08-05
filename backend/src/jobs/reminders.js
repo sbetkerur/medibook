@@ -6,7 +6,6 @@ const { toZonedTime, IST_TODAY_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
 const { FEEDBACK_BATCH_LIMIT } = require('../utils/errors');
-const emailService = require('../services/email');
 // Cron sends go through these so they land in the tenant's message history —
 // wa.sendText/sendTemplate on their own do not record anything.
 const { sendPatientText, sendPatientTemplate, sendPatientMessage } = require('../services/outbound');
@@ -16,7 +15,10 @@ const { sendPatientText, sendPatientTemplate, sendPatientMessage } = require('..
 const { KINDS, recordPendingReply } = require('../services/pendingReply');
 // Persistent logs (logs/combined.log in production) must not carry full patient
 // numbers — same helper the webhook and bot engine use.
-const { maskPhone } = require('../services/bot/utils');
+const { maskPhone, notifyAdminWhatsApp } = require('../services/bot/utils');
+// Reminders are NEVER gated by this — a patient with an appointment tomorrow
+// wants that message. Only the discretionary sends below are.
+const { canSendDiscretionary, budgetFor } = require('../services/messageBudget');
 
 // Allow timezone override via env var so multi-region deployments work without code changes
 const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
@@ -100,7 +102,7 @@ async function sendReminders() {
             treatmentLine +
             `🦷 *${dt} at ${(appt.appointment_time || '').slice(0, 5)}*\n` +
             `with Dr. ${appt.doctor_name}\n\n` +
-            `📍 ${appt.hospital_name}` +
+            `At ${appt.hospital_name}` +
             `${departmentChecklist}\n\n` +
             `Arriving 10 minutes early helps us start on time. If you can't make it, tell us now and we'll offer the slot to someone who's waiting.\n\n` +
             `Reply *Yes* to confirm, or *Reschedule* / *Cancel Appointment*.`;
@@ -158,11 +160,19 @@ async function sendReminders() {
       const r2 = await tenantQuery(tenant.schema_name, `
         SELECT a.id, a.booking_id, a.appointment_date::text as appointment_date, a.appointment_time,
                p.phone, p.name as patient_name, d.name as doctor_name,
+               -- hospitals is joined for hospital_name, which the 2h reminder
+               -- needs for the same reason the 24h one does: on a shared number
+               -- a message that never names the clinic is genuinely ambiguous.
+               -- It is also a TEMPLATE parameter, and Meta rejects the whole
+               -- send when a parameter is undefined — so a missing join here
+               -- silences the reminder rather than merely shortening it.
+               h.name as hospital_name,
                dep.pre_visit_checklist,
                tp.title AS treatment_title, tp.total_visits, a.visit_number
         FROM appointments a
         JOIN patients p ON p.id=a.patient_id
         JOIN doctors d ON d.id=a.doctor_id
+        JOIN hospitals h ON h.id=a.hospital_id
         LEFT JOIN treatment_plans tp ON tp.id=a.treatment_plan_id
         LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         WHERE a.status='confirmed'
@@ -198,7 +208,7 @@ async function sendReminders() {
             `Your appointment with Dr. ${appt.doctor_name} is at *${(appt.appointment_time || '').slice(0, 5)}*` +
             (dayLabel === 'Tomorrow' ? ' tomorrow' : '') + `.` +
             `${departmentChecklist}\n\n` +
-            `See you shortly — we're ready for you.`;
+            `${appt.hospital_name} — see you shortly.`;
 
           // Try template first, fall back to plain text with pre-visit checklist
           try {
@@ -211,6 +221,10 @@ async function sendReminders() {
                 parameters: [
                   { type: 'text', text: appt.doctor_name },
                   { type: 'text', text: (appt.appointment_time || '').slice(0, 5) },
+                  // {{3}} — added so a reminder from a shared number says who
+                  // it is from. Appended, not inserted, so the existing
+                  // placeholders keep their numbers.
+                  { type: 'text', text: appt.hospital_name },
                 ]
               }],
               reminderText,
@@ -333,6 +347,11 @@ async function sendPostAppointmentFollowup() {
     for (const appt of appts.rows) {
       try {
         const firstName = appt.patient_name ? appt.patient_name.split(' ')[0] : 'there';
+        // Over budget: this patient has already had a week's worth of messages
+        // from this clinic. Skipping leaves feedback_request_sent false, so it
+        // is reconsidered on a later run rather than lost.
+        if (!await canSendDiscretionary(tenant.schema_name, appt.phone, budgetFor(tenant))) continue;
+
         // Template-first: a feedback request goes out the day AFTER the visit,
         // by which point the patient is outside Meta's 24-hour window and a
         // plain text send is rejected. Same reasoning as the reminders above,
@@ -345,6 +364,7 @@ async function sendPostAppointmentFollowup() {
             parameters: [
               { type: 'text', text: firstName },
               { type: 'text', text: appt.doctor_name },
+              { type: 'text', text: tenant.name },
             ],
           }],
           // In step with the `appointment_feedback_request` template. The full
@@ -353,8 +373,8 @@ async function sendPostAppointmentFollowup() {
           // accepts 1–5; it just isn't recited.
           text:
             `⭐ *How did we do?*\n\n` +
-            `Hi ${firstName}, we hope Dr. ${appt.doctor_name} took good care of you yesterday.\n\n` +
-            `Reply with a number from *1* (poor) to *5* (excellent) — it takes a second and helps us look after everyone a little better.`,
+            `Hi ${firstName}, we hope Dr. ${appt.doctor_name} at ${tenant.name} took good care of you yesterday.\n\n` +
+            `Reply with a number from *1* (poor) to *5* (excellent). It goes only to the clinic — nothing is published anywhere.`,
         });
         // Trigger feedback state in bot session.
         // Use the appointment's OWN patient_id. This used to re-look-up by phone
@@ -424,6 +444,16 @@ async function sendFeedbackRequests() {
                                    AND ${IST_TODAY_SQL} - INTERVAL '1 day'
         AND a.follow_up_sent IS NOT TRUE
         AND a.feedback_request_sent IS NOT TRUE
+        -- Once per patient per month, not once per appointment. Keyed on the
+        -- PATIENT rather than the phone: a family shares one number, and the
+        -- father's root canal must not silence the daughter's first visit.
+        AND NOT EXISTS (
+          SELECT 1 FROM appointments prev
+           WHERE prev.patient_id = a.patient_id
+             AND prev.id <> a.id
+             AND prev.feedback_request_sent IS TRUE
+             AND prev.updated_at >= NOW() - INTERVAL '30 days'
+        )
         AND NOT EXISTS (
           SELECT 1 FROM appointment_feedback af WHERE af.appointment_id=a.id
         )
@@ -454,12 +484,14 @@ async function sendFeedbackRequests() {
         // their failure is the one they don't answer. The discomfort line
         // supplies the urgency instead.
         const message = appt.status === 'no_show'
-          ? `Hi ${firstName}, you weren't able to make your appointment with Dr. ${appt.doctor_name} ${visitLabel} — that's alright, it happens.\n\n` +
+          ? `Hi ${firstName}, you weren't able to make your appointment with Dr. ${appt.doctor_name} at ${tenant.name} ${visitLabel} — that's alright, it happens.\n\n` +
             `Whenever you're ready we'll find you another time. Sooner is better if you were in any discomfort.\n\n` +
             `Reply *Menu* to book.`
           : `⭐ *How did we do?*\n\n` +
-            `Hi ${firstName}, we hope Dr. ${appt.doctor_name} took good care of you.\n\n` +
-            `Reply with a number from *1* (poor) to *5* (excellent) — it takes a second and helps us look after everyone a little better.`;
+            `Hi ${firstName}, we hope Dr. ${appt.doctor_name} at ${tenant.name} took good care of you.\n\n` +
+            `Reply with a number from *1* (poor) to *5* (excellent). It goes only to the clinic — nothing is published anywhere.`;
+        if (!await canSendDiscretionary(tenant.schema_name, appt.phone, budgetFor(tenant))) continue;
+
         // Template-first for the same reason as the feedback job: this runs
         // days after the visit, well outside the 24-hour window.
         await sendPatientMessage(tenant.schema_name, appt.phone, {
@@ -470,6 +502,9 @@ async function sendFeedbackRequests() {
             parameters: [
               { type: 'text', text: firstName },
               { type: 'text', text: appt.doctor_name },
+              // {{3}} on BOTH templates — they are interchangeable here, so the
+              // parameter list has to fit either.
+              { type: 'text', text: tenant.name },
             ],
           }],
           text: message,
@@ -501,45 +536,71 @@ async function sendFeedbackRequests() {
   });
 }
 
-// ── WEEKLY DENTIST PERFORMANCE DIGEST ────────────────────────
+// ── WEEKLY SUMMARY FOR THE OWNER ─────────────────────────────
+/**
+ * The one report that reaches a clinic owner without them logging in.
+ *
+ * It used to be an email, and went out with services/email.js. That left the
+ * dashboard as the only place to see how the week went — and an owner who is
+ * chairside all day does not open the dashboard. So it now goes where they
+ * already are: WhatsApp, to whichever admins have set a notify_phone.
+ *
+ * Deliberately short. A wall of per-dentist statistics is a report nobody reads
+ * twice; the numbers here are the ones an owner acts on — who came, who did
+ * not, and what is still owed to the practice in unbooked treatment.
+ */
 async function sendWeeklyDigests() {
   const nowIST = toZonedTime(new Date(), TIMEZONE);
-  // Use the previous 7 days as the reporting window
   const rangeEnd   = format(nowIST, 'yyyy-MM-dd');
   const rangeStart = format(subWeeks(nowIST, 1), 'yyyy-MM-dd');
 
   await forEachActiveTenantParallel('sendWeeklyDigests', async (tenant) => {
     try {
-      // Get all admin users for this tenant
-      const adminR = await tenantQuery(tenant.schema_name,
-        `SELECT email, name FROM users WHERE role='admin' AND is_active=true LIMIT 5`);
-      if (!adminR.rows.length) return;
+      const [statsR, outstandingR] = await Promise.all([
+        tenantQuery(tenant.schema_name, `
+          SELECT COUNT(*)::int AS total,
+                 COUNT(*) FILTER (WHERE a.status='completed')::int AS completed,
+                 COUNT(*) FILTER (WHERE a.status='no_show')::int   AS no_show,
+                 COUNT(*) FILTER (WHERE a.status='cancelled')::int AS cancelled,
+                 COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee))
+                          FILTER (WHERE a.status IN ('confirmed','completed')), 0)::int AS revenue
+          FROM appointments a JOIN doctors d ON d.id=a.doctor_id
+          WHERE a.appointment_date BETWEEN $1 AND $2
+        `, [rangeStart, rangeEnd]),
+        // Treatment advised and never booked — revenue already agreed and
+        // sitting idle. This is the number that makes the message worth opening.
+        tenantQuery(tenant.schema_name, `
+          SELECT COUNT(*)::int AS n FROM treatment_plans
+           WHERE status NOT IN ('completed','cancelled','declined')
+        `).catch(() => ({ rows: [{ n: null }] })),
+      ]);
 
-      // Per-doctor stats for the past week
-      const statsR = await tenantQuery(tenant.schema_name, `
-        SELECT d.name,
-               COUNT(*)::int AS total,
-               COUNT(*) FILTER (WHERE a.status='completed')::int AS completed,
-               COUNT(*) FILTER (WHERE a.status='no_show')::int AS no_show,
-               COUNT(*) FILTER (WHERE a.status='cancelled')::int AS cancelled,
-               COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)) FILTER (WHERE a.status IN ('confirmed','completed')), 0)::int AS revenue
-        FROM appointments a JOIN doctors d ON d.id=a.doctor_id
-        WHERE a.appointment_date BETWEEN $1 AND $2
-        GROUP BY d.name ORDER BY total DESC
-      `, [rangeStart, rangeEnd]);
+      const st = statsR.rows[0] || {};
+      if (!st.total) return; // a week with no appointments is not worth a message
 
-      const stats = {
-        weekStart: rangeStart,
-        weekEnd: rangeEnd,
-        doctors: statsR.rows,
-      };
+      let label = `${rangeStart} to ${rangeEnd}`;
+      try {
+        label = `${format(parseISO(rangeStart), 'd MMM')} – ${format(parseISO(rangeEnd), 'd MMM')}`;
+      } catch (_) {}
 
-      for (const admin of adminR.rows) {
-        await emailService.sendWeeklyDigest(admin.email, tenant.name, stats);
-      }
-      logger.info(`Weekly digest sent for tenant ${tenant.name}`);
+      const outstanding = outstandingR.rows[0]?.n;
+      const message =
+        `📊 *Last week at ${tenant.name}*\n` +
+        `_${label}_\n\n` +
+        `${st.total} appointment${st.total === 1 ? '' : 's'} · ${st.completed} completed\n` +
+        `${st.no_show} no-show${st.no_show === 1 ? '' : 's'} · ${st.cancelled} cancelled\n` +
+        `₹${st.revenue.toLocaleString('en-IN')} booked\n` +
+        (outstanding ? `\n${outstanding} treatment${outstanding === 1 ? '' : 's'} advised and not yet booked.\n` : '') +
+        `\nOpen the dashboard for the detail.`;
+
+      // notifyAdminWhatsApp fans out to every admin with a notify_phone and
+      // logs each send, so it is called ONCE — never inside a per-admin loop.
+      // A clinic with no notify_phone set simply gets nothing, which is the
+      // correct behaviour for a number we were never given.
+      await notifyAdminWhatsApp(tenant.schema_name, tenant, message);
+      logger.info(`Weekly summary sent for tenant ${tenant.name}`);
     } catch (err) {
-      logger.error(`Weekly digest failed for ${tenant.name}`, { error: err.message });
+      logger.error(`Weekly summary failed for ${tenant.name}`, { error: err.message });
     }
   });
 }
@@ -591,20 +652,6 @@ function startReminderCron() {
     });
   });
 
-  // Weekly digest: every Monday at 8 AM IST (02:30 UTC)
-  const digestTask = cron.schedule('30 2 * * 1', async () => {
-    await withCronLock('cron:weekly_digest', 3600, async () => {
-      logger.info('Running weekly digest cron...');
-      try {
-        await sendWeeklyDigests();
-        await query(`UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='weekly_digest'`).catch(() => {});
-      } catch (err) {
-        logger.error('Weekly digest cron error', { error: err.message });
-        await query(`UPDATE cron_jobs SET last_run_at=NOW(), last_status='error', last_error=$1 WHERE job_name='weekly_digest'`, [err.message.slice(0, 500)]).catch(() => {});
-      }
-    });
-  });
-
   // Post-appointment follow-up: every 30 minutes
   const followupTask = cron.schedule('*/30 * * * *', async () => {
     await withCronLock('cron:post_appt_followup', 1740, async () => {
@@ -615,10 +662,24 @@ function startReminderCron() {
   });
   logger.info('Post-appointment follow-up cron registered (every 30 minutes)');
 
+  // Weekly summary: Mondays 8 AM IST (02:30 UTC)
+  const digestTask = cron.schedule('30 2 * * 1', async () => {
+    await withCronLock('cron:weekly_digest', 3600, async () => {
+      logger.info('Running weekly summary cron...');
+      try {
+        await sendWeeklyDigests();
+        await query(`UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='weekly_digest'`).catch(() => {});
+      } catch (err) {
+        logger.error('Weekly summary cron error', { error: err.message });
+        await query(`UPDATE cron_jobs SET last_run_at=NOW(), last_status='error', last_error=$1 WHERE job_name='weekly_digest'`, [err.message.slice(0, 500)]).catch(() => {});
+      }
+    });
+  });
+
   logger.info('Reminder cron registered (runs hourly)');
   logger.info('Feedback cron registered (daily at 10 AM IST)');
-  logger.info('Weekly digest cron registered (Mondays 8 AM IST)');
-  return [reminderTask, feedbackTask, digestTask, followupTask];
+  logger.info('Weekly summary cron registered (Mondays 8 AM IST)');
+  return [reminderTask, feedbackTask, followupTask, digestTask];
 }
 
 module.exports = {

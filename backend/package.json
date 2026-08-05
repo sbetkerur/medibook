@@ -6,7 +6,8 @@
     "start": "node src/db/migrate.js && node src/index.js",
     "migrate": "node src/db/migrate.js",
     "seed": "node src/db/seed.js",
-    "test": "node tests/bot.test.js"
+    "test": "node tests/bot.test.js",
+    "qr:export": "node scripts/exportClinicQrCodes.js"
   },
   "dependencies": {
     "@sentry/node": "^10.44.0",
@@ -29,7 +30,7 @@
     "jsonwebtoken": "^9.0.2",
     "node-cron": "^3.0.3",
     "pg": "^8.11.3",
-    "resend": "^2.0.0",
+    "qrcode": "^1.5.4",
     "winston": "^3.11.0"
   },
   "devDependencies": {

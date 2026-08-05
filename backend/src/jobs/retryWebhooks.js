@@ -108,23 +108,9 @@ async function retryFailedWebhooks() {
         );
         logger.error(`Webhook permanently failed after ${row.max_attempts} attempts`, { id: row.id });
 
-        // Alert super admins via email
-        try {
-          const emailService = require('../services/email');
-          const admins = await query(`SELECT email FROM super_admins LIMIT 3`);
-          for (const admin of admins.rows) {
-            await emailService.sendAdminBookingAlert({
-              toEmail: admin.email,
-              bookingId: `WEBHOOK-${row.id.slice(-8).toUpperCase()}`,
-              patientName: `Phone: ****${row.phone.slice(-4)}`,
-              doctorName: 'N/A',
-              hospitalName: row.name || 'Unknown Tenant',
-              date: new Date().toISOString().slice(0, 10),
-              time: new Date().toTimeString().slice(0, 5),
-              visitType: `Failed after ${row.max_attempts} retries: ${err.message?.slice(0, 100)}`,
-            });
-          }
-        } catch (_) {}
+        // A permanently failed webhook used to raise a super-admin email.
+        // With email gone the log line above is the only signal — it carries the
+        // row id, and `failed_webhooks` keeps the payload for inspection.
       } else {
         // Exponential backoff: 2^attempts minutes
         const backoffMinutes = Math.min(Math.pow(2, nextAttemptNum), 1440); // cap at 24h

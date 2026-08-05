@@ -19,8 +19,8 @@ export default function SuperAdminPage() {
   const [suspending, setSuspending] = useState(false);
 
   // City edit state. There is no general tenant-edit modal, and city is the one
-  // field the bot's "clinics near me" search depends on, so it gets its own
-  // focused affordance rather than waiting for a full edit form.
+  // clinic field with no other editor anywhere, so it gets its own focused
+  // affordance rather than waiting for a full edit form.
   const [cityModal, setCityModal] = useState(null); // { tenant }
   const [cityValue, setCityValue] = useState('');
   const [savingCity, setSavingCity] = useState(false);
@@ -337,9 +337,7 @@ export default function SuperAdminPage() {
                       <div className="min-w-0">
                         <div className="font-medium text-gray-900 break-words">{t.name}</div>
                         {/* City rides under the clinic name rather than getting its
-                            own column/row, matching the desktop table. Rendered even
-                            when empty: no city means the clinic never appears in the
-                            bot's "near me" results, which must not be invisible. */}
+                            own column/row, matching the desktop table. */}
                         <div className="text-xs text-gray-500 break-words">
                           {t.city || <span className="text-gray-400">— no city —</span>}
                         </div>
@@ -428,9 +426,7 @@ export default function SuperAdminPage() {
                       <tr key={t.id} className="hover:bg-gray-50">
                         {/* City lives inside the Clinic cell rather than as a tenth
                             column: this table is already wide enough to scroll at md,
-                            and a sub-line needs no header/colSpan change. Rendered
-                            even when empty — a clinic with no city is silently
-                            excluded from the bot's "near me" results. */}
+                            and a sub-line needs no header/colSpan change. */}
                         <td className="px-4 py-3 font-medium text-gray-900">
                           {t.name}
                           <div className="text-xs font-normal text-gray-500">
@@ -1037,8 +1033,8 @@ export default function SuperAdminPage() {
               <button onClick={() => setCityModal(null)} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">✕</button>
             </div>
             <p className="text-sm text-gray-600 mb-4 break-words">
-              The city for <strong>{cityModal.tenant.name}</strong>. Patients use it to find this clinic
-              through the bot&apos;s &quot;clinics near me&quot; search — clear it to remove the clinic from those results.
+              The city for <strong>{cityModal.tenant.name}</strong>. Used to label the clinic in admin
+              and billing views; patients reach it by scanning its QR code, so this does not affect booking.
             </p>
             <div className="mb-5">
               <label className="block text-xs font-medium text-gray-700 mb-1">City (leave blank to clear)</label>

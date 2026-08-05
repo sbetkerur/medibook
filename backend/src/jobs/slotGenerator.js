@@ -82,28 +82,37 @@ function planDoctorSlots(doc, today, days, isBlockedDay) {
 
   for (let i = 0; i <= days; i++) {
     const date = addDays(today, i);
-    const sched = doc.schedules.find(s => s.dow === date.getDay());
-    if (!sched) continue;
+    // filter, NOT find. A working day is a LIST of sessions: an Indian dentist
+    // routinely does 10–1 at one branch and 5–9 at another on the same day, and
+    // `.find()` silently dropped every session after the first — so the second
+    // branch generated no slots and reported no error.
+    const sessions = doc.schedules.filter(s => s.dow === date.getDay());
+    if (!sessions.length) continue;
 
+    const dateStr = format(date, 'yyyy-MM-dd');
+
+    for (const sched of sessions) {
     // A visiting consultant who comes on the 1st and 3rd Saturday. Empty or
     // absent means every week, which is what every schedule meant before this
     // existed — so an unset value must never filter anything out.
     if (!matchesWeekOfMonth(sched.weeksOfMonth, date)) continue;
 
-    // The branch for THIS weekday (doctor_hospitals), falling back to the
-    // doctor's primary. Stamped per slot rather than per doctor: one doctor row
-    // can now serve Monday at one branch and Wednesday at another.
+    // The branch for THIS session, falling back to the doctor's primary.
+    // Stamped per slot rather than per doctor: one doctor row can serve Monday
+    // morning at one branch and Monday evening at another.
     const hospitalId = sched.hospitalId || doc.hospital_id;
 
-    const dateStr = format(date, 'yyyy-MM-dd');
+    // Per branch: a holiday at one branch must not close the session the
+    // doctor spends at the other, even on the same day.
     if (isBlockedDay(dateStr, hospitalId)) continue;
 
-    for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
-      // Today only: skip slots whose start time has already passed. Booking
-      // rejects them anyway (see completeBooking's time predicate), so
-      // generating them would just show patients times they cannot take.
-      if (i === 0 && st <= nowHHMM) continue;
-      planned.push({ dateStr, st, et, hospitalId });
+      for (const { st, et } of computeDaySlotTimes(sched.start, sched.end, doc.duration, sched.lunchStart, sched.lunchEnd)) {
+        // Today only: skip slots whose start time has already passed. Booking
+        // rejects them anyway (see completeBooking's time predicate), so
+        // generating them would just show patients times they cannot take.
+        if (i === 0 && st <= nowHHMM) continue;
+        planned.push({ dateStr, st, et, hospitalId });
+      }
     }
   }
   return planned;
@@ -233,18 +242,25 @@ async function updateNoShowScores(schema) {
 }
 
 async function generateSlotsForTenant(schema) {
-  // doctor_hospitals supplies the branch for a given weekday when the doctor
-  // visits more than one. LEFT JOIN, so a doctor without those rows behaves
-  // exactly as before: every day at doctors.hospital_id.
+  // One row per SESSION. `doctor_schedules.hospital_id` is now the branch for
+  // that session, so a dentist can have two rows for one weekday — 10–1 here,
+  // 5–9 there. It is only joined back to doctor_hospitals for rows written
+  // before that column existed and never backfilled; NULL in both still means
+  // the doctor's primary branch, which is every non-visiting doctor.
+  //
+  // The join is scoped to the SESSION's branch, not just the weekday. Matching
+  // on weekday alone is what produced the original bug: two branch rows for one
+  // day multiplied every schedule row in two.
   const doctors = await tenantQuery(schema,
     `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
             s.day_of_week, s.start_time, s.end_time,
             s.lunch_start_time, s.lunch_end_time, s.week_of_month,
-            dh.hospital_id AS day_hospital_id
+            COALESCE(s.hospital_id, dh.hospital_id) AS day_hospital_id
      FROM doctors d
      JOIN doctor_schedules s ON s.doctor_id=d.id
      LEFT JOIN doctor_hospitals dh
        ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
+      AND s.hospital_id IS NULL
      WHERE d.is_active=true AND s.is_working=true`);
 
   if (!doctors.rows.length) return 0;

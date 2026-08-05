@@ -197,7 +197,7 @@ router.get('/doctors/:id', validateUUID(), async (req, res) => {
 
 router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
-    const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, department_ids, hospital_id, pricing_rules, is_visiting } = req.body;
+    const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, department_ids, hospital_id, pricing_rules, is_visiting, online_bookable } = req.body;
     const s = req.tenant.schema_name;
     // Validate UUID fields early — PostgreSQL's ::uuid cast would otherwise return 500
     if (hospital_id && !UUID_RE.test(hospital_id)) {
@@ -266,11 +266,17 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
           department_id=CASE WHEN $11::boolean THEN NULL ELSE COALESCE($7::uuid,department_id) END,
           hospital_id=COALESCE($8::uuid,hospital_id),
           pricing_rules=COALESCE($10::jsonb,pricing_rules),
-          is_visiting=COALESCE($12::boolean,is_visiting)
+          is_visiting=COALESCE($12::boolean,is_visiting),
+          -- Whether PATIENTS may pick this dentist in the bot. Distinct from
+          -- is_active: a visiting orthodontist is very much active, they just
+          -- take referred cases rather than walk-in toothache off a menu.
+          -- The desk can still book anyone, either way.
+          online_bookable=COALESCE($13::boolean,online_bookable)
         WHERE id=$9 RETURNING *
       `, [name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active,
           primaryDeptId, hospital_id || null, req.params.id, pricingRulesVal, clearingPrimary,
-          typeof is_visiting === 'boolean' ? is_visiting : null]);
+          typeof is_visiting === 'boolean' ? is_visiting : null,
+          typeof online_bookable === 'boolean' ? online_bookable : null]);
 
       if (replacingSet) {
         await syncDoctorDepartments(client, req.params.id, deptIds);
@@ -318,7 +324,7 @@ router.get('/doctors/:id/schedule', validateUUID(), async (req, res) => {
     // that weekday. NULL means their primary branch, which is every doctor who
     // isn't a visiting consultant.
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT s.*, dh.hospital_id
+      `SELECT s.*, COALESCE(s.hospital_id, dh.hospital_id) AS hospital_id
        FROM doctor_schedules s
        LEFT JOIN doctor_hospitals dh
          ON dh.doctor_id = s.doctor_id AND dh.day_of_week = s.day_of_week
@@ -376,6 +382,30 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
         }
       }
     }
+
+    // A day may now carry SEVERAL sessions — 10–1 at one branch, 5–9 at
+    // another — but they must not overlap, whatever branch each names: a
+    // dentist cannot be in two places at once. Without this check the overlap
+    // is not rejected, it is silently swallowed by the
+    // (doctor_id, slot_date, start_time) unique index on time_slots, and the
+    // second branch simply has no availability with no error anywhere.
+    const byDay = new Map();
+    for (const x of schedules) {
+      if (x.is_working === false) continue;
+      const dow = parseInt(x.day_of_week);
+      if (!byDay.has(dow)) byDay.set(dow, []);
+      byDay.get(dow).push(x);
+    }
+    for (const [dow, list] of byDay) {
+      const sorted = [...list].sort((a, b) => String(a.start_time).localeCompare(String(b.start_time)));
+      for (let i = 1; i < sorted.length; i++) {
+        if (String(sorted[i].start_time) < String(sorted[i - 1].end_time)) {
+          return res.status(400).json({
+            error: `Day ${dow}: sessions overlap (${sorted[i - 1].start_time}-${sorted[i - 1].end_time} and ${sorted[i].start_time}-${sorted[i].end_time}). A dentist cannot be in two places at once.`,
+          });
+        }
+      }
+    }
     const s = req.tenant.schema_name;
 
     // Per-day branches must belong to this tenant and be live, or slots would be
@@ -390,25 +420,46 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
       }
     }
     await tenantTransaction(s, async (client) => {
+      // Replace whole DAYS rather than upserting rows. A day is now a LIST of
+      // sessions, so an upsert keyed on one session can never remove a session
+      // the admin deleted — the evening branch would linger after being taken
+      // off the form, and keep generating slots nobody expected.
+      const submittedDays = [...new Set(schedules.map(x => parseInt(x.day_of_week)))];
+      if (submittedDays.length) {
+        await client.query(
+          `DELETE FROM doctor_schedules WHERE doctor_id=$1 AND day_of_week = ANY($2::int[])`,
+          [req.params.id, submittedDays]);
+        await client.query(
+          `DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND day_of_week = ANY($2::int[])`,
+          [req.params.id, submittedDays]);
+      }
+
       for (const sched of schedules) {
         const weeks = Array.isArray(sched.week_of_month) && sched.week_of_month.length
           ? [...new Set(sched.week_of_month)].sort((a, b) => a - b)
           : null; // null = every week
+
+        // A non-working day is recorded once, with no hours and no branch, so
+        // the GET still reports "closed" rather than an absent row.
         await client.query(`
-          INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working, lunch_start_time, lunch_end_time, week_of_month)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-          ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
-            start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time,
+          INSERT INTO doctor_schedules
+            (doctor_id, day_of_week, start_time, end_time, is_working,
+             lunch_start_time, lunch_end_time, week_of_month, hospital_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          ON CONFLICT (doctor_id, day_of_week, start_time) DO UPDATE SET
+            end_time=EXCLUDED.end_time,
             is_working=EXCLUDED.is_working,
             lunch_start_time=EXCLUDED.lunch_start_time,
             lunch_end_time=EXCLUDED.lunch_end_time,
-            week_of_month=EXCLUDED.week_of_month
-        `, [req.params.id, sched.day_of_week, sched.start_time, sched.end_time, sched.is_working !== false, sched.lunch_start_time || null, sched.lunch_end_time || null, weeks]);
+            week_of_month=EXCLUDED.week_of_month,
+            hospital_id=EXCLUDED.hospital_id
+        `, [req.params.id, sched.day_of_week, sched.start_time, sched.end_time,
+            sched.is_working !== false, sched.lunch_start_time || null,
+            sched.lunch_end_time || null, weeks, sched.hospital_id || null]);
 
-        // The branch worked THAT day. Written to doctor_hospitals, which
-        // slotGenerator reads to stamp each slot — the two must be kept in step
-        // here, since this is the only UI that sets either. Hours are mirrored
-        // for the /locations API's benefit; doctor_schedules stays authoritative.
+        // doctor_hospitals is mirrored for the /locations API. It is no longer
+        // what slot generation reads — doctor_schedules.hospital_id is — so the
+        // two can no longer disagree about which branch a session belongs to.
         if (sched.hospital_id && sched.is_working !== false) {
           await client.query(`
             INSERT INTO doctor_hospitals (doctor_id, hospital_id, day_of_week, start_time, end_time)
@@ -416,17 +467,6 @@ router.post('/doctors/:id/schedule', adminOnly, validateUUID(), async (req, res)
             ON CONFLICT (doctor_id, hospital_id, day_of_week) DO UPDATE
               SET start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time
           `, [req.params.id, sched.hospital_id, sched.day_of_week, sched.start_time, sched.end_time]);
-          // Clearing the day of any OTHER branch: a doctor is at one place on a
-          // given weekday, and a stale row would leave two branches generating
-          // slots for the same hours.
-          await client.query(
-            `DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND day_of_week=$2 AND hospital_id<>$3`,
-            [req.params.id, sched.day_of_week, sched.hospital_id]);
-        } else {
-          // Blank (or not working) means "primary branch" — drop any override.
-          await client.query(
-            `DELETE FROM doctor_hospitals WHERE doctor_id=$1 AND day_of_week=$2`,
-            [req.params.id, sched.day_of_week]);
         }
       }
     });

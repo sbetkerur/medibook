@@ -20,6 +20,7 @@ const { IST_TODAY_SQL } = require('../utils/dateTz');
 // (that is its trigger condition), so they are outside Meta's 24-hour window
 // and a plain text send is rejected. See services/outbound.js.
 const { sendPatientMessage } = require('../services/outbound');
+const { canSendDiscretionary, budgetFor } = require('../services/messageBudget');
 // Clinic-INITIATED question on a shared WhatsApp number: without this the reply
 // is looked up in whichever clinic the patient last searched for.
 const { KINDS, recordPendingReply } = require('../services/pendingReply');
@@ -62,6 +63,12 @@ async function findPlansNeedingNudge(schema) {
     LEFT JOIN hospitals h ON h.id = tp.hospital_id
     LEFT JOIN appointments a ON a.treatment_plan_id = tp.id
     WHERE tp.status IN ('proposed','in_progress')
+      -- Orthodontics is 18-24 monthly adjustments and the next one is set by
+      -- the dentist at the chair ("come back in four weeks"), never chosen by
+      -- the patient from a slot list. Nudging them to self-book a monthly
+      -- adjustment is wrong for the single biggest course type in an Indian
+      -- practice, and it is 24 unwanted messages per patient.
+      AND tp.scheduling_mode = 'patient'
       AND p.opted_out IS NOT TRUE
       AND p.deleted_at IS NULL
       AND tp.nudge_count < $1
@@ -107,9 +114,13 @@ async function sendTreatmentNudges() {
             ? `Your dentist advised *${plan.title}* — ${plan.total_visits} sitting${plan.total_visits > 1 ? 's' : ''} in total, and none of them booked yet.\n`
             : `Your *${plan.title}* isn't finished. Sitting *${nextVisit}* of *${plan.total_visits}* still needs a date.\n`) +
           (plan.doctor_name ? `\nwith Dr. ${plan.doctor_name}` : '') +
-          (plan.hospital_name ? `\n📍 ${plan.hospital_name}` : '') +
+          (plan.hospital_name ? `\n${plan.hospital_name}` : '') +
           `\n\nLeaving a treatment part-done can undo the work already carried out, so let's get it in the diary.\n\n` +
           `Reply *Treatment* to pick a time, or call the clinic.`;
+
+        // A nudge is the most skippable message this product sends — the
+        // patient has an open course and will be reminded again in a week.
+        if (!await canSendDiscretionary(tenant.schema_name, plan.phone, budgetFor(tenant))) continue;
 
         await sendPatientMessage(tenant.schema_name, plan.phone, {
           template: TREATMENT_NUDGE_TEMPLATE,
@@ -120,6 +131,9 @@ async function sendTreatmentNudges() {
               { type: 'text', text: String(nextVisit) },
               { type: 'text', text: String(plan.total_visits) },
               { type: 'text', text: plan.doctor_name || 'your dentist' },
+              // {{5}} — see the note in jobs/reminders.js: a clinic-initiated
+              // message on a shared number has to say which clinic.
+              { type: 'text', text: tenant.name },
             ],
           }],
           // Button 1 on the template. 'Treatment' is the keyword the engine

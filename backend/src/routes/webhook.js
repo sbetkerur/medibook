@@ -8,17 +8,15 @@ const wa = require('../services/whatsapp');
 const logger = require('../utils/logger');
 const { handleReminderConfirmation } = require('../jobs/reminders');
 const { isEnabled } = require('../utils/featureFlags');
-const { isRealAppSecret, UUID_RE } = require('../utils/errors');
+const { isRealAppSecret } = require('../utils/errors');
 // maskPhone moved to services/bot/utils.js — the bot engine, the booking flow
 // and the reminder cron log the same value and each needed it too.
-const { parseChoiceNumber, maskPhone, isOptedOut, logMessage } = require('../services/bot/utils');
+const { maskPhone, isOptedOut, logMessage } = require('../services/bot/utils');
 const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { sendPatientText } = require('../services/outbound');
-const { searchTenants, isQueryTooGeneric, shortLabel, MAX_SHORTLIST, matchCity,
-        buildCityChoices, normalizeCity } = require('../services/bot/clinicSearch');
-const { listActiveBranches } = require('../services/bot/clinicBranches');
+const { extractEntryCode } = require('../utils/entryCode');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -102,8 +100,8 @@ _rlCleanupInterval.unref(); // don't block process exit
 // failed_webhooks so the retry cron replays it — used by ALL sync fallback paths
 // (queue unavailable, queue saturated, queue add failed). Previously only the
 // queue-unavailable path saved failures; the other two silently lost messages.
-function processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType, context }) {
-  botEngine.handle({ phone, text, buttonId, tenant }).catch(err => {
+function processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType, context, welcome }) {
+  botEngine.handle({ phone, text, buttonId, tenant, welcome }).catch(err => {
     logger.error(`Sync bot processing error (${context})`, { error: err.message });
     query(`
       INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, error_message, next_retry_at)
@@ -247,93 +245,15 @@ router.post('/webhook/whatsapp', async (req, res) => {
 
 // A greeting restarts the whole conversation, clinic choice included.
 //
-// Two words botEngine also treats as greetings are deliberately NOT here:
-//   "menu"  — it stays the one-step way back to the CURRENT clinic's menu,
-//             which is what the bot's own prompts promise.
-//   "start" — it is the RE-SUBSCRIBE keyword. The opt-out reply tells patients
-//             "to re-subscribe, reply START", and that only clears opted_out if
-//             the message reaches the engine with their clinic still attached.
-//             Restarting on it would drop the clinic first, so the patient would
-//             re-pick a clinic and stay opted out for good.
-const RESTART_GREETING_RE = /^(hi|hello|hey|restart|helo|hy|hai)$/i;
-
-// Inputs that are a request to begin, not search text. Superset of the above:
-// in the clinic-search state "menu" is no more a clinic name than "hi" is.
-const GREETING_RE = /^(hi|hello|hey|start|restart|menu|main menu|helo|hy|hai)$/i;
-
-// The "clinics near me" entry, offered ALONGSIDE the name search — a patient
-// who already knows their clinic's name must never be made to pick a city
-// first. Matched on the message TEXT rather than the interactive reply id:
-// wa.sendButtons mints its own opaque ids (`btn_0_<timestamp>`), so the id a
-// tap returns is not something a caller can recognise. Accepting the typed
-// forms is also what keeps the numbered TEXT fallback usable when the
-// interactive send fails.
-const NEARBY_BUTTON_LABEL = '📍 Clinics near me';
-// Bare "near" and bare "city" are deliberately NOT accepted: "City Dental
-// Clinic" and "Garden City Dental" are entirely plausible tenant names, and
-// shadowing a real search term with the city picker is worse than making the
-// patient type two more words.
-const NEARBY_RE = /^(📍\s*)?(clinics?\s+near\s+me|near\s+me|near\s*by|my\s+city)$/i;
-
-// Row id prefix for the city picker. Namespaced so it can never collide with
-// the tenant UUIDs the clinic shortlist uses as row ids.
-const CITY_ROW_PREFIX = 'city:';
-
-// Row id for a BRANCH in the city picker: `br:<tenantId>:<hospitalId>`. Both
-// ids are needed — the tenant to route to, the hospital to preselect — and the
-// prefix keeps it distinguishable from a bare tenant UUID (the name-search
-// shortlist) and from a `city:` row.
-const BRANCH_ROW_PREFIX = 'br:';
-
-/**
- * Resolve a `br:` row id (or a stored shortlist entry) back to its clinic and
- * branch. Returns null unless the tenant is STILL active — a shortlist can
- * outlive a clinic being suspended, and a stale tap must not attach a patient
- * to it. The hospital id is not verified here: bookingFlow re-checks it against
- * the live branch list and falls back to asking, so one lookup does the job.
- */
-function resolveBranchRef(ref, activeTenants) {
-  if (typeof ref !== 'string' || !ref.startsWith(BRANCH_ROW_PREFIX)) return null;
-  const [tenantId, hospitalId] = ref.slice(BRANCH_ROW_PREFIX.length).split(':');
-  if (!UUID_RE.test(tenantId || '') || !UUID_RE.test(hospitalId || '')) return null;
-  const tenant = (activeTenants || []).find(t => t.id === tenantId);
-  return tenant ? { tenant, hospitalId } : null;
-}
-
-// WhatsApp rejects a list with more than 10 rows outright (Meta #131009).
-const MAX_CITY_ROWS = 10;
-
-/**
- * Does this message open the city picker?
- *
- * This used to be `!buttonId && NEARBY_RE.test(text)`, which meant the picker
- * only ever opened for TYPED text: a tap on the button sends BOTH an opaque
- * `btn_0_<ts>` id and the title as the body, so `!buttonId` rejected the very
- * tap the button exists for. The patient got "no clinic found matching
- * '📍 Clinics near me'" instead of the city list.
- *
- * So the phrase is matched on the TEXT, as the button contract requires, and
- * the ids we DO recognise are what suppresses it:
- *  - a `city:` row — that is an answer to this picker, not a request to reopen
- *    it, and it must fall through to `pickedCity` below;
- *  - a `br:` BRANCH row — likewise an answer, and its title is a hospital name;
- *  - a tenant UUID row — a clinic legitimately named "Nearby Dental" shortens
- *    to a row title NEARBY_RE would otherwise swallow, hijacking the tap.
- * Any other id is one we did not mint a meaning for, so the text decides.
- *
- * The `br:` case was missing. The city picker lists BRANCHES, whose titles are
- * hospital names, so a branch called "Nearby" or "Near By" matched NEARBY_RE on
- * its own title: tapping it reopened the city picker instead of attaching the
- * patient, an unbreakable loop for that branch.
- */
-function isNearbyTrigger({ text, buttonId, cityRowId, tenantIds }) {
-  const trimmed = (text || '').trim();
-  if (!trimmed || GREETING_RE.test(trimmed)) return false;
-  if (cityRowId) return false;
-  if (typeof buttonId === 'string' && buttonId.startsWith(BRANCH_ROW_PREFIX)) return false;
-  if (buttonId && Array.isArray(tenantIds) && tenantIds.includes(buttonId)) return false;
-  return NEARBY_RE.test(trimmed);
-}
+// A patient asking to move to a different clinic. The noun is REQUIRED — a bare
+// "change" mid-booking ("change the date") must not be read as this.
+//
+// Nothing here DETACHES them, because a QR scan is the only way to attach and a
+// detached patient with no poster in front of them would have no way back. The
+// answer is an instruction to scan, and scanning the other clinic's code is
+// itself the switch — `entryCode` routing below honours a tagged code from any
+// state, including mid-booking with someone else.
+const SWITCH_CLINIC_RE = /^(switch|change)\s+(clinic|hospital|branch)$/i;
 
 // A bare "yes" or "4" is only meaningful as an answer to something. These are
 // the two questions a CLINIC asks unprompted, via the reminder and feedback
@@ -567,36 +487,16 @@ async function processIncomingMessage(msg) {
     const inboundContent = (templateButtonLabel || text || buttonId || '').slice(0, 500);
 
     // ── GLOBAL SESSION ROUTING (shared WhatsApp number) ──────────
-    // All tenants share one phone number. Route each patient to their chosen clinic
-    // via the global_bot_sessions table. New patients see a clinic selector first.
+    // All tenants share one phone number, so every inbound message has to be
+    // routed to a clinic. The ONLY thing that attaches a patient to one is the
+    // clinic's own entry code, scanned off its QR (utils/entryCode.js) — there
+    // is deliberately no name search and no browse-by-location, so a clinic's
+    // patients are never shown another clinic's existence. Once attached, the
+    // session persists: a returning patient just messages and carries on.
     let tenant = null;
 
-    // Noun is REQUIRED — a bare "change" mid-booking ("change the date") must
-    // not silently reset the patient's clinic selection.
-    const isSwitchClinic = /^(switch|change)\s+(clinic|hospital|branch)$/i.test((text || '').trim());
-    // "Hi" means START OVER, and the start of a conversation on a shared number
-    // is the clinic search — not the menu of whichever clinic happens to still
-    // be attached to the session. So a greeting drops the clinic too, and the
-    // patient is asked who they want. ("menu" deliberately does NOT: it is what
-    // the bot's own "reply for the main menu" prompts point at, and it should
-    // stay a one-step trip back to the CURRENT clinic's menu.)
-    const isRestartGreeting = RESTART_GREETING_RE.test((text || '').trim());
-    // Which clinic they are leaving, if any — read BEFORE the reset clears it,
-    // so the prompt can say what just happened instead of greeting a patient
-    // mid-booking as though they had never been here.
-    let leavingClinic = null;
-    if (isSwitchClinic || isRestartGreeting) {
-      const prev = await query(
-        `SELECT t.name FROM global_bot_sessions gs
-         JOIN tenants t ON t.id = gs.tenant_id WHERE gs.phone=$1`, [phone]
-      ).catch(() => null);
-      leavingClinic = prev?.rows[0]?.name || null;
-      await query(
-        `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant',
-           search_matches=NULL, pending_hospital_id=NULL, last_activity=NOW() WHERE phone=$1`,
-        [phone]
-      ).catch(() => {});
-    }
+    const trimmedText = (text || '').trim();
+    const isSwitchClinic = SWITCH_CLINIC_RE.test(trimmedText);
 
     const gs = await query(`SELECT * FROM global_bot_sessions WHERE phone=$1`, [phone]).catch(() => null);
     const globalSession = gs?.rows[0] || null;
@@ -610,349 +510,124 @@ async function processIncomingMessage(msg) {
       return;
     }
 
-    if (!globalSession || !globalSession.tenant_id || globalSession.state === 'select_tenant') {
-      // Load all active tenants
-      // `city` moved from the settings JSONB to a real column (migrate.js
-      // backfills it). The COALESCE is belt-and-braces for a deployment that
-      // has written settings.city out of band — the column always wins.
-      const tenantsR = await query(
-        `SELECT id, name, slug, schema_name, COALESCE(city, settings->>'city') AS city
-           FROM tenants WHERE status='active' ORDER BY name`
+    // ── ENTRY CODE (the clinic's QR) ─────────────────────────────
+    // The one and only way a patient becomes attached to a clinic.
+    //
+    // A TAGGED code (`#K7M2QX`, which is what the deep link pre-types) is
+    // honoured from ANY state: a patient half-way through a booking who scans a
+    // different clinic's poster means it, and being told "please finish your
+    // current booking first" would be absurd. A BARE code — the whole message
+    // and nothing else, which is what typing it off a printed card produces —
+    // is honoured only while no clinic is attached, because mid-conversation
+    // six characters are far more likely to be an answer to a question.
+    const entryRef = extractEntryCode(text);
+    const attachedTenantId = globalSession?.tenant_id || null;
+    // Set when this message is the scan itself, so the main menu that follows
+    // can open with the clinic's name instead of the ordinary greeting. It must
+    // survive the handoff to the engine — which happens through BullMQ, so it
+    // rides on the job payload, not on a closure.
+    let isQrArrival = false;
+
+    let scannedTenant = null;
+    if (entryRef && (entryRef.tagged || !attachedTenantId)) {
+      // Only active clinics resolve. A suspended clinic's posters are still on
+      // its wall, and attaching a patient to it would strand them somewhere
+      // that cannot answer.
+      const codeR = await query(
+        `SELECT * FROM tenants WHERE entry_code=$1 AND status='active'`, [entryRef.code]
+      ).catch(() => null);
+      scannedTenant = codeR?.rows[0] || null;
+    }
+
+    if (scannedTenant) {
+      // `pending_hospital_id` is written NULL rather than left alone: one code
+      // identifies a CLINIC, not a branch, so booking must ask which branch. A
+      // value parked by some earlier path must not leak into this booking.
+      await query(
+        `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id, pending_hospital_id)
+         VALUES ($1,$2,'active',NOW(),$3,NULL)
+         ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
+           last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
+           pending_hospital_id=NULL`,
+        [phone, scannedTenant.id, msgId || null]
       );
-      const activeTenants = tenantsR.rows;
+      tenant = scannedTenant;
 
-      if (activeTenants.length === 0) {
-        logger.warn('No active tenants — dropping incoming message', { phone: maskPhone(phone) });
-        return;
-      }
+      // No "connecting you to…" handover line. It made sense when a patient had
+      // SEARCHED and needed to be told which of several matches they got; after
+      // a scan there is nothing to disambiguate — they pointed a camera at that
+      // clinic's own poster. Sending it anyway put a switchboard between the
+      // patient and the clinic, which is exactly the impression this product
+      // must not give: from the patient's side this is the clinic's WhatsApp,
+      // and the first thing they should see is the clinic's own welcome. The
+      // engine's main menu follows immediately and carries the clinic's name in
+      // its header, so nothing is lost by staying quiet here.
 
-      // The patient SEARCHES for their clinic. The roster is never listed —
-      // only the matches for what they typed, and only when there is more than
-      // one of them. This runs even when a single tenant is onboarded: the
-      // entry step must not change shape as clinics are added, and a patient
-      // messaging the shared number should never be silently attached to a
-      // clinic they did not name.
-      let selected = null;
-      // Set alongside `selected` when they arrived via a branch row, so booking
-      // can skip "which branch?" — see pending_hospital_id below.
-      let pickedBranchId = null;
-      const trimmed = (text || '').trim();
-      const isGreeting = GREETING_RE.test(trimmed);
-
-      // ── "CLINICS NEAR ME" ────────────────────────────────────────
-      // A second way in, for a patient who knows where they are but not what
-      // their clinic is called. It still never lists the roster: a city has to
-      // be chosen first, and only that city's clinics are ever shown.
-      // Branches are what the city picker lists, and loading them costs one
-      // query PER active clinic (`hospitals` is per-tenant). So it is lazy:
-      // a plain name search must never pay for it. Memoised per message.
-      let _branches = null;
-      const getBranches = async () => {
-        if (_branches === null) _branches = await listActiveBranches(activeTenants);
-        return _branches;
-      };
-      // Cities that actually have a branch, followed by the default metros
-      // (`DEFAULT_CITIES`). The defaults mean this list is never empty, so the
-      // location button is always offered — a default city with no branches is
-      // not a dead end, it answers "no clinics in X yet" and points back at the
-      // name search.
-      const getKnownCities = async () => buildCityChoices((await getBranches()).map(b => b.city));
-
-      // Tapping a city row, or typing one while we were asking. A typed city is
-      // only read as a city in `select_city` — elsewhere "Pune" is far more
-      // likely to be part of a clinic's name than an answer to a question we
-      // never asked.
-      const cityRowId = buttonId && buttonId.startsWith(CITY_ROW_PREFIX)
-        ? buttonId.slice(CITY_ROW_PREFIX.length)
-        : null;
-      const pickedCity = cityRowId || (
-        globalSession?.state === 'select_city' && trimmed && !isGreeting
-          ? matchCity(await getKnownCities(), trimmed)
-          : null
-      );
-
-      if (isNearbyTrigger({ text: trimmed, buttonId, cityRowId, tenantIds: activeTenants.map(t => t.id) })) {
-        // Record the message id first, for the same reason the shortlist below
-        // does: a Meta redelivery must not re-send this prompt.
-        await query(
-          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches)
-           VALUES ($1,'select_city',NOW(),$2,NULL)
-           ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_city',
-             last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
-             search_matches=NULL, pending_hospital_id=NULL`,
-          [phone, msgId || null]
-        ).catch(() => {});
-
-        const knownCities = await getKnownCities();
-        // How many cities can actually resolve to a branch. Drives the row-cap
-        // decision: padding is only ever allowed to fill space real cities
-        // didn't need.
-        const clinicCityCount = new Set(
-          (await getBranches()).map(b => normalizeCity(b.city)).filter(Boolean)
-        ).size;
-
-        if (!knownCities.length) {
-          // Only reachable if DEFAULT_CITIES is emptied AND no branch has a
-          // city — sendList would otherwise be called with zero rows.
-          await wa.sendText(phone,
-            `📍 Clinic locations aren't set up yet.\n\n🔍 Please send your clinic's name instead — a few letters are enough.`,
-            null, null
-          ).catch(err => logger.error('Failed to send no-cities prompt', { error: err.message }));
-        } else if (clinicCityCount <= MAX_CITY_ROWS) {
-          // Real cities all fit, so the defaults can pad out whatever room is
-          // left. Truncation only ever falls on the padding.
-          await wa.sendList(phone, "Pick the nearest one and I'll show you the clinics there.", 'Select city', [{
-            title: 'Cities',
-            rows: knownCities.slice(0, MAX_CITY_ROWS).map(c => ({ id: CITY_ROW_PREFIX + c, title: c })),
-          }], null, null, { header: 'Which city are you in?', footer: 'Or reply Hi to search by name' }).catch(err =>
-            logger.error('Failed to send city list', { error: err.message }));
-        } else {
-          // More clinic cities than a list message can hold — ask them to type
-          // it. Tested on the REAL city count, not the padded list: padding must
-          // never be what pushes a city with actual clinics off the picker.
-          await wa.sendText(phone,
-            `📍 Which city are you in?\n\nPlease send your city's name.`,
-            null, null
-          ).catch(err => logger.error('Failed to send city prompt', { error: err.message }));
-        }
-        return;
-      }
-
-      if (pickedCity) {
-        // BRANCHES, not clinics: a clinic with two branches in this city is two
-        // rows, because "which of your branches?" three steps later is exactly
-        // the question choosing by location was supposed to answer.
-        const wanted = normalizeCity(pickedCity);
-        const cityBranches = (await getBranches()).filter(b => normalizeCity(b.city) === wanted);
-        const shownBranches = cityBranches.slice(0, MAX_CITY_ROWS);
-
-        // Back to the normal search state either way: whatever happens next is
-        // a clinic choice, not another city. The shortlist stores `br:` refs so
-        // a numbered reply resolves to the same branch the rows offered.
-        await query(
-          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches, pending_hospital_id)
-           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb,NULL)
-           ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
-             last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
-             search_matches=EXCLUDED.search_matches, pending_hospital_id=NULL`,
-          [phone, msgId || null,
-           shownBranches.length
-             ? JSON.stringify(shownBranches.map(b => BRANCH_ROW_PREFIX + b.tenant_id + ':' + b.hospital_id))
-             : null]
-        ).catch(() => {});
-
-        if (!shownBranches.length) {
-          await wa.sendText(phone,
-            `📍 No clinics in *${pickedCity}* yet.\n\n🔍 Please send your clinic's name instead.`,
-            null, null
-          ).catch(err => logger.error('Failed to send empty-city prompt', { error: err.message }));
-          return;
-        }
-
-        // Shown as a list even when there is exactly ONE branch in the city.
-        // Choosing a city is not naming a clinic, and the entry point's rule is
-        // that a patient is never silently attached to a clinic they did not
-        // pick — the same reason there is no auto-assign when only one tenant
-        // is onboarded.
-        const more = cityBranches.length > shownBranches.length
-          ? `\n\nShowing ${shownBranches.length} of ${cityBranches.length} — send your clinic's name if it isn't listed.`
-          : '';
-        // The address is the useful second line when every row is the same
-        // clinic; once two clinics share a city the clinic's name is what
-        // actually tells them apart, so it leads.
-        const oneClinic = new Set(shownBranches.map(b => b.tenant_id)).size === 1;
-        await wa.sendList(phone,
-          `📍 ${cityBranches.length} clinic${cityBranches.length !== 1 ? 's' : ''} in *${pickedCity}*.\n\nPick yours:${more}`,
-          'Select clinic',
-          [{
-            title: pickedCity.slice(0, 24),
-            rows: shownBranches.map(b => ({
-              id: BRANCH_ROW_PREFIX + b.tenant_id + ':' + b.hospital_id,
-              title: (b.hospital_name || b.tenant_name).slice(0, 24),
-              description: (oneClinic
-                ? b.address
-                : [b.tenant_name, b.address].filter(Boolean).join(' · ')).slice(0, 72),
-            })),
-          }], null, null
-        ).catch(err => logger.error('Failed to send city clinic list', { error: err.message }));
-        return;
-      }
-
-      // 1. Tap on a shortlist row — a `br:` branch ref from the city picker, or
-      //    a bare tenant UUID from the name-search shortlist.
-      if (buttonId) {
-        const ref = resolveBranchRef(buttonId, activeTenants);
-        if (ref) { selected = ref.tenant; pickedBranchId = ref.hospitalId; }
-        else selected = activeTenants.find(t => t.id === buttonId) || null;
-      }
-
-      // 2. "2" — a pick from the numbered shortlist we last sent this phone.
-      //    Re-checked against activeTenants so a stale reply can't select a
-      //    tenant that has since been deactivated.
-      //    Entries are branch refs when the shortlist came from the city picker
-      //    and bare tenant ids when it came from a name search, so both shapes
-      //    have to resolve here.
-      const shortlist = Array.isArray(globalSession?.search_matches) ? globalSession.search_matches : [];
-      if (!selected && trimmed && shortlist.length) {
-        const n = parseChoiceNumber(trimmed);
-        if (n >= 1 && n <= shortlist.length) {
-          const entry = shortlist[n - 1];
-          const ref = resolveBranchRef(entry, activeTenants);
-          if (ref) { selected = ref.tenant; pickedBranchId = ref.hospitalId; }
-          else selected = activeTenants.find(t => t.id === entry) || null;
-        }
-      }
-
-      // 3. Otherwise treat the message as a search query.
-      let matches = [];
-      let tooGeneric = false;
-      if (!selected && trimmed && !isGreeting) {
-        if (isQueryTooGeneric(trimmed)) tooGeneric = true;
-        else {
-          matches = searchTenants(activeTenants, trimmed);
-          if (matches.length === 1) selected = matches[0];
-        }
-      }
-
-      if (selected) {
-        // Patient matched a clinic — confirm and route. `pending_hospital_id`
-        // carries a branch picked at the city step through to booking: the
-        // synthesised "Hi" below resets the TENANT session's context, so a
-        // branch parked there would be wiped before bookingFlow could read it.
-        // Always written (NULL when they got here by name), so a branch from an
-        // earlier city pick can never leak into a later name search.
-        await query(
-          `INSERT INTO global_bot_sessions (phone, tenant_id, state, last_activity, last_wa_message_id, pending_hospital_id)
-           VALUES ($1,$2,'active',NOW(),$3,$4)
-           ON CONFLICT (phone) DO UPDATE SET tenant_id=$2, state='active',
-             search_matches=NULL, last_activity=NOW(),
-             last_wa_message_id=EXCLUDED.last_wa_message_id,
-             pending_hospital_id=EXCLUDED.pending_hospital_id`,
-          [phone, selected.id, msgId || null, pickedBranchId || null]
-        );
-        // Resolve the tenant BEFORE confirming, for two reasons the old order
-        // made impossible: the confirmation is a patient-facing message sent
-        // outside botEngine and so must go through services/outbound.js (a raw
-        // wa.sendText writes no wa_messages row — invisible in clinic history,
-        // and nothing for the delivery receipts the status handler will try to
-        // attach), and we need the schema to ask whether this patient opted out
-        // of this clinic. If they did, stay silent: the synthesised "Hi" below
-        // is dropped by the engine's opt-out check anyway, so sending this line
-        // meant one message from a clinic they unsubscribed from and then
-        // nothing.
-        const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [selected.id]);
-        tenant = r.rows[0] || null;
-        if (tenant && !(await isOptedOut(tenant.schema_name, phone))) {
-          // The clinic's own welcome follows immediately and carries its name in
-          // the header, so this is a one-line handover, not a second greeting.
-          await sendPatientText(tenant.schema_name, phone, `✅ Connecting you to *${selected.name}*…`)
-            .catch(err => logger.warn('Failed to send clinic confirmation', { error: err.message }));
-        }
-
-        // Picking a clinic is the first step of a fresh conversation, so hand
-        // the engine a greeting rather than the clinic name the patient just
-        // typed. Two reasons: the name is not a valid answer to whatever step
-        // their old session was on (a half-finished booking would try to read
-        // "smile" as a date), and a greeting is what resets that session and
-        // shows the clinic's main menu — which is where "start over" ends.
-        text = 'Hi';
-        buttonId = null;
-      } else {
-        // No single match — re-prompt. Shown matches are stored in render
-        // order so a numbered reply resolves; a search that matched nothing
-        // clears the previous shortlist so an old "2" can't resurface.
-        const shown = matches.length > 1 && matches.length <= MAX_SHORTLIST ? matches : [];
-
-        // Record the message id so a Meta redelivery doesn't re-send this prompt.
-        await query(
-          `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, search_matches, pending_hospital_id)
-           VALUES ($1,'select_tenant',NOW(),$2,$3::jsonb,NULL)
-           ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
-             last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
-             search_matches=EXCLUDED.search_matches, pending_hospital_id=NULL`,
-          [phone, msgId || null, shown.length ? JSON.stringify(shown.map(t => t.id)) : null]
-        ).catch(() => {});
-
-        if (shown.length) {
-          const body = matches.length === 1
-            ? `One clinic matches *"${trimmed}"*.`
-            : `${matches.length} clinics match *"${trimmed}"*.`;
-          await wa.sendList(phone, body, 'Select clinic', [{
-            title: 'Matching clinics',
-            rows: shown.map(t => ({
-              id: t.id,
-              title: shortLabel(t.name),
-              description: t.city ? `${t.name} — ${t.city}` : t.name,
-            })),
-          }], null, null,
-          { header: 'Is this yours?', footer: 'Reply Hi to search again' }).catch(err =>
-            logger.error('Failed to send clinic shortlist', { error: err.message }));
-          return;
-        }
-
-        // This is the very first thing a patient ever reads from the product,
-        // and it was the last surface still in the original voice: a header for
-        // the question, the body carrying only what to do next, and the
-        // "leave out dental and clinic" hint moved to the footer where a hint
-        // belongs. Each branch says what actually happened rather than opening
-        // with ❌.
-        let prompt, header;
-        if (tooGeneric) {
-          header = 'Almost';
-          prompt = `Nearly every clinic here is a "dental clinic" — send the distinctive part of the name instead. *Smile*, for "Smile Dental Clinic".`;
-        } else if (matches.length > MAX_SHORTLIST) {
-          header = `${matches.length} clinics match that`;
-          prompt = `*"${trimmed}"* is too broad to list. A few more letters will narrow it down.`;
-        } else if (trimmed && !isGreeting) {
-          header = 'No match for that name';
-          prompt = `Nothing here is called *"${trimmed}"*. Worth checking the spelling — or browse by city instead.`;
-        } else if (leavingClinic) {
-          // They were with a clinic and asked to start over. Say so — a plain
-          // "welcome" to someone who was three steps into a booking reads as
-          // though the bot forgot them.
-          header = 'Starting over';
-          prompt = `You've left *${leavingClinic}*.\n\nSend another clinic's name to continue.`;
-        } else {
-          header = 'Welcome to MediBook';
-          prompt = `Send your clinic's name and I'll take you to them. A few letters are enough.`;
-        }
-
-        // The location path is offered as an EXTRA, never as a replacement: the
-        // body still asks for the clinic's name, so a patient who knows it is
-        // not made to pick a city first. Offered unconditionally — `DEFAULT_CITIES`
-        // guarantees the picker has rows, and a city with no branches is
-        // answered ("no clinics in X yet"), not a dead end. Deliberately does
-        // NOT consult the branch list: this line runs on EVERY first-contact
-        // message, and loading branches costs a query per clinic. The hint line
-        // matters because wa.sendButtons degrades to numbered text if the
-        // interactive send fails, and "📍 Clinics near me" is a phrase
-        // NEARBY_RE also accepts typed.
-        await wa.sendButtons(
-          phone,
-          `${prompt}\n\n📍 Or reply *${NEARBY_BUTTON_LABEL.replace('📍 ', '')}* to browse by city.`,
-          [NEARBY_BUTTON_LABEL], null, null,
-          { header, footer: 'You can leave out "dental" and "clinic"' }
-        ).catch(err => logger.error('Failed to send clinic selection prompt', { error: err.message }));
-        return;
-      }
-    } else {
-      // Patient already assigned to a tenant
-      const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [globalSession.tenant_id]);
+      // Hand the engine a greeting rather than the scanned message. The message
+      // body is prose plus a code — not a valid answer to whatever step an old
+      // session was on — and a greeting is what resets that session and opens
+      // the clinic's main menu, which is where scanning a QR should land.
+      text = 'Hi';
+      buttonId = null;
+      isQrArrival = true;
+    } else if (attachedTenantId) {
+      const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [attachedTenantId]);
       tenant = r.rows[0] || null;
 
       if (!tenant) {
-        // Tenant was deactivated — reset and re-run selection on next message.
-        // search_matches is cleared too: a shortlist from an earlier search is
-        // no longer on the patient's screen, and leaving it would let a stray
-        // "2" pick a clinic they were never shown.
+        // Clinic was deactivated. Detach, and let the next message fall through
+        // to the prompt below rather than answering as a clinic that is gone.
         await query(
           `UPDATE global_bot_sessions SET tenant_id=NULL, state='select_tenant',
-             search_matches=NULL, pending_hospital_id=NULL, last_activity=NOW() WHERE phone=$1`,
+             pending_hospital_id=NULL, last_activity=NOW() WHERE phone=$1`,
           [phone]
         ).catch(() => {});
         logger.warn('Tenant deactivated — global session reset', { phone: maskPhone(phone) });
         return;
       }
+
+      // Asked to move clinics while attached. Nothing is detached: with the QR
+      // as the only way in, a patient left with no clinic and no poster in
+      // front of them would have no way back. Scanning the other clinic's code
+      // IS the switch, and the tagged branch above already honours it from here.
+      // Answered from inside the clinic's own voice. It deliberately does NOT
+      // advertise that other clinics exist here — no roster, no "other clinics
+      // on MediBook", not even the word "switch". The patient asked, so they
+      // are told the one thing they need (scan the other place's code), framed
+      // as this clinic pointing them elsewhere rather than as a directory
+      // offering alternatives.
+      if (isSwitchClinic) {
+        await sendPatientText(tenant.schema_name, phone,
+          `This is *${tenant.name}*.\n\nIf you're trying to reach a different practice, scan the QR code at their reception and it will open a chat with them.\n\nReply *Menu* to carry on here.`
+        ).catch(err => logger.warn('Failed to send switch-clinic reply', { error: err.message }));
+        return;
+      }
+    } else {
+      // No clinic, and nothing in this message attaches one. Record the message
+      // id first so a Meta redelivery does not re-send the prompt.
+      await query(
+        `INSERT INTO global_bot_sessions (phone, state, last_activity, last_wa_message_id, pending_hospital_id)
+         VALUES ($1,'select_tenant',NOW(),$2,NULL)
+         ON CONFLICT (phone) DO UPDATE SET tenant_id=NULL, state='select_tenant',
+           last_activity=NOW(), last_wa_message_id=EXCLUDED.last_wa_message_id,
+           pending_hospital_id=NULL`,
+        [phone, msgId || null]
+      ).catch(() => {});
+
+      // Distinguish "your code is wrong" from "you haven't sent one". A patient
+      // who scanned something and got a generic welcome has no idea whether the
+      // scan failed or the clinic is not on MediBook.
+      const header = entryRef ? "That code didn't match a clinic" : 'Welcome to MediBook';
+      const body = entryRef
+        ? `No clinic is using the code *${entryRef.code}*. The poster may be out of date — worth asking at the clinic's front desk for their current QR code.`
+        : `Scan your clinic's QR code to start — it's at their reception desk, and usually on their card and website too.\n\nScanning opens this chat with everything already filled in; just press send.`;
+
+      // Plain text, not buttons: there is nothing here for the patient to pick.
+      // wa.sendText directly (not services/outbound.js) because no clinic is
+      // attached, so there is no tenant schema to log the message into.
+      await wa.sendText(phone, `*${header}*\n\n${body}`, null, null)
+        .catch(err => logger.error('Failed to send entry prompt', { error: err.message }));
+      return;
     }
 
     if (!tenant) {
@@ -1046,7 +721,7 @@ async function processIncomingMessage(msg) {
       // from the clinic, and this line fires on EVERY image.
       if (!await isOptedOut(tenant.schema_name, phone)) {
         sendPatientText(tenant.schema_name, phone,
-          `Sorry, I can only process text messages. Please type *Menu* to start booking an appointment. 😊`
+          `I can only read typed messages, I am afraid.\n\nPlease type *Menu* to get started.`
         ).catch(err => logger.warn('Failed to send unsupported-type reply', { phone: maskPhone(phone), type: unsupportedType, error: err.message }));
       }
       return;
@@ -1108,10 +783,10 @@ async function processIncomingMessage(msg) {
       const { LIMITS } = require('../utils/errors');
       if (waiting > LIMITS.QUEUE_BACKPRESSURE_THRESHOLD) {
         logger.warn(`Bot queue backpressure: ${waiting} jobs waiting — processing synchronously`);
-        processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'backpressure fallback' });
+        processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'backpressure fallback', welcome: isQrArrival });
       } else {
         try {
-          await botWorker.getQueue().add('process', { phone, text, buttonId, tenantId: tenant.id }, {
+          await botWorker.getQueue().add('process', { phone, text, buttonId, tenantId: tenant.id, welcome: isQrArrival }, {
             attempts: 2,
             backoff: { type: 'fixed', delay: 1000 },
             removeOnComplete: 100,
@@ -1122,12 +797,12 @@ async function processIncomingMessage(msg) {
           // message is never silently dropped. This is the most common cause of
           // "bot not responding" when Redis has a blip.
           logger.warn('Queue add failed, falling back to sync processing', { error: queueErr.message });
-          processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'queue fallback' });
+          processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'queue fallback', welcome: isQrArrival });
         }
       }
     } else {
       // Sync fallback: process inline
-      processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'queue unavailable' });
+      processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageType: msg?.type, context: 'queue unavailable', welcome: isQrArrival });
     }
 }
 
@@ -1201,24 +876,12 @@ if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT ==
 }
 
 module.exports = router;
-// Exported for tests: which words restart the conversation is a decision with a
-// sharp edge — "start" belongs to the re-subscribe flow, not to this one.
-module.exports.RESTART_GREETING_RE = RESTART_GREETING_RE;
-module.exports.GREETING_RE = GREETING_RE;
 // Exported for tests: when a reply belongs to the clinic that ASKED rather than
 // the one the patient selected is a decision with two sharp edges — a menu pick
 // must never be read as a star rating, and an answer must never be handed to a
 // clinic whose session cannot receive it (see tests/askingTenant.unit.test.js).
 module.exports.resolveAskingTenant = resolveAskingTenant;
-// Exported for tests: the "clinics near me" trigger has a sharp edge of its own
-// — it must not swallow a query that is really a clinic name ("City Dental
-// Care" is a tenant in the search fixtures). See tests/clinicNearby.unit.test.js.
-module.exports.NEARBY_RE = NEARBY_RE;
-module.exports.CITY_ROW_PREFIX = CITY_ROW_PREFIX;
-// Exported for tests: the tap-vs-type distinction here is exactly what broke the
-// button once (see isNearbyTrigger), so it is pinned by tests/clinicNearby.
-module.exports.isNearbyTrigger = isNearbyTrigger;
-// Exported for tests: a branch row carries BOTH ids, and resolving it against a
-// stale shortlist must not attach a patient to a suspended clinic.
-module.exports.BRANCH_ROW_PREFIX = BRANCH_ROW_PREFIX;
-module.exports.resolveBranchRef = resolveBranchRef;
+// Exported for tests: nothing a patient can TYPE may detach them from their
+// clinic — with the QR as the only way in, a detached patient with no poster in
+// front of them has no way back (see tests/entryCode.unit.test.js).
+module.exports.SWITCH_CLINIC_RE = SWITCH_CLINIC_RE;

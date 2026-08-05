@@ -10,9 +10,9 @@ via a Next.js dashboard; a super admin manages tenants.
 ## Stack
 
 - **Backend:** Node.js + Express (`backend/`), PostgreSQL (schema-per-tenant),
-  Redis + BullMQ (bot/email queues, rate limits, caches, cron locks)
+  Redis + BullMQ (bot queue, rate limits, caches, cron locks)
 - **Frontend:** Next.js 14 App Router + Tailwind (`frontend/`)
-- **Messaging:** Meta WhatsApp Cloud API (v21.0), Resend (email), Twilio (SMS fallback)
+- **Messaging:** Meta WhatsApp Cloud API (v21.0) — the ONLY channel; see below
 
 ## Commands
 
@@ -24,12 +24,11 @@ cd backend && npm run seed      # demo tenant + doctors + slots
 cd frontend && npm run dev      # dashboard on :3000
 cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
-cd backend && node tests/clinicSearch.unit.test.js
-cd backend && node tests/clinicNearby.unit.test.js   # "clinics near me" entry
-cd backend && node tests/clinicNearbyFlow.test.js    # entry routing e2e (needs DB;
-                                                     # seeds + drops its own tenants)
+cd backend && node tests/entryCode.unit.test.js      # QR entry codes (the only way in)
+cd backend && node tests/templateContract.unit.test.js   # doc vs senders: template params
+cd backend && node tests/entryFlow.test.js           # entry routing e2e (needs DB + seed
+                                                     # AND a backend running on :3001)
 cd backend && node tests/slotPlanner.unit.test.js
-cd backend && node tests/restartGreeting.unit.test.js
 cd backend && node tests/billingDrift.unit.test.js   # per-branch billing staleness
 cd backend && node tests/doctorDepartments.unit.test.js  # multi-department doctors
 cd backend && node tests/treatmentPlan.unit.test.js      # multi-visit treatment courses
@@ -73,63 +72,68 @@ transaction-scoped `SET LOCAL search_path` (pool-safe). Never interpolate a
 schema name without that validation. Public-schema tables (tenants, plans,
 refresh_tokens, global_bot_sessions, …) use plain `query`.
 
-**Shared WhatsApp number.** All tenants share the global `META_*` credentials.
-Incoming messages are routed to a tenant via `global_bot_sessions` (patient
-SEARCHES for their clinic on first contact; "switch clinic" resets). The tenant
-roster is never listed — `services/bot/clinicSearch.js` matches the typed query
-and only matches are shown (≥2 as a numbered shortlist parked on
-`global_bot_sessions.search_matches`, >`MAX_SHORTLIST` asks them to narrow it
-down). "Dental"/"clinic" are stripped from both the query and the tenant names,
-so a query of only those words is refused rather than matching everyone. The
-search runs even when exactly ONE tenant is active — there is deliberately no
-auto-assign shortcut, so the entry step doesn't change shape as clinics are
-onboarded.
+**Shared WhatsApp number, and the QR is the only way in.** All tenants share the
+global `META_*` credentials, so every inbound message has to be resolved to a
+clinic. Exactly one thing does that: the clinic's own **entry code**
+(`utils/entryCode.js`), scanned off a QR that encodes a `wa.me` deep link with
+the code pre-typed. There is deliberately no clinic-name search and no
+browse-by-location — both existed, both worked, and both were removed because
+they answered a clinic's own patients with a picker containing the competitors
+down the road, which is not a product a clinic will pay for. A clinic whose QR
+is not printed anywhere is unreachable; that is the accepted cost, and it is why
+the QR panel leads the Settings tab.
 
-**"Clinics near me" is the second entry, never the first.** The name search
-stays the primary path; the entry prompt merely ALSO offers a location button
-(`NEARBY_RE` in `routes/webhook.js`). The picker is padded with
-`DEFAULT_CITIES` (`bot/clinicSearch.js` — the six metros), so it is never empty
-and the button is always offered; a picked city with no clinics is answered
-("no clinics in X yet") rather than dead-ending. `buildCityChoices` puts cities
-that actually HAVE clinics first and appends the defaults — the padding never
-replaces real data, and the >`MAX_CITY_ROWS` "type your city" fallback is
-tested on the real-city count so padding can never push a real city off the
-list. Dedup is on `normalizeCity`, so a tenant storing "bengaluru" doesn't
-double the row. Tapping it parks the session in
-`select_city` and asks for a city; picking one lists that city's **branches**
-(≤10, WhatsApp's row cap) into the same `search_matches` shortlist the name
-search uses, so a numbered reply resolves identically. Two rules carry over
-unchanged: a city with exactly ONE branch is still shown as a list rather than
-auto-attached (choosing a city is not naming a clinic), and the full roster is
-still never listed.
+Codes are 6 characters from an alphabet with no `0/O`, `1/I/L` or `U`
+(`ALPHABET`), because a misread character cannot be recovered afterwards — an
+"O" is an equally plausible misreading of both "Q" and "D". Input is therefore
+case-folded and stripped of separators only, never character-substituted. The
+code identifies a CLINIC and is printed in a public waiting room: it is a
+routing hint, not a credential, and confers no authority — everything
+downstream still authenticates the patient by phone number.
 
-Rows are BRANCHES, not clinics — a clinic with two branches in one city is two
-rows, since "which of your branches?" three steps later is the question picking
-by location was meant to answer. `services/bot/clinicBranches.js`
-(`listActiveBranches`) reads `hospitals` from every active tenant's schema; it
-is one `tenantQuery` per clinic, run concurrently and caught INDIVIDUALLY so one
-broken schema can't take the entry step down. It is therefore loaded LAZILY —
-never on a plain name search, and never for the entry prompt (which offers the
-button unconditionally). A branch with no `city` falls back to `tenants.city`.
-Consequence: a clinic with NO `hospitals` row is invisible to this path.
-Row ids are `br:<tenantId>:<hospitalId>` (`resolveBranchRef`, which re-checks
-the tenant is still active — a shortlist outlives the message that sent it).
-The chosen branch is parked on `global_bot_sessions.pending_hospital_id`, NOT in
-the tenant session context, because selecting a clinic hands the engine a
-synthesised "Hi" and a greeting resets that context to empty;
-`bookingFlow.startBooking` consumes it one-shot (cleared even when it no longer
-resolves, so a deactivated branch can't wedge every future booking) and skips
-the branch question. Every path that clears the clinic clears it too. The trigger is matched on message TEXT, not the interactive
-reply id — `wa.sendButtons` mints its own opaque ids — and deliberately does NOT
-accept a bare "city"/"near", which would shadow real searches like "City Dental
-Care". That match lives in `isNearbyTrigger` (exported for tests): a tap sends
-BOTH an opaque `btn_0_<ts>` id and the title as the body, so gating on
-"no buttonId" silently limits the button to typed text only — the ids that
-suppress it are the ones we mint and recognise (a `city:` row, which is an
-ANSWER to the picker, and a tenant-UUID row, so a clinic named "Nearby Dental"
-can't have its tap hijacked), never the mere presence of an id. Clinic city lives in `tenants.city` (public schema, indexed on
-`lower(city)`); it was previously read from `settings->>'city'`, which nothing
-ever wrote. A clinic with no city is invisible to this path. Pass
+`extractEntryCode` returns two shapes and the difference is the whole safety
+story. A **tagged** code (`#K7M2QX`, what the deep link pre-types) is honoured
+from ANY state, including mid-booking with a different clinic — a patient who
+scans another clinic's poster means it, and "finish your current booking first"
+would be absurd. A **bare** code (the whole message and nothing else, what
+typing off a printed card produces) is honoured only while no clinic is
+attached, since mid-conversation six characters are far more likely to be an
+answer. A candidate that resolves to no active tenant is answered with "that
+code didn't match a clinic", not a generic welcome — a patient who scanned
+something needs to know whether the scan or the clinic was the problem.
+
+**Nothing a patient can type detaches them from their clinic.** With the QR as
+the only way in, a detached patient with no poster in front of them has no way
+back, so `global_bot_sessions.tenant_id` is cleared by exactly two things: a
+successful scan of a DIFFERENT clinic's code, and the clinic being deactivated.
+"Hi" no longer resets the clinic (it used to, when the reset landed on a
+search); it now reaches the engine, which resets to that clinic's main menu —
+which also means "start" reaches the engine with the clinic attached, so an
+opted-out patient can still re-subscribe. "Switch clinic" (`SWITCH_CLINIC_RE`,
+noun required so a bare "change" mid-booking doesn't fire) is answered with an
+instruction to scan, and clears nothing. Selecting a clinic hands the engine a
+synthesised "Hi" so it lands on that clinic's menu with a clean session, and the
+patient's real message is preserved in `inboundContent` for clinic history.
+
+Codes are minted at tenant creation (`POST /tenants`, `seed.js`) AND backfilled
+unconditionally on every boot in `migrate.js` — migrate runs before seed, so a
+tenant created without one would otherwise be unreachable until the next
+restart. Uniqueness is settled by `idx_tenants_entry_code` with a retry, never
+by a prior SELECT, which would race a concurrent create. The demo tenant's code
+is fixed (`TESTME`) so the demo link survives a re-seed.
+
+`GET /admin/clinic-qr` renders the SVG/PNG and the deep link for the dashboard;
+regenerating is `adminOnly` and audited, because it is destructive in the
+physical world — every card and poster already carrying the old code stops
+working, and the clinic finds out when patients stop arriving. `buildEntryLink`
+percent-encodes the `#`: left raw it becomes a URL fragment, never reaches
+WhatsApp, and the QR silently degrades into a blank message to the shared
+number. The link needs `WHATSAPP_PUBLIC_NUMBER` (the human-dialable number, not
+`META_PHONE_NUMBER_ID`); without it the API reports `configured:false` with a
+reason rather than printing a QR that goes nowhere.
+
+Clinic city lives in `tenants.city` (public schema, indexed on `lower(city)`);
+it is no longer used for routing but is still shown in admin views. Pass
 `null, null` for token/phoneId to the `whatsapp.js` senders — they fall back to
 env vars. `notifyAdminWhatsApp()` fans out to ALL admins with a `notify_phone`
 — call it once per event, never inside a per-admin loop.
@@ -143,6 +147,27 @@ that ask a question record it via `services/pendingReply.js`
 redirects just that message back to the asker, only when the current clinic's
 session is idle AND the asking clinic is verifiably still waiting. Any new
 clinic-initiated question needs the same `recordPendingReply` call.
+
+**WhatsApp is the only channel out — there is no email and no SMS.**
+`services/email.js` (Resend) and `services/sms.js` (Twilio) are gone, along with
+the BullMQ email queue, the Resend bounce webhook, the open-tracking pixel, the
+email unsubscribe flow and the weekly digest cron (which existed only to send
+one). Do not reintroduce a second channel without a decision to: every patient
+message must be reachable in `wa_messages`, and a channel that bypasses it is
+invisible in clinic history.
+
+Two consequences worth knowing. **Password recovery is no longer self-service** —
+`/auth/forgot-password` and `/auth/reset-password` delivered a link by email and
+are removed; the only path is `POST /superadmin/tenants/:id/users/:userId/reset-password`,
+which returns the new password ONCE for a human to hand over. And `users.email`
+stays throughout: it is the LOGIN identity, never a delivery address. So does
+`notify_phone`, which has only ever fed `notifyAdminWhatsApp` — it was mislabelled
+"SMS notification number" in the dashboard and never touched Twilio.
+
+The DB schema is untouched: `patients.email`, `email_sent_log`,
+`email_unsubscribes` and friends still exist. Nothing reads or writes them, and
+dropping columns is the one irreversible step here — do it deliberately in a
+migration if ever, not as a side effect.
 
 **Cron sends must be logged, AND template-first.** Patient-facing messages sent
 outside botEngine go through `services/outbound.js`, which writes to
@@ -158,6 +183,69 @@ production while logging a per-patient error. Any retry bookkeeping around such
 a send must advance on the ATTEMPT, not on success — counting only successes
 turns a permanently-failing send into an unbounded daily retry that never
 reaches its own cap (`jobs/treatmentNudges.js`).
+
+**From the patient's side, this is the CLINIC's WhatsApp, not a platform.** The
+number is shared, so nothing but copy sells that — and the copy has to hold the
+line everywhere. Every interactive message carries the clinic's name in its
+`header` (`sendMainMenu`), and a QR arrival additionally leads with it in the
+BODY, because the header renders small and grey and the first thing someone who
+scanned a poster needs is confirmation they reached the practice they are
+standing in. That welcome is ONE message: the old "✅ Connecting you to X…"
+handover is gone, since after a scan there is nothing to disambiguate and it put
+a switchboard between the patient and the clinic. `welcome` is set by
+`routes/webhook.js` only on the synthesised greeting after a scan and rides the
+BullMQ job payload to `botEngine.handle` — an ordinary "Hi" or "Menu" later in
+the thread is not an arrival and must not trigger it. No patient-facing copy may
+mention MediBook, offer "a different clinic", or otherwise imply a roster
+exists; the ONLY platform-branded surface is the prompt shown to someone with no
+clinic attached, who by definition has no clinic to speak as.
+`tests/botFlow.unit.test.js` pins all of this.
+
+**If the bot says "call us", it must give the number.** `hospitals.phone`
+existed for a long time and was read by nothing, while six messages — including
+the emergency reply, where it is the ONLY useful instruction — told patients to
+ring and left them to find the number themselves. `clinicPhoneLine`
+(`bot/utils.js`) resolves the branch's number, falls back to any active branch,
+and returns '' when the clinic stored none, so callers concatenate it
+unconditionally. The third main-menu button is *Address & Phone*
+(`showClinicInfo`); it replaced *Check Status*, which asked for a booking ID no
+patient keeps in order to show what *My Appointments* already shows from their
+phone number alone. "status" stays a keyword and now routes there too. Every
+menu offering the three buttons must offer the SAME three — bookingFlow's two
+cancelled-booking menus included, or the third option changes meaning depending
+on how the patient arrived.
+
+**The owner's week arrives on WhatsApp.** `sendWeeklyDigests` (Mondays 08:00
+IST) is the one report that reaches a clinic owner without them logging in, and
+an owner who is chairside all day does not log in. It was an email; it now goes
+through `notifyAdminWhatsApp` to admins with a `notify_phone`. Deliberately
+short — appointments, no-shows, revenue, and treatment advised but not booked —
+and it sends nothing at all for a week with no appointments.
+
+**Password recovery is the clinic's own.** `POST /admin/staff/:id/reset-password`
+(`adminOnly`, audited) returns a new password ONCE and revokes that user's
+refresh tokens. It refuses to reset your OWN account: `/auth/change-password` is
+that path and it requires the current password, so allowing self-reset here
+would turn a hijacked admin session into a permanent takeover. Removing email
+left the SUPER admin as the only unlock, which meant a Saturday call to the
+vendor before the front desk could take a booking.
+
+**One shared number is the single point of failure.** See
+`docs/whatsapp-outage-plan.md` — what to watch, what still works during an
+outage (the whole dashboard; only patient messaging stops), and the
+clinic-facing exports that mean nobody is trapped: `/analytics/export` with
+`type=patients`, `type=appointments&days=all` or `type=treatments`, capped at
+50k rows. One clinic's block rate degrades the number for EVERY clinic, which
+is why the sending rules live in the platform and not in clinic hands.
+
+**Error copy names the cause and gives exactly one way out.** "Sorry, something
+went wrong. Please try again." appeared in four different phrasings and told a
+patient nothing — most importantly not whether anything had been booked, which
+is the only thing they actually want to know. Every failure message now says
+whose fault it was ("at our end"), what state things are in ("nothing was
+booked, so no time has been held for you") and the single next step. Emoji
+prefixes on errors (⚠️ ❌ ❓) are gone: when every message shouts, none of them
+does, and a patient who mistyped a date has not encountered a warning.
 
 **Conversation design.** Interactive messages use WhatsApp's real `header` and
 `footer` slots (`wa.sendButtons`/`sendList` take a 6th `{header, footer}` arg,
@@ -175,16 +263,16 @@ break a suite.
 **Bot engine.** `services/botEngine.js` is a state machine over
 `bot_sessions.state` with context stored ENCRYPTED (`{_enc: ...}`, AES-256-GCM
 via `utils/encryption.js`). Always read/write context through
-`getSession`/`updateSession` in `services/bot/utils.js`. **"Hi" restarts the
-whole conversation** — `routes/webhook.js` intercepts it before the engine,
-clears the clinic and re-runs the search; selecting a clinic then hands the
-engine a synthesised "Hi" so it lands on that clinic's main menu with a clean
-session. "Menu" is the one-step reset to the CURRENT clinic's menu and is what
-patient-facing copy must point at (`Reply *Menu*`); `*Hi*` in copy means start
-over / change clinic. "Start" is NOT a restart word — it is the re-subscribe
-keyword and must reach the engine with the clinic attached, or an opted-out
-patient can never opt back in (`tests/restartGreeting.unit.test.js`). Inside the engine, a greeting still always resets to the
-main menu from any state. Handlers live in `services/bot/bookingFlow.js`
+`getSession`/`updateSession` in `services/bot/utils.js`. **"Hi" and "Menu" both
+mean the CURRENT clinic's main menu**, and neither detaches the patient —
+`routes/webhook.js` no longer intercepts greetings at all, so every one of them
+reaches the engine with the clinic attached (which is what lets "start"
+re-subscribe an opted-out patient). Patient-facing copy should point at
+`Reply *Menu*`; copy must NOT tell a patient that `*Hi*` changes clinic, because
+only scanning another clinic's QR does that. Selecting a clinic hands the engine
+a synthesised "Hi" so it lands on that clinic's main menu with a clean session,
+and a greeting always resets to the main menu from any state.
+Handlers live in `services/bot/bookingFlow.js`
 and `appointmentFlow.js`. In confirm steps, check negative intent ("no",
 "don't", "keep") BEFORE positive keywords. `fuzzyFind` (`bot/utils.js`)
 returns null when input is under 3 chars or matches more than one item — it
@@ -254,6 +342,111 @@ atomic slot lock + `checkMonthlyQuota` — a 3-visit course is 3 appointments, n
 a back door around the cap. The patient confirmation goes through
 `services/outbound.js`; it is a STATEMENT, so it needs no `recordPendingReply` —
 add one if a clinic-initiated *question* is ever sent from here.
+
+**Cancelling offers to MOVE it first.** When a patient rings to cancel, the
+receptionist says "what about Thursday?" and a good share take Thursday — the
+bot used to automate only the losing half of that conversation, with "Schedule
+conflict" sitting on the reason screen one tap from a red button. The confirm
+step now leads with *Move it instead* and hands straight to
+`handleRescheduleSelect`, which re-reads the booking by id so nothing is
+destroyed on the way through. Every button index shifted by one as a result —
+`btnIdx` 1 is cancel, 2 is keep, and the numbered text fallback moved with them
+(`tests/staleConfirm.unit.test.js`). A stale tap still re-asks rather than
+reaching the save.
+
+**One message budget per patient, across every cron.** Each cron throttled
+itself and nothing looked at the patient as a whole: a root-canal patient could
+collect two reminders per sitting, a feedback request after each, three nudges
+and a recall inside a few weeks. Blocks are what degrade a WhatsApp number, and
+every clinic shares one — so one clinic's over-messaging degrades delivery for
+all of them. `services/messageBudget.js` gates the DISCRETIONARY sends only
+(feedback, post-visit follow-up, treatment nudges, recalls) at 6 per 7 days.
+Reminders and confirmations are NEVER gated: a patient with an appointment
+tomorrow wants that message, and suppressing it causes the no-show the reminder
+exists to prevent. The COUNT includes everything the patient received, because
+blocking is driven by total volume as they experience it — but `admin_alert`
+rows go to STAFF and must never eat a patient's budget. Fails OPEN.
+
+**`is_active` and `online_bookable` are different questions.** The first is
+"does this dentist work here", the second is "may a PATIENT pick them in the
+bot". A visiting orthodontist is very much active and takes referred cases, not
+walk-in toothache off a menu; an owner usually wants new patients coming to them
+rather than to whichever associate has a gap. Every bot query that lists
+dentists filters on `online_bookable`; the dashboard deliberately does not, so
+the desk can still book anyone. Defaults TRUE.
+
+**Feedback is asked once a month per PATIENT, not once per visit.** Three
+sittings in a month used to mean three rating requests — fatiguing, and it
+manufactures a written archive of complaints. Keyed on `patient_id` rather than
+phone, so a father's root canal does not silence his daughter's first visit. The
+copy now states plainly that the answer goes only to the clinic.
+
+**Money leaves a trail the patient keeps.** Recording a `treatment_payment`
+sends a receipt over WhatsApp — amount, method, paid-so-far and balance. It is
+NOT a tax invoice and does not pretend to be; it is the payment slip a front
+desk would hand over. Best-effort and non-blocking: the money is already
+recorded, and a failed send must never fail the request or tempt the
+receptionist into keying the payment twice. `POST /treatment-plans/:id/consent`
+records that consent was taken, by whom and what was explained — the FACT, not a
+signature — and is audited, because an unaudited consent record is worth little
+if it is ever needed. Not `adminOnly`: the dentist who took it is usually not
+the account owner.
+
+**`GET /day-close` is the end-of-day count.** Consultation fees and treatment
+payments stay SEPARATE (conflating them double-counts revenue) and are added
+once into `collected_total`, broken down by method so the drawer can be counted
+against the cash line. IST throughout — `created_at` is a TIMESTAMPTZ and is
+compared in Asia/Kolkata, or a clinic closing at 21:00 sees yesterday.
+
+**A working day is a LIST of sessions.** An Indian dentist routinely does 10–1
+at one clinic and 5–9 at another on the SAME day; for a visiting endodontist it
+is the default arrangement. `doctor_schedules` therefore keys on
+`(doctor_id, day_of_week, start_time)` and carries its own `hospital_id` — a
+schedule row IS a session. It used to be `UNIQUE(doctor_id, day_of_week)` while
+`doctor_hospitals` was keyed per `(doctor, hospital, day)`, so two branches on
+one weekday returned two joined rows and `planDoctorSlots` took the first with
+`.find()`: the evening branch generated NO slots and nothing reported a problem.
+The planner now `filter`s, each session carries its own branch, week-of-month
+cadence and holiday check, and `POST /doctors/:id/schedule` rejects overlapping
+sessions outright — otherwise the overlap is swallowed by the
+`(doctor_id, slot_date, start_time)` unique index on `time_slots`, which is
+exactly how the original bug stayed invisible. `doctor_hospitals` is now a
+mirror for the `/locations` API only; `doctor_schedules.hospital_id` is what
+slot generation reads. Days are REPLACED on save, not upserted, or a session the
+admin deleted lingers and keeps generating slots.
+
+**The grid is a guide, not the diary.** An Indian clinic does not turn a patient
+away because the slot list is empty — the receptionist fits them in. So the two
+places the bot used to dead-end (a dentist with nothing in the whole lookahead,
+and a specific date that filled up) now offer a way through:
+`services/bot/requestFlow.js` writes a `clinic_requests` row and alerts admins on
+WhatsApp. `callback` is also a menu keyword in its own right. A partial unique
+index keeps ONE open request per phone per kind — a patient who taps it on three
+dates is one person wanting one appointment, not three items on the
+receptionist's list. Clearing them is front-desk work, so `PATCH /requests/:id`
+is deliberately NOT `adminOnly`: gate it behind the owner and the list is never
+cleared and stops being trusted.
+
+**Orthodontics is scheduled by the clinic, not the patient.** Braces are 18–24
+monthly adjustments over two years and the next one is set at the chair, never
+chosen from a slot list. `treatment_plans.scheduling_mode` (`patient` | `clinic`)
+gates that: `clinic` plans are excluded from the nudge cron AND from the bot's
+treatment list, or the patient is chased 24 times for something they cannot
+book. `total_visits` caps at 60, not 30 — a two-year case is monthly
+adjustments plus bonding, debond and retainer reviews.
+
+**The consultation fee is quotable, not fixed.** Indian clinics waive it when the
+patient takes treatment, and they negotiate. A firm number shown in WhatsApp and
+not charged at the desk is an argument the receptionist has to have, so
+`settings.show_consultation_fee` (default true, preserving existing behaviour)
+switches it off everywhere — the dentist picker and the confirmation both read
+`showFeesEnabled`, so the two cannot disagree. When shown it reads "payable at
+the clinic", which leaves room for the waiver.
+
+**The dashboard opens on today, because half the footfall walks in.** The landing
+tab leads with today's queue and a `+ Walk-in` button, then the requests above,
+then the stat row. Walk-in entry goes through ONE `openWalkinModal` callback
+shared with the appointments tab so the two cannot prefill differently.
 
 **Visiting consultants.** The specialist is usually a visiting doctor: at one
 branch on Tuesdays, another on Thursdays, and often only on some weeks of the
@@ -371,12 +564,13 @@ substantially, prefer extracting tabs into `components/tabs/` (see
 Required in prod (startup fails or warns otherwise): `DATABASE_URL`,
 `JWT_SECRET` (≥32 chars), `ENCRYPTION_KEY` (≥32 chars, non-default),
 `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_WEBHOOK_VERIFY_TOKEN`,
-`META_APP_SECRET`, `FRONTEND_URL` (locks CORS/CSP). Optional: `REDIS_URL`
+`META_APP_SECRET`, `FRONTEND_URL` (locks CORS/CSP),
+`WHATSAPP_PUBLIC_NUMBER` (the human-dialable number behind
+`META_PHONE_NUMBER_ID`, digits or E.164 — every clinic's QR deep link is built
+from it, so without it no clinic can be reached at all and the dashboard shows
+`configured:false`). Optional: `REDIS_URL`
 (queues, cron locks and shared rate-limit counters all degrade to in-process
-fallbacks without it — nothing probes localhost), `RESEND_API_KEY`,
-`PUBLIC_API_URL` (this API's public origin; required for email open-tracking
-pixels to resolve — omit rather than pointing at localhost),
-`RESEND_WEBHOOK_SECRET`, `TWILIO_*`, `OPENAI_API_KEY` (voice transcription),
+fallbacks without it — nothing probes localhost), `OPENAI_API_KEY` (voice transcription),
 `SENTRY_DSN`, `METRICS_SECRET`, `BACKUP_DIR`, `TIMEZONE`,
 `WEBHOOK_RATE_LIMIT_PER_MIN` (default 2000; per-IP, and Meta delivers every
 tenant's traffic from a shared IP pool, so this is effectively platform-wide).
@@ -386,4 +580,7 @@ Frontend: `BACKEND_URL` (server-side, Railway).
 
 `POST /api/webhook/test` (`{phone, message, button_id, tenant_slug}`) runs a
 message through the real bot engine and returns the replies it would have sent.
-Enabled outside production or with `ENABLE_TEST_ENDPOINT=true`.
+Enabled outside production or with `ENABLE_TEST_ENDPOINT=true`. It takes
+`tenant_slug` directly, so it bypasses entry-code routing — to exercise the QR
+path itself, send the code as the message (`#TESTME` for the demo tenant)
+without a slug.

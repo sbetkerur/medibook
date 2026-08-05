@@ -843,41 +843,4 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
   } catch (err) { handleError(res, err, 'POST /appointments/:id/followup'); }
 });
 
-// ── SMS FALLBACK ──────────────────────────────────────────────
-router.post('/appointments/:id/sms', adminOnly, validateUUID(), async (req, res) => {
-  try {
-    const s = req.tenant.schema_name;
-    const r = await tenantQuery(s, `
-      SELECT a.*, p.phone, p.name as patient_name, d.name as doctor_name, h.name as hospital_name
-      FROM appointments a
-      JOIN patients p ON p.id=a.patient_id
-      JOIN doctors d ON d.id=a.doctor_id
-      JOIN hospitals h ON h.id=a.hospital_id
-      WHERE a.id=$1
-    `, [req.params.id]);
-    if (!r.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
-    const appt = r.rows[0];
-    if (appt.sms_fallback_sent) {
-      return res.status(409).json({ error: 'SMS already sent for this appointment' });
-    }
-    const smsService = require('../services/sms');
-    const { format, parseISO } = require('date-fns');
-    let dateStr = appt.appointment_date;
-    try { dateStr = format(parseISO(String(appt.appointment_date).slice(0, 10)), 'EEE, d MMM yyyy'); } catch {}
-    const sent = await smsService.sendBookingConfirmationSMS(appt.phone, {
-      bookingId: appt.booking_id,
-      doctorName: appt.doctor_name,
-      date: dateStr,
-      time: (appt.appointment_time || '').slice(0, 5),
-      hospitalName: appt.hospital_name,
-    });
-    if (sent) {
-      await tenantQuery(s, `UPDATE appointments SET sms_fallback_sent=true WHERE id=$1`, [appt.id]);
-      res.json({ success: true, message: 'SMS sent successfully' });
-    } else {
-      res.status(503).json({ error: 'SMS service not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER.' });
-    }
-  } catch (err) { handleError(res, err, 'POST /appointments/:id/sms'); }
-});
-
 module.exports = router;

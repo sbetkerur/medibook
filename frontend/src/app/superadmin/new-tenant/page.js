@@ -215,11 +215,11 @@ export default function NewTenantPage() {
                 </div>
               </div>
               {/* City sits with the clinic fields, not the admin ones: it describes
-                  where the clinic IS, and is what the bot matches on for
-                  "clinics near me". Optional — a clinic without one still works,
-                  it just never surfaces in a near-me search. */}
+                  where the clinic IS. Purely informational since patients reach a
+                  clinic by scanning its QR code, not by browsing a location — it
+                  labels the clinic in admin and billing views. */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">City <span className="text-gray-400 font-normal">(used for &quot;clinics near me&quot; search)</span></label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">City <span className="text-gray-400 font-normal">(optional)</span></label>
                 <input value={form.city} onChange={e => set('city', e.target.value)}
                   maxLength={100}
                   placeholder="e.g. Bengaluru"
@@ -318,9 +318,6 @@ export default function NewTenantPage() {
                 {[
                   { label: 'Clinic Name', value: form.name },
                   { label: 'Slug', value: form.slug, mono: true },
-                  // Shown even when blank: a missing city silently keeps the clinic
-                  // out of the bot's "near me" results, so its absence has to be
-                  // visible here rather than discovered later.
                   { label: 'City', value: form.city.trim() || '— not set —' },
                   { label: 'Admin Email', value: form.owner_email },
                   { label: 'Admin Name', value: form.owner_name || `${form.name} Admin` },

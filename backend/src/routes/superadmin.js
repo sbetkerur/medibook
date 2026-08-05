@@ -11,6 +11,7 @@ const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
 const { IST_TODAY_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const { getClient: getRedisClient } = require('../utils/redisClient');
+const { generateEntryCode } = require('../utils/entryCode');
 
 // v2: the meaning of total_appointments_30d / appointments_this_month changed
 // (see GET /stats below). A v1 payload written by the previous deploy would be
@@ -255,11 +256,32 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
     if (existing.rows[0]) return res.status(409).json({ error: 'Slug already taken' });
 
     // Phase 1: insert tenant record (WA credentials are now global — no per-tenant fields)
-    const r = await query(`
-      INSERT INTO tenants (name, slug, schema_name, owner_email, plan, city)
-      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *
-    `, [name, slug, schema, owner_email, plan || 'starter', city?.trim() || null]);
-    const tenant = r.rows[0];
+    //
+    // The entry code is minted HERE rather than left to the backfill in
+    // migrate.js. Migrate runs once per boot, so a tenant created through this
+    // route would otherwise have no code — and therefore no QR, and therefore no
+    // way for its patients to reach it at all — until the next restart.
+    //
+    // Collisions are settled by the unique index rather than a prior SELECT,
+    // which would race a concurrent create. Only an entry-code collision is
+    // retried: any other 23505 (the slug, most likely, since the check above is
+    // racy) is a real conflict and must surface.
+    let tenant = null;
+    for (let attempt = 0; attempt < 5 && !tenant; attempt++) {
+      try {
+        const r = await query(`
+          INSERT INTO tenants (name, slug, schema_name, owner_email, plan, city, entry_code)
+          VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
+        `, [name, slug, schema, owner_email, plan || 'starter', city?.trim() || null,
+            generateEntryCode()]);
+        tenant = r.rows[0];
+      } catch (e) {
+        if (e.code === '23505' && e.constraint === 'idx_tenants_entry_code') continue;
+        if (e.code === '23505') return res.status(409).json({ error: 'Slug already taken' });
+        throw e;
+      }
+    }
+    if (!tenant) return res.status(503).json({ error: 'Could not allocate a clinic entry code. Please retry.' });
 
     // Phase 2 & 3: create schema + admin user — rollback both if either fails
     const effectivePassword = owner_password || crypto.randomBytes(8).toString('hex');
@@ -558,8 +580,7 @@ router.get('/billing', async (req, res) => {
     // out of true are listed right next to it.
     //
     // Branch counts live in each tenant's own schema, so this is one query per
-    // active tenant — the same shape as bot/clinicBranches.listActiveBranches,
-    // run concurrently and caught INDIVIDUALLY so a single schema mid-migration
+    // active tenant, run concurrently and caught INDIVIDUALLY so a single schema mid-migration
     // degrades to "unknown branch count" instead of taking the billing page
     // down. Acceptable here because /billing is an on-demand admin view, not a
     // hot path.
@@ -882,9 +903,9 @@ router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
       // for the first 5.5 hours of the 1st.
       tenantQuery(t.schema_name, `SELECT COUNT(*) FROM appointments WHERE created_at >= ${IST_MONTH_START_TS_SQL}`),
       tenantQuery(t.schema_name, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
-      // Same predicate as the branch cap in POST /hospitals and as
-      // clinicBranches.listActiveBranches — three places counting "a live
-      // branch" differently is how a clinic gets billed for a deleted one.
+      // Same predicate as the branch cap in POST /hospitals — two places
+      // counting "a live branch" differently is how a clinic gets billed for a
+      // deleted one.
       tenantQuery(t.schema_name, `SELECT COUNT(*) FROM hospitals WHERE is_active=true AND deleted_at IS NULL`),
     ]);
 

@@ -247,7 +247,7 @@ async function run() {
     await bookingFlow.handleSelectDate(PHONE, SCHEMA, tenant, makeSend(sink), ctxAtDateStep(), SHUT_DAY);
     assert(!sink.some(m => m.type === 'list' && (m.sections || []).some(s => /^Slots on /.test(s.title))),
       'slots were offered on a declared holiday: ' + JSON.stringify(sink));
-    assert(sink.some(m => /No slots/i.test(m.text)), 'expected a "no slots" reply: ' + JSON.stringify(sink));
+    assert(sink.some(m => /Nothing left on that date/i.test(m.text)), 'expected a "no slots" reply: ' + JSON.stringify(sink));
   });
 
   await test('a holiday at THIS branch blocks the day', async () => {

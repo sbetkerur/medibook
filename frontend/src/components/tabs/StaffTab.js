@@ -7,6 +7,7 @@ import Modal from '@/components/ui/Modal';
 // Self-contained. `setConfirmModal` drives the shared confirm dialog rendered
 // at the page root.
 export default function StaffTab({ isAdmin, setConfirmModal }) {
+  const [newPassword, setNewPassword] = useState(null);
   const [staff, setStaff] = useState([]);
   const [showStaffModal, setShowStaffModal] = useState(false);
   const [editingStaff, setEditingStaff] = useState(null);
@@ -48,6 +49,26 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
     } finally { setStaffSaving(false); }
   }
 
+  // The new password comes back ONCE and is never stored, so it is held in
+  // component state and shown until dismissed. Reloading the page loses it —
+  // which is correct: there is nowhere safe to keep it.
+  function resetPassword(member) {
+    setConfirmModal({
+      title: `Reset password for ${member.name}?`,
+      message: 'They will be signed out everywhere, and you will get a new password to give them directly.',
+      danger: true,
+      onConfirm: async () => {
+        setConfirmModal(null);
+        try {
+          const { data } = await api.post(`/admin/staff/${member.id}/reset-password`);
+          setNewPassword({ name: member.name, email: data.user?.email, password: data.password });
+        } catch (err) {
+          toast.error(err.response?.data?.error || 'Could not reset the password');
+        }
+      },
+    });
+  }
+
   function deactivateStaff(member) {
     setConfirmModal({
       title: `Deactivate ${member.name}?`,
@@ -68,6 +89,34 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
 
   return (
     <>
+      {newPassword && (
+        <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
+          <p className="text-sm font-semibold text-amber-900">
+            New password for {newPassword.name}
+          </p>
+          <p className="mt-1 text-xs text-amber-800">
+            Shown once. Give it to them directly and ask them to change it — we cannot show it again.
+          </p>
+          <code className="mt-2 block break-all rounded-lg border border-amber-300 bg-white px-3 py-2 font-mono text-sm">
+            {newPassword.password}
+          </code>
+          <div className="mt-3 flex gap-2">
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(newPassword.password)
+                  .then(() => toast.success('Copied'))
+                  .catch(() => toast.error('Could not copy — select it and copy by hand'));
+              }}
+              className="px-3 py-1.5 text-xs bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition">
+              Copy
+            </button>
+            <button onClick={() => setNewPassword(null)}
+              className="px-3 py-1.5 text-xs border border-amber-300 text-amber-900 rounded-lg hover:bg-amber-100 transition">
+              Done
+            </button>
+          </div>
+        </div>
+      )}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <p className="text-sm text-gray-500">{staff.length} team member{staff.length !== 1 ? 's' : ''}</p>
@@ -104,6 +153,12 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
                       className="px-3 py-2 text-xs border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
                       ✏️ Edit
                     </button>
+                    {m.is_active && m.id !== undefined && (
+                      <button onClick={() => resetPassword(m)}
+                        className="px-3 py-2 text-xs border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 transition">
+                        🔑 Reset password
+                      </button>
+                    )}
                     {m.is_active && (
                       <button onClick={() => deactivateStaff(m)}
                         className="px-3 py-2 text-xs border border-red-200 text-red-500 rounded-lg hover:bg-red-50 transition">

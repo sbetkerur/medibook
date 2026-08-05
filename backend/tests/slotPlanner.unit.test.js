@@ -128,5 +128,58 @@ const afterHoliday = planDoctorSlots(twoBranches, at('07:00'), 7, h2Closed);
 check('a holiday at the visiting branch blocks only that day',
   [...new Set(afterHoliday.map(p => p.dateStr))], ['2026-03-11']);
 
+// ── TWO BRANCHES ON THE SAME DAY ─────────────────────────────
+// An Indian dentist routinely works 10–1 at one clinic and 5–9 at another on
+// the SAME day; for a visiting endodontist it is the normal arrangement. The
+// planner used to pick the day's schedule with `.find()`, so only the FIRST
+// session was ever generated — the evening branch had no availability and
+// nothing anywhere reported a problem.
+const sameDayTwoBranches = {
+  hospital_id: 'h1',
+  duration: 60,
+  schedules: [
+    { dow: 1, start: '10:00', end: '13:00', lunchStart: null, lunchEnd: null, hospitalId: 'hA' },
+    { dow: 1, start: '17:00', end: '20:00', lunchStart: null, lunchEnd: null, hospitalId: 'hB' },
+  ],
+};
+const twoSessions = planDoctorSlots(sameDayTwoBranches, at('07:00'), 7, never)
+  .filter(p => p.dateStr === '2026-03-16');
+
+check('the morning branch still gets its slots',
+  twoSessions.filter(p => p.hospitalId === 'hA').map(p => p.st), ['10:00', '11:00', '12:00']);
+check('REGRESSION: the evening branch gets its slots too',
+  twoSessions.filter(p => p.hospitalId === 'hB').map(p => p.st), ['17:00', '18:00', '19:00']);
+// The times must not collide: the unique index on (doctor, date, start_time)
+// would drop the duplicates silently, which is exactly how the original bug
+// stayed invisible.
+check('no two sessions claim the same start time',
+  twoSessions.length, new Set(twoSessions.map(p => p.st)).size);
+
+// A holiday at ONE branch must close only that branch's session, not the
+// dentist's whole day.
+const hBClosed = (dateStr, hospitalId) => hospitalId === 'hB';
+const morningOnly = planDoctorSlots(sameDayTwoBranches, at('07:00'), 7, hBClosed)
+  .filter(p => p.dateStr === '2026-03-16');
+check('a holiday at the evening branch leaves the morning intact',
+  [...new Set(morningOnly.map(p => p.hospitalId))], ['hA']);
+
+// Each session keeps its OWN week-of-month cadence: the specialist may be at
+// the second branch only on alternate weeks.
+const alternateEvening = {
+  hospital_id: 'h1',
+  duration: 60,
+  schedules: [
+    { dow: 1, start: '10:00', end: '11:00', lunchStart: null, lunchEnd: null, hospitalId: 'hA' },
+    { dow: 1, start: '17:00', end: '18:00', lunchStart: null, lunchEnd: null, hospitalId: 'hB',
+      weeksOfMonth: [1, 3] },
+  ],
+};
+const cadence = planDoctorSlots(alternateEvening, at('07:00'), 21, never);
+// 16 March 2026 is the 3rd Monday, 23 March the 4th.
+check('the alternate-week evening session runs on the 3rd Monday',
+  cadence.filter(p => p.dateStr === '2026-03-16').map(p => p.hospitalId), ['hA', 'hB']);
+check('and is absent on the 4th Monday, while the morning stays',
+  cadence.filter(p => p.dateStr === '2026-03-23').map(p => p.hospitalId), ['hA']);
+
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

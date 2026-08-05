@@ -220,15 +220,29 @@ router.post('/treatment-plans', async (req, res) => {
     const {
       appointment_id, patient_id, department_id, service_id,
       treating_doctor_id, title, tooth_ref, total_visits, estimated_cost, notes,
+      scheduling_mode,
     } = req.body;
     const s = req.tenant.schema_name;
 
     if (!title || !String(title).trim()) {
       return res.status(400).json({ error: 'title is required (what treatment was advised)' });
     }
+    // 60, not 30: a two-year orthodontic case is monthly adjustments plus
+    // bonding, debond and retainer reviews. Still bounded — an unbounded value
+    // here is a typo that puts hundreds of visits on a plan.
     const visits = parseInt(total_visits ?? 1, 10);
-    if (!Number.isInteger(visits) || visits < 1 || visits > 30) {
-      return res.status(400).json({ error: 'total_visits must be between 1 and 30' });
+    if (!Number.isInteger(visits) || visits < 1 || visits > 60) {
+      return res.status(400).json({ error: 'total_visits must be between 1 and 60' });
+    }
+    // Who books the sittings after the first. 'patient' (the default) is the
+    // ordinary case: the patient is nudged and books the next one themselves.
+    // 'clinic' is orthodontics and anything else the dentist schedules at the
+    // chair — those plans are never nudged and never offered in the bot's
+    // treatment list, because the date depends on clinical progress the
+    // patient cannot judge.
+    const mode = scheduling_mode || 'patient';
+    if (!['patient', 'clinic'].includes(mode)) {
+      return res.status(400).json({ error: "scheduling_mode must be 'patient' or 'clinic'" });
     }
     const cost = parseInt(estimated_cost ?? 0, 10);
     if (!Number.isInteger(cost) || cost < 0 || cost > 10000000) {
@@ -295,16 +309,16 @@ router.post('/treatment-plans', async (req, res) => {
       INSERT INTO treatment_plans
         (patient_id, hospital_id, department_id, service_id, origin_appointment_id,
          advised_by_doctor_id, treating_doctor_id, title, tooth_ref, total_visits,
-         estimated_cost, notes, created_by_user_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         estimated_cost, notes, created_by_user_id, scheduling_mode)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING *
     `, [effectivePatientId, effectiveHospitalId, effectiveDepartmentId, service_id || null,
         appointment_id || null, origin?.doctor_id || null, effectiveTreatingId,
         String(title).trim().slice(0, 255), tooth_ref ? String(tooth_ref).slice(0, 50) : null,
-        visits, cost, notes || null, req.user.id]);
+        visits, cost, notes || null, req.user.id, mode]);
 
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_TREATMENT_PLAN', 'treatment_plan',
-      r.rows[0].id, null, { title: r.rows[0].title, total_visits: visits, treating_doctor_id: effectiveTreatingId }, req.ip);
+      r.rows[0].id, null, { title: r.rows[0].title, total_visits: visits, treating_doctor_id: effectiveTreatingId, scheduling_mode: mode }, req.ip);
 
     res.json({ treatment_plan: withProgress({ ...r.rows[0], completed_visits: 0, booked_visits: 0 }) });
   } catch (err) { handleError(res, err, 'POST /treatment-plans'); }
@@ -480,17 +494,46 @@ router.post('/treatment-plans/:id/visits', validateUUID(), async (req, res) => {
     // nothing is waiting on a reply that could be routed to the wrong clinic.
     (async () => {
       try {
-        const { sendPatientText } = require('../services/outbound');
+        const { sendPatientMessage } = require('../services/outbound');
         const { format, parseISO } = require('date-fns');
         const pretty = format(parseISO(booked.slot.slot_date), 'EEE, d MMM yyyy');
-        await sendPatientText(s, plan.patient_phone,
-          `🦷 *Treatment Appointment Booked*\n\n` +
-          `*${plan.title}* — visit ${booked.visitNumber} of ${plan.total_visits}\n` +
-          `👨‍⚕️ Dr. ${doctor.name}\n` +
-          `📅 ${pretty} at ${String(booked.slot.start_time).slice(0, 5)}\n` +
-          (plan.hospital_name ? `🏥 ${plan.hospital_name}\n` : '') +
-          `🪪 Booking ID: *${booked.bookingId}*\n\n` +
-          `Reply *Menu* for your appointments.`);
+        const time = String(booked.slot.start_time).slice(0, 5);
+        const branch = plan.hospital_name || '';
+
+        // Restyled to match every other confirmation: WHEN and WHO lead,
+        // supporting detail sits under them, one glyph at most. It was the last
+        // message still opening each fact with its own emoji (🦷 👨‍⚕️ 📅 🏥).
+        const text =
+          `✅ *Your next visit is booked*\n\n` +
+          `*${pretty}*\n` +
+          `*${time}* with Dr. ${doctor.name}\n\n` +
+          `${plan.title} — visit ${booked.visitNumber} of ${plan.total_visits}\n` +
+          (branch ? `${branch}\n` : '') +
+          `Booking ID *${booked.bookingId}*\n\n` +
+          `Reply *Menu* for your appointments.`;
+
+        // Template-first: the receptionist books this at the desk, so the
+        // patient is very often NOT mid-conversation — outside Meta's 24-hour
+        // window a plain text send is rejected and they hear nothing at all,
+        // while the clinic believes they were told.
+        await sendPatientMessage(s, plan.patient_phone, {
+          template: 'treatment_sitting_booked',
+          components: [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: String(plan.title).slice(0, 120) },
+              { type: 'text', text: String(booked.visitNumber) },
+              { type: 'text', text: String(plan.total_visits) },
+              { type: 'text', text: pretty },
+              { type: 'text', text: time },
+              { type: 'text', text: String(doctor.name).slice(0, 60) },
+              // A plan with no branch would leave the parameter empty, and Meta
+              // rejects the whole send on an empty parameter.
+              { type: 'text', text: branch || 'the clinic' },
+            ],
+          }],
+          text,
+        });
       } catch (err) {
         logger.warn('Treatment visit booked but patient notification failed', {
           plan: req.params.id, error: err.message,
@@ -647,8 +690,112 @@ router.post('/treatment-plans/:id/payments', validateUUID(), async (req, res) =>
     const totals = await tenantQuery(s, `
       SELECT COALESCE(SUM(amount),0)::int AS amount_paid FROM treatment_payments WHERE treatment_plan_id=$1
     `, [req.params.id]);
+
+    // ── THE RECEIPT ──────────────────────────────────────────
+    // Every patient who pays asks for something to keep, and until now there
+    // was nothing to give them — the only "receipt" in this codebase was a
+    // WhatsApp delivery receipt. This is not a tax invoice (the product does
+    // not issue those) and does not pretend to be: it is the payment slip a
+    // front desk would hand over, in the place the patient will still have it
+    // in six months.
+    //
+    // Best-effort and non-blocking: the money is already recorded, and a failed
+    // WhatsApp send must never fail the request the receptionist just made or
+    // tempt them into keying the payment twice.
+    (async () => {
+      const info = await tenantQuery(s, `
+        SELECT p.phone, p.name AS patient_name, p.opted_out, tp.title, tp.estimated_cost
+          FROM treatment_plans tp JOIN patients p ON p.id = tp.patient_id
+         WHERE tp.id = $1
+      `, [req.params.id]);
+      const row = info.rows[0];
+      if (!row?.phone || row.opted_out) return;
+
+      const paid = totals.rows[0].amount_paid;
+      // Clamped at 0 and reported the same way the plan's own balance is: an
+      // overpayment usually means a stale estimate, and a negative "balance"
+      // on a receipt is alarming rather than informative.
+      const balance = Math.max(0, (row.estimated_cost || 0) - paid);
+      const money = n => '₹' + Number(n || 0).toLocaleString('en-IN');
+      const methodLabel = (method || 'cash').replace(/_/g, ' ');
+
+      // The two figures that vary in SHAPE, not just in value, are pre-composed
+      // into single parameters. A template cannot carry a conditional line, and
+      // a course with no estimate has no balance to state — so the phrase is
+      // built here and passed whole.
+      const paidPhrase = row.estimated_cost
+        ? `${money(paid)} of ${money(row.estimated_cost)}`
+        : money(paid);
+      const balancePhrase = !row.estimated_cost
+        ? 'we will confirm the total with you'
+        : (balance > 0 ? money(balance) : 'nothing further to pay');
+
+      const text =
+        `*Payment received*\n\n` +
+        `${money(amt)} by ${methodLabel}\n` +
+        `for *${row.title}*\n\n` +
+        `Paid so far  ${paidPhrase}\n` +
+        `Balance  ${balancePhrase}\n\n` +
+        `Thank you — ${req.tenant.name}`;
+
+      // Template-first. A payment is routinely recorded days after the patient
+      // last messaged, which puts them outside Meta's 24-hour window — where a
+      // plain text send is rejected outright and the patient gets nothing.
+      const { sendPatientMessage } = require('../services/outbound');
+      await sendPatientMessage(s, row.phone, {
+        template: 'payment_receipt',
+        components: [{
+          type: 'body',
+          parameters: [
+            { type: 'text', text: money(amt) },
+            { type: 'text', text: methodLabel },
+            { type: 'text', text: String(row.title).slice(0, 120) },
+            { type: 'text', text: paidPhrase },
+            { type: 'text', text: balancePhrase },
+            { type: 'text', text: String(req.tenant.name).slice(0, 60) },
+          ],
+        }],
+        text,
+      });
+    })().catch(err => logger.warn('Payment receipt not sent', { plan: req.params.id, error: err.message }));
+
     res.json({ payment: r.rows[0], amount_paid: totals.rows[0].amount_paid });
   } catch (err) { handleError(res, err, 'POST /treatment-plans/:id/payments'); }
+});
+
+/**
+ * Record that consent was taken for this course.
+ *
+ * Extractions and surgery need one and it is what protects the dentist. This
+ * records the FACT of consent — who took it, when, and what was explained —
+ * rather than capturing a signature, which is a different and much larger
+ * thing. The note is where "explained risk of nerve damage, patient agreed"
+ * goes.
+ *
+ * Not adminOnly: the dentist who took the consent is usually not the account
+ * owner, and consent recorded a day late by the one person allowed to type it
+ * is worth less than consent recorded at the chair.
+ */
+router.post('/treatment-plans/:id/consent', validateUUID(), async (req, res) => {
+  try {
+    const s = req.tenant.schema_name;
+    const note = req.body?.note ? String(req.body.note).slice(0, 2000) : null;
+
+    const r = await tenantQuery(s, `
+      UPDATE treatment_plans
+         SET consent_taken_at = NOW(), consent_taken_by = $1, consent_note = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, title, consent_taken_at, consent_note
+    `, [req.user.id, note, req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Treatment plan not found' });
+
+    // Audited because it is evidence. An unaudited consent record is worth
+    // little if it is ever actually needed.
+    await writeAuditLog(s, req.user.id, req.user.role, 'RECORD_CONSENT', 'treatment_plan',
+      req.params.id, null, { note }, req.ip);
+
+    res.json({ treatment_plan: r.rows[0] });
+  } catch (err) { handleError(res, err, 'POST /treatment-plans/:id/consent'); }
 });
 
 // Correcting a mis-keyed amount. Admin-only and audited: this is the one

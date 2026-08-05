@@ -12,6 +12,7 @@ const {
   parseChoiceNumber,
   maskPhone,
   sendConfirmButtons,
+  clinicPhoneLine,
   confirmButtonIndex,
   getPatient,
   getPatients,
@@ -26,7 +27,7 @@ async function showMyAppointments(phone, schema, tenant, send) {
   // booked for other family members were invisible in this view.
   const patients = await getPatients(schema, phone);
   if (!patients.length) {
-    await send.text('We don\'t have any appointments linked to this number.\n\nReply *Menu* and tap *Book Appointment* to schedule your first one! 😊');
+    await send.text('We have no appointments under this number yet.\n\nReply *Menu* and tap *Book Appointment* to make your first one.');
     return;
   }
 
@@ -61,7 +62,7 @@ async function showMyAppointments(phone, schema, tenant, send) {
   ]);
 
   if (!upcomingR.rows.length && !pastR.rows.length) {
-    await send.text('You have no appointments yet.\n\nReply *Menu* and tap *Book Appointment* to get started! 📅');
+    await send.text('You have no appointments with us yet.\n\nReply *Menu* and tap *Book Appointment* to make one.');
     return;
   }
 
@@ -136,7 +137,8 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
     const apptDateTimeR = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
     const hoursUntilR = (apptDateTimeR - nowDateR) / (1000 * 60 * 60);
     if (!isNaN(hoursUntilR) && hoursUntilR < 2 && hoursUntilR >= 0) {
-      await send.text(`⚠️ Rescheduling must be done at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Menu* to return to main menu.`);
+      await send.text(`Appointments can only be moved up to 2 hours beforehand, and yours is closer than that.\n\nPlease call us — we can still move it for you.\n\nReply *Menu* to go back.`
+        + await clinicPhoneLine(schema, a.hospital_id));
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -178,7 +180,8 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
     slots: parseInt(r.slots),
   }));
   if (!dates.length) {
-    await send.text(`No available slots for Dr. ${a.doctor_name} in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nReply *Menu* to go back.`);
+    await send.text(`Dr. ${a.doctor_name} has nothing free in the next ${SLOT_LOOKAHEAD_DAYS} days.\n\nPlease call us to move it. Reply *Menu* to go back.`
+      + await clinicPhoneLine(schema, a.hospital_id));
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
@@ -226,7 +229,7 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
     if (n >= 1 && n <= cachedDates.length) {
       resolvedDate = cachedDates[n - 1].date;
     } else {
-      await send.text('Please select a date from the list.');
+      await send.text('Please pick a date from the list.');
       return;
     }
   }
@@ -239,7 +242,7 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
   // in exactly the case where we can't verify it against leaves/holidays.
   const offeredDates = ctx._reschedule_dates || [];
   if (!offeredDates.length || !offeredDates.some(d => d.date === resolvedDate)) {
-    await send.text('That date is not available. Please pick a date from the list, or reply *Menu* to start over.');
+    await send.text('That day is not on offer. Please pick one from the list, or reply *Menu* to start over.');
     return;
   }
   ctx.reschedule_new_date = resolvedDate;
@@ -264,7 +267,7 @@ async function handleRescheduleDate(phone, schema, tenant, send, ctx, choice) {
      ORDER BY start_time`,
     [ctx.reschedule_doctor_id, resolvedDate, ctx.reschedule_hospital_id || null]);
   if (!slots.rows.length) {
-    await send.text('No slots available for that date. Please pick another.\n\nReply *Menu* to start over.');
+    await send.text('Nothing left on that date. Please pick another.\n\nReply *Menu* to start over.');
     return;
   }
   // Cap at 10 rows — WhatsApp list messages reject more than 10 rows per section.
@@ -295,7 +298,7 @@ async function handleRescheduleSlot(phone, schema, tenant, send, ctx, choice, in
     s.start_time.slice(0, 5) === input ||
     s.start_time.slice(0, 5) === choice
   ) || (num >= 1 && num <= slots.length ? slots[num - 1] : null);
-  if (!slot) { await send.text('Please select a time slot from the list.'); return; }
+  if (!slot) { await send.text('Please pick a time from the list.'); return; }
   ctx.reschedule_new_slot_id = slot.id;
   ctx.reschedule_new_time = slot.start_time;
 
@@ -326,7 +329,7 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
   const btnIdx = confirmButtonIndex(ctx, choice);
   if (btnIdx === -1) {
     await sendConfirmButtons(send, ctx,
-      `🔄 That looks like a tap on an older message.\n\nConfirm the change to your appointment?`,
+      `That looks like a tap on an older message.\n\nConfirm the change to your appointment?`,
       ['✅ Yes, Reschedule', '❌ No, Keep Original']
     );
     await updateSession(schema, phone, STATES.RESCHEDULE_CONFIRM, ctx);
@@ -385,12 +388,12 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       return 'ok';
     });
     if (rescheduled === 'appt_gone') {
-      await send.text('⚠️ This appointment is no longer active — it may have been cancelled or updated by the clinic. Reply *Menu* to check your appointments.');
+      await send.text('That appointment is no longer active — the clinic may have changed or cancelled it.\n\nReply *My* to see where things stand.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
     if (rescheduled !== 'ok') {
-      await send.text('⚠️ That slot was just taken! Reply *Menu* to pick another time.');
+      await send.text('Someone just took that time.\n\nReply *Menu* to pick another.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -450,7 +453,8 @@ async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
     const apptDateTime = fromZonedTime(`${a.appointment_date}T${a.appointment_time}`, IST);
     const hoursUntilAppt = (apptDateTime - nowDate) / (1000 * 60 * 60);
     if (!isNaN(hoursUntilAppt) && hoursUntilAppt < 2 && hoursUntilAppt >= 0) {
-      await send.text(`⚠️ Cancellations must be made at least 2 hours before the appointment.\n\nYour appointment is in less than 2 hours. Please call the clinic directly.\n\nReply *Menu* to return to main menu.`);
+      await send.text(`Appointments can only be cancelled up to 2 hours beforehand, and yours is closer than that.\n\nPlease call us and let us know.\n\nReply *Menu* to go back.`
+        + await clinicPhoneLine(schema, a.hospital_id));
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
@@ -482,11 +486,18 @@ async function handleCancelReason(phone, schema, tenant, send, ctx, input, butto
   try { confirmDateLabel = format(parseISO(ctx.cancel_date), 'EEE, d MMM'); } catch {}
   // sendConfirmButtons, not send.buttons — "this cannot be undone" must only be
   // answerable by the buttons on THIS message (see bot/utils.js).
+  // Moving it comes FIRST, and it is the only non-destructive option on the
+  // message. When a patient rings a clinic to cancel, the receptionist says
+  // "what about Thursday?" and a good share of them take Thursday — the bot
+  // used to automate only the losing half of that conversation. "Schedule
+  // conflict" is one of the reasons on the previous screen, which makes the
+  // omission plainer still.
   await sendConfirmButtons(send, ctx,
     `*${confirmDateLabel} at ${(ctx.cancel_time || '').slice(0, 5)}* with Dr. ${ctx.cancel_doctor_name}\n\n` +
-    `_${ctx.cancel_reason}_`,
-    ['Yes, Cancel It', 'No, Keep It'],
-    { header: 'This cannot be undone', footer: `${ctx.cancel_booking_id} · Nothing changes until you tap` }
+    `_${ctx.cancel_reason}_\n\n` +
+    `If the time is the problem, we can move it instead — you keep your place with Dr. ${ctx.cancel_doctor_name}.`,
+    ['📅 Move it instead', 'Yes, cancel it', 'No, keep it'],
+    { header: 'Before you cancel', footer: `${ctx.cancel_booking_id} · Nothing changes until you tap` }
   );
   await updateSession(schema, phone, STATES.CANCEL_CONFIRM, ctx);
 }
@@ -499,9 +510,9 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
   const btnIdx = confirmButtonIndex(ctx, choice);
   if (btnIdx === -1) {
     await sendConfirmButtons(send, ctx,
-      `❌ That looks like a tap on an older message.\n\n` +
-      `Booking: *${ctx.cancel_booking_id}*\n\nThis cannot be undone. Are you sure?`,
-      ['Yes, Cancel It', 'No, Keep It']
+      `That looks like a tap on an older message.\n\n` +
+      `Booking: *${ctx.cancel_booking_id}*\n\nCancelling cannot be undone. Are you sure?`,
+      ['📅 Move it instead', 'Yes, cancel it', 'No, keep it']
     );
     await updateSession(schema, phone, STATES.CANCEL_CONFIRM, ctx);
     return;
@@ -510,8 +521,24 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
   // word "cancel" and would otherwise match the positive pattern and cancel
   // the appointment the patient explicitly asked to keep. btn_0/btn_1 are now
   // matched by verified index rather than as substrings of the raw id.
-  const isNegative = btnIdx === 1 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^2$/i.test(choice);
-  if (!isNegative && (btnIdx === 0 || /yes|cancel|^1$/.test(choice))) {
+  // The save, checked before either of the other two: a patient who taps
+  // "Move it instead" has said neither yes nor no to cancelling, and the
+  // reschedule flow re-reads the booking from its id, so nothing is destroyed
+  // on the way through. Falls back to the cancel prompt if the booking can no
+  // longer be moved (inside the 2-hour window, or no free slots), which is the
+  // honest outcome rather than a dead end.
+  const wantsMove = btnIdx === 0 || /\bmove\b|\breschedul/i.test(choice);
+  if (wantsMove) {
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return handleRescheduleSelect(phone, schema, tenant, send, {}, ctx.cancel_booking_id);
+  }
+
+  // Indices shift with the button above: 1 is now "yes, cancel", 2 is "keep".
+  // Check negative intent FIRST — replies like "no, don't cancel" contain the
+  // word "cancel" and would otherwise match the positive pattern and cancel the
+  // appointment the patient explicitly asked to keep.
+  const isNegative = btnIdx === 2 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^3$/i.test(choice);
+  if (!isNegative && (btnIdx === 1 || /yes|cancel|^2$/.test(choice))) {
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(
         `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,
@@ -527,7 +554,7 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
       return false;
     });
     if (!cancelled) {
-      await send.text('⚠️ This appointment has already been cancelled or modified. Reply *Menu* to check your appointments.');
+      await send.text('That appointment has already been cancelled or changed.\n\nReply *My* to see where things stand.');
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }

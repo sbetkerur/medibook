@@ -674,8 +674,12 @@ async function migrate() {
       `);
     });
 
-    // Version 25: which BRANCH the patient tapped at the "clinics near me" city
-    // step, so booking doesn't ask again. It lives on the global session rather
+    // Version 25: a BRANCH the patient chose before booking started, so booking
+    // doesn't ask again. Written by the "clinics near me" city picker, which has
+    // since been removed in favour of per-clinic QR entry codes; the column and
+    // its one-shot read in bookingFlow.startBooking are kept as the hook a
+    // per-BRANCH QR would use, and stay NULL until something writes them.
+    // It lives on the global session rather
     // than in the tenant's bot_sessions context because selecting a clinic hands
     // the engine a synthesised "Hi", and a greeting resets that context to empty
     // — anything parked there would be wiped before booking could read it.
@@ -687,6 +691,65 @@ async function migrate() {
         ALTER TABLE global_bot_sessions ADD COLUMN IF NOT EXISTS pending_hospital_id UUID;
       `);
     });
+
+    // Version 26: the clinic's own way into the shared WhatsApp number. A
+    // printed QR encodes a wa.me link with this code pre-typed, so a clinic's
+    // patient reaches that clinic directly instead of searching for it by name
+    // and being shown a picker that contains competitors. See
+    // utils/entryCode.js for the format and why it is not a secret.
+    //
+    // The unique index is what the generator's collision retry tests against,
+    // so it is not optional. It is deliberately NOT partial on NULL: the column
+    // is nullable only for the instant between a tenant row being inserted and
+    // the backfill below giving it a code, and Postgres already treats NULLs as
+    // distinct in a unique index.
+    await runMigration(client, 26, 'tenant_entry_code', async () => {
+      await client.query(`
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS entry_code VARCHAR(16);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_entry_code ON tenants(entry_code);
+      `);
+    });
+
+    // Backfill, unconditionally on every boot rather than inside the migration
+    // above. Two reasons: prod runs with SEED_DEMO_DATA=false so seed-time
+    // fixups never execute there, and a tenant created through any path that
+    // forgets to mint a code would otherwise have a NULL one forever — with the
+    // only symptom being that its QR panel is permanently empty. This UPDATE
+    // no-ops once every tenant has a code, which is the normal case.
+    //
+    // Placed AFTER version 26 and not with the other unconditional blocks at
+    // the top of this file: those run before the versioned migrations, so on a
+    // fresh database `entry_code` would not exist yet (the same trap documented
+    // on global_bot_sessions above).
+    try {
+      const missing = await client.query(
+        `SELECT id FROM tenants WHERE entry_code IS NULL`);
+      if (missing.rows.length) {
+        const { generateEntryCode } = require('../utils/entryCode');
+        let filled = 0;
+        for (const t of missing.rows) {
+          // Retry on the unique index rather than pre-checking: a SELECT-then-
+          // INSERT would race a concurrently booting instance, and the index is
+          // the only thing that can actually answer "is this code taken".
+          for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+              await client.query(
+                `UPDATE tenants SET entry_code=$1 WHERE id=$2 AND entry_code IS NULL`,
+                [generateEntryCode(), t.id]);
+              filled++;
+              break;
+            } catch (e) {
+              if (e.code !== '23505') throw e; // not a collision — real failure
+            }
+          }
+        }
+        console.log(`✅ Entry codes backfilled for ${filled} tenant(s)`);
+      }
+    } catch (e) {
+      // Never fatal: entrypoint.sh runs migrate under `set -e`, and a clinic
+      // without a QR code is a missing feature, not a reason to refuse to boot.
+      console.warn('⚠️  Entry code backfill skipped:', e.message);
+    }
 
     console.log('✅ Public schema migrations complete');
     console.log('✅ Plans seeded (starter ₹799, professional ₹1799/branch)');

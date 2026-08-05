@@ -73,7 +73,8 @@ async function createTenantSchema(schemaName) {
         is_working BOOLEAN DEFAULT true,
         lunch_start_time TIME DEFAULT NULL,
         lunch_end_time   TIME DEFAULT NULL,
-        UNIQUE(doctor_id, day_of_week)
+        hospital_id UUID REFERENCES hospitals(id),
+        UNIQUE(doctor_id, day_of_week, start_time)
       );
 
       CREATE TABLE IF NOT EXISTS time_slots (
@@ -784,7 +785,9 @@ async function runTenantMigrations(schemaName) {
         treating_doctor_id UUID REFERENCES doctors(id),
         title VARCHAR(255) NOT NULL,
         tooth_ref VARCHAR(50),
-        total_visits INTEGER NOT NULL DEFAULT 1 CHECK (total_visits BETWEEN 1 AND 30),
+        total_visits INTEGER NOT NULL DEFAULT 1 CHECK (total_visits BETWEEN 1 AND 60),
+        scheduling_mode VARCHAR(10) NOT NULL DEFAULT 'patient'
+          CHECK (scheduling_mode IN ('patient','clinic')),
         estimated_cost INTEGER DEFAULT 0,
         status VARCHAR(20) NOT NULL DEFAULT 'proposed'
           CHECK (status IN ('proposed','in_progress','completed','declined','cancelled')),
@@ -996,6 +999,147 @@ async function runTenantMigrations(schemaName) {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_appt_followup_unique
         ON appointments(follow_up_appointment_id) WHERE follow_up_appointment_id IS NOT NULL;
     `).catch(err => logger.warn('Could not create idx_appt_followup_unique (likely pre-existing duplicate data)', { schema: schemaName, error: err.message }));
+
+    // ── A WORKING DAY IS A LIST OF SESSIONS, NOT ONE WINDOW ────
+    // An Indian dentist routinely works 10–1 at one clinic and 5–9 at another
+    // on the SAME day — the default arrangement for a visiting endodontist or
+    // an owner with two branches. The old model could not express it:
+    // doctor_schedules was UNIQUE(doctor_id, day_of_week), one window per day,
+    // while doctor_hospitals was keyed per (doctor, hospital, day). Two branch
+    // rows for one weekday made the LEFT JOIN return two schedule rows, and
+    // planDoctorSlots took the FIRST with `.find()` — so the second branch got
+    // no slots, with no error anywhere. The clinic would notice weeks later.
+    //
+    // A schedule row now IS a session: doctor + weekday + hours + branch.
+    // `hospital_id` NULL still means the doctor's primary branch, which is
+    // every doctor who is not a visiting consultant.
+    await client.query(`
+      ALTER TABLE doctor_schedules ADD COLUMN IF NOT EXISTS hospital_id UUID REFERENCES hospitals(id);
+    `);
+    // Carry the existing per-weekday branch across before the old constraint
+    // goes, or the meaning of those rows is lost.
+    await client.query(`
+      UPDATE doctor_schedules s
+         SET hospital_id = dh.hospital_id
+        FROM doctor_hospitals dh
+       WHERE dh.doctor_id = s.doctor_id
+         AND dh.day_of_week = s.day_of_week
+         AND s.hospital_id IS NULL;
+    `).catch(err => logger.warn('doctor_schedules branch backfill skipped', { schema: schemaName, error: err.message }));
+    // Swap UNIQUE(doctor,day) for UNIQUE(doctor,day,start_time). Dropped by
+    // lookup rather than by its default name: a schema created before the
+    // constraint was named this way would silently keep it and reject the
+    // second session forever.
+    await client.query(`
+      DO $$
+      DECLARE conname TEXT;
+      BEGIN
+        SELECT c.conname INTO conname
+          FROM pg_constraint c
+          JOIN pg_class t ON t.oid = c.conrelid
+          JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE t.relname = 'doctor_schedules'
+           AND n.nspname = current_schema()
+           AND c.contype = 'u'
+           AND (SELECT COUNT(*) FROM unnest(c.conkey)) = 2
+         LIMIT 1;
+        IF conname IS NOT NULL THEN
+          EXECUTE format('ALTER TABLE doctor_schedules DROP CONSTRAINT %I', conname);
+        END IF;
+      END $$;
+    `).catch(err => logger.warn('doctor_schedules unique swap skipped', { schema: schemaName, error: err.message }));
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_doctor_schedules_session
+        ON doctor_schedules(doctor_id, day_of_week, start_time);
+    `).catch(err => logger.warn('idx_doctor_schedules_session skipped', { schema: schemaName, error: err.message }));
+
+    // ── REQUESTS THE BOT COULD NOT SATISFY ─────────────────────
+    // Two dead ends the front desk never heard about: a patient who wanted a
+    // day with no free slots, and a patient the bot simply could not help. In
+    // an Indian clinic both would have phoned, and the receptionist would have
+    // fitted them in — the grid is a guide, not the diary. These rows are that
+    // conversation, queued for someone to work through.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS clinic_requests (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        kind VARCHAR(20) NOT NULL CHECK (kind IN ('appointment','callback')),
+        phone VARCHAR(20) NOT NULL,
+        patient_id UUID REFERENCES patients(id) ON DELETE SET NULL,
+        patient_name VARCHAR(255),
+        hospital_id UUID REFERENCES hospitals(id),
+        department_id UUID REFERENCES departments(id),
+        doctor_id UUID REFERENCES doctors(id) ON DELETE SET NULL,
+        preferred_date DATE,
+        note TEXT,
+        status VARCHAR(20) NOT NULL DEFAULT 'open'
+          CHECK (status IN ('open','handled','closed')),
+        handled_by_user_id UUID,
+        handled_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_clinic_requests_open
+        ON clinic_requests(created_at DESC) WHERE status = 'open';
+      CREATE INDEX IF NOT EXISTS idx_clinic_requests_phone ON clinic_requests(phone);
+    `);
+    // One open request per phone per kind. A patient who taps "ask the clinic"
+    // on three different dates is one person wanting one appointment, not three
+    // items on the receptionist's list.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_clinic_requests_one_open
+        ON clinic_requests(phone, kind) WHERE status = 'open';
+    `).catch(err => logger.warn('idx_clinic_requests_one_open skipped', { schema: schemaName, error: err.message }));
+
+    // ── COURSES THE CLINIC SCHEDULES, NOT THE PATIENT ──────────
+    // Orthodontics is 18–24 monthly adjustments over two years, and the next
+    // appointment is set by the dentist at the chair ("come back in four
+    // weeks") — never chosen by the patient from a slot list. Nudging them to
+    // self-book a monthly adjustment is wrong for the single biggest course
+    // type in an Indian practice.
+    await client.query(`
+      ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS scheduling_mode VARCHAR(10)
+        NOT NULL DEFAULT 'patient';
+    `);
+    await client.query(`
+      ALTER TABLE treatment_plans DROP CONSTRAINT IF EXISTS treatment_plans_scheduling_mode_check;
+      ALTER TABLE treatment_plans ADD CONSTRAINT treatment_plans_scheduling_mode_check
+        CHECK (scheduling_mode IN ('patient','clinic'));
+    `).catch(err => logger.warn('scheduling_mode check skipped', { schema: schemaName, error: err.message }));
+    // 30 visits does not cover a two-year ortho case (monthly adjustments plus
+    // bonding, debond and retainer reviews). Raised rather than removed: an
+    // unbounded value here is a typo that generates hundreds of appointments.
+    await client.query(`
+      ALTER TABLE treatment_plans DROP CONSTRAINT IF EXISTS treatment_plans_total_visits_check;
+      ALTER TABLE treatment_plans ADD CONSTRAINT treatment_plans_total_visits_check
+        CHECK (total_visits BETWEEN 1 AND 60);
+    `).catch(err => logger.warn('total_visits cap raise skipped', { schema: schemaName, error: err.message }));
+
+    // ── NOT EVERY DENTIST BELONGS ON THE PUBLIC LIST ───────────
+    // "Active with a schedule" used to mean "bookable by any stranger". A
+    // clinic's visiting orthodontist takes referred cases, not walk-in
+    // toothache, and an owner usually wants new patients coming to them rather
+    // than to whichever associate has a gap. Defaults TRUE so nothing changes
+    // for an existing clinic until they decide otherwise.
+    await client.query(`
+      ALTER TABLE doctors ADD COLUMN IF NOT EXISTS online_bookable BOOLEAN NOT NULL DEFAULT true;
+    `);
+
+    // Which board, referral or listing actually brought the patient in. Set at
+    // the desk, not asked in the bot — the booking flow is already long enough,
+    // and the receptionist knows the answer better than the patient does.
+    await client.query(`
+      ALTER TABLE patients ADD COLUMN IF NOT EXISTS referral_source VARCHAR(50);
+    `);
+
+    // ── CONSENT ────────────────────────────────────────────────
+    // Extractions and surgery need one, and it is what protects the dentist.
+    // Recorded as evidence that consent WAS taken, by whom and when — not as a
+    // digital signature, which is a different and much larger thing. The note
+    // is where "explained risks of nerve damage, patient agreed" goes.
+    await client.query(`
+      ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS consent_taken_at TIMESTAMPTZ;
+      ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS consent_taken_by UUID;
+      ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS consent_note TEXT;
+    `);
 
   } finally {
     // RESET BOTH. statement_timeout is per-session state and the pool sets it

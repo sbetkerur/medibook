@@ -4,9 +4,50 @@ Every message MediBook sends to a patient **outside a 24-hour conversation
 window** must be a template approved by Meta. That covers every cron: reminders,
 feedback, treatment nudges and recalls. Without them those jobs fall back to
 plain text, which Meta rejects for anyone who has not messaged the clinic in the
-last 24 hours — i.e. exactly the people each job is trying to reach.
+last 24 hours — i.e. exactly the people each job is trying to reach. It also
+covers the desk: receipts, sittings booked at reception, and the alerts sent to
+the clinic's own staff.
 
 Create these in **Meta Business Manager → WhatsApp Manager → Message templates**.
+
+## Every template that must exist
+
+Ten. Create them all — the product has a message for each and **none of them
+reaches anybody without its template**, because every one is sent outside a
+conversation the patient started.
+
+| # | Name | Vars | Sent by | Buttons |
+|---|---|---|---|---|
+| 1 | `appointment_confirmed` | 5 | booking completes | 2 |
+| 2 | `appointment_reminder_24h` | 4 | the day before | 3 |
+| 3 | `appointment_reminder_2h` | 3 | a couple of hours before | — |
+| 4 | `appointment_feedback_request` | 3 | day after a completed visit | 3 |
+| 5 | `appointment_missed_rebook` | 3 | day after a no-show | 1 |
+| 6 | `treatment_sitting_reminder` | 5 | course unfinished, nothing booked | 1 |
+| 7 | `patient_recall_checkup` | 2 | six-month check-up loop | 1 |
+| 8 | `payment_receipt` | 6 | a payment is recorded | — |
+| 9 | `treatment_sitting_booked` | 7 | the desk books the next sitting | 2 |
+| 10 | `clinic_staff_alert` | 2 | alerts + Monday summary, **to staff** | — |
+
+**8, 9 and 10 are new and have never been submitted.** Until they are approved,
+those three messages do not arrive at all:
+
+- **10 is the urgent one.** It fails *100% of the time*, not occasionally. A
+  clinic owner never messages the shared number — that is the point of the QR —
+  so they are permanently outside the 24-hour window. Every booking alert and
+  every Monday summary is currently rejected in silence.
+- **8** fails whenever a payment is recorded more than 24 hours after the
+  patient last wrote, which is most of them.
+- **9** fails whenever the receptionist books a sitting for a patient who is not
+  mid-conversation, which is most of them.
+
+1–7 were re-submitted on 2026-08-05 (clinic name added to 3, 4, 5 and 6; bodies
+restyled on 1 and 2). If you have not done that yet, do it in the same sitting.
+
+> **Deploy the code and the approvals together.** An approved template invoked
+> with the wrong number of parameters fails the send *entirely*, and the
+> plain-text fallback is then rejected for anyone outside the window. A mismatch
+> silences the message rather than degrading it.
 
 ## These are the messages patients see most
 
@@ -22,21 +63,24 @@ messages use:
 | **Footer** | 60 chars | Small grey text. **No variables allowed.** Where the opt-out line goes. |
 | **Buttons** | max 3 | Quick replies. Label is what the patient sees; **payload** is what MediBook routes on. |
 
-Emoji are used as *icons on facts* (📍 a place, 📅 a date) or as a single
-leading glyph — never one per line for decoration. That restraint is what makes
-a message read as designed rather than as an alert.
+**At most one emoji per message, in the header.** Bodies carry none. The bodies
+used to open each fact with its own icon (🦷 a time, 📍 a place, 🪪 an ID) and it
+read as an alert rather than as a message from a dentist — six glyphs is not
+emphasis, it is noise, and it made every template look like every other one.
+Bold does the emphasis instead: the WHEN and the WHO, which is what a patient
+scrolls back to check.
 
 ## Filling in the form
 
 The **Create template** form asks for these, in this order. Everything below is
-per-template; the values for each of the seven are in the sections after.
+per-template; the values for each of the ten are in the sections after.
 
 | Form field | What to do |
 |---|---|
-| **Category** | `Utility` for all seven. Not Marketing — it costs more and is suppressed for anyone who opted out of marketing, which would silently kill the recall. |
+| **Category** | `Utility` for all ten. Not Marketing — it costs more and is suppressed for anyone who opted out of marketing, which would silently kill the recall. |
 | **Name** | Copy the heading exactly, e.g. `appointment_reminder_24h`. Lowercase, digits and underscores only — the code looks it up by this string. |
 | **Languages** | `English` → the code sends language code `en`. **Not** `English (US)`, which is `en_US` and will not match. |
-| **Header** | Change the dropdown from `None` to **Text**, then paste the header line. Leave "Add variable" alone — all seven headers are static. |
+| **Header** | Change the dropdown from `None` to **Text**, then paste the header line. Leave "Add variable" alone — every header is static. |
 | **Body** | Paste the body. Where the text shows `{{1}}`, `{{2}}` …, type them exactly like that — the form accepts them typed. They must be numbered in order with no gaps. |
 | **Samples** ⚠️ | The form will refuse to submit until you fill the **"Add sample content"** box that appears under the body — one example value per variable. Each template section below gives them. This is the step that trips everyone up. |
 | **Footer** | Paste the footer line. Plain text only — variables are not allowed here. |
@@ -95,14 +139,18 @@ Sent the moment a booking completes.
 
 **Body**
 ```
-🦷 *{{4}} at {{5}}*
-with Dr. {{2}}
+*{{4}}*
+*{{5}}* with Dr. {{2}}
 
-📍 {{3}}
-🪪 Booking ID *{{1}}*
+At {{3}}
+Booking ID *{{1}}*
 
 Please arrive 10 minutes early, and bring any previous X-rays or a list of the medicines you take.
 ```
+
+> Matches `confirmationText` in `bookingFlow.js` line for line. It has to: that
+> string is what patients get when the template is not approved, and a clinic
+> should not have two different-looking confirmations in circulation.
 
 **Sample values** (the form asks for one per variable, in order)
 ```
@@ -139,10 +187,10 @@ The day before. `jobs/reminders.js` (24-hour block)
 
 **Body**
 ```
-🦷 *{{2}} at {{3}}*
+*{{2}} at {{3}}*
 with Dr. {{1}}
 
-📍 {{4}}
+At {{4}}
 
 Arriving 10 minutes early helps us start on time. If you can't make it, tell us now and we'll offer the slot to someone who's waiting.
 ```
@@ -182,6 +230,7 @@ A couple of hours before. `jobs/reminders.js` (2-hour block)
 |---|---|---|
 | `{{1}}` | Dentist name | `Kavitha Reddy` |
 | `{{2}}` | Time | `11:30` |
+| `{{3}}` | Branch name | `Smile Dental - Banjara Hills` |
 
 **Header** — `⏰ Later today`
 
@@ -189,14 +238,19 @@ A couple of hours before. `jobs/reminders.js` (2-hour block)
 ```
 Your appointment with Dr. {{1}} is at *{{2}}*.
 
-See you shortly — we're ready for you.
+{{3}} — see you shortly.
 ```
 
 **Sample values**
 ```
 Kavitha Reddy
 11:30
+Smile Dental - Banjara Hills
 ```
+
+> `{{3}}` is why `jobs/reminders.js` now joins `hospitals` in the 2-hour query.
+> It did not before, so this parameter would have been `undefined` — and Meta
+> fails the whole send on an undefined parameter rather than dropping it.
 
 **Footer** — `Reply STOP to turn off reminders`
 
@@ -214,12 +268,13 @@ The day after a completed visit. Sent by BOTH `sendFeedbackRequests` and
 |---|---|---|
 | `{{1}}` | Patient first name | `Priya` |
 | `{{2}}` | Dentist name | `Kavitha Reddy` |
+| `{{3}}` | Clinic name | `Smile Dental Clinic` |
 
 **Header** — `⭐ How did we do?`
 
 **Body**
 ```
-Hi {{1}}, we hope Dr. {{2}} took good care of you yesterday.
+Hi {{1}}, we hope Dr. {{2}} at {{3}} took good care of you yesterday.
 
 One tap tells us how it went — and helps us look after everyone a little better.
 ```
@@ -228,6 +283,7 @@ One tap tells us how it went — and helps us look after everyone a little bette
 ```
 Priya
 Kavitha Reddy
+Smile Dental Clinic
 ```
 
 **Footer** — `Your answer goes only to the clinic`
@@ -254,12 +310,13 @@ Sent instead of the feedback request when a visit was marked no-show.
 |---|---|---|
 | `{{1}}` | Patient first name | `Priya` |
 | `{{2}}` | Dentist name | `Kavitha Reddy` |
+| `{{3}}` | Clinic name | `Smile Dental Clinic` |
 
 **Header** — `We missed you`
 
 **Body**
 ```
-Hi {{1}}, you weren't able to make your appointment with Dr. {{2}} — that's alright, it happens.
+Hi {{1}}, you weren't able to make your appointment with Dr. {{2}} at {{3}} — that's alright, it happens.
 
 Whenever you're ready we'll find you another time. Sooner is better if you were in any discomfort.
 ```
@@ -268,7 +325,12 @@ Whenever you're ready we'll find you another time. Sooner is better if you were 
 ```
 Priya
 Kavitha Reddy
+Smile Dental Clinic
 ```
+
+> This template and `appointment_feedback_request` are chosen between at the
+> same call site in `sendPostAppointmentFollowup`, so their parameter lists must
+> stay the same shape — `{{3}}` was added to both together.
 
 **Footer** — `Reply STOP to turn off these messages`
 
@@ -294,12 +356,13 @@ Kavitha Reddy
 | `{{2}}` | Next sitting number | `2` |
 | `{{3}}` | Total sittings | `3` |
 | `{{4}}` | Treating dentist | `Arjun Sharma` |
+| `{{5}}` | Clinic name | `Smile Dental Clinic` |
 
 **Header** — `🦷 About your treatment`
 
 **Body**
 ```
-Hi — your *{{1}}* isn't finished yet.
+Hi — your *{{1}}* at {{5}} isn't finished yet.
 
 Sitting *{{2}}* of *{{3}}* with Dr. {{4}} still needs a date. Leaving a treatment part-done can undo the work already carried out, so let's get it in the diary.
 ```
@@ -310,6 +373,7 @@ Root canal 36
 2
 3
 Arjun Sharma
+Smile Dental Clinic
 ```
 
 **Footer** — `Reply STOP to turn off these messages`
@@ -360,6 +424,171 @@ Smile Dental - Banjara Hills
 | 📅 Book a check-up | `Menu` |
 
 ---
+
+---
+
+## 8. `payment_receipt`
+
+Sent the moment a payment is recorded against a treatment.
+`routes/treatmentPlans.js` → `POST /treatment-plans/:id/payments`
+
+**Why it needs a template:** a payment is routinely recorded days after the
+patient last messaged. Outside the 24-hour window a plain text send is rejected
+and the patient gets nothing, while the clinic believes they were sent a receipt.
+
+| Variable | Value | Example |
+|---|---|---|
+| `{{1}}` | Amount paid now | `₹4,000` |
+| `{{2}}` | Method | `upi` |
+| `{{3}}` | Treatment | `Crown 46` |
+| `{{4}}` | Paid so far | `₹4,000 of ₹9,000` |
+| `{{5}}` | Balance phrase | `₹5,000` |
+| `{{6}}` | Clinic name | `Smile Dental Clinic` |
+
+**Header** — `✅ Payment received`
+
+**Body**
+```
+We have received {{1}} by {{2}} for *{{3}}*.
+
+Paid so far: {{4}}
+Balance: {{5}}
+
+Thank you — {{6}}. Please keep this message for your records.
+```
+
+**Sample values**
+```
+₹4,000
+upi
+Crown 46
+₹4,000 of ₹9,000
+₹5,000
+Smile Dental Clinic
+```
+
+**Footer** — `Not a tax invoice`
+
+**Buttons** — none. There is nothing for the patient to do.
+
+> `{{4}}` and `{{5}}` are composed in code, not assembled from separate
+> variables, because their SHAPE changes: a course with no estimate has no
+> balance to state, and a template cannot carry a conditional line. `{{5}}`
+> arrives as `₹5,000`, `nothing further to pay` or
+> `we will confirm the total with you`.
+>
+> This is deliberately **not** a tax invoice and the footer says so. MediBook
+> does not issue those (see the GST note in `leads/outreach_email.txt`); this is
+> the payment slip a front desk would hand over.
+
+---
+
+## 9. `treatment_sitting_booked`
+
+The receptionist books the next sitting of a course from the dashboard.
+`routes/treatmentPlans.js` → `POST /treatment-plans/:id/visits`
+
+**Why it needs a template:** this is booked AT THE DESK, so the patient is very
+often not mid-conversation. Same 24-hour problem as above.
+
+| Variable | Value | Example |
+|---|---|---|
+| `{{1}}` | Treatment | `Root canal 36` |
+| `{{2}}` | This visit number | `2` |
+| `{{3}}` | Total visits | `3` |
+| `{{4}}` | Date | `Wed, 12 Aug 2026` |
+| `{{5}}` | Time | `11:30` |
+| `{{6}}` | Dentist | `Kavitha Reddy` |
+| `{{7}}` | Branch | `Smile Dental - Banjara Hills` |
+
+**Header** — `✅ Your next visit is booked`
+
+**Body**
+```
+Your *{{1}}* continues — visit {{2}} of {{3}}.
+
+{{4}} at {{5}}
+with Dr. {{6}} at {{7}}
+
+Please arrive 10 minutes early.
+```
+
+**Sample values**
+```
+Root canal 36
+2
+3
+Wed, 12 Aug 2026
+11:30
+Kavitha Reddy
+Smile Dental - Banjara Hills
+```
+
+**Footer** — `Reply Menu to see all your appointments`
+
+**Buttons**
+
+| Label | Payload |
+|---|---|
+| 📅 Reschedule | `Reschedule` |
+| Cancel appointment | `Cancel appointment` |
+
+> `{{7}}` falls back to the literal string `the clinic` when a plan has no
+> branch. Meta rejects the whole send on an EMPTY parameter, so no variable here
+> is ever allowed to resolve to `''`.
+
+---
+
+## 10. `clinic_staff_alert`
+
+Every alert to the clinic's own staff: new booking, cancellation, and the Monday
+summary. `services/bot/utils.js` → `notifyAdminWhatsApp`
+
+**Why it needs a template — read this one:** a clinic owner **never** messages
+the shared number. That is the entire point of the QR entry: patients scan, the
+owner uses the dashboard. So an owner is *permanently* outside the 24-hour
+window, and the plain-text send this used to be failed **100% of the time** in
+production. Every "new booking" alert and every Monday summary was silently
+rejected while the log recorded a per-admin warning nobody reads.
+
+| Variable | Value | Example |
+|---|---|---|
+| `{{1}}` | Clinic name | `Smile Dental Clinic` |
+| `{{2}}` | The alert body, flattened | `📊 Last week · 26 appointments · 4 completed · ₹11,000 booked` |
+
+**Header** — `🔔 Clinic update`
+
+**Body**
+```
+Update for *{{1}}*:
+
+{{2}}
+
+Open the dashboard for the full detail.
+```
+
+**Sample values**
+```
+Smile Dental Clinic
+📊 Last week · 26 appointments · 4 completed · 2 no-shows · ₹11,000 booked
+```
+
+**Footer** — `Staff notification`
+
+**Buttons** — none. Staff act in the dashboard, not in WhatsApp.
+
+> **One variable carries the whole body, which is unusual and deliberate.**
+> These alerts are genuinely free-form — a booking, a cancellation, a weekly
+> summary — and minting a template per alert type would mean a Meta re-approval
+> every time the wording changed.
+>
+> Meta rejects newlines inside a parameter, so `notifyAdminWhatsApp` flattens
+> the message to ` · ` separators and truncates at 900 characters. The alerts
+> are short lists of facts rather than prose, so they survive it; the dashboard
+> has the detail either way.
+>
+> This is the only template addressed to STAFF. It is still `Utility` — it
+> follows a real event in the business's own account.
 
 ## Payload reference
 

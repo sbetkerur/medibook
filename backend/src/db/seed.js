@@ -18,6 +18,9 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 const SEED_DEMO = process.env.SEED_DEMO_DATA === 'true';
 const SEED_DEMO_RESET = process.env.SEED_DEMO_RESET === 'true';
 const DEMO_PASSWORD = process.env.DEMO_ADMIN_PASSWORD || (IS_PROD ? null : 'Demo@123456');
+// The demo clinic's QR entry code. Fixed, so the demo link in the outreach mail
+// and the docs keeps working across re-seeds. Not a secret — see utils/entryCode.js.
+const DEMO_ENTRY_CODE = 'TESTME';
 
 async function seed() {
   if (IS_PROD && !SEED_DEMO) {
@@ -41,15 +44,21 @@ async function seed() {
   if (!tenant) {
     const r = await query(`
       -- 'professional', not 'growth': this fixture seeds TWO branches
-      -- (Banjara Hills + KPHB) to exercise the "clinics near me" flow, and
+      -- (Banjara Hills + KPHB) to exercise the "which branch?" booking step, and
       -- Professional is the only tier that allows more than one. The inserts
       -- below go through tenantQuery rather than POST /hospitals so they would
       -- bypass the cap either way — but a demo tenant sitting over its own
       -- plan limit is exactly the fixture that teaches the wrong rule.
-      INSERT INTO tenants (name, slug, schema_name, owner_email, plan, status, city)
-      VALUES ('Smile Dental Clinic', $1, $2, 'demo@medibook.com', 'professional', 'active', 'Bengaluru')
+      -- A FIXED entry code, unlike the random one every real tenant gets. This
+      -- is the code the demo QR encodes and the one the docs quote, so it has to
+      -- survive a re-seed; and it is set here rather than left to the backfill
+      -- in migrate.js because migrate runs BEFORE seed on every boot, which
+      -- would leave the freshly seeded demo tenant unreachable until the next
+      -- restart. Every character is in the entry-code alphabet (no O/0, I/1/L).
+      INSERT INTO tenants (name, slug, schema_name, owner_email, plan, status, city, entry_code)
+      VALUES ('Smile Dental Clinic', $1, $2, 'demo@medibook.com', 'professional', 'active', 'Bengaluru', $3)
       RETURNING *
-    `, [slug, schema]);
+    `, [slug, schema, DEMO_ENTRY_CODE]);
     tenant = r.rows[0];
     await createTenantSchema(schema);
     await runTenantMigrations(schema);
@@ -57,10 +66,11 @@ async function seed() {
   } else {
     // This UPDATE used to be unconditional. entrypoint.sh runs the seed on every
     // Railway boot, so renaming the clinic in the Settings tab reverted on the
-    // next deploy — and because services/bot/clinicSearch.js matches a patient's
-    // typed search against the tenant NAME, patients who had learned the new name
-    // stopped finding the clinic at all. The rename was a one-time migration off
-    // the old non-dental demo fixture, so it is opt-in now.
+    // next deploy — undoing a real edit an operator had made, and changing the
+    // name patients see on every message from it. The rename was a one-time
+    // migration off the old non-dental demo fixture, so it is opt-in now.
+    // (Patient ROUTING is unaffected either way: it keys on the entry code, not
+    // the name, which is exactly why a clinic can rename without reprinting.)
     if (SEED_DEMO_RESET) {
       await query(`UPDATE tenants SET name='Smile Dental Clinic' WHERE slug=$1`, [slug]);
       console.log('✅ Tenant name reset to: Smile Dental Clinic (SEED_DEMO_RESET)');
@@ -72,6 +82,16 @@ async function seed() {
     // city lookup. Scoped to `city IS NULL` so, unlike the name above, it can
     // never revert a value an operator set — no SEED_DEMO_RESET gate needed.
     await query(`UPDATE tenants SET city='Bengaluru' WHERE slug=$1 AND city IS NULL`, [slug]);
+    // Same reasoning as the city above, plus one more: a demo tenant that
+    // existed before entry codes did will have been given a RANDOM one by the
+    // backfill in migrate.js, which the demo QR and the docs would not match.
+    // Pinning it back is safe — the code identifies a clinic, it is not a
+    // credential — and is skipped on the (astronomically unlikely) collision
+    // with a real tenant's random code rather than failing the whole seed.
+    await query(
+      `UPDATE tenants SET entry_code=$2 WHERE slug=$1 AND entry_code IS DISTINCT FROM $2`,
+      [slug, DEMO_ENTRY_CODE]
+    ).catch(err => console.warn(`⚠️  Demo entry code not applied: ${err.message}`));
     await runTenantMigrations(schema);
   }
 
@@ -310,12 +330,17 @@ async function seed() {
 
   // ── SCHEDULES: Mon–Sat 10AM–5PM with lunch 1–2PM ─────────────
   for (const doc of doctorIds) {
+    // A working day is now a LIST of sessions (a dentist can do 10-1 at one
+    // branch and 5-9 at another), so a re-seed clears the day first rather than
+    // upserting one row. Without this a demo tenant that had been given a second
+    // session would keep it forever — a re-seed must be a true reset.
+    await tenantQuery(schema, `DELETE FROM doctor_schedules WHERE doctor_id=$1`, [doc.id]);
     // Monday–Friday: working, 10:00–17:00, lunch 13:00–14:00
     for (let dow = 1; dow <= 5; dow++) {
       await tenantQuery(schema, `
         INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working, lunch_start_time, lunch_end_time)
         VALUES ($1,$2,'10:00','17:00',true,'13:00','14:00')
-        ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
+        ON CONFLICT (doctor_id, day_of_week, start_time) DO UPDATE SET
           start_time='10:00', end_time='17:00', is_working=true,
           lunch_start_time='13:00', lunch_end_time='14:00',
           -- Same reasoning as the lunch columns below: a re-run must be a true
@@ -328,7 +353,7 @@ async function seed() {
     await tenantQuery(schema, `
       INSERT INTO doctor_schedules (doctor_id, day_of_week, start_time, end_time, is_working)
       VALUES ($1,6,'10:00','13:00',true)
-      ON CONFLICT (doctor_id, day_of_week) DO UPDATE SET
+      ON CONFLICT (doctor_id, day_of_week, start_time) DO UPDATE SET
         start_time='10:00', end_time='13:00', is_working=true,
         lunch_start_time=NULL, lunch_end_time=NULL, week_of_month=NULL
     `, [doc.id]);

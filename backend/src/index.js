@@ -58,9 +58,6 @@ if (_tzOffsetMinutes !== 0) {
 }
 
 // Warn about optional services that are not configured
-if (!process.env.RESEND_API_KEY) {
-  logger.warn('RESEND_API_KEY not set — booking confirmation emails will not be sent');
-}
 if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
   logger.warn('META credentials not configured — WhatsApp messaging requires real credentials in production');
 }
@@ -71,26 +68,6 @@ if (process.env.NODE_ENV === 'production' &&
     !require('./utils/errors').isRealAppSecret(process.env.META_APP_SECRET)) {
   logger.error('FATAL: META_APP_SECRET is not set (or is a placeholder). Webhook signatures cannot be verified. Exiting.');
   process.exit(1);
-}
-// The Resend bounce/complaint webhook (POST /api/webhook/resend) mutates
-// patients rows in EVERY active tenant schema, so an unsigned request is a
-// cross-tenant write primitive: anyone who can reach the URL could POST
-// {type:'email.bounced', data:{to:['victim@…']}} and flip email_status platform
-// -wide, silently killing that patient's email notifications. It used to verify
-// only when RESEND_WEBHOOK_SECRET was set — and that variable is OPTIONAL, so a
-// default deploy skipped verification entirely. It now fails CLOSED in
-// production. Resend really is optional (unlike Meta), so we do NOT exit; we
-// warn once here so an operator learns about it at boot instead of from a
-// silent 503 storm when the first real bounce arrives. Reuses isRealAppSecret()
-// so 'changeme'/'placeholder' values count as unset, same as META_APP_SECRET.
-const RESEND_WEBHOOK_SIGNING_ENABLED =
-  require('./utils/errors').isRealAppSecret(process.env.RESEND_WEBHOOK_SECRET);
-if (!RESEND_WEBHOOK_SIGNING_ENABLED) {
-  if (process.env.NODE_ENV === 'production') {
-    logger.warn('RESEND_WEBHOOK_SECRET not set (or a placeholder) — POST /api/webhook/resend will REJECT every request with 503. Bounce/complaint handling is DISABLED until the Svix signing secret is configured.');
-  } else {
-    logger.warn('RESEND_WEBHOOK_SECRET not set — POST /api/webhook/resend accepts UNSIGNED payloads. Local dev only; production rejects them.');
-  }
 }
 if (!process.env.FRONTEND_URL) {
   if (process.env.NODE_ENV === 'production') {
@@ -267,166 +244,10 @@ app.use('/api/admin', require('./routes/admin'));
 app.use('/api/admin', require('./routes/services'));  // A1 service catalog + A4 holidays
 app.use('/api/admin', require('./routes/treatmentPlans')); // multi-visit courses, payments, lab work
 app.use('/api/admin', require('./routes/recalls'));        // recare / check-up loop
+app.use('/api/admin', require('./routes/requests'));       // patients the bot could not finish serving
+app.use('/api/admin', require('./routes/dayClose'));       // end-of-day cash reconciliation
 app.use('/api/admin', require('./routes/events'));    // SSE real-time dashboard
 app.use('/api/superadmin', require('./routes/superadmin'));
-
-// ── EMAIL TRACKING ────────────────────────────────────────────
-// GET /api/track/open?h=<hash> — 1×1 transparent pixel, increments open_count
-app.get('/api/track/open', async (req, res) => {
-  // Transparent 1×1 GIF
-  const pixel = Buffer.from(
-    'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'
-  );
-  res.setHeader('Content-Type', 'image/gif');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.end(pixel);
-
-  // Update open count in background (non-blocking)
-  const token = req.query.h;
-  if (token) {
-    const { query: dbQuery } = require('./db');
-    dbQuery(
-      `UPDATE email_sent_log SET open_count = open_count + 1
-       WHERE content_hash = $1`,
-      [token]
-    ).catch(() => {});
-  }
-});
-
-// Verify a Svix webhook signature (used by Resend).
-// Svix signs `${svix-id}.${svix-timestamp}.${rawBody}` with HMAC-SHA256 using the
-// base64-decoded portion of the `whsec_…` secret, and sends one or more
-// space-separated `v1,<base64sig>` values in the `svix-signature` header.
-function verifySvixSignature(req, secret) {
-  const svixId = req.headers['svix-id'];
-  const svixTimestamp = req.headers['svix-timestamp'];
-  const svixSignature = req.headers['svix-signature'];
-  if (!svixId || !svixTimestamp || !svixSignature) return false;
-
-  // Reject stale/future timestamps (±5 min) to prevent replay attacks
-  const ts = parseInt(svixTimestamp, 10);
-  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 300) return false;
-
-  let key;
-  try {
-    key = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
-  } catch { return false; }
-
-  const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
-  const signedContent = `${svixId}.${svixTimestamp}.${rawBody.toString('utf8')}`;
-  const expected = crypto.createHmac('sha256', key).update(signedContent).digest();
-
-  // Header may contain multiple signatures: "v1,<sig> v1,<sig>"
-  for (const part of String(svixSignature).split(' ')) {
-    const [version, sig] = part.split(',');
-    if (version !== 'v1' || !sig) continue;
-    let candidate;
-    try { candidate = Buffer.from(sig, 'base64'); } catch { continue; }
-    if (candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// POST /api/webhook/resend — Resend bounce/complaint webhook (signed via Svix)
-//
-// This endpoint sits under WEBHOOK_PATHS, so it inherits the 2000/min ceiling
-// meant for Meta's shared-IP inbound firehose — far too generous for a route
-// whose every request fans out one UPDATE per tenant schema. Resend sends
-// bounce/complaint events at human volume (a handful a minute at most), so cap
-// it separately: a signature-guessing or replay flood is then bounded at 60
-// fan-outs/min instead of 2000.
-const resendWebhookLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many Resend webhook requests' },
-});
-
-// Fan-out bounds. One bounce touches every active tenant, so the work grows
-// with the tenant roster: cap the roster we will scan in a single event and run
-// the schemas in small concurrent batches rather than an unbounded sequential
-// loop that can hold a connection per iteration for the length of the platform.
-const RESEND_BOUNCE_MAX_TENANTS = 500;
-const RESEND_BOUNCE_BATCH_SIZE = 10;
-
-app.post('/api/webhook/resend', resendWebhookLimiter, express.json(), async (req, res) => {
-  // FAIL CLOSED. An unverifiable bounce webhook is untrusted input with a
-  // cross-tenant write behind it, so it must be rejected, not trusted.
-  if (RESEND_WEBHOOK_SIGNING_ENABLED) {
-    if (!verifySvixSignature(req, process.env.RESEND_WEBHOOK_SECRET)) {
-      logger.warn('Invalid or missing Svix signature on Resend webhook — rejected');
-      return res.sendStatus(403);
-    }
-  } else if (process.env.NODE_ENV === 'production') {
-    // 503, not 403: nothing is wrong with the CALLER's request — we are the
-    // ones who cannot verify it. Svix retries 5xx with backoff and gives up on
-    // 4xx, so once an operator sets the secret the queued real bounce events
-    // are redelivered instead of having been silently discarded.
-    logger.warn('Resend webhook rejected — RESEND_WEBHOOK_SECRET is not configured, signatures cannot be verified');
-    return res.status(503).json({ error: 'Resend webhook signature verification is not configured' });
-  } else {
-    // Permissive outside production so the bounce path stays testable locally,
-    // but noisy per request so nobody mistakes this for the production shape.
-    logger.warn('Resend webhook accepted WITHOUT signature verification — RESEND_WEBHOOK_SECRET unset (non-production only)');
-  }
-
-  res.sendStatus(200);
-  try {
-    const { type, data } = req.body || {};
-    if (type === 'email.bounced' || type === 'email.complained') {
-      const raw = data?.to?.[0] || data?.email_address;
-      // The payload is attacker-shaped in the unsigned dev case and merely
-      // untrusted otherwise — `to` may hold a non-string, which would make the
-      // parameter a JSON blob rather than an address.
-      if (typeof raw !== 'string') return;
-      const email = raw.trim().toLowerCase();
-      if (!email) return;
-
-      // Mark patient email as bounced across all active tenant schemas.
-      // Matching is CASE-INSENSITIVE on both sides: patient emails are NOT
-      // normalised on the way in — the bot flow lowercases (botEngine), but the
-      // admin patient edit and the CSV import store what was typed, so
-      // 'John@Gmail.com' is really in the table. Comparing the column verbatim
-      // against a lowercased parameter would silently skip exactly those rows.
-      // TRADE-OFF: idx_patients_email (tenantMigrate.js, "Email index for
-      // bounce handler") is on the bare column, so lower(email) cannot use it
-      // and each tenant pays a seq scan on patients. Accepted because a
-      // correct-but-slower bounce beats a fast one that misses the patient; the
-      // rate limit and batching above bound the cost. To get the index back,
-      // add an expression index on lower(email) in tenantMigrate.js.
-      const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
-      const { pool: dbPool } = require('./db');
-      const tenants = await dbPool.query(
-        `SELECT schema_name FROM tenants WHERE status='active' ORDER BY schema_name LIMIT $1`,
-        [RESEND_BOUNCE_MAX_TENANTS]
-      );
-      const schemas = tenants.rows
-        .map(t => t.schema_name)
-        .filter(s => SCHEMA_RE.test(s)); // never interpolate an unvalidated schema name
-
-      let updated = 0;
-      for (let i = 0; i < schemas.length; i += RESEND_BOUNCE_BATCH_SIZE) {
-        const batch = schemas.slice(i, i + RESEND_BOUNCE_BATCH_SIZE);
-        const results = await Promise.all(batch.map(schema =>
-          dbPool.query(
-            // The email_status guard makes a replayed event a no-op instead of
-            // rewriting (and WAL-logging) the same rows on every delivery.
-            `UPDATE "${schema}".patients SET email_status='bounced'
-             WHERE lower(email) = $1 AND email_status IS DISTINCT FROM 'bounced'`,
-            [email]
-          ).catch(() => ({ rowCount: 0 }))
-        ));
-        updated += results.reduce((n, r) => n + (r.rowCount || 0), 0);
-      }
-      logger.info('Resend bounce handled', { type, tenants: schemas.length, updated });
-    }
-  } catch (err) {
-    logger.warn('Resend webhook handler error', { error: err.message });
-  }
-});
 
 // ── API v1 ALIASES ────────────────────────────────────────────
 // Mount the same routers under /api/v1/ so clients can adopt the versioned
@@ -442,6 +263,8 @@ app.use('/api/v1/admin',    require('./routes/admin'));
 app.use('/api/v1/admin',    require('./routes/services'));
 app.use('/api/v1/admin',    require('./routes/treatmentPlans'));
 app.use('/api/v1/admin',    require('./routes/recalls'));
+app.use('/api/v1/admin',    require('./routes/requests'));
+app.use('/api/v1/admin',    require('./routes/dayClose'));
 app.use('/api/v1/admin',    require('./routes/events'));
 app.use('/api/v1/superadmin', require('./routes/superadmin'));
 

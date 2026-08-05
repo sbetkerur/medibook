@@ -24,17 +24,12 @@ const schemas = {
   }),
 
   // Super admin login. NOTE: no complexity rules here — complexity is enforced
-  // when a password is SET (resetPassword/changePassword). Enforcing it at login
+  // when a password is SET (changePassword). Enforcing it at login
   // would lock out accounts whose existing password predates the policy, and
   // leaks the password policy to unauthenticated callers.
   loginStrict: Joi.object({
     email: Joi.string().email().required(),
     password: Joi.string().min(6).required(),
-  }),
-
-  forgotPassword: Joi.object({
-    email: Joi.string().email().required(),
-    tenant_slug: Joi.string().optional(),
   }),
 
   resetPassword: Joi.object({
@@ -133,8 +128,11 @@ const schemas = {
     // alert_webhook_url). Allowlist explicitly so a tenant admin can never
     // inject those.
     notification_prefs: Joi.object({
-      email_on_booking: Joi.boolean(),
       reminder_24h_enabled: Joi.boolean(),
+      // Indian clinics waive the consultation when treatment is taken, and they
+      // negotiate. A firm number quoted in WhatsApp and not charged at the desk
+      // is an argument the receptionist has to have.
+      show_consultation_fee: Joi.boolean(),
       reminder_2h_enabled: Joi.boolean(),
       reminder_hours_before_24: Joi.number().integer().min(1).max(168),
       reminder_hours_before_2: Joi.number().integer().min(1).max(24),

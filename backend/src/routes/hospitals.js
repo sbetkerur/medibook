@@ -38,8 +38,8 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
       await client.query(`SELECT pg_advisory_xact_lock($1)`, [lockId]);
 
       if (planLimit !== null) {
-        // Matches how clinicBranches.listActiveBranches counts a live branch —
-        // a soft-deleted one must not consume quota the clinic can't reclaim.
+        // Matches how the billing page counts a live branch — a soft-deleted
+        // one must not consume quota the clinic can't reclaim.
         const countR = await client.query(
           `SELECT COUNT(*) FROM hospitals WHERE is_active=true AND deleted_at IS NULL`);
         const current = parseInt(countR.rows[0].count);

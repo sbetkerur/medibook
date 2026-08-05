@@ -38,3 +38,8 @@ pg_portable/
 
 # Lead lists — real business contact data, keep out of git
 leads/
+
+# Generated clinic QR codes (scripts/exportClinicQrCodes.js).
+# Regenerate with `npm run qr:export` — these embed the live WhatsApp number
+# and every clinic's entry code, so they are build artefacts, not source.
+backend/qr-codes/

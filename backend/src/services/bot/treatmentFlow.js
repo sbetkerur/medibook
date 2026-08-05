@@ -34,6 +34,10 @@ async function getOpenPlans(schema, phone) {
     LEFT JOIN appointments a ON a.treatment_plan_id = tp.id
     WHERE p.phone = $1 AND p.deleted_at IS NULL
       AND tp.status IN ('proposed','in_progress')
+      -- Clinic-scheduled courses (ortho) are booked at the chair. Offering the
+      -- patient a slot list for their next adjustment invites a booking the
+      -- dentist did not plan, at a date the treatment is not ready for.
+      AND tp.scheduling_mode = 'patient'
     GROUP BY tp.id, dep.name, h.name, d.name, d.qualification, d.consultation_fee, d.specialization
     HAVING COUNT(a.id) FILTER (WHERE a.status <> 'cancelled') < tp.total_visits
     ORDER BY tp.created_at DESC
@@ -63,8 +67,10 @@ async function showTreatmentPlans(phone, schema, tenant, send, ctx = {}) {
 
   if (!plans.length) {
     await send.text(
-      '🦷 You have no treatment sittings waiting to be booked.\n\n' +
-      'Reply *Menu* to book a regular appointment.'
+      'You have no treatment sittings waiting to be booked.\n\n' +
+      'If you are having braces or aligners, your next visit is arranged by the ' +
+      'dentist at your appointment — there is nothing for you to book here.\n\n' +
+      'Reply *Menu* to book an ordinary appointment.'
     );
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return false;
@@ -81,7 +87,7 @@ async function showTreatmentPlans(phone, schema, tenant, send, ctx = {}) {
       + (p.doctor_name ? ` · Dr. ${p.doctor_name}` : ''),
   }));
   await send.list(
-    '🦷 *Your Treatments*\n\nWhich treatment would you like to book the next sitting for?',
+    'Which one would you like to book the next sitting for?',
     'View Treatments',
     [{ title: 'Ongoing Treatments', rows }]
   );
@@ -103,7 +109,7 @@ async function handleSelectTreatmentPlan(phone, schema, tenant, send, ctx, choic
   if (!plan) {
     if (plans.length) {
       await send.list(
-        "❓ I couldn't tell which treatment you meant.\n\nPlease pick one from the list:",
+        'I could not tell which treatment you meant. Please pick one from the list:',
         'View Treatments',
         [{
           title: 'Ongoing Treatments',
@@ -136,9 +142,10 @@ async function startPlanBooking(phone, schema, tenant, send, ctx, plan) {
     // The dentist was deactivated after the plan was written. The patient can't
     // resolve that; the clinic has to reassign it.
     await send.text(
-      `🦷 *${plan.title}*\n\n` +
-      'The dentist for this treatment is not available for online booking right now. ' +
-      'Please call the clinic to arrange your next sitting.\n\nReply *Menu* to go back.'
+      `*${plan.title}*\n\n` +
+      'The dentist looking after this treatment is not taking online bookings at the moment. ' +
+      'Please call us and we will arrange your next sitting.\n\nReply *Menu* to go back.'
+      + await clinicPhoneLine(schema, plan.hospital_id)
     );
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return true;
@@ -146,10 +153,10 @@ async function startPlanBooking(phone, schema, tenant, send, ctx, plan) {
 
   const nextVisit = plan.booked_visits + 1;
   await send.text(
-    `🦷 *${planLabel(plan)}*\n\n` +
-    `👨‍⚕️ Dr. ${plan.doctor_name}${plan.specialization ? ` · ${plan.specialization}` : ''}\n` +
-    (plan.hospital_name ? `🏥 ${plan.hospital_name}\n` : '') +
-    `\nLet's find a time for you.`
+    `*${planLabel(plan)}*\n\n` +
+    `with Dr. ${plan.doctor_name}${plan.specialization ? ` · ${plan.specialization}` : ''}\n` +
+    (plan.hospital_name ? `${plan.hospital_name}\n` : '') +
+    `\nLet us find you a time.`
   );
 
   const planCtx = {

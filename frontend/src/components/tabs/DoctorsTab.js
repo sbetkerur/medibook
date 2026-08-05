@@ -16,6 +16,7 @@ export default function DoctorsTab({
   openSchedule,
   openSlotsViewer,
   toggleDoctorStatus,
+  toggleOnlineBookable,
 }) {
   return (
     <div className="space-y-4">
@@ -95,7 +96,12 @@ export default function DoctorsTab({
               </div>
             )}
             {!d.is_active && (
-              <p className="mt-2 text-xs text-red-400 font-medium">⚠️ Inactive — hidden from bot</p>
+              <p className="mt-2 text-xs text-red-400 font-medium">⚠️ Inactive — hidden everywhere</p>
+            )}
+            {d.is_active && d.online_bookable === false && (
+              <p className="mt-2 text-xs text-amber-600 font-medium">
+                Desk booking only — patients cannot pick this dentist on WhatsApp
+              </p>
             )}
             {/* Two columns still fit a 320px phone (~124px per button); only the
                 vertical padding is raised to a thumb-sized target below sm. */}
@@ -116,6 +122,12 @@ export default function DoctorsTab({
                 className="px-3 py-3 sm:py-2 text-xs font-medium border border-green-200 text-green-600 rounded-lg hover:bg-green-50 transition">
                 ⏰ View Slots
               </button>
+              {isAdmin && d.is_active && (
+              <button onClick={() => toggleOnlineBookable(d)}
+                className={`px-3 py-3 sm:py-2 text-xs font-medium border rounded-lg transition ${d.online_bookable === false ? 'border-amber-300 text-amber-700 hover:bg-amber-50' : 'border-gray-200 text-gray-600 hover:bg-gray-50'}`}>
+                {d.online_bookable === false ? '🔒 Desk only' : '🌐 On WhatsApp'}
+              </button>
+              )}
               {isAdmin && (
               <button onClick={() => toggleDoctorStatus(d)}
                 className={`px-3 py-3 sm:py-2 text-xs font-medium border rounded-lg transition ${d.is_active ? 'border-red-200 text-red-500 hover:bg-red-50' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>

@@ -7,8 +7,6 @@ const counters = {
   webhook_messages_total: 0,
   appointments_booked_total: 0,
   bot_errors_total: 0,
-  emails_sent_total: 0,
-  emails_failed_total: 0,
   uncaught_exceptions_total: 0,
   unhandled_rejections_total: 0,
 };

@@ -12,9 +12,7 @@ const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 
 let botQueue = null;
 let dlQueue = null;  // dead-letter queue for failed jobs
-let emailQueue = null;
 let botWorkerInstance = null; // stored so shutdown() can close it
-let emailWorker = null;
 let queueAvailable = false;
 let workerStarted = false;
 let watchdogStarted = false;
@@ -85,12 +83,8 @@ async function setup() {
     botQueue = new Queue('bot-messages', { connection });
     // Dead-letter queue — stores jobs that failed all 3 attempts for manual inspection
     dlQueue = new Queue('bot-messages-failed', { connection });
-    // Email queue — async sending with 3-attempt exponential backoff retry
-    emailQueue = new Queue('email-jobs', { connection });
-    // Wire email service to use queue
-    require('../services/email').setEmailQueue(emailQueue);
     queueAvailable = true;
-    logger.info('BullMQ queues initialized (bot + email, with dead-letter queue)');
+    logger.info('BullMQ queues initialized (bot, with dead-letter queue)');
 
     // Start worker immediately now that queue is ready (avoids race condition
     // where startBotWorker() is called from index.js before setup() completes)
@@ -128,7 +122,7 @@ function startBotWorker() {
 
   const connection = createConnection();
   botWorkerInstance = new Worker('bot-messages', async (job) => {
-    const { phone, text, buttonId, tenantId } = job.data;
+    const { phone, text, buttonId, tenantId, welcome } = job.data;
     const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [tenantId]);
     if (!r.rows[0]) return;
 
@@ -143,7 +137,7 @@ function startBotWorker() {
       logger.warn('Phone lock not acquired before deadline — processing anyway', { phone, tenantId });
     }
     try {
-      await botEngine.handle({ phone, text, buttonId, tenant: r.rows[0] });
+      await botEngine.handle({ phone, text, buttonId, tenant: r.rows[0], welcome });
     } finally {
       if (acquired) await releasePhoneLock(lockKey, token);
     }
@@ -219,35 +213,6 @@ function startBotWorker() {
     watchdogInterval.unref();
   }
 
-  // Email worker — processes email-jobs queue (create once; watchdog restarts
-  // must not orphan a healthy instance)
-  if (emailQueue && !emailWorker) {
-    const emailConn = createConnection();
-    const emailSvc = require('../services/email');
-    emailWorker = new Worker('email-jobs', async (job) => {
-      const type = job.name;
-      // rethrow:true — a failed send must throw so BullMQ's 3-attempt backoff
-      // actually retries it (see queueEmail's job options in services/email.js)
-      if (type === 'booking_confirmation') {
-        await emailSvc.sendBookingConfirmation(job.data.toEmail, job.data.data, { rethrow: true });
-      } else if (type === 'reminder') {
-        await emailSvc.sendReminderEmail(job.data.toEmail, job.data.data, { rethrow: true });
-      } else if (type === 'admin_booking_alert') {
-        await emailSvc.sendAdminBookingAlert(job.data);
-      } else {
-        logger.warn('Unknown email job type', { type });
-      }
-    }, { connection: emailConn, concurrency: 3 });
-
-    emailWorker.on('failed', (job, err) => {
-      logger.error('Email job failed', { jobId: job?.id, type: job?.name, attempts: job?.attemptsMade, error: err.message });
-    });
-    emailWorker.on('completed', (job) => {
-      logger.info('Email job completed', { jobId: job?.id, type: job?.name });
-    });
-    logger.info('BullMQ email worker started (concurrency: 3)');
-  }
-
   logger.info('BullMQ bot worker started (concurrency: 5)');
   return botWorkerInstance;
 }
@@ -282,10 +247,8 @@ async function shutdown() {
   try {
     // Close workers first so in-flight jobs finish before queues are torn down
     if (botWorkerInstance) await botWorkerInstance.close();
-    if (emailWorker) await emailWorker.close();
     if (botQueue) await botQueue.close();
     if (dlQueue) await dlQueue.close();
-    if (emailQueue) await emailQueue.close();
     logger.info('BullMQ workers and queues closed');
   } catch (err) {
     logger.warn('Error closing BullMQ on shutdown', { error: err.message });

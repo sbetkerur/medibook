@@ -304,7 +304,13 @@
       "Bash(grep -n -B 6 \"SELECT COUNT\\(\\\\*\\) FROM patients\\\\`\" src/routes/superadmin.js)",
       "Bash(timeout 400 npm i next@14.2.35 --save-exact)",
       "Bash(timeout 200 npm audit --production)",
-      "Bash(timeout 400 npm audit fix)"
+      "Bash(timeout 400 npm audit fix)",
+      "PowerShell($p = \"$env:ProgramFiles\\\\Docker\\\\Docker\\\\Docker Desktop.exe\"; if \\(Test-Path $p\\) { Start-Process $p; \"started\" } else { \"not found at $p\" })",
+      "Bash(SEED_DEMO_DATA=true npm run seed)",
+      "Bash(grep -v \"logger\\\\|require\\(\\\\|^.*//\")",
+      "Bash(grep -oiE \"\\(footer|header\\): *[\\\\`'\\\\\"][^\\\\`'\\\\\"]*\")",
+      "Bash(npm uninstall *)",
+      "Bash(awk '/^async function sendFeedbackRequests/,/^}/' src/jobs/reminders.js)"
     ]
   }
 }
