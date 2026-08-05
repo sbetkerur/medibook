@@ -283,7 +283,28 @@
       "PowerShell(try { $r = Invoke-WebRequest -Uri \"https://frontend-production-2f2d.up.railway.app/login\" -TimeoutSec 40 -UseBasicParsing; Write-Output \"frontend HTTP $\\($r.StatusCode\\), $\\($r.Content.Length\\) bytes\" } catch { Write-Output \"frontend check failed: $\\($_.Exception.Message\\)\" })",
       "PowerShell(Set-Location C:\\\\claude_projects\\\\medibook; $env:DATABASE_PUBLIC_URL=\\(railway variables --service postgres --kv 2>$null | Select-String -Pattern \"^DATABASE_PUBLIC_URL=\" | ForEach-Object { $_.Line -replace '^DATABASE_PUBLIC_URL=','' }\\); node \"C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\7dbf20f7-83af-4ffe-97e2-604635336559\\\\scratchpad\\\\prod_discoverable.js\" 2>&1 | Select-Object -First 40)",
       "PowerShell(foreach \\($d in @\\(\"2026-08-12\",\"2026-08-20\",\"2026-08-23\",\"2026-08-26\",\"2026-08-27\",\"2026-08-28\",\"2026-09-04\",\"2026-09-14\",\"2026-08-15\"\\)\\) { $dt=[datetime]::ParseExact\\($d,\"yyyy-MM-dd\",$null\\); Write-Output \"$d = $\\($dt.DayOfWeek\\)\" })",
-      "PowerShell(try { $r = Invoke-RestMethod -Uri \"https://backend-production-f66a.up.railway.app/health\" -TimeoutSec 30; $r | ConvertTo-Json -Depth 4 } catch { \"ERR: $\\($_.Exception.Message\\)\" })"
+      "PowerShell(try { $r = Invoke-RestMethod -Uri \"https://backend-production-f66a.up.railway.app/health\" -TimeoutSec 30; $r | ConvertTo-Json -Depth 4 } catch { \"ERR: $\\($_.Exception.Message\\)\" })",
+      "Bash(taskkill //F //IM node.exe //FI \"WINDOWTITLE eq *\")",
+      "Bash(pkill -f nodemon)",
+      "Bash(bash \"C:/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/25c47ae1-34ff-4514-9fb8-123585dc244e/scratchpad/patient_flow.sh\" 2>&1)",
+      "Bash(npm ls *)",
+      "Bash(SHOT_DIR=\"C:/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/25c47ae1-34ff-4514-9fb8-123585dc244e/scratchpad\" node shots.tmp.js)",
+      "Bash(grep -oE \"'[^']{25,}'\")",
+      "Bash(grep -rhoE \"api\\\\.\\(get|post|put|patch|del|delete\\)\\\\\\(\\\\s*[\\\\`'][^\\\\`']*\" frontend/src)",
+      "Bash(sed -E \"s/.*[\\\\`']//\")",
+      "Bash(grep -rn \"localhost:3001\\\\|NEXT_PUBLIC_API\\\\|http://\\\\|https://\" src/ --include=*.js)",
+      "Bash(timeout 180 npm audit --production)",
+      "Bash(timeout 180 npm audit --production --json)",
+      "Bash(grep -n '\\\\${' admin.js appointments.js doctors.js patients.js treatmentPlans.js recalls.js hospitals.js services.js analytics.js auth.js superadmin.js events.js adminHelpers.js)",
+      "Bash(grep -vi \"ist_\\\\|slot_date\\\\|appointment_date::\\\\|leave_date\\\\|holiday_date\\\\|\\\\\\\\\\\\$1::date\\\\|\\\\\\\\\\\\$2::date\")",
+      "Bash(awk 'NR>=37 && NR<=160 && /catch|finally|try/ {print NR\": \"$0}' src/db/migrate.js)",
+      "Bash(awk 'NR<=292 && /^\\(async \\)?function |^const .*= async/ {l=NR\": \"$0} END{}' src/services/bot/bookingFlow.js)",
+      "Bash(awk 'NR<=292 && /^async function |^function /{l=NR\": \"$0} NR==292{print l}' src/services/bot/bookingFlow.js)",
+      "Bash(grep -n \"SELECT COUNT\\(\\\\*\\) FROM patients\\\\`\" src/routes/superadmin.js)",
+      "Bash(grep -n -B 6 \"SELECT COUNT\\(\\\\*\\) FROM patients\\\\`\" src/routes/superadmin.js)",
+      "Bash(timeout 400 npm i next@14.2.35 --save-exact)",
+      "Bash(timeout 200 npm audit --production)",
+      "Bash(timeout 400 npm audit fix)"
     ]
   }
 }
