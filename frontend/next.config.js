@@ -22,6 +22,21 @@ const nextConfig = {
   // old backend. The Dockerfile passes it as a build ARG for exactly this
   // reason. Set BACKEND_URL in the Railway service variables (Railway forwards
   // service variables as Docker build args) and redeploy to change it.
+  // The bare domain sends people to the login page.
+  //
+  // This used to be `redirect('/login')` inside a statically prerendered
+  // src/app/page.js. Next 14.2 serves that as a **307 with no Location header** —
+  // a response no client can follow. Real visitors to the root domain got
+  // nothing, and Railway's healthcheck (pointed at `/`) read it as
+  // 'service unavailable' and killed every deploy after the 14.0.4 → 14.2.35
+  // bump in 7b8c1c5, which had never been deployed until then.
+  //
+  // Declared here instead, so it is compiled into routes-manifest.json and
+  // served with a proper Location.
+  async redirects() {
+    return [{ source: '/', destination: '/login', permanent: false }];
+  },
+
   async rewrites() {
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';
     return [

@@ -3,7 +3,10 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-healthcheckPath = "/"
+# A real page, not the bare domain: "/" is a redirect, and a healthcheck
+# that has to interpret a 3xx is one indirection away from failing for a
+# reason that has nothing to do with the app being up.
+healthcheckPath = "/login"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
