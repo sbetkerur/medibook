@@ -1000,7 +1000,7 @@ export default function SuperAdminPage() {
 
       {suspendModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3 sm:p-4">
-          <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-md shadow-2xl">
+          <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-md shadow-2xl max-h-[85vh] supports-[max-height:85dvh]:max-h-[85dvh] overflow-y-auto">
             <div className="flex items-center justify-between gap-2 mb-4">
               <h2 className="text-base font-semibold text-gray-900">Suspend Tenant</h2>
               <button onClick={() => setSuspendModal(null)} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">✕</button>
@@ -1034,7 +1034,7 @@ export default function SuperAdminPage() {
 
       {cityModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3 sm:p-4">
-          <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-md shadow-2xl">
+          <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-md shadow-2xl max-h-[85vh] supports-[max-height:85dvh]:max-h-[85dvh] overflow-y-auto">
             <div className="flex items-center justify-between gap-2 mb-4">
               <h2 className="text-base font-semibold text-gray-900">Set City</h2>
               <button onClick={() => setCityModal(null)} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">✕</button>
