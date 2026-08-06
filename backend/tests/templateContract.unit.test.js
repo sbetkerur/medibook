@@ -11,7 +11,7 @@
  * Also enforces the two Meta body rules that are easy to break by editing copy:
  * no two variables separated by only whitespace, and no body that begins or
  * ends with one. Both were violated the moment the emoji were removed from
- * appointment_confirmed and appointment_reminder_24h — the emoji had been the
+ * appointment_confirmed_v3 and appointment_reminder_24h_v3 — the emoji had been the
  * text between two variables.
  *
  * Run: node tests/templateContract.unit.test.js   (no DB, no network)
@@ -23,9 +23,9 @@ const DOC = fs.readFileSync('C:/claude_projects/medibook/docs/whatsapp-templates
 
 // name -> how many parameters the sender pushes, read off the source.
 const SRC = {
-  'appointment_confirmed':        ['src/services/whatsapp.js', 'sendBookingConfirmationTemplate'],
-  'appointment_reminder_24h':     ['src/jobs/reminders.js', null],
-  'appointment_reminder_2h':      ['src/jobs/reminders.js', null],
+  'appointment_confirmed_v3':     ['src/services/whatsapp.js', 'sendBookingConfirmationTemplate'],
+  'appointment_reminder_24h_v3':  ['src/jobs/reminders.js', null],
+  'appointment_reminder_2h_v3':   ['src/jobs/reminders.js', null],
   'appointment_feedback_request': ['src/jobs/reminders.js', null],
   'appointment_missed_rebook':    ['src/jobs/reminders.js', null],
   'treatment_sitting_reminder':   ['src/jobs/treatmentNudges.js', null],
@@ -103,6 +103,42 @@ for (const name of Object.keys(SRC)) {
   check(`${name}: does not begin or end with a variable`,
     !/^\{\{\d+\}\}/.test(t) && !/\{\{\d+\}\}$/.test(t),
     `→ starts "${t.slice(0, 14)}" ends "${t.slice(-14)}"`);
+}
+
+// ── BUTTON PAYLOADS ─────────────────────────────────────────────────────────
+// A quick-reply row in WhatsApp Manager has a Label AND a Payload, and the form
+// PREFILLS the payload from the label. Our labels carry an emoji and read like
+// sentences, while the engine's keyword tests are anchored (/^reschedule$/i) —
+// so a payload left at that default matches nothing and the tap does nothing,
+// silently. Two things have to hold: the documented payload must be a bare
+// keyword (no emoji, no stray space), and the sender must pass the same string
+// as its send-time override, or the template's stored payload is all there is.
+console.log('\nButton payloads — doc vs. code\n');
+for (const [name, [file]] of Object.entries(SRC)) {
+  const start = DOC.indexOf('`' + name + '`\n');
+  if (start === -1) continue;
+  const nextHeading = DOC.indexOf('\n## ', start);
+  const section = DOC.slice(start, nextHeading === -1 ? undefined : nextHeading);
+  const block = section.match(/\*\*Buttons\*\*([\s\S]*?)(?:\n\n>|\n---|$)/);
+  if (!block) continue;
+
+  // Table rows only; the header and the |---|---| separator are dropped. Cell 1
+  // is the label, cell 2 the payload — a third "Why" column is commentary.
+  const payloads = block[1].split('\n')
+    .filter(l => l.trim().startsWith('|'))
+    .map(l => l.split('|').map(c => c.trim()).filter((_, i, a) => i > 0 && i < a.length - 1))
+    .filter(cells => cells.length >= 2 && cells[0] !== 'Label' && !/^-+$/.test(cells[0]))
+    .map(cells => cells[1].replace(/`/g, ''));
+  if (!payloads.length) continue;
+
+  const src = fs.readFileSync('C:/claude_projects/medibook/backend/' + file, 'utf8');
+  for (const p of payloads) {
+    check(`${name}: payload "${p}" is a bare keyword`,
+      p.length > 0 && p === p.trim() && !/[^\x20-\x7E]/.test(p),
+      '→ emoji or padding in a payload never matches');
+    check(`${name}: ${file} sends payload "${p}"`, src.includes(`'${p}'`),
+      '→ sender passes no buttonPayloads for this button');
+  }
 }
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILURES'}: ${pass} passed, ${fail} failed\n`);

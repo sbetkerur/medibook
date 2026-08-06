@@ -281,7 +281,7 @@ async function updateMessageStatus(schemaName, waMessageId, status) {
 
 // ── Template convenience wrappers ─────────────────────────────────────────────
 async function sendBookingConfirmationTemplate(to, { bookingId, doctorName, hospitalName, date, time }, accessToken, phoneNumberId) {
-  return await sendTemplate(to, 'appointment_confirmed', [
+  return await sendTemplate(to, 'appointment_confirmed_v3', [
     {
       type: 'body',
       parameters: [
@@ -292,8 +292,10 @@ async function sendBookingConfirmationTemplate(to, { bookingId, doctorName, hosp
         { type: 'text', text: String(time) },
       ],
     },
-    // Quick-reply payloads, index-aligned with the template's two buttons. The
-    // create-template form has no payload field — it is set here, at send time.
+    // Quick-reply payloads, index-aligned with the template's two buttons.
+    // These override whatever payload the template carries — the form prefills
+    // that from the LABEL, which here would be "📅 Reschedule" and matches no
+    // keyword. Keep in step with docs/whatsapp-templates.md.
     { type: 'button', sub_type: 'quick_reply', index: '0', parameters: [{ type: 'payload', payload: 'Reschedule' }] },
     { type: 'button', sub_type: 'quick_reply', index: '1', parameters: [{ type: 'payload', payload: 'Cancel appointment' }] },
   ], accessToken, phoneNumberId);

@@ -86,7 +86,7 @@ async function sendReminders() {
               (appt.visit_number && appt.total_visits ? ` — visit ${appt.visit_number} of ${appt.total_visits}` : '') + `\n`
             : '';
 
-          // Kept word-for-word in step with the `appointment_reminder_24h`
+          // Kept word-for-word in step with the `appointment_reminder_24h_v3`
           // template (docs/whatsapp-templates.md). This is the text a patient
           // gets whenever the template is not approved — which is every clinic
           // until their WhatsApp account is set up — so the two drifting apart
@@ -111,7 +111,7 @@ async function sendReminders() {
             await sendPatientTemplate(
               tenant.schema_name,
               appt.phone,
-              'appointment_reminder_24h',
+              'appointment_reminder_24h_v3',
               [{
                 type: 'body',
                 parameters: [
@@ -199,7 +199,7 @@ async function sendReminders() {
             ? `🦷 *${appt.treatment_title}*` +
               (appt.visit_number && appt.total_visits ? ` — visit ${appt.visit_number} of ${appt.total_visits}` : '') + `\n`
             : '';
-          // In step with the `appointment_reminder_2h` template. Two hours out
+          // In step with the `appointment_reminder_2h_v3` template. Two hours out
           // there is nothing useful left to instruct — the patient is already
           // on their way — so this says the time and gets out of the way.
           const reminderText =
@@ -215,7 +215,7 @@ async function sendReminders() {
             await sendPatientTemplate(
               tenant.schema_name,
               appt.phone,
-              'appointment_reminder_2h',
+              'appointment_reminder_2h_v3',
               [{
                 type: 'body',
                 parameters: [

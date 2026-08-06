@@ -538,6 +538,12 @@ router.post('/treatment-plans/:id/visits', validateUUID(), async (req, res) => {
               { type: 'text', text: branch || 'the clinic' },
             ],
           }],
+          // Index-aligned with the template's two quick replies. Without this
+          // the tap carries the payload stored on the template, which the form
+          // prefills from the LABEL — "📅 Reschedule", matching neither
+          // /^reschedule$/i nor /^cancel appointment$/i, so the button did
+          // nothing. Every other buttoned template already passes these.
+          buttonPayloads: ['Reschedule', 'Cancel appointment'],
           text,
         });
       } catch (err) {

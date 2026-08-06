@@ -43,15 +43,17 @@ async function sendPatientTemplate(schema, phone, templateName, components, logT
 /**
  * Quick-reply payloads for a template's buttons.
  *
- * WhatsApp Manager's create-template form has no payload field — a quick-reply
- * button there is only a LABEL. The payload the webhook receives is supplied by
- * the SENDER, one button component per button, index-aligned with the order the
- * buttons appear in the template.
+ * A send-time override of the payload stored on the template, one button
+ * component per button, index-aligned with the order the buttons appear in the
+ * template. It is what the tap actually carries.
  *
- * Without this the label doubles as the payload, which forces every button to be
- * worded exactly like the keyword it triggers ("Treatment", "Yes") — so the
- * buttons in docs/whatsapp-templates.md ("Book my next sitting") would have
- * arrived as unrecognised text and done nothing.
+ * WhatsApp Manager's create-template form does have a payload field per
+ * quick-reply button, but it PREFILLS it with the label as you type — and our
+ * labels read like sentences and carry an emoji ("📅 Book my next sitting"),
+ * while the keyword tests are anchored (/^reschedule$/i). A payload left at that
+ * default arrives as unrecognised text and the tap does nothing. So the form is
+ * filled in with the real payload (docs/whatsapp-templates.md) AND every sender
+ * passes it here; the two must agree.
  *
  * @param {string[]} [payloads] - e.g. ['Yes', 'Reschedule', 'Cancel appointment']
  */
