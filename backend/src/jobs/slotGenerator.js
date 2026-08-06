@@ -590,17 +590,28 @@ function startSlotGeneratorCron() {
  * @param {boolean} dryRun  - If true, return preview without inserting
  * @param {number} days     - Lookahead window in days (defaults to the cron window)
  * @returns {number|object} - Slot count, or dry-run preview object
+ *
+ * The doctor query below must stay IDENTICAL in shape to the tenant sweep's
+ * (see the note above it): a schedule row IS a session, so the session's own
+ * hospital_id wins and doctor_hospitals is consulted only when it is NULL.
+ * This path had drifted — it read dh.hospital_id alone and joined on weekday
+ * only, so a dentist with two branches on one weekday matched both dh rows,
+ * multiplied 2 sessions into 4, and stamped the evening session with the
+ * MORNING branch (flushSlots' ON CONFLICT DO NOTHING keeps whichever lands
+ * first). It runs on every schedule save, and the nightly sweep could not
+ * repair it for the same ON CONFLICT reason.
  */
 async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = CRON_LOOKAHEAD_DAYS) {
   const docR = await tenantQuery(schema,
     `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
             s.day_of_week, s.start_time, s.end_time,
             s.lunch_start_time, s.lunch_end_time, s.week_of_month,
-            dh.hospital_id AS day_hospital_id
+            COALESCE(s.hospital_id, dh.hospital_id) AS day_hospital_id
      FROM doctors d
      JOIN doctor_schedules s ON s.doctor_id=d.id
      LEFT JOIN doctor_hospitals dh
        ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
+      AND s.hospital_id IS NULL
      WHERE d.id=$1 AND d.is_active=true AND s.is_working=true`,
     [doctorId]);
 

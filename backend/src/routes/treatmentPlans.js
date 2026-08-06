@@ -20,6 +20,12 @@ const { planProgress, derivePlanStatus, canTransitionPlan, PLAN_STATUSES } = req
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 
+// Shared by POST and PATCH, and matched by the treatment_plans_total_visits_check
+// CHECK constraint in tenantMigrate.js. The two routes drifted once — PATCH kept
+// an old cap of 30 while POST allowed 60 — which made a long orthodontic course
+// creatable but permanently uneditable. One constant, both call sites.
+const MAX_TOTAL_VISITS = 60;
+
 const OPEN_STATUSES = ['proposed', 'in_progress'];
 // A started course with nothing booked and no sitting in this long is not
 // "pending", it is abandoned. 30 days is past any normal gap between sittings
@@ -231,8 +237,8 @@ router.post('/treatment-plans', async (req, res) => {
     // bonding, debond and retainer reviews. Still bounded — an unbounded value
     // here is a typo that puts hundreds of visits on a plan.
     const visits = parseInt(total_visits ?? 1, 10);
-    if (!Number.isInteger(visits) || visits < 1 || visits > 60) {
-      return res.status(400).json({ error: 'total_visits must be between 1 and 60' });
+    if (!Number.isInteger(visits) || visits < 1 || visits > MAX_TOTAL_VISITS) {
+      return res.status(400).json({ error: `total_visits must be between 1 and ${MAX_TOTAL_VISITS}` });
     }
     // Who books the sittings after the first. 'patient' (the default) is the
     // ordinary case: the patient is nudged and books the next one themselves.
@@ -575,8 +581,11 @@ router.patch('/treatment-plans/:id', validateUUID(), async (req, res) => {
     let visits;
     if (total_visits !== undefined) {
       visits = parseInt(total_visits, 10);
-      if (!Number.isInteger(visits) || visits < 1 || visits > 30) {
-        return res.status(400).json({ error: 'total_visits must be between 1 and 30' });
+      // 60, not 30 — must match the POST cap and the DB CHECK. A two-year
+      // orthodontic case is monthly adjustments plus bonding, debond and
+      // retainer reviews, and a plan created at 48 has to stay editable.
+      if (!Number.isInteger(visits) || visits < 1 || visits > MAX_TOTAL_VISITS) {
+        return res.status(400).json({ error: `total_visits must be between 1 and ${MAX_TOTAL_VISITS}` });
       }
       // Shrinking below what's already on the calendar would make canBookNext
       // and the outstanding queue disagree with the appointments themselves.

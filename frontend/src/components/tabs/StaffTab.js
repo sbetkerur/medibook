@@ -204,6 +204,16 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
                         className="px-2 py-1 text-xs border border-gray-200 text-gray-600 rounded hover:bg-gray-50 transition">
                         ✏️ Edit
                       </button>
+                      {/* Also on the desktop table, not just the mobile cards.
+                          Removing email left this the clinic's only self-service
+                          unlock, and a front desk on a desktop had to shrink the
+                          window to reach it. */}
+                      {m.is_active && m.id !== undefined && (
+                        <button onClick={() => resetPassword(m)}
+                          className="px-2 py-1 text-xs border border-gray-200 text-gray-600 rounded hover:bg-gray-50 transition">
+                          🔑 Reset password
+                        </button>
+                      )}
                       {m.is_active && (
                         <button onClick={() => deactivateStaff(m)}
                           className="px-2 py-1 text-xs border border-red-200 text-red-500 rounded hover:bg-red-50 transition">

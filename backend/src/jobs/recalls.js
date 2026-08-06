@@ -69,6 +69,15 @@ async function sendRecalls() {
 
     const due = await findRecallsDue(tenant.schema_name);
     for (const rec of due) {
+      // Outside the try — same reasoning as the treatment nudge: `continue`
+      // from inside it still runs the finally, so a suppressed send burned one
+      // of the recall's three attempts without ever attempting one. Three quiet
+      // months exhausted the recall and findRecallsDue then excluded it
+      // forever, silently dropping that patient out of the recare loop.
+      //
+      // Six months have passed already; another week costs nothing.
+      if (!await canSendDiscretionary(tenant.schema_name, rec.phone, budgetFor(tenant))) continue;
+
       try {
         const firstName = rec.patient_name ? rec.patient_name.split(' ')[0] : 'there';
         // In step with the `patient_recall_checkup` template.
@@ -77,9 +86,6 @@ async function sendRecalls() {
           `Hi ${firstName}, it's been a while since we saw you${rec.hospital_name ? ` at ${rec.hospital_name}` : ''}.\n\n` +
           `A check-up takes about twenty minutes and catches small problems while they're still small — and still cheap to fix.\n\n` +
           `Reply *Menu* to find a time that suits you.`;
-
-        // Six months have passed already; another week costs nothing.
-        if (!await canSendDiscretionary(tenant.schema_name, rec.phone, budgetFor(tenant))) continue;
 
         await sendPatientMessage(tenant.schema_name, rec.phone, {
           template: RECALL_TEMPLATE,

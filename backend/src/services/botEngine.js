@@ -456,28 +456,36 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return showTreatmentPlans(phone, schema, tenant, send, ctx);
   }
 
-  // ── IDLE fallback — any non-greeting message when session is idle ──
-  if (session.state === STATES.IDLE) {
-    const patient = await getPatient(schema, phone);
-    await sendMainMenu(send, tenant, patient);
-    await updateSession(schema, phone, STATES.MAIN_MENU, {});
-    return;
-  }
-
   // ── "CALL ME BACK" ───────────────────────────────────────────
   // The way out of every dead end, and a menu option in its own right. In an
   // Indian practice a patient the bot cannot help simply phones; this is the
   // same thing from the other end, so the clinic learns they existed.
   //
-  // Placed ABOVE the state handlers for the same reason the treatment keyword
-  // is: offerRequest parks the session at IDLE, and the IDLE fallback below
-  // returns unconditionally.
+  // MUST stay ABOVE the IDLE fallback, exactly like the treatment keyword and
+  // for the same reason. This block used to sit BELOW it while its own comment
+  // claimed otherwise, and offerRequest parks the session at IDLE — so every
+  // dead end that offers a callback (a dentist with nothing in the lookahead,
+  // a date that filled up) landed the tap on the fallback instead: the main
+  // menu was sent, updateSession wiped ctx, and request_preferred_date /
+  // request_note were destroyed. No clinic_requests row was written and no
+  // admin was alerted, so the patient the bot could not serve vanished. A
+  // second tap recorded a request, but a contextless one.
   if (atRestingState && REQUEST_RE.test(input)) {
     // A request that came out of a full diary carries what they had chosen;
     // one typed at the menu carries nothing, which is fine.
     return ctx.request_preferred_date || ctx.request_note
       ? handleAppointmentRequest(phone, schema, tenant, send, ctx)
       : handleCallbackRequest(phone, schema, tenant, send, ctx);
+  }
+
+  // ── IDLE fallback — any non-greeting message when session is idle ──
+  // Returns unconditionally, so everything that must work from an idle session
+  // has to be tested above this point.
+  if (session.state === STATES.IDLE) {
+    const patient = await getPatient(schema, phone);
+    await sendMainMenu(send, tenant, patient);
+    await updateSession(schema, phone, STATES.MAIN_MENU, {});
+    return;
   }
 
   // ── MAIN MENU ────────────────────────────────────────────────
@@ -790,20 +798,34 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
-  // Buttons are ['⭐ 1 — Poor', '⭐⭐⭐ 3 — Okay', '⭐⭐⭐⭐⭐ 5 — Great'] (3 buttons).
-  // WhatsApp button IDs include a timestamp suffix (e.g. btn_0_1712345678),
-  // so we match by prefix rather than exact key.
-  const ratingMap = { btn_0: 1, btn_1: 3, btn_2: 5 };
-  const matchedKey = Object.keys(ratingMap).find(k => (choice || '').startsWith(k + '_') || choice === k);
+  // A positional tap is only a rating if it came from a prompt WE sent for this
+  // question. The state is armed by the feedback cron while the patient is idle
+  // (triggerFeedback), and WhatsApp keeps every button it ever delivered
+  // tappable forever — so a bare `btn_0` used to be read as "1 — Poor" no
+  // matter which message it came off. A patient who scrolled up and tapped the
+  // clinic's still-live main menu "📅 Book Appointment" (btn_0) filed a 1-star
+  // review, lost their booking intent, and had their next message stored as the
+  // complaint text. Same binding the cancel/reschedule confirms use.
+  //
+  // The cron's own template buttons carry '5'/'3'/'1' payloads rather than
+  // positional ids, so the ordinary first answer arrives as text and is handled
+  // by parseChoiceNumber below — the binding only governs the re-prompt.
+  const RATING_BY_INDEX = [1, 3, 5];
+  const btnIdx = confirmButtonIndex(ctx, choice);
   // parseChoiceNumber, not parseInt: parseInt pulls a leading digit run out of
   // anything, so "3rd visit, staff were lovely" was filed as a 3-star rating and
   // the compliment thrown away. A whole-string number or nothing.
-  let rating = matchedKey ? ratingMap[matchedKey] : parseChoiceNumber(input);
+  let rating = btnIdx === null ? parseChoiceNumber(input)
+    : btnIdx >= 0 ? RATING_BY_INDEX[btnIdx]
+    : null; // -1: a stale tap from some other message — never a rating.
   if (!rating || rating < 1 || rating > 5) {
-    await send.buttons(
+    await sendConfirmButtons(send, ctx,
       `Please reply with a number from *1* to *5* — 1 is poor, 5 is excellent.`,
       ['⭐ 1 — Poor', '⭐⭐⭐ 3 — Okay', '⭐⭐⭐⭐⭐ 5 — Great']
     );
+    // Persist the window sendConfirmButtons just recorded on ctx, or the next
+    // tap has nothing to verify against and fails closed forever.
+    await updateSession(schema, phone, STATES.COLLECT_FEEDBACK_RATING, ctx);
     return;
   }
   ctx.feedback_rating = rating;

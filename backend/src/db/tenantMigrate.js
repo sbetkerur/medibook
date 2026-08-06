@@ -290,10 +290,26 @@ async function createTenantSchema(schemaName) {
     // 'SET statement_timeout TO 0' keeps NO timeout for the rest of its life —
     // silently disabling the pool-starvation guard for that slot. Tenant
     // creation runs this at runtime from the super admin console.
-    await client.query('RESET statement_timeout').catch(() => {});
-    await client.query('RESET lock_timeout').catch(() => {});
-    await client.query('RESET search_path').catch(() => {});
-    client.release();
+    // Swallowing a RESET failure and releasing anyway returned a POISONED
+    // connection to the pool: still pointing at "tenant_x", public, and with no
+    // statement timeout. audit_logs, users and documents exist in both the
+    // public and tenant schemas, so a later platform-level write on that slot
+    // resolved the unqualified name inside a tenant's schema — cross-tenant
+    // data landing in the wrong place, with the empty .catch() guaranteeing
+    // nobody noticed. If the connection cannot be restored it is not fit to
+    // reuse: pass the error to release() so the pool destroys it instead.
+    let resetErr = null;
+    try {
+      await client.query('RESET statement_timeout');
+      await client.query('RESET lock_timeout');
+      await client.query('RESET search_path');
+    } catch (err) {
+      resetErr = err;
+      logger.warn('Connection reset failed after tenant migration — discarding it', {
+        schema: schemaName, error: err.message,
+      });
+    }
+    client.release(resetErr || undefined);
   }
 }
 
@@ -460,10 +476,24 @@ async function runTenantMigrations(schemaName) {
           DROP INDEX idx_wa_messages_msg_id;
         END IF;
       END $$;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
       -- Email index for bounce handler (UPDATE patients SET email_status WHERE email=$1)
       CREATE INDEX IF NOT EXISTS idx_patients_email ON patients(email) WHERE email IS NOT NULL;
     `);
+
+    // Split out of the block above and caught, because it is UNIQUE over data
+    // that predates it. If the legacy-shape DROP just ran and wa_messages holds
+    // duplicate wa_message_ids, this throws — and migrate.js catches a tenant
+    // failure per tenant and moves on, so an uncaught throw here silently
+    // abandons every remaining migration block for that clinic while the deploy
+    // still reports success. A deterministic failure never self-heals: the same
+    // line dies on every future boot, so clinic_requests, online_bookable and
+    // doctor_schedules.hospital_id would never arrive for them.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_msg_id
+        ON wa_messages(wa_message_id) WHERE wa_message_id IS NOT NULL;
+    `).catch(err => logger.warn('idx_wa_messages_msg_id not created — duplicate wa_message_id rows present', {
+      schema: schemaName, error: err.message,
+    }));
 
     // Create audit_logs table if not exists
     await client.query(`
@@ -933,11 +963,19 @@ async function runTenantMigrations(schemaName) {
       );
       CREATE INDEX IF NOT EXISTS idx_recalls_due ON patient_recalls(due_date) WHERE status='due';
       CREATE INDEX IF NOT EXISTS idx_recalls_patient ON patient_recalls(patient_id);
-      -- One open recall per patient per reason: completing three visits in a
-      -- month must not queue three identical check-up reminders.
+    `);
+
+    // Same reasoning as idx_wa_messages_msg_id above: UNIQUE over pre-existing
+    // rows, so it must not be able to abandon the rest of this file.
+    //
+    // One open recall per patient per reason: completing three visits in a
+    // month must not queue three identical check-up reminders.
+    await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_recalls_one_open
         ON patient_recalls(patient_id, reason) WHERE status='due';
-    `);
+    `).catch(err => logger.warn('idx_recalls_one_open not created — duplicate due recalls present', {
+      schema: schemaName, error: err.message,
+    }));
 
     // Reminder confirmations (patient YES/NO replies)
     await client.query(`
@@ -1018,14 +1056,56 @@ async function runTenantMigrations(schemaName) {
     `);
     // Carry the existing per-weekday branch across before the old constraint
     // goes, or the meaning of those rows is lost.
-    await client.query(`
-      UPDATE doctor_schedules s
-         SET hospital_id = dh.hospital_id
-        FROM doctor_hospitals dh
-       WHERE dh.doctor_id = s.doctor_id
-         AND dh.day_of_week = s.day_of_week
-         AND s.hospital_id IS NULL;
-    `).catch(err => logger.warn('doctor_schedules branch backfill skipped', { schema: schemaName, error: err.message }));
+    //
+    // ONE-SHOT, via seed_markers. This file has no runMigration versioning, so
+    // an ungated UPDATE here ran on every boot for every tenant — and because
+    // `hospital_id IS NULL` means "the doctor's primary branch" (not "unknown"),
+    // it did not just backfill legacy rows: it rewrote deliberate ones. A
+    // dentist with Tuesday 10-13 at a second branch and Tuesday 17-21 at their
+    // primary stores (Tue,10:00,B) and (Tue,17:00,NULL); every deploy stamped
+    // the evening session with B, so slots generated at the wrong branch and
+    // isBlockedDay checked the wrong branch's holidays. Re-saving in the UI
+    // restored NULL and the next deploy clobbered it again, with nothing
+    // logged either time.
+    const backfilled = await client.query(
+      `SELECT 1 FROM seed_markers WHERE key='backfill_schedule_hospital_v1'`
+    ).catch(() => ({ rows: [] }));
+    if (!backfilled.rows.length) {
+      await client.query(`
+        UPDATE doctor_schedules s
+           SET hospital_id = dh.hospital_id
+          FROM doctor_hospitals dh
+         WHERE dh.doctor_id = s.doctor_id
+           AND dh.day_of_week = s.day_of_week
+           AND s.hospital_id IS NULL
+           -- Only on a weekday where NO session names a branch explicitly.
+           --
+           -- This is the load-bearing condition, not a nicety. POST
+           -- /doctors/:id/schedule writes a doctor_hospitals row ONLY for a
+           -- session that has an explicit hospital_id, so a Tuesday split
+           -- "10-13 at branch B / 17-21 at primary (NULL)" has exactly ONE dh
+           -- row — counting dh rows would call that unambiguous and stamp the
+           -- deliberate NULL with B, which is the bug this gating exists to
+           -- stop. If any session that day names a branch, the NULLs beside it
+           -- mean "primary branch" and must be left alone. A genuinely legacy
+           -- weekday (every session NULL, dh rows written by the old API) still
+           -- backfills, which is all this was ever for.
+           AND NOT EXISTS (
+             SELECT 1 FROM doctor_schedules s2
+              WHERE s2.doctor_id = s.doctor_id
+                AND s2.day_of_week = s.day_of_week
+                AND s2.hospital_id IS NOT NULL
+           )
+           -- With two branches on one legacy weekday the UPDATE ... FROM would
+           -- still pick an arbitrary dh row; leave those for a human.
+           AND (SELECT COUNT(*) FROM doctor_hospitals dh2
+                 WHERE dh2.doctor_id = s.doctor_id
+                   AND dh2.day_of_week = s.day_of_week) = 1;
+      `).catch(err => logger.warn('doctor_schedules branch backfill skipped', { schema: schemaName, error: err.message }));
+      await client.query(
+        `INSERT INTO seed_markers (key) VALUES ('backfill_schedule_hospital_v1') ON CONFLICT DO NOTHING`
+      ).catch(() => {});
+    }
     // Swap UNIQUE(doctor,day) for UNIQUE(doctor,day,start_time). Dropped by
     // lookup rather than by its default name: a schema created before the
     // constraint was named this way would silently keep it and reject the
@@ -1099,19 +1179,39 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS scheduling_mode VARCHAR(10)
         NOT NULL DEFAULT 'patient';
     `);
-    await client.query(`
-      ALTER TABLE treatment_plans DROP CONSTRAINT IF EXISTS treatment_plans_scheduling_mode_check;
-      ALTER TABLE treatment_plans ADD CONSTRAINT treatment_plans_scheduling_mode_check
-        CHECK (scheduling_mode IN ('patient','clinic'));
-    `).catch(err => logger.warn('scheduling_mode check skipped', { schema: schemaName, error: err.message }));
+    // Both CHECKs below are applied ONLY when the wanted definition is absent.
+    // They used to DROP and re-ADD unconditionally on every boot for every
+    // tenant, and ADD CONSTRAINT ... CHECK takes ACCESS EXCLUSIVE on
+    // treatment_plans and full-scans it to validate — the same anti-pattern the
+    // patients_phone_format block above was rewritten to remove. Worse, being
+    // .catch-wrapped under a 5s lock_timeout, a busy tenant could lose the
+    // constraint on the DROP and silently fail the re-ADD, so the 60-visit cap
+    // might never actually be in force. pg_constraint carries the compiled
+    // expression, so we can ask whether it is already right.
+    const ensureCheck = async (name, expr, definitionMatch) => {
+      const existing = await client.query(
+        `SELECT pg_get_constraintdef(c.oid) AS def
+           FROM pg_constraint c
+           JOIN pg_class t ON t.oid = c.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND t.relname = 'treatment_plans'
+            AND c.conname = $1`,
+        [name]
+      ).catch(() => ({ rows: [] }));
+      if (existing.rows.length && definitionMatch.test(existing.rows[0].def)) return;
+      await client.query(`
+        ALTER TABLE treatment_plans DROP CONSTRAINT IF EXISTS ${name};
+        ALTER TABLE treatment_plans ADD CONSTRAINT ${name} CHECK (${expr});
+      `).catch(err => logger.warn(`${name} not applied`, { schema: schemaName, error: err.message }));
+    };
+    await ensureCheck('treatment_plans_scheduling_mode_check',
+      `scheduling_mode IN ('patient','clinic')`, /'patient'.*'clinic'/s);
     // 30 visits does not cover a two-year ortho case (monthly adjustments plus
     // bonding, debond and retainer reviews). Raised rather than removed: an
     // unbounded value here is a typo that generates hundreds of appointments.
-    await client.query(`
-      ALTER TABLE treatment_plans DROP CONSTRAINT IF EXISTS treatment_plans_total_visits_check;
-      ALTER TABLE treatment_plans ADD CONSTRAINT treatment_plans_total_visits_check
-        CHECK (total_visits BETWEEN 1 AND 60);
-    `).catch(err => logger.warn('total_visits cap raise skipped', { schema: schemaName, error: err.message }));
+    await ensureCheck('treatment_plans_total_visits_check',
+      `total_visits BETWEEN 1 AND 60`, /\b60\b/);
 
     // ── NOT EVERY DENTIST BELONGS ON THE PUBLIC LIST ───────────
     // "Active with a schedule" used to mean "bookable by any stranger". A
@@ -1147,10 +1247,26 @@ async function runTenantMigrations(schemaName) {
     // 'SET statement_timeout TO 0' keeps NO timeout for the rest of its life —
     // silently disabling the pool-starvation guard for that slot. Tenant
     // creation runs this at runtime from the super admin console.
-    await client.query('RESET statement_timeout').catch(() => {});
-    await client.query('RESET lock_timeout').catch(() => {});
-    await client.query('RESET search_path').catch(() => {});
-    client.release();
+    // Swallowing a RESET failure and releasing anyway returned a POISONED
+    // connection to the pool: still pointing at "tenant_x", public, and with no
+    // statement timeout. audit_logs, users and documents exist in both the
+    // public and tenant schemas, so a later platform-level write on that slot
+    // resolved the unqualified name inside a tenant's schema — cross-tenant
+    // data landing in the wrong place, with the empty .catch() guaranteeing
+    // nobody noticed. If the connection cannot be restored it is not fit to
+    // reuse: pass the error to release() so the pool destroys it instead.
+    let resetErr = null;
+    try {
+      await client.query('RESET statement_timeout');
+      await client.query('RESET lock_timeout');
+      await client.query('RESET search_path');
+    } catch (err) {
+      resetErr = err;
+      logger.warn('Connection reset failed after tenant migration — discarding it', {
+        schema: schemaName, error: err.message,
+      });
+    }
+    client.release(resetErr || undefined);
   }
 }
 

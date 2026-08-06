@@ -517,27 +517,33 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
     await updateSession(schema, phone, STATES.CANCEL_CONFIRM, ctx);
     return;
   }
-  // Check negative intent FIRST — replies like "no, don't cancel" contain the
-  // word "cancel" and would otherwise match the positive pattern and cancel
-  // the appointment the patient explicitly asked to keep. btn_0/btn_1 are now
-  // matched by verified index rather than as substrings of the raw id.
-  // The save, checked before either of the other two: a patient who taps
-  // "Move it instead" has said neither yes nor no to cancelling, and the
-  // reschedule flow re-reads the booking from its id, so nothing is destroyed
-  // on the way through. Falls back to the cancel prompt if the booking can no
-  // longer be moved (inside the 2-hour window, or no free slots), which is the
-  // honest outcome rather than a dead end.
-  const wantsMove = btnIdx === 0 || /\bmove\b|\breschedul/i.test(choice);
+  // Negative intent is computed FIRST and gates everything below it, including
+  // the move. "no, don't reschedule it, don't move it" contains "move" and
+  // "reschedul", so testing wantsMove first sent a patient who had just asked
+  // to be left alone into the date picker. Same rule as the cancel branch and
+  // for the same reason: in a confirm step the negative reading always wins.
+  //
+  // Indices: 0 is "move it instead", 1 is "yes, cancel", 2 is "keep".
+  const isNegative = btnIdx === 2 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^3$/i.test(choice);
+
+  // The save, checked before the cancel: a patient who taps "Move it instead"
+  // has said neither yes nor no to cancelling, and the reschedule flow re-reads
+  // the booking from its id, so nothing is destroyed on the way through. Falls
+  // back to the cancel prompt if the booking can no longer be moved (inside the
+  // 2-hour window, or no free slots), which is the honest outcome rather than a
+  // dead end. btn_0 is matched by verified index rather than as a substring.
+  //
+  // `^1$` matters when sendButtons degrades to numbered text — the very case
+  // the fallback exists for. whatsapp.js renders it "1. 📅 Move it instead /
+  // 2. Yes, cancel it / 3. No, keep it", and without this a patient replying
+  // "1" fell through to "Still on — nothing has changed", the opposite of what
+  // they picked, with nothing to tell them so.
+  const wantsMove = !isNegative && (btnIdx === 0 || /\bmove\b|\breschedul|^1$/i.test(choice));
   if (wantsMove) {
     await updateSession(schema, phone, STATES.IDLE, {});
     return handleRescheduleSelect(phone, schema, tenant, send, {}, ctx.cancel_booking_id);
   }
 
-  // Indices shift with the button above: 1 is now "yes, cancel", 2 is "keep".
-  // Check negative intent FIRST — replies like "no, don't cancel" contain the
-  // word "cancel" and would otherwise match the positive pattern and cancel the
-  // appointment the patient explicitly asked to keep.
-  const isNegative = btnIdx === 2 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^3$/i.test(choice);
   if (!isNegative && (btnIdx === 1 || /yes|cancel|^2$/.test(choice))) {
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(

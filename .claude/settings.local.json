@@ -310,7 +310,12 @@
       "Bash(grep -v \"logger\\\\|require\\(\\\\|^.*//\")",
       "Bash(grep -oiE \"\\(footer|header\\): *[\\\\`'\\\\\"][^\\\\`'\\\\\"]*\")",
       "Bash(npm uninstall *)",
-      "Bash(awk '/^async function sendFeedbackRequests/,/^}/' src/jobs/reminders.js)"
+      "Bash(awk '/^async function sendFeedbackRequests/,/^}/' src/jobs/reminders.js)",
+      "Bash(npm audit *)",
+      "Bash(grep -rn \"dangerouslySetInnerHTML\\\\|document.write\\\\|innerHTML\\\\|NEXT_PUBLIC\\\\|http://\\\\|https://\\\\|fetch\\(\" --include=*.js .)",
+      "Bash(awk 'NR>=940 && NR<=1022 && \\(/runMigration/ || /^  \\\\/\\\\/ ──/ || /seed_markers/\\)' src/db/tenantMigrate.js)",
+      "Bash(npm ci *)",
+      "Bash(grep -n \"hospital_id: v\\\\|setWalkinForm\\(f => \\({ ...f, hospital_id\" src/app/dashboard/page.js)"
     ]
   }
 }

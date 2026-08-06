@@ -307,6 +307,37 @@ async function run() {
     assert.strictEqual(db.appointments[0].status, 'confirmed');
   });
 
+  // REGRESSION: the move was tested BEFORE negative intent, so a reply that
+  // named the move in order to REFUSE it opened the date picker for a booking
+  // the patient had just asked to leave alone. Confirm steps check the negative
+  // reading first, always.
+  await test('REGRESSION: "don\'t move it" is a refusal, not a reschedule', async () => {
+    for (const reply of ["no, don't move it", "don't reschedule it", 'no, keep it, don\'t move']) {
+      restoreAppointment();
+      const ctx = await cancelCtx();
+      reset();
+      await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, reply);
+      assert.strictEqual(db.appointments[0].status, 'confirmed',
+        `"${reply}" cancelled the appointment: ` + texts());
+      assert(!/pick a (date|time)|which date|available/i.test(texts()),
+        `"${reply}" opened the reschedule picker: ` + texts());
+    }
+  });
+
+  // REGRESSION: whatsapp.js renders the degraded text fallback as
+  // "1. Move it instead / 2. Yes, cancel it / 3. No, keep it", but "1" had no
+  // case — it fell through to "Still on, nothing has changed", the opposite of
+  // the option the patient picked, on the exact path the fallback exists for.
+  await test('REGRESSION: typed "1" is the move (numbered text fallback)', async () => {
+    restoreAppointment();
+    const ctx = await cancelCtx();
+    reset();
+    await handleCancelConfirm(PHONE, SCHEMA, tenant, send, ctx, '1');
+    assert.strictEqual(db.appointments[0].status, 'confirmed', texts());
+    assert(!/still on|nothing has changed/i.test(texts()),
+      '"1" was treated as "keep it" instead of the move: ' + texts());
+  });
+
   await test('typed "yes" still cancels (unchanged)', async () => {
     restoreAppointment();
     const ctx = await cancelCtx();

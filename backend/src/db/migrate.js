@@ -37,6 +37,23 @@ async function runMigration(client, version, name, sqlFn) {
 async function migrate() {
   const client = await pool.connect();
   try {
+    // The pool sets statement_timeout=10s in the startup packet (db/index.js)
+    // so a runaway bot query can't starve it. Migrations are the one workload
+    // that legitimately exceeds it, and inheriting it here broke two things:
+    //
+    //  - pg_advisory_lock below BLOCKS while another replica migrates, and was
+    //    cancelled at 10s with 57014. The lock exists precisely to serialise
+    //    concurrent boots, so the loser exited non-zero under entrypoint.sh's
+    //    `set -e` and Railway could burn all its restart retries.
+    //  - the ADD COLUMN / ALTER blocks take ACCESS EXCLUSIVE on `tenants`, the
+    //    table every inbound request reads to resolve a clinic.
+    //
+    // lock_timeout bounds the second: better to fail one boot fast than to
+    // queue an ACCESS EXCLUSIVE that stalls every reader behind it. Mirrors
+    // what tenantMigrate.js already does per tenant schema.
+    await client.query(`SET statement_timeout TO 0`);
+    await client.query(`SET lock_timeout TO '5s'`);
+
     // Serialize migrations across concurrently booting instances — two
     // containers interleaving a data-mutating migration (e.g. 18's token
     // hashing) would double-apply it before either records the version.
@@ -781,7 +798,18 @@ async function migrate() {
 
   } finally {
     await client.query(`SELECT pg_advisory_unlock(824619001)`).catch(() => {});
-    client.release();
+    // Put the pool's own limits back before the connection is reused. If that
+    // fails the connection is NOT fit to return — it would go back carrying
+    // statement_timeout=0, so a later runaway query could hold it forever.
+    // Passing the error to release() destroys it instead of reusing it.
+    let resetErr = null;
+    try {
+      await client.query(`RESET statement_timeout`);
+      await client.query(`RESET lock_timeout`);
+    } catch (err) {
+      resetErr = err;
+    }
+    client.release(resetErr || undefined);
   }
 }
 

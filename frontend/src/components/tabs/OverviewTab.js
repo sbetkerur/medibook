@@ -24,6 +24,7 @@ export default function OverviewTab({
   setTab,
   exportCSV,
   onAddWalkin,
+  isAdmin,
 }) {
   return (
     <div className="space-y-6">
@@ -40,18 +41,27 @@ export default function OverviewTab({
           </h2>
           {/* The walk-in button lives HERE, not two tabs away. A patient at the
               counter is the most common thing that happens in the day and it
-              used to be the least accessible action in the product. */}
-          <button onClick={onAddWalkin}
-            className="shrink-0 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition">
-            + Walk-in
-          </button>
+              used to be the least accessible action in the product.
+              Gated on isAdmin to match POST /admin/appointments, which is
+              adminOnly: rendering it to staff and doctors offered an action
+              that always answered 403. The Appointments tab already gates its
+              copy of this button the same way. */}
+          {isAdmin && (
+            <button onClick={onAddWalkin}
+              className="shrink-0 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition">
+              + Walk-in
+            </button>
+          )}
         </div>
         {loading ? (
           <div className="px-5 py-8 text-center text-gray-400 text-sm">Loading…</div>
         ) : stats?.todays_schedule?.length ? (
           <div className="divide-y divide-gray-50">
+            {/* Keyed on the appointment, not the array index: this list is
+                refetched every 60s and after every status change, so an index
+                key made React reuse a row for a different patient. */}
             {stats.todays_schedule.map((a, i) => (
-              <div key={i} className="px-4 md:px-5 py-3 flex items-center justify-between gap-2">
+              <div key={a.id || a.booking_id || i} className="px-4 md:px-5 py-3 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-3 min-w-0">
                   <div className="text-sm font-medium text-blue-600 w-12 shrink-0">{a.appointment_time?.slice(0,5)}</div>
                   <div className="min-w-0">
@@ -65,7 +75,7 @@ export default function OverviewTab({
           </div>
         ) : (
           <div className="px-5 py-8 text-center text-gray-400 text-sm">
-            Nothing booked yet today. Walk-ins go straight in with the button above.
+            Nothing booked yet today.{isAdmin ? ' Walk-ins go straight in with the button above.' : ''}
           </div>
         )}
       </div>
@@ -159,7 +169,9 @@ export default function OverviewTab({
       <div className="bg-white rounded-xl p-5 shadow-sm">
         <h3 className="font-semibold text-gray-800 mb-3">Quick Actions</h3>
         <div className="flex flex-wrap gap-3">
-          <button onClick={onAddWalkin} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">+ Walk-in</button>
+          {isAdmin && (
+            <button onClick={onAddWalkin} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition">+ Walk-in</button>
+          )}
           <button onClick={() => setTab('appointments')} className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">View All Appointments</button>
           <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Dentists</button>
           <button onClick={() => setTab('test')} className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700 transition">Test WhatsApp Bot</button>

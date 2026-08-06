@@ -8,7 +8,15 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const rateLimit = require('express-rate-limit');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
-router.use(rateLimit({ windowMs: 60 * 1000, max: 120 }));
+//
+// SCOPED to this router's own paths. A path-less router.use() runs for every
+// request that ENTERS the router, and index.js mounts this one at /api/admin
+// ahead of treatmentPlans, recalls, requests, dayClose and events — so an
+// unscoped limiter counted those five routers' traffic (and every /api/admin
+// 404) against a bucket this file never serves. express-rate-limit keys on
+// req.ip by default and a whole clinic sits behind one NAT'd address, so six
+// staff were sharing 120 req/min across six unrelated features.
+router.use(['/services', '/holidays'], rateLimit({ windowMs: 60 * 1000, max: 120 }));
 
 // ── SERVICE CATALOG (A1) ──────────────────────────────────────
 

@@ -195,7 +195,13 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
     }
     const s = req.tenant.schema_name;
     const r = await tenantQuery(s,
-      `UPDATE patients SET dental_history=$1, updated_at=NOW() WHERE id=$2 RETURNING id, name, dental_history as medical_history`,
+      // deleted_at IS NULL for the same reason PATCH /patients/:id carries it:
+      // DELETE /patients/:id anonymises the row and clears dental_history, and
+      // without this guard a later PATCH writes live clinical data back onto a
+      // record that every read path has stopped showing.
+      `UPDATE patients SET dental_history=$1, updated_at=NOW()
+        WHERE id=$2 AND deleted_at IS NULL
+        RETURNING id, name, dental_history as medical_history`,
       [JSON.stringify(medical_history), req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_MEDICAL_HISTORY', 'patient', req.params.id,

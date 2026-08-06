@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import api, { clearSessionTimers } from '@/lib/api';
 import toast from 'react-hot-toast';
@@ -48,6 +48,7 @@ export default function SuperAdminPage() {
   const [backups, setBackups] = useState(null);
   const [backupsLoading, setBackupsLoading] = useState(false);
   const [triggeringBackup, setTriggeringBackup] = useState(false);
+  const backupPollRef = useRef(null);
 
   useEffect(() => {
     const u = localStorage.getItem('user');
@@ -56,6 +57,10 @@ export default function SuperAdminPage() {
     try { parsed = JSON.parse(u); } catch { router.push('/login'); return; }
     if (parsed.role !== 'super_admin') { router.push('/dashboard'); return; }
     fetchAll();
+  }, []);
+
+  useEffect(() => () => {
+    if (backupPollRef.current) clearTimeout(backupPollRef.current);
   }, []);
 
   async function logout() {
@@ -201,7 +206,9 @@ export default function SuperAdminPage() {
     try {
       await api.post('/superadmin/backups/trigger');
       toast.success('Backup started in background');
-      setTimeout(fetchBackups, 3000);
+      // Tracked so it can be cleared on unmount — otherwise it fires after the
+      // page is gone and sets state on an unmounted component.
+      backupPollRef.current = setTimeout(fetchBackups, 3000);
     } catch { toast.error('Failed to trigger backup'); }
     finally { setTriggeringBackup(false); }
   }

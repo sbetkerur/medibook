@@ -1,6 +1,6 @@
 'use strict';
 
-const { tenantQuery, pool, query } = require('../../db');
+const { tenantQuery, pool, query, validateSchemaName } = require('../../db');
 const { format, addDays, parseISO } = require('date-fns');
 const { toZonedTime } = require('../../utils/dateTz');
 const logger = require('../../utils/logger');
@@ -980,6 +980,12 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     await updateSession(schema, phone, STATES.IDLE, {});
     return;
   }
+
+  // This is the one place outside db/index.js that interpolates a schema name
+  // into SQL, so it has to run the same check tenantQuery/tenantTransaction do.
+  // superadmin.js INSERTs the tenants row BEFORE createTenantSchema validates
+  // it, so a malformed schema_name can exist in `tenants` and reach here.
+  validateSchemaName(schema);
 
   // Single transaction: patient upsert + slot lock + appointment insert (that
   // order is load-bearing — see the lock-ordering note inside).

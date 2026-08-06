@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { format, parseISO, subDays, addDays } from 'date-fns';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
+import { todayIST } from '@/lib/dateIST';
 
 /**
  * End of day: what came in, so the drawer can be counted against it.
@@ -24,9 +25,13 @@ const METHOD_LABELS = {
 const money = n => '₹' + Number(n || 0).toLocaleString('en-IN');
 
 export default function DayCloseTab() {
-  // Local YYYY-MM-DD, not toISOString(): the server is UTC and a clinic closing
-  // at 21:00 IST would otherwise open on tomorrow's (empty) date.
-  const todayStr = format(new Date(), 'yyyy-MM-dd');
+  // todayIST(), not the device's local date. The product is IST but a reception
+  // PC may be set to UTC or sit abroad, and this value is load-bearing three
+  // times over — it seeds the picker, caps it via max=, and gates the "next
+  // day" arrow. On a UTC-set machine the tab opened on YESTERDAY between 00:00
+  // and 05:30 IST and today's collections could not be selected at all, which
+  // is precisely when a clinic closing at 21:00 IST does its count.
+  const todayStr = todayIST();
   const [date, setDate] = useState(todayStr);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);

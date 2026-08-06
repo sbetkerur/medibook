@@ -31,9 +31,24 @@ import AuditTab from '@/components/tabs/AuditTab';
 import TestBotTab from '@/components/tabs/TestBotTab';
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
-  day_of_week: i,
-  is_working: i >= 1 && i <= 6,
+
+// A weekday is a LIST of sessions, not one row. An Indian dentist routinely
+// does 10–1 at one clinic and 5–9 at another on the same day, and for a
+// visiting endodontist that is the default arrangement — doctor_schedules is
+// keyed (doctor_id, day_of_week, start_time) for exactly this reason.
+//
+// This modal used to model one session per weekday: it loaded with .find() and
+// saved one row per day, while POST /doctors/:id/schedule DELETEs every row for
+// each submitted day before re-inserting. So opening a two-session Tuesday
+// showed only the morning, and pressing Save silently deleted the evening
+// session and the slots generated from it.
+let _sessionKeySeq = 0;
+const nextSessionKey = () => `s${++_sessionKeySeq}`;
+
+const blankSession = (dayOfWeek, isWorking) => ({
+  _key: nextSessionKey(),
+  day_of_week: dayOfWeek,
+  is_working: isWorking,
   start_time: '09:00',
   end_time: '17:00',
   has_lunch: false,
@@ -43,7 +58,9 @@ const DEFAULT_SCHEDULE = DAYS.map((_, i) => ({
   // [] = every week (which is what a resident dentist always means).
   hospital_id: '',
   week_of_month: [],
-}));
+});
+
+const defaultSchedule = () => DAYS.map((_, i) => blankSession(i, i >= 1 && i <= 6));
 
 // "1st Saturday", "3rd Tuesday" — counted as the Nth occurrence of that weekday
 // in the month, which is how clinics say it. Alternate weeks = 1st, 3rd and 5th.
@@ -120,7 +137,7 @@ export default function Dashboard() {
   // Schedule state
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [schedulingDoctor, setSchedulingDoctor] = useState(null);
-  const [schedule, setSchedule] = useState(DEFAULT_SCHEDULE);
+  const [schedule, setSchedule] = useState(defaultSchedule);
   const [scheduleSaving, setScheduleSaving] = useState(false);
   // Visiting consultant: attends particular branches on particular weekdays,
   // often only on some weeks of the month. Hidden by default — it would be
@@ -233,6 +250,7 @@ export default function Dashboard() {
   // Cancel appointment state
   const [cancellingAppt, setCancellingAppt] = useState(null); // appointment object
   const [cancelReason, setCancelReason] = useState('');
+  const [cancelSaving, setCancelSaving] = useState(false);
   // Bulk cancellation reuses the same reason prompt — the backend requires a
   // reason for bulk cancels too, and the bulk path never collected one.
   const [bulkCancelling, setBulkCancelling] = useState(false);
@@ -757,6 +775,16 @@ export default function Dashboard() {
     setPatientHistoryLoading(true);
     setMedHistoryEditing(false);
     setShowPatientHistory(true);
+    // Clear the PREVIOUS patient's clinical fields before fetching this one's.
+    // Without this, a failed /medical-history request (500, timeout, or a 429
+    // from the per-tenant limiter) left the last patient's allergies, chronic
+    // conditions and medications in state — and the render below only shows the
+    // amber "Unavailable" notice for EMPTY fields, so they displayed as this
+    // patient's own data, unflagged. Clicking Edit → Save then wrote them onto
+    // the wrong record permanently. The generation token below guards ordering;
+    // it cannot guard this.
+    setMedHistory({ blood_type: '', allergies: '', conditions: '', medications: '', notes: '' });
+    setMedHistoryFailed(false);
     // Generation token — the guard SlotsTab implements for the same hazard.
     // Without it, opening patient A, closing, then opening patient B raced: B's
     // smaller payloads landed first and rendered, then A's slower ones
@@ -847,6 +875,12 @@ export default function Dashboard() {
   async function confirmCancelAppointment() {
     if (!cancellingAppt) return;
     if (!cancelReason.trim()) { toast.error('Cancellation reason is required'); return; }
+    // In-flight guard. 'cancelled' is terminal in APPOINTMENT_TRANSITIONS, so a
+    // double-click fired a second PATCH that the server correctly rejected —
+    // and the operator saw "Failed to cancel appointment" immediately after a
+    // cancellation that had in fact succeeded.
+    if (cancelSaving) return;
+    setCancelSaving(true);
     try {
       await api.patch(`/admin/appointments/${cancellingAppt.id}`, {
         status: 'cancelled',
@@ -860,6 +894,8 @@ export default function Dashboard() {
       setCancelReason('');
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to cancel appointment');
+    } finally {
+      setCancelSaving(false);
     }
   }
 
@@ -922,24 +958,34 @@ export default function Dashboard() {
 
   async function openSchedule(doc) {
     setSchedulingDoctor(doc);
-    setSchedule(DEFAULT_SCHEDULE.map(d => ({ ...d })));
+    setSchedule(defaultSchedule());
     try {
       const { data } = await api.get(`/admin/doctors/${doc.id}/schedule`);
       if (data.schedule?.length) {
-        setSchedule(DEFAULT_SCHEDULE.map(def => {
-          const saved = data.schedule.find(s => s.day_of_week === def.day_of_week);
-          if (!saved) return def;
-          return {
-            day_of_week: def.day_of_week,
-            is_working: saved.is_working,
-            start_time: saved.start_time?.slice(0, 5) || def.start_time,
-            end_time: saved.end_time?.slice(0, 5) || def.end_time,
-            has_lunch: !!(saved.lunch_start_time && saved.lunch_end_time),
-            lunch_start_time: saved.lunch_start_time?.slice(0, 5) || '13:00',
-            lunch_end_time: saved.lunch_end_time?.slice(0, 5) || '14:00',
-            hospital_id: saved.hospital_id || '',
-            week_of_month: saved.week_of_month || [],
-          };
+        // Group by weekday and keep EVERY session, in start_time order. The old
+        // .find() took only the first and the save then destroyed the rest.
+        const byDay = new Map();
+        for (const s of data.schedule) {
+          if (!byDay.has(s.day_of_week)) byDay.set(s.day_of_week, []);
+          byDay.get(s.day_of_week).push(s);
+        }
+        setSchedule(DAYS.flatMap((_, dow) => {
+          const saved = (byDay.get(dow) || [])
+            .slice()
+            .sort((a, b) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
+          // A weekday with nothing stored is a day off, shown as one blank row.
+          if (!saved.length) return [blankSession(dow, false)];
+          return saved.map(s => ({
+            ...blankSession(dow, s.is_working),
+            is_working: s.is_working,
+            start_time: s.start_time?.slice(0, 5) || '09:00',
+            end_time: s.end_time?.slice(0, 5) || '17:00',
+            has_lunch: !!(s.lunch_start_time && s.lunch_end_time),
+            lunch_start_time: s.lunch_start_time?.slice(0, 5) || '13:00',
+            lunch_end_time: s.lunch_end_time?.slice(0, 5) || '14:00',
+            hospital_id: s.hospital_id || '',
+            week_of_month: s.week_of_month || [],
+          }));
         }));
         // Show the visiting controls if the saved schedule already uses them,
         // even when the flag on the doctor was never set.
@@ -956,6 +1002,8 @@ export default function Dashboard() {
   async function saveSchedule() {
     setScheduleSaving(true);
     try {
+      // Every session, not one row per day: the backend REPLACES all rows for
+      // each day_of_week it receives, so omitting a session deletes it.
       const schedules = schedule.map(d => ({
         day_of_week: d.day_of_week,
         is_working: d.is_working,
@@ -1002,8 +1050,54 @@ export default function Dashboard() {
     } finally { setGeneratingSlots(false); }
   }
 
-  function updateScheduleDay(index, field, value) {
-    setSchedule(prev => prev.map((d, i) => i === index ? { ...d, [field]: value } : d));
+  // Keyed on the session's stable _key rather than its array index: sessions
+  // are added and removed within a day, so an index captured in a closure goes
+  // stale and would edit the neighbouring session.
+  function updateScheduleDay(key, field, value) {
+    setSchedule(prev => prev.map(d => d._key === key ? { ...d, [field]: value } : d));
+  }
+
+  // A second (or third) session on the same weekday — the 10–1 / 5–9 split.
+  // Defaults to an evening window after the last session of that day so the
+  // backend's overlap check passes without the admin having to think about it.
+  function addScheduleSession(dayOfWeek) {
+    setSchedule(prev => {
+      const ofDay = prev.filter(d => d.day_of_week === dayOfWeek);
+      const last = ofDay[ofDay.length - 1];
+      const lastEndHour = parseInt(String(last?.end_time || '17:00').slice(0, 2), 10) || 17;
+      // Never earlier than the previous session ends — the backend rejects
+      // overlapping sessions outright, and clamping the +1 at 22 could
+      // otherwise propose a start BEFORE a late-finishing session's end.
+      const startHour = Math.max(Math.min(22, lastEndHour + 1), lastEndHour);
+      const added = {
+        ...blankSession(dayOfWeek, true),
+        start_time: `${String(startHour).padStart(2, '0')}:00`,
+        end_time: `${String(Math.min(23, startHour + 4)).padStart(2, '0')}:00`,
+        // Inherit the branch so a two-branch day starts from the likely answer.
+        hospital_id: last?.hospital_id || '',
+      };
+      // Insert directly after that day's existing sessions to keep the list in
+      // weekday order.
+      const lastIdx = prev.map(d => d.day_of_week).lastIndexOf(dayOfWeek);
+      const next = prev.slice();
+      next.splice(lastIdx + 1, 0, added);
+      return next;
+    });
+  }
+
+  function removeScheduleSession(key) {
+    setSchedule(prev => {
+      const target = prev.find(d => d._key === key);
+      if (!target) return prev;
+      const remaining = prev.filter(d => d.day_of_week === target.day_of_week && d._key !== key);
+      // Never leave a weekday with no row at all — the save would then send
+      // nothing for that day, and the backend only replaces days it receives,
+      // so the deleted sessions would survive. Collapse to a day off instead.
+      if (!remaining.length) {
+        return prev.map(d => d._key === key ? { ...blankSession(d.day_of_week, false), _key: d._key } : d);
+      }
+      return prev.filter(d => d._key !== key);
+    });
   }
 
   async function openSlotsViewer(doc) {
@@ -1307,7 +1401,37 @@ export default function Dashboard() {
   }
 
   async function exportCSV(rowsOverride) {
-    const source = rowsOverride || appointments;
+    // With no override this used to export `appointments`, which holds ONE page
+    // of 25 — so an owner who filtered to a month and clicked Export got 25 rows
+    // in a file named appointments_<date>.csv with nothing saying it was
+    // truncated. Re-fetch the full filtered set instead, honouring the same
+    // filters the table is showing.
+    // The list endpoint clamps limit to 100, so page through rather than asking
+    // for one huge response. Bounded at 50 pages (5,000 rows) — past that the
+    // right tool is Settings → Export, which streams the whole book server-side.
+    let source = rowsOverride;
+    if (!source) {
+      const MAX_PAGES = 50;
+      const collected = [];
+      try {
+        for (let page = 1; page <= MAX_PAGES; page++) {
+          const params = new URLSearchParams({ limit: '100', page: String(page) });
+          if (filterDate) params.set('date', filterDate);
+          if (filterStatus) params.set('status', filterStatus);
+          const { data } = await api.get(`/admin/appointments?${params}`);
+          const batch = data.appointments || [];
+          collected.push(...batch);
+          if (!data.has_more || !batch.length) break;
+          if (page === MAX_PAGES) {
+            toast('Exported the first 5,000 rows — use Settings → Export for the full book.');
+          }
+        }
+      } catch {
+        toast.error('Could not load the full list to export');
+        return;
+      }
+      source = collected;
+    }
     if (!source.length) { toast.error('No data to export'); return; }
     const h = ['Booking ID', 'Patient', 'Phone', 'Doctor', 'Department', 'Date', 'Time', 'Type', 'Status'];
     const rows = source.map(a => [
@@ -1457,7 +1581,10 @@ export default function Dashboard() {
                     {notifications.length === 0 ? (
                       <div className="px-4 py-6 text-center text-gray-400 text-sm">No new bookings</div>
                     ) : notifications.map((n, i) => (
-                      <div key={n.id || i} className="px-4 py-3 hover:bg-gray-50">
+                      // booking_id as the second choice before the index: this
+                      // list is PREPENDED to by both the SSE stream and the 30s
+                      // poll, so an index key shifts every row's identity.
+                      <div key={n.id || n.booking_id || i} className="px-4 py-3 hover:bg-gray-50">
                         <div className="text-sm font-medium text-gray-900">{n.patient_name || 'New Patient'}</div>
                         <div className="text-xs text-gray-500 mt-0.5">
                           Dr. {n.doctor_name} · {n.appointment_date} {n.appointment_time?.slice(0, 5)}
@@ -1565,6 +1692,7 @@ export default function Dashboard() {
               setTab={setTab}
               exportCSV={exportCSV}
               onAddWalkin={openWalkinModal}
+              isAdmin={isAdmin}
             />
           )}
 
@@ -2042,8 +2170,15 @@ export default function Dashboard() {
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-gray-800">🩺 Medical History</h3>
                 {!isAdmin ? null : !medHistoryEditing ? (
+                  // Not editable when the load failed. The fields are blank in
+                  // that state (they are cleared before every fetch), so Save
+                  // would PATCH empty strings over a patient's real allergies
+                  // and medications — destroying clinical data because of a
+                  // transient 500. Reopen the record once it loads.
                   <button onClick={() => setMedHistoryEditing(true)}
-                    className="text-xs text-blue-600 hover:underline">Edit</button>
+                    disabled={medHistoryFailed}
+                    title={medHistoryFailed ? 'Medical history could not be loaded — reopen the record to edit' : undefined}
+                    className="text-xs text-blue-600 hover:underline disabled:text-gray-300 disabled:no-underline disabled:cursor-not-allowed">Edit</button>
                 ) : (
                   <div className="flex gap-2">
                     <button onClick={() => setMedHistoryEditing(false)}
@@ -2250,12 +2385,21 @@ export default function Dashboard() {
           <div className="hidden sm:grid grid-cols-[90px_60px_1fr_1fr_70px_1fr_1fr] gap-2 px-2 text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">
             <span>Day</span><span>On</span><span>Start</span><span>End</span><span>Lunch</span><span>Break Start</span><span>Break End</span>
           </div>
-          {schedule.map((day, i) => (
-            <div key={day.day_of_week}>
+          {schedule.map((day) => {
+            const sessionKey = day._key;
+            const ofDay = schedule.filter(d => d.day_of_week === day.day_of_week);
+            const seq = ofDay.indexOf(day);
+            const isFirstOfDay = seq === 0;
+            const isLastOfDay = seq === ofDay.length - 1;
+            const dayLabel = isFirstOfDay
+              ? DAYS[day.day_of_week]
+              : `${DAYS[day.day_of_week].slice(0, 3)} · session ${seq + 1}`;
+            return (
+            <div key={day._key}>
               {/* Mobile card layout */}
               <div className={`sm:hidden rounded-lg p-3 mb-1 ${day.is_working ? 'bg-blue-50' : 'bg-gray-50'}`}>
                 <div className="flex items-center justify-between mb-2">
-                  <span className="text-sm font-semibold text-gray-700">{DAYS[day.day_of_week]}</span>
+                  <span className="text-sm font-semibold text-gray-700">{dayLabel}</span>
                   {/* The switch itself stays 36x20; the LABEL is the hit area,
                       and at content height that was a 20px-tall target on the
                       screen reception uses to set a dentist's week. The negative
@@ -2263,7 +2407,7 @@ export default function Dashboard() {
                   <label className="flex items-center gap-2 cursor-pointer py-2.5 -my-2.5 pl-3 -ml-3">
                     <span className="text-xs text-gray-400">{day.is_working ? 'Working' : 'Off'}</span>
                     <div className="relative">
-                      <input type="checkbox" className="sr-only" checked={day.is_working} onChange={e => updateScheduleDay(i, 'is_working', e.target.checked)} />
+                      <input type="checkbox" className="sr-only" checked={day.is_working} onChange={e => updateScheduleDay(sessionKey, 'is_working', e.target.checked)} />
                       <div className={`w-9 h-5 rounded-full transition-colors ${day.is_working ? 'bg-blue-500' : 'bg-gray-300'}`} />
                       <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.is_working ? 'translate-x-4' : ''}`} />
                     </div>
@@ -2273,16 +2417,16 @@ export default function Dashboard() {
                   <div className="grid grid-cols-2 gap-2 mb-2">
                     <div>
                       <p className="text-xs text-gray-400 mb-1">Start</p>
-                      <input type="time" value={day.start_time} onChange={e => updateScheduleDay(i, 'start_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full" />
+                      <input type="time" value={day.start_time} onChange={e => updateScheduleDay(sessionKey, 'start_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full" />
                     </div>
                     <div>
                       <p className="text-xs text-gray-400 mb-1">End</p>
-                      <input type="time" value={day.end_time} onChange={e => updateScheduleDay(i, 'end_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full" />
+                      <input type="time" value={day.end_time} onChange={e => updateScheduleDay(sessionKey, 'end_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full" />
                     </div>
                   </div>
                   <label className="flex items-center gap-2 cursor-pointer mb-2 py-2.5 -my-0.5 pr-3">
                     <div className="relative">
-                      <input type="checkbox" className="sr-only" checked={day.has_lunch} onChange={e => updateScheduleDay(i, 'has_lunch', e.target.checked)} />
+                      <input type="checkbox" className="sr-only" checked={day.has_lunch} onChange={e => updateScheduleDay(sessionKey, 'has_lunch', e.target.checked)} />
                       <div className={`w-9 h-5 rounded-full transition-colors ${day.has_lunch ? 'bg-orange-400' : 'bg-gray-300'}`} />
                       <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.has_lunch ? 'translate-x-4' : ''}`} />
                     </div>
@@ -2292,11 +2436,11 @@ export default function Dashboard() {
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <p className="text-xs text-gray-400 mb-1">Break Start</p>
-                        <input type="time" value={day.lunch_start_time} onChange={e => updateScheduleDay(i, 'lunch_start_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 w-full" />
+                        <input type="time" value={day.lunch_start_time} onChange={e => updateScheduleDay(sessionKey, 'lunch_start_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 w-full" />
                       </div>
                       <div>
                         <p className="text-xs text-gray-400 mb-1">Break End</p>
-                        <input type="time" value={day.lunch_end_time} onChange={e => updateScheduleDay(i, 'lunch_end_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 w-full" />
+                        <input type="time" value={day.lunch_end_time} onChange={e => updateScheduleDay(sessionKey, 'lunch_end_time', e.target.value)} className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 w-full" />
                       </div>
                     </div>
                   )}
@@ -2304,32 +2448,32 @@ export default function Dashboard() {
               </div>
               {/* Desktop row layout */}
               <div className={`hidden sm:grid grid-cols-[90px_60px_1fr_1fr_70px_1fr_1fr] gap-2 items-center px-2 py-2 rounded-lg transition-colors ${day.is_working ? 'bg-blue-50' : 'bg-gray-50'}`}>
-                <span className="text-sm font-medium text-gray-700">{DAYS[day.day_of_week]}</span>
+                <span className={`text-sm text-gray-700 ${isFirstOfDay ? 'font-medium' : 'text-xs text-gray-400 pl-2'}`}>{dayLabel}</span>
                 {/* Same padding on the ≥640px row: a tablet in portrait renders
                     this layout and is still a touch device. */}
                 <label className="flex items-center cursor-pointer py-2.5 -my-2.5">
                   <div className="relative">
                     <input type="checkbox" className="sr-only"
                       checked={day.is_working}
-                      onChange={e => updateScheduleDay(i, 'is_working', e.target.checked)} />
+                      onChange={e => updateScheduleDay(sessionKey, 'is_working', e.target.checked)} />
                     <div className={`w-9 h-5 rounded-full transition-colors ${day.is_working ? 'bg-blue-500' : 'bg-gray-300'}`} />
                     <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.is_working ? 'translate-x-4' : ''}`} />
                   </div>
                 </label>
                 <input type="time" value={day.start_time}
                   disabled={!day.is_working}
-                  onChange={e => updateScheduleDay(i, 'start_time', e.target.value)}
+                  onChange={e => updateScheduleDay(sessionKey, 'start_time', e.target.value)}
                   className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-30 disabled:bg-gray-100 w-full" />
                 <input type="time" value={day.end_time}
                   disabled={!day.is_working}
-                  onChange={e => updateScheduleDay(i, 'end_time', e.target.value)}
+                  onChange={e => updateScheduleDay(sessionKey, 'end_time', e.target.value)}
                   className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-30 disabled:bg-gray-100 w-full" />
                 <label className={`flex items-center gap-1 cursor-pointer py-2.5 -my-2.5 ${!day.is_working ? 'opacity-30 pointer-events-none' : ''}`}>
                   <div className="relative">
                     <input type="checkbox" className="sr-only"
                       checked={day.has_lunch}
                       disabled={!day.is_working}
-                      onChange={e => updateScheduleDay(i, 'has_lunch', e.target.checked)} />
+                      onChange={e => updateScheduleDay(sessionKey, 'has_lunch', e.target.checked)} />
                     <div className={`w-9 h-5 rounded-full transition-colors ${day.has_lunch && day.is_working ? 'bg-orange-400' : 'bg-gray-300'}`} />
                     <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${day.has_lunch && day.is_working ? 'translate-x-4' : ''}`} />
                   </div>
@@ -2337,11 +2481,11 @@ export default function Dashboard() {
                 </label>
                 <input type="time" value={day.lunch_start_time}
                   disabled={!day.is_working || !day.has_lunch}
-                  onChange={e => updateScheduleDay(i, 'lunch_start_time', e.target.value)}
+                  onChange={e => updateScheduleDay(sessionKey, 'lunch_start_time', e.target.value)}
                   className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:opacity-30 disabled:bg-gray-100 w-full" />
                 <input type="time" value={day.lunch_end_time}
                   disabled={!day.is_working || !day.has_lunch}
-                  onChange={e => updateScheduleDay(i, 'lunch_end_time', e.target.value)}
+                  onChange={e => updateScheduleDay(sessionKey, 'lunch_end_time', e.target.value)}
                   className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:opacity-30 disabled:bg-gray-100 w-full" />
               </div>
 
@@ -2352,7 +2496,7 @@ export default function Dashboard() {
                   <div className="flex items-center gap-2 shrink-0">
                     <span className="text-[11px] text-gray-500 w-10">Branch</span>
                     <select value={day.hospital_id}
-                      onChange={e => updateScheduleDay(i, 'hospital_id', e.target.value)}
+                      onChange={e => updateScheduleDay(sessionKey, 'hospital_id', e.target.value)}
                       className="border border-gray-200 rounded px-2 py-1 text-xs bg-white min-w-[10rem]">
                       <option value="">Primary branch</option>
                       {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
@@ -2365,7 +2509,7 @@ export default function Dashboard() {
                       const on = (day.week_of_month || []).includes(week);
                       return (
                         <button key={week} type="button"
-                          onClick={() => updateScheduleDay(i, 'week_of_month',
+                          onClick={() => updateScheduleDay(sessionKey, 'week_of_month',
                             on ? day.week_of_month.filter(w => w !== week)
                                : [...(day.week_of_month || []), week].sort((a, b) => a - b))}
                           // Five chips in a row: small AND adjacent, so a
@@ -2384,8 +2528,36 @@ export default function Dashboard() {
                   </div>
                 </div>
               )}
+
+              {/* Session controls. "Add session" is the 10–1 / 5–9 split, which
+                  is ordinary for a resident dentist and the default arrangement
+                  for a visiting one — so it is offered on every working day,
+                  not just when the visiting toggle is on. */}
+              {day.is_working && isLastOfDay && (
+                <div className="flex items-center gap-3 px-2 mb-2 mt-0.5">
+                  <button type="button" onClick={() => addScheduleSession(day.day_of_week)}
+                    className="text-[11px] text-blue-600 hover:underline">
+                    + Add another session on {DAYS[day.day_of_week]}
+                  </button>
+                  {ofDay.length > 1 && (
+                    <button type="button" onClick={() => removeScheduleSession(day._key)}
+                      className="text-[11px] text-red-500 hover:underline">
+                      Remove this session
+                    </button>
+                  )}
+                </div>
+              )}
+              {day.is_working && !isLastOfDay && ofDay.length > 1 && (
+                <div className="px-2 mb-2 mt-0.5">
+                  <button type="button" onClick={() => removeScheduleSession(day._key)}
+                    className="text-[11px] text-red-500 hover:underline">
+                    Remove this session
+                  </button>
+                </div>
+              )}
             </div>
-          ))}
+            );
+          })}
         </div>
         <div className="border-t border-gray-100 pt-4 flex flex-col sm:flex-row gap-3">
           <button onClick={() => setShowScheduleModal(false)}
@@ -2441,9 +2613,9 @@ export default function Dashboard() {
               className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
               Keep Appointment
             </button>
-            <button onClick={confirmCancelAppointment} disabled={!cancelReason.trim()}
+            <button onClick={confirmCancelAppointment} disabled={cancelSaving || !cancelReason.trim()}
               className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50 transition">
-              Confirm Cancel
+              {cancelSaving ? 'Cancelling…' : 'Confirm Cancel'}
             </button>
           </div>
         </div>
@@ -2515,7 +2687,18 @@ export default function Dashboard() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Hospital *</label>
-              <select value={walkinForm.hospital_id} onChange={e => setWalkinForm(f => ({ ...f, hospital_id: e.target.value }))}
+              {/* Clear the dependent selections, the way the doctor modal does.
+                  The Doctor list is filtered by hospital_id, so a retained
+                  doctor_id matched no option: the select showed the placeholder
+                  while state still held the old doctor, and the slot effect
+                  (keyed on doctor_id) kept offering the OLD branch's times as
+                  selectable. Submitting produced either a bare native "please
+                  select an item" or a 400 from the server. */}
+              <select value={walkinForm.hospital_id}
+                onChange={e => setWalkinForm(f => ({
+                  ...f, hospital_id: e.target.value,
+                  doctor_id: '', slot_id: '', appointment_time: '',
+                }))}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                 <option value="">— Select —</option>
                 {hospitals.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}

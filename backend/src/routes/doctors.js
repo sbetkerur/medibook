@@ -320,15 +320,25 @@ router.delete('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
 // ── DOCTOR SCHEDULE ───────────────────────────────────────────
 router.get('/doctors/:id/schedule', validateUUID(), async (req, res) => {
   try {
-    // hospital_id comes from doctor_hospitals — the branch this doctor is at on
-    // that weekday. NULL means their primary branch, which is every doctor who
-    // isn't a visiting consultant.
+    // A schedule row IS a session: doctor + weekday + hours + branch. Ordered
+    // by start_time within the day so two sessions come back morning-first.
+    //
+    // doctor_schedules.hospital_id is authoritative and is what slot generation
+    // reads; doctor_hospitals is consulted only to fill a legacy NULL. The
+    // `AND s.hospital_id IS NULL` on the join is load-bearing — without it a
+    // dentist with two branches on one weekday matched both dh rows and the
+    // query returned 2 sessions × 2 branches = 4 rows. The dashboard then
+    // rendered phantom sessions, and any client round-tripping this payload
+    // back into POST /doctors/:id/schedule tripped the overlap check and was
+    // told the dentist "cannot be in two places at once" — making a schedule
+    // that already existed impossible to save.
     const r = await tenantQuery(req.tenant.schema_name,
       `SELECT s.*, COALESCE(s.hospital_id, dh.hospital_id) AS hospital_id
        FROM doctor_schedules s
        LEFT JOIN doctor_hospitals dh
          ON dh.doctor_id = s.doctor_id AND dh.day_of_week = s.day_of_week
-       WHERE s.doctor_id=$1 ORDER BY s.day_of_week`, [req.params.id]);
+        AND s.hospital_id IS NULL
+       WHERE s.doctor_id=$1 ORDER BY s.day_of_week, s.start_time`, [req.params.id]);
     res.json({ schedule: r.rows });
   } catch (err) { handleError(res, err); }
 });

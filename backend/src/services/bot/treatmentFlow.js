@@ -14,7 +14,7 @@
  * treatment and dentist the patient would otherwise have had to choose again.
  */
 const { tenantQuery } = require('../../db');
-const { STATES, parseChoiceNumber, updateSession } = require('./utils');
+const { STATES, parseChoiceNumber, updateSession, clinicPhoneLine } = require('./utils');
 
 /** Plans the patient can still book a sitting on, newest first. */
 async function getOpenPlans(schema, phone) {

@@ -66,6 +66,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
   const [payForm, setPayForm] = useState({ amount: '', method: 'cash', note: '' });
   const [labForm, setLabForm] = useState({ item: '', lab_name: '', expected_date: '', cost: '' });
   const [busy, setBusy] = useState(false);
+  const [bookingPlanId, setBookingPlanId] = useState(null);
   const todayISO = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
   const fetchPlans = useCallback(async () => {
@@ -183,9 +184,14 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
   // the plan lock the second one booked the NEXT visit — an extra appointment,
   // an extra locked slot and an extra quota decrement, from a button the
   // operator pressed once as far as they were concerned.
+  // Keyed on the plan id rather than the shared `busy` flag. `busy` is also
+  // used by the payment and lab-work forms in the detail modal, so booking a
+  // visit on one card disabled and relabelled ("Booking…") the button on EVERY
+  // other plan's card at the same time. The modal forms can keep sharing it —
+  // only one of them is on screen at a time.
   async function bookNextVisit(plan) {
-    if (busy) return;
-    setBusy(true);
+    if (bookingPlanId) return;
+    setBookingPlanId(plan.id);
     try {
       const { data } = await api.post(`/admin/treatment-plans/${plan.id}/visits`, {
         after_days: Number(bookingGap) || 7,
@@ -195,7 +201,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
       if (detail?.treatment_plan?.id === plan.id) openDetail(plan.id);
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to book the visit');
-    } finally { setBusy(false); }
+    } finally { setBookingPlanId(null); }
   }
 
   function changeStatus(plan, status, label) {
@@ -332,9 +338,9 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
                     Visits
                   </button>
                   {p.canBookNext && ['proposed', 'in_progress'].includes(p.status) && (
-                    <button onClick={() => bookNextVisit(p)} disabled={busy}
+                    <button onClick={() => bookNextVisit(p)} disabled={bookingPlanId != null}
                       className="px-2.5 py-1.5 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed">
-                      {busy ? 'Booking…' : `Book visit ${p.nextVisitNumber}`}
+                      {bookingPlanId === p.id ? 'Booking…' : `Book visit ${p.nextVisitNumber}`}
                     </button>
                   )}
                 </div>

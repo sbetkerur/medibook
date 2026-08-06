@@ -154,6 +154,14 @@ const mockDb = {
   query: (sql, params) => routeQuery(sql, params),
   tenantQuery: (_schema, sql, params) => routeQuery(sql, params),
   tenantTransaction: async (_schema, cb) => cb(mockClient),
+  // Mirrors the real implementation rather than stubbing it to a no-op:
+  // completeBooking interpolates the schema into `SET LOCAL search_path`, so
+  // the guard it runs first is worth exercising here too.
+  validateSchemaName: (schemaName) => {
+    if (!schemaName || !/^tenant_[a-z0-9_]+$/.test(schemaName)) {
+      throw new Error(`Invalid schema name: "${schemaName}"`);
+    }
+  },
 };
 const dbPath = path.resolve(__dirname, '../src/db/index.js');
 require.cache[dbPath] = { id: dbPath, filename: dbPath, loaded: true, exports: mockDb };

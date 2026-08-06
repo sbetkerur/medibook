@@ -103,6 +103,18 @@ async function sendTreatmentNudges() {
 
     const plans = await findPlansNeedingNudge(tenant.schema_name);
     for (const plan of plans) {
+      // The budget gate sits OUTSIDE the try, because `continue` from inside it
+      // would still run the finally and burn one of the plan's three attempts
+      // on a send that was never attempted. A patient who booked their first
+      // sitting over WhatsApp is routinely over budget for the following week,
+      // and three suppressed weeks used to exhaust the plan permanently — the
+      // half-finished root canal then never got nudged at all, which is the one
+      // thing this job exists to prevent.
+      //
+      // A nudge is the most skippable message this product sends — the patient
+      // has an open course and will be reminded again in a week.
+      if (!await canSendDiscretionary(tenant.schema_name, plan.phone, budgetFor(tenant))) continue;
+
       try {
         const nextVisit = plan.booked_visits + 1;
         const isFirst = plan.booked_visits === 0;
@@ -117,10 +129,6 @@ async function sendTreatmentNudges() {
           (plan.hospital_name ? `\n${plan.hospital_name}` : '') +
           `\n\nLeaving a treatment part-done can undo the work already carried out, so let's get it in the diary.\n\n` +
           `Reply *Treatment* to pick a time, or call the clinic.`;
-
-        // A nudge is the most skippable message this product sends — the
-        // patient has an open course and will be reminded again in a week.
-        if (!await canSendDiscretionary(tenant.schema_name, plan.phone, budgetFor(tenant))) continue;
 
         await sendPatientMessage(tenant.schema_name, plan.phone, {
           template: TREATMENT_NUDGE_TEMPLATE,
