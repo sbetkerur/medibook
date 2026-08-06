@@ -11,7 +11,7 @@
  * Also enforces the two Meta body rules that are easy to break by editing copy:
  * no two variables separated by only whitespace, and no body that begins or
  * ends with one. Both were violated the moment the emoji were removed from
- * appointment_confirmed_v3 and appointment_reminder_24h_v3 — the emoji had been the
+ * appointment_confirmed_v4 and appointment_reminder_24h_v3 — the emoji had been the
  * text between two variables.
  *
  * Run: node tests/templateContract.unit.test.js   (no DB, no network)
@@ -23,7 +23,7 @@ const DOC = fs.readFileSync('C:/claude_projects/medibook/docs/whatsapp-templates
 
 // name -> how many parameters the sender pushes, read off the source.
 const SRC = {
-  'appointment_confirmed_v3':     ['src/services/whatsapp.js', 'sendBookingConfirmationTemplate'],
+  'appointment_confirmed_v4':     ['src/services/whatsapp.js', 'sendBookingConfirmationTemplate'],
   'appointment_reminder_24h_v3':  ['src/jobs/reminders.js', null],
   'appointment_reminder_2h_v3':   ['src/jobs/reminders.js', null],
   'appointment_feedback_request': ['src/jobs/reminders.js', null],

@@ -281,7 +281,7 @@ async function updateMessageStatus(schemaName, waMessageId, status) {
 
 // ── Template convenience wrappers ─────────────────────────────────────────────
 async function sendBookingConfirmationTemplate(to, { bookingId, doctorName, hospitalName, date, time }, accessToken, phoneNumberId) {
-  return await sendTemplate(to, 'appointment_confirmed_v3', [
+  return await sendTemplate(to, 'appointment_confirmed_v4', [
     {
       type: 'body',
       parameters: [

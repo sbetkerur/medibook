@@ -42,7 +42,7 @@ function canonical(label) {
 
 // label (canonical form) -> keyword the engine already understands.
 const LABEL_TO_KEYWORD = {
-  // 1 appointment_confirmed_v3, 2 appointment_reminder_24h_v3,
+  // 1 appointment_confirmed_v4, 2 appointment_reminder_24h_v3,
   // 9 treatment_sitting_booked
   'reschedule': 'Reschedule',
   'cancel appointment': 'Cancel appointment',

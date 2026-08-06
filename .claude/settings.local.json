@@ -315,7 +315,10 @@
       "Bash(grep -rn \"dangerouslySetInnerHTML\\\\|document.write\\\\|innerHTML\\\\|NEXT_PUBLIC\\\\|http://\\\\|https://\\\\|fetch\\(\" --include=*.js .)",
       "Bash(awk 'NR>=940 && NR<=1022 && \\(/runMigration/ || /^  \\\\/\\\\/ ──/ || /seed_markers/\\)' src/db/tenantMigrate.js)",
       "Bash(npm ci *)",
-      "Bash(grep -n \"hospital_id: v\\\\|setWalkinForm\\(f => \\({ ...f, hospital_id\" src/app/dashboard/page.js)"
+      "Bash(grep -n \"hospital_id: v\\\\|setWalkinForm\\(f => \\({ ...f, hospital_id\" src/app/dashboard/page.js)",
+      "PowerShell(node backend/tests/templateContract.unit.test.js)",
+      "PowerShell(cd backend *)",
+      "PowerShell($sp='C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\e740d952-6bb1-4ccc-8f75-8c59026ed5ca\\\\scratchpad'; git commit -F \"$sp\\\\msg1.txt\"; if \\($?\\) { git add backend/src/services/whatsapp.js backend/src/utils/templateButtons.js backend/tests/templateContract.unit.test.js docs/whatsapp-templates.md .claude/settings.local.json; git commit -F \"$sp\\\\msg2.txt\" })"
     ]
   }
 }

@@ -18,7 +18,7 @@ conversation the patient started.
 
 | # | Name | Vars | Sent by | Buttons |
 |---|---|---|---|---|
-| 1 | `appointment_confirmed_v3` | 5 | booking completes | 2 |
+| 1 | `appointment_confirmed_v4` | 5 | booking completes | 2 |
 | 2 | `appointment_reminder_24h_v3` | 4 | the day before | 3 |
 | 3 | `appointment_reminder_2h_v3` | 3 | a couple of hours before | — |
 | 4 | `appointment_feedback_request` | 3 | day after a completed visit | 3 |
@@ -29,19 +29,19 @@ conversation the patient started.
 | 9 | `treatment_sitting_booked` | 7 | the desk books the next sitting | 2 |
 | 10 | `clinic_staff_alert` | 2 | alerts + Monday summary, **to staff** | — |
 
-**1, 2 and 3 carry a `_v3` suffix, and 8, 9 and 10 have never been submitted.**
-Six of the ten, then, are names Meta has not approved yet — until it does, those
-messages do not arrive at all.
+**1 carries a `_v4` suffix, 2 and 3 a `_v3` one, and 8, 9 and 10 have never been
+submitted.** Six of the ten, then, are names Meta has not approved yet — until
+it does, those messages do not arrive at all.
 
 A template cannot be renamed in WhatsApp Manager. **1, 2 and 3 are therefore
-created fresh under the new names**, and the un-suffixed `appointment_confirmed`,
+created fresh under the new names**, and the previous `appointment_confirmed_v3`,
 `appointment_reminder_24h` and `appointment_reminder_2h` keep working right up
 until this code deploys, at which point they are dead — nothing looks them up.
-Create and get the `_v3` names approved BEFORE deploying, or every booking
+Create and get the new names approved BEFORE deploying, or every booking
 confirmation and every reminder falls back to plain text in the gap, which Meta
-rejects for anyone outside the 24-hour window. Delete the old three only once
-the new ones are live; a deleted template cannot be recovered, and while they
-exist they are a working rollback.
+rejects for anyone outside the 24-hour window. Delete the superseded ones only
+once the new ones are live; a deleted template cannot be recovered, and while
+they exist they are a working rollback.
 
 The other three:
 
@@ -150,7 +150,7 @@ still goes out as plain text — see the fallback note at the end.
 
 ---
 
-## 1. `appointment_confirmed_v3`
+## 1. `appointment_confirmed_v4`
 
 Sent the moment a booking completes.
 `services/bot/bookingFlow.js` → `wa.sendBookingConfirmationTemplate`
