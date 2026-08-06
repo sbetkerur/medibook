@@ -105,15 +105,25 @@ for (const name of Object.keys(SRC)) {
     `→ starts "${t.slice(0, 14)}" ends "${t.slice(-14)}"`);
 }
 
-// ── BUTTON PAYLOADS ─────────────────────────────────────────────────────────
-// A quick-reply row in WhatsApp Manager has a Label AND a Payload, and the form
-// PREFILLS the payload from the label. Our labels carry an emoji and read like
-// sentences, while the engine's keyword tests are anchored (/^reschedule$/i) —
-// so a payload left at that default matches nothing and the tap does nothing,
-// silently. Two things have to hold: the documented payload must be a bare
-// keyword (no emoji, no stray space), and the sender must pass the same string
-// as its send-time override, or the template's stored payload is all there is.
-console.log('\nButton payloads — doc vs. code\n');
+// ── BUTTON LABELS AND PAYLOADS ──────────────────────────────────────────────
+// A quick-reply button on a TEMPLATE carries no payload of its own — the LABEL
+// is what arrives in `msg.button.payload`. Our labels carry an emoji and read
+// like sentences ("📅 Book my next sitting") while the engine's keyword tests
+// are anchored (/^treatment$/i), so the tap arrives as unrecognised text and
+// does nothing at all, silently.
+//
+// `utils/templateButtons.js` closes that gap, and this is what pins it: every
+// LABEL in the doc must map to that row's PAYLOAD. Reword a label in WhatsApp
+// Manager without adding it to the map and this fails — which is the only
+// warning there is, since the live failure is a button that just sits there.
+//
+// Two older checks stay. The payload must be a bare keyword (an emoji or a
+// stray space in the map's output would defeat the same anchored tests), and
+// the sender must still pass it as a send-time override — belt and braces,
+// covering the case where Meta does honour the override.
+const { normalizeTemplateButton } = require('../src/utils/templateButtons');
+
+console.log('\nButton labels and payloads — doc vs. code\n');
 for (const [name, [file]] of Object.entries(SRC)) {
   const start = DOC.indexOf('`' + name + '`\n');
   if (start === -1) continue;
@@ -124,20 +134,28 @@ for (const [name, [file]] of Object.entries(SRC)) {
 
   // Table rows only; the header and the |---|---| separator are dropped. Cell 1
   // is the label, cell 2 the payload — a third "Why" column is commentary.
-  const payloads = block[1].split('\n')
+  const rows = block[1].split('\n')
     .filter(l => l.trim().startsWith('|'))
     .map(l => l.split('|').map(c => c.trim()).filter((_, i, a) => i > 0 && i < a.length - 1))
     .filter(cells => cells.length >= 2 && cells[0] !== 'Label' && !/^-+$/.test(cells[0]))
-    .map(cells => cells[1].replace(/`/g, ''));
-  if (!payloads.length) continue;
+    .map(cells => ({ label: cells[0].replace(/`/g, ''), payload: cells[1].replace(/`/g, '') }));
+  if (!rows.length) continue;
 
   const src = fs.readFileSync('C:/claude_projects/medibook/backend/' + file, 'utf8');
-  for (const p of payloads) {
-    check(`${name}: payload "${p}" is a bare keyword`,
-      p.length > 0 && p === p.trim() && !/[^\x20-\x7E]/.test(p),
+  for (const { label, payload } of rows) {
+    check(`${name}: label "${label}" → "${payload}"`,
+      normalizeTemplateButton(label) === payload,
+      `→ got "${normalizeTemplateButton(label)}"; add it to LABEL_TO_KEYWORD`);
+    check(`${name}: payload "${payload}" is a bare keyword`,
+      payload.length > 0 && payload === payload.trim() && !/[^\x20-\x7E]/.test(payload),
       '→ emoji or padding in a payload never matches');
-    check(`${name}: ${file} sends payload "${p}"`, src.includes(`'${p}'`),
+    check(`${name}: ${file} sends payload "${payload}"`, src.includes(`'${payload}'`),
       '→ sender passes no buttonPayloads for this button');
+    // The override, where it lands, must survive the map unchanged — otherwise
+    // the two mechanisms disagree and the result depends on Meta's behaviour.
+    check(`${name}: payload "${payload}" passes through unchanged`,
+      normalizeTemplateButton(payload) === payload,
+      '→ the map rewrites an already-correct keyword');
   }
 }
 

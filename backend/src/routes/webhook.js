@@ -17,6 +17,7 @@ const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../service
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { sendPatientText } = require('../services/outbound');
 const { extractEntryCode } = require('../utils/entryCode');
+const { normalizeTemplateButton } = require('../utils/templateButtons');
 
 const testEndpointLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -456,18 +457,19 @@ async function processIncomingMessage(msg) {
       }
     } else if (msg.type === 'button') {
       // A quick-reply tap on a TEMPLATE (not an interactive message — those
-      // arrive as type 'interactive'). Meta sends both the visible label and the
-      // payload set when the template was created, and we used only the label,
-      // which forced every template button to be worded exactly like the keyword
-      // it triggers ("Treatment", "Yes").
+      // arrive as type 'interactive'). A template button has no payload of its
+      // own: the LABEL is what arrives, so "📅 Book my next sitting" reaches the
+      // engine, whose keyword tests are anchored (/^treatment$/i) and match
+      // none of it. `normalizeTemplateButton` maps the labels back to the
+      // keywords; a send-time payload override, where one lands, is already a
+      // keyword and passes through untouched.
       //
-      // Routing on the PAYLOAD lets a button read "Book my next sitting" while
-      // carrying the token the engine already understands. Deliberately fed in
-      // as `text`, NOT as buttonId: several steps gate on the ABSENCE of a
-      // buttonId (the *Treatment* keyword, the clinics-near-me trigger), so a
-      // template tap must behave exactly as if the patient had typed it.
+      // Deliberately fed in as `text`, NOT as buttonId: several steps gate on
+      // the ABSENCE of a buttonId (the *Treatment* keyword, the clinics-near-me
+      // trigger), so a template tap must behave exactly as if the patient had
+      // typed it.
       templateButtonLabel = msg.button?.text || '';
-      text = msg.button?.payload || templateButtonLabel;
+      text = normalizeTemplateButton(msg.button?.payload || templateButtonLabel);
     } else if (msg.type === 'audio') {
       audioId = msg.audio?.id || null;
       unsupportedType = 'audio';
