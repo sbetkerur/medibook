@@ -36,8 +36,15 @@ const {
  * a general dentist. That is the honest label for a visit where nothing has been
  * diagnosed yet; the actual treatment is recorded on the treatment plan the
  * dentist writes afterwards, and that plan's own sittings carry it explicitly.
+ *
+ * The name has to survive BOTH interactive shapes: a list row title caps at 24
+ * characters and a reply-button title at 20, and whatsapp.js slices to fit
+ * rather than let Meta reject the whole message. '🩺 Consultation / Not sure'
+ * was 26 UTF-16 units (the emoji is a surrogate pair, so it costs two), which
+ * rendered as "🩺 Consultation / Not su" in a list and "🩺 Consultation / No" on
+ * a button — the latter reading as if "No" were the option. Keep this under 20.
  */
-const GENERAL_CONSULT = { id: 'general_consult', name: '🩺 Consultation / Not sure' };
+const GENERAL_CONSULT = { id: 'general_consult', name: '🩺 Not sure yet' };
 
 /**
  * Header + footer for a step of the booking flow. Both cap at 60 characters
@@ -64,11 +71,134 @@ const BRANCH_STEP = { header: 'Which branch?', footer: 'Reply Menu to start over
 function doctorListRow(d, showFees = true) {
   return {
     id: d.id,
-    title: `Dr. ${d.name}`,
+    title: fitPersonName(d.name),
+    // The complete name, which sendChoice moves into the description whenever
+    // the title above had to shorten it.
+    fullTitle: `Dr. ${d.name}`,
     description: [d.specialization, d.qualification,
       showFees && d.consultation_fee ? '₹' + d.consultation_fee : '']
-      .filter(Boolean).join(' • ').slice(0, 72),
+      .filter(Boolean).join(' • '),
   };
+}
+
+// Meta's caps on interactive titles, mirrored from whatsapp.js, which slices to
+// them rather than let Meta reject the whole message. A reply button is cut FOUR
+// characters earlier than a list row — and emoji cost two units each, being
+// surrogate pairs, which is why these compare .length and not visible glyphs.
+const BUTTON_TITLE_MAX = 20;
+const LIST_ROW_TITLE_MAX = 24;
+const LIST_ROW_DESC_MAX = 72;
+
+/**
+ * A dentist's name fitted to a list-row title.
+ *
+ * Cutting a long name at the character limit is the one truncation that can make
+ * a picker unusable rather than merely ugly: "Dr. Padmanabhan Venkatesh" and
+ * "Dr. Padmanabhan Krishnan" both end up "Dr. Padmanabhan…", and the patient
+ * cannot tell which dentist is which. Abbreviating the GIVEN names instead keeps
+ * the surname — the part that distinguishes them, and how a long name gets
+ * written on a clinic board anyway. The full name still reaches the patient:
+ * sendChoice puts it in the row description.
+ */
+function fitPersonName(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return 'Dr.';
+  const full = `Dr. ${parts.join(' ')}`;
+  if (full.length <= LIST_ROW_TITLE_MAX) return full;
+
+  // "Padmanabhan Venkatesh" → "P. Venkatesh"
+  if (parts.length > 1) {
+    const initials = parts.slice(0, -1).map(p => `${p[0].toUpperCase()}.`).join(' ');
+    const abbreviated = `Dr. ${initials} ${parts[parts.length - 1]}`;
+    if (abbreviated.length <= LIST_ROW_TITLE_MAX) return abbreviated;
+  }
+  // One name that overruns on its own — nothing left to abbreviate.
+  return `${full.slice(0, LIST_ROW_TITLE_MAX - 1)}…`;
+}
+
+/**
+ * Any other label fitted to a list-row title, cut at a word boundary.
+ *
+ * "Oral and Maxillofacial Surgery" reads far better as "Oral and Maxillofacial…"
+ * than as the mid-word "Oral and Maxillofacial S" a blind slice produces. The
+ * boundary is only honoured in the last few characters, though: "Restorative and
+ * Cosmetic Dentistry" breaks at 15, and "Restorative and…" both ends on a
+ * conjunction and throws away the word that distinguishes it from plain
+ * restorative work — a mid-word "Restorative and Cosmeti…" carries more. As with
+ * names, the full text survives in the description.
+ */
+function fitTitle(text) {
+  const s = String(text || '');
+  if (s.length <= LIST_ROW_TITLE_MAX) return s;
+  const cut = s.slice(0, LIST_ROW_TITLE_MAX - 1); // room for the ellipsis
+  const space = cut.lastIndexOf(' ');
+  const base = space >= LIST_ROW_TITLE_MAX - 6 ? cut.slice(0, space) : cut;
+  return `${base.replace(/[\s•,\-]+$/, '')}…`;
+}
+
+/**
+ * Render a set of choices as buttons or as a list.
+ *
+ * Buttons need ≤3 options AND every label to fit in 20 characters. Every picker
+ * here used to switch on the COUNT alone, so a short set of long names —
+ * "Orthodontics & Braces", "Dr. Padmanabhan Venkatesh", a branch named after its
+ * locality — rendered as buttons and was cut mid-word, when the list row it
+ * would otherwise have used holds four more characters and carries a
+ * description besides. The branch picker made this explicit with a
+ * `.slice(0, 20)` on the label; the others simply let whatsapp.js do it.
+ *
+ * Falling through to the list is also the safer tap: a list reply carries the
+ * row's real id, which every handler matches exactly, while a button reply
+ * carries a synthetic `btn_N_<ts>` and leaves the handler to recognise the
+ * TITLE — the very string that was truncated.
+ *
+ * No title slot is wider than 24 characters anywhere in the WhatsApp API, so a
+ * label longer than that CANNOT be shown whole in the title. It is shown whole
+ * in the DESCRIPTION instead — 72 characters, rendered under the title — and the
+ * title carries a shortened form purely as the visual handle. Nothing a patient
+ * needs to tell two rows apart is lost, which is the actual requirement; a name
+ * cut to "Dr. Padmanabhan…" fails it, "Dr. P. Venkatesh" with the full name
+ * beneath does not.
+ *
+ * `fullTitle` is the untruncated label when the caller has already shortened
+ * `title` itself (doctorListRow does, to abbreviate given names rather than
+ * chop surnames). It also decides the widget: buttons carry no description, so
+ * they are only used when the FULL label fits a button — otherwise the row falls
+ * to a list, where the description can hold what the title cannot.
+ *
+ * @param {Array<{id, title, fullTitle?, description?}>} items
+ */
+async function sendChoice(send, prompt, items, opts, { listLabel, sectionTitle }) {
+  const fullOf = i => String(i.fullTitle || i.title);
+  const fitsButtons = items.length <= 3
+    && items.every(i => fullOf(i).length <= BUTTON_TITLE_MAX);
+  if (fitsButtons) {
+    // Every label fits whole, so the button shows the full text — never the
+    // caller's pre-shortened one.
+    return send.buttons(prompt, items.map(fullOf), opts);
+  }
+  return send.list(prompt, listLabel,
+    [{ title: fitTitle(sectionTitle), rows: fitRows(items) }], opts);
+}
+
+/**
+ * Choice items as WhatsApp list rows, each fitted to the 24-character title.
+ *
+ * Split out of sendChoice so a caller that must stay a list — the "pick one
+ * from the list" re-prompt, whose own copy promises one — gets the same fitting
+ * instead of hand-rolling rows that truncate.
+ */
+function fitRows(items) {
+  return items.map(i => {
+    const full = String(i.fullTitle || i.title);
+    const title = fitTitle(String(i.title));
+    // The full label leads the description whenever the title had to shorten
+    // it — ahead of the caller's own detail, because identifying the row is what
+    // the patient is doing here and the specialisation is context.
+    const description = [title === full ? '' : full, i.description]
+      .filter(Boolean).join(' • ').slice(0, LIST_ROW_DESC_MAX);
+    return { id: i.id, title, ...(description ? { description } : {}) };
+  });
 }
 
 /**
@@ -157,19 +287,9 @@ async function startBooking(phone, schema, tenant, send, ctx) {
 
   const prompt = 'Which one is easiest for you to get to?';
 
-  if (hospitals.rows.length <= 3) {
-    await send.buttons(prompt, hospitals.rows.map(h => h.name.slice(0, 20)), BRANCH_STEP);
-  } else {
-    const sections = [{
-      title: 'Our Branches',
-      rows: hospitals.rows.map(h => ({
-        id: h.id,
-        title: h.name.slice(0, 24),
-        description: (h.city || '').slice(0, 72),
-      })),
-    }];
-    await send.list(prompt, 'See branches', sections, BRANCH_STEP);
-  }
+  await sendChoice(send, prompt,
+    hospitals.rows.map(h => ({ id: h.id, title: h.name, description: h.city || '' })),
+    BRANCH_STEP, { listLabel: 'See branches', sectionTitle: 'Our Branches' });
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
 
@@ -223,19 +343,9 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
 // Helper: render the branch picker (buttons or list depending on count)
 async function _sendBranchPicker(phone, schema, tenant, send, ctx, hospitalRows) {
   const prompt = 'Which one is easiest for you to get to?';
-  if (hospitalRows.length <= 3) {
-    await send.buttons(prompt, hospitalRows.map(h => h.name.slice(0, 20)), BRANCH_STEP);
-  } else {
-    const sections = [{
-      title: 'Our Branches',
-      rows: hospitalRows.map(h => ({
-        id: h.id,
-        title: h.name.slice(0, 24),
-        description: (h.city || '').slice(0, 72),
-      })),
-    }];
-    await send.list(prompt, 'See branches', sections, BRANCH_STEP);
-  }
+  await sendChoice(send, prompt,
+    hospitalRows.map(h => ({ id: h.id, title: h.name, description: h.city || '' })),
+    BRANCH_STEP, { listLabel: 'See branches', sectionTitle: 'Our Branches' });
   await updateSession(schema, phone, STATES.SELECT_HOSPITAL, ctx);
 }
 
@@ -284,19 +394,13 @@ async function showDepartments(phone, schema, tenant, send, ctx) {
   }
 
   const prompt = 'Not sure what you need? Pick the first option — the dentist will advise at your visit.';
-  if (options.length <= 3) {
-    await send.buttons(prompt, options.map(d => d.name), STEP('What do you need?'));
-  } else {
-    const sections = [{
-      title: 'Appointments',
-      rows: options.map(d => ({
-        id: d.id,
-        title: d.name,
-        ...(d.id === GENERAL_CONSULT.id ? { description: 'Any available dentist' } : {}),
-      })),
-    }];
-    await send.list(prompt, 'Choose', sections, STEP('What do you need?'));
-  }
+  await sendChoice(send, prompt,
+    options.map(d => ({
+      id: d.id,
+      title: d.name,
+      ...(d.id === GENERAL_CONSULT.id ? { description: 'Any available dentist' } : {}),
+    })),
+    STEP('What do you need?'), { listLabel: 'Choose', sectionTitle: 'Appointments' });
   await updateSession(schema, phone, STATES.SELECT_DEPARTMENT, ctx);
 }
 
@@ -328,7 +432,7 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
   // tell which treatment you meant" re-prompt. Only "not sure" and
   // "consultation" appeared to work, by accidental substring match against
   // GENERAL_CONSULT's own name — which is also why the tests passed.
-  const wantsGeneral = !buttonId && /^(not sure|dont know|don'?t know|any|anyone|any doctor|any dentist|consult|consultation|general|checkup|check up)$/i
+  const wantsGeneral = !buttonId && /^(not sure|not sure yet|dont know|don'?t know|any|anyone|any doctor|any dentist|consult|consultation|general|checkup|check up)$/i
     .test(input.trim());
   const dept = (wantsGeneral ? GENERAL_CONSULT : null)
     || depts.find(d => d.id === choice) || fuzzyFind(depts, input)
@@ -337,10 +441,13 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
     // Same reasoning as dentist selection: an unrecognised or ambiguous reply
     // should re-ask, not discard the booking.
     if (depts.length) {
+      // Stays a list — its own copy promises one — but through fitRows, or a
+      // long treatment name is cut in exactly the re-prompt that exists because
+      // the patient could not identify one.
       await send.list(
         `I could not tell which treatment you meant. Please pick one from the list:`,
         'View Treatments',
-        [{ title: 'Treatments', rows: depts.map(d => ({ id: d.id, title: d.name })) }]
+        [{ title: 'Treatments', rows: fitRows(depts.map(d => ({ id: d.id, title: d.name }))) }]
       );
       await updateSession(schema, phone, STATES.SELECT_DEPARTMENT, ctx);
       return;
@@ -428,15 +535,9 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
     ? 'Anyone available, or pick a name you know.'
     : `Everyone below treats ${dept.name.toLowerCase()}.`;
   const feesOn = await showFeesEnabled(schema);
-  if (doctors.rows.length <= 3) {
-    await send.buttons(doctorPrompt, doctors.rows.map(d => `Dr. ${d.name}`), STEP('Choose a dentist'));
-  } else {
-    const sections = [{
-      title: `${dept.name} Dentists`.slice(0, 24),
-      rows: doctors.rows.map(d => doctorListRow(d, feesOn)),
-    }];
-    await send.list(doctorPrompt, 'See dentists', sections, STEP('Choose a dentist'));
-  }
+  await sendChoice(send, doctorPrompt, doctors.rows.map(d => doctorListRow(d, feesOn)),
+    STEP('Choose a dentist'),
+    { listLabel: 'See dentists', sectionTitle: `${dept.name} Dentists` });
   await updateSession(schema, phone, STATES.SELECT_DOCTOR, ctx);
 }
 
@@ -550,15 +651,9 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       // widened search found nothing either, so quoting the two-week figure
       // would understate how far ahead we actually looked.
       await send.text(`Dr. ${doc.name} has nothing free in the next ${CRON_LOOKAHEAD_DAYS} days. These dentists also do ${ctx.department_name}:`);
-      if (otherDoctors.length <= 3) {
-        await send.buttons('Who would you like to see?', otherDoctors.map(d => `Dr. ${d.name}`), STEP('Choose a dentist'));
-      } else {
-        const sections = [{
-          title: `${ctx.department_name} Dentists`,
-          rows: otherDoctors.map(d => doctorListRow(d, feesOn)),
-        }];
-        await send.list('Who would you like to see?', 'See dentists', sections, STEP('Choose a dentist'));
-      }
+      await sendChoice(send, 'Who would you like to see?',
+        otherDoctors.map(d => doctorListRow(d, feesOn)), STEP('Choose a dentist'),
+        { listLabel: 'See dentists', sectionTitle: `${ctx.department_name} Dentists` });
       await updateSession(schema, phone, STATES.SELECT_DOCTOR, { ...ctx, _doctors: otherDoctors });
     } else {
       // No other doctors in this department — guide user back to menu
@@ -866,9 +961,13 @@ async function askChiefComplaint(phone, schema, send, ctx) {
   if (ctx.chief_complaint) {
     return showConfirmation(phone, schema, send, ctx, updateSession);
   }
+  // Unspaced slashes, matching complaintMap below verbatim: '🔍 Checkup / Cleaning'
+  // was 21 UTF-16 units against a 20-character button cap and arrived as
+  // "🔍 Checkup / Cleanin". Closing the spaces brings it to 19 and makes the
+  // label the patient taps identical to the value the clinic reads back.
   await send.buttons(
     'In your own words — it helps the dentist prepare.',
-    ['🚨 Pain / Emergency', '🔍 Checkup / Cleaning', '✨ Cosmetic / Other'],
+    ['🚨 Pain/Emergency', '🔍 Checkup/Cleaning', '✨ Cosmetic/Other'],
     { header: 'What brings you in?' }
   );
   await updateSession(schema, phone, STATES.COLLECT_CHIEF_COMPLAINT, ctx);
@@ -1316,4 +1415,10 @@ module.exports = {
   handleChiefComplaint,
   showConfirmation,
   completeBooking,
+  // Label fitting — exported for tests/labelFit.unit.test.js. The caps they
+  // enforce are Meta's and silent: over-length titles are sliced, never
+  // rejected, so nothing else would catch a regression.
+  fitPersonName,
+  fitTitle,
+  fitRows,
 };

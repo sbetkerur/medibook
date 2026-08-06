@@ -25,6 +25,7 @@ cd frontend && npm run dev      # dashboard on :3000
 cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
 cd backend && node tests/entryCode.unit.test.js      # QR entry codes (the only way in)
+cd backend && node tests/labelFit.unit.test.js       # long clinic names vs WhatsApp title caps
 cd backend && node tests/templateContract.unit.test.js   # doc vs senders: template params
 cd backend && node tests/entryFlow.test.js           # entry routing e2e (needs DB + seed
                                                      # AND a backend running on :3001)

@@ -303,12 +303,42 @@ async function run() {
       'consultation option is not first: ' + JSON.stringify(names));
   });
 
+  // Pickers used to choose buttons vs list on the option COUNT alone, so a short
+  // set of long names rendered as buttons and was cut: a reply-button title caps
+  // at 20 characters and whatsapp.js slices to fit rather than let Meta reject
+  // the message. Three treatments, one of them 21 characters, is exactly that
+  // case — it must fall through to a list, whose rows hold 24.
+  await test('a label too long for a button falls to the list rather than being cut', async () => {
+    const picker = sent.find(m => /What do you need/.test(m.all));
+    assert.strictEqual(picker.type, 'list',
+      'a 21-character treatment name was rendered as a button: ' + JSON.stringify(picker));
+    const titles = (picker.sections?.[0].rows || []).map(r => r.title);
+    assert(titles.includes('Orthodontics & Braces'),
+      'treatment name reached the patient truncated: ' + JSON.stringify(titles));
+    for (const t of titles) {
+      assert(t.length <= 24, `row title over the 24-char cap: ${JSON.stringify(t)}`);
+    }
+  });
+
+
   await test('REGRESSION: tapping a treatment button advances to dentist selection (not main-menu reset)', async () => {
     const r = await send('Orthodontics & Braces', 'btn_1_1700000000002');
     assert(!r.some(m => /How can I help you today|Booking cancelled/.test(m.text)),
       'flow was reset to main menu — stale-button bug is back');
     assert(r.some(m => /Choose a dentist/.test(m.all)), 'dentist picker not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_doctor');
+  });
+
+  // The other half of the same rule: when every label DOES fit, buttons are
+  // still the better widget (one tap, no menu to open) and must be kept — the
+  // width check must not quietly push every picker into a list.
+  await test('labels that fit are still offered as buttons, not pushed into a list', async () => {
+    const picker = sent.find(m => /Choose a dentist/.test(m.all));
+    assert.strictEqual(picker.type, 'buttons',
+      'two short dentist names should stay buttons: ' + JSON.stringify(picker));
+    for (const b of picker.buttons) {
+      assert(b.length <= 20, `button title over the 20-char cap: ${JSON.stringify(b)}`);
+    }
   });
 
   // ── Multi-department dentists ───────────────────────────────
@@ -350,10 +380,10 @@ async function run() {
     // "Not sure" now asks what brings them in FIRST — the answer can still
     // change who they see at that point, which it could not once the dentist,
     // day and time were already chosen.
-    const asked = await send('🩺 Consultation / Not sure', 'general_consult');
+    const asked = await send('🩺 Not sure yet', 'general_consult');
     assert(asked.some(m => /What brings you in/.test(m.all)),
       'complaint should be asked before dentists on the consult path: ' + JSON.stringify(asked));
-    const r = await send('🔍 Checkup / Cleaning', 'btn_1_1700000000105');
+    const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000105');
     const picker = r.find(m => /Choose a dentist/.test(m.all));
     assert(picker, 'dentist picker not shown: ' + JSON.stringify(r));
     const names = picker.buttons || (picker.sections?.[0].rows || []).map(r2 => r2.title);
@@ -365,7 +395,7 @@ async function run() {
     await send('Hi');
     await send('📅 Book Appointment', 'btn_0_1700000000104');
     await send('not sure');
-    const r = await send('🔍 Checkup / Cleaning', 'btn_1_1700000000106');
+    const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000106');
     assert(r.some(m => /Choose a dentist/.test(m.all)),
       'typed "not sure" did not reach dentist selection: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_doctor');
@@ -428,7 +458,7 @@ async function run() {
 
   await test('Typed name → DOB → reason → confirmation summary', async () => {
     assert.strictEqual(state(), 'collect_chief_complaint');
-    const r = await send('🔍 Checkup / Cleaning', 'btn_1_1700000000006');
+    const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000006');
     const summary = r.find(m => /Check and confirm/.test(m.all));
     assert(summary, 'confirmation summary not shown: ' + JSON.stringify(r));
     confirmBtnId = summary.ids[0];
