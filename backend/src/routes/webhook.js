@@ -809,9 +809,12 @@ async function processIncomingMessage(msg) {
 }
 
 // ── DEV TEST ENDPOINT ─────────────────────────────────────────
-// Mutex to serialize /webhook/test calls — prevents concurrent requests from
-// corrupting each other's module-level monkey-patch of the whatsapp module.
-let _testEndpointMutex = Promise.resolve();
+// The mutex and sender monkey-patching live in services/bot/testRunner.js,
+// shared with the authenticated /admin/bot-test route (routes/admin.js) that
+// the dashboard's Bot Tester tab actually calls — this one stays unauthenticated
+// (behind NODE_ENV/secret below) for local dev and the entry-code test flows
+// documented in CLAUDE.md, which take tenant_slug directly.
+const { runBotTest } = require('../services/bot/testRunner');
 
 if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT === 'true') {
   router.post('/webhook/test', testEndpointLimiter, async (req, res) => {
@@ -837,35 +840,7 @@ if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT ==
       }
       const tenant = r.rows[0];
 
-      const responses = [];
-      const waModule = require('../services/whatsapp');
-
-      // Acquire mutex — wait for any in-flight test to finish before patching module globals
-      let releaseMutex;
-      const prevMutex = _testEndpointMutex;
-      _testEndpointMutex = new Promise(resolve => { releaseMutex = resolve; });
-      await prevMutex;
-
-      const origSendText = waModule.sendText;
-      const origSendButtons = waModule.sendButtons;
-      const origSendList = waModule.sendList;
-
-      waModule.sendText = async (to, text) => { responses.push({ type: 'text', text }); };
-      // Include the header/footer slots — without them this endpoint reports a
-      // message the patient would never see, which is the opposite of its job.
-      waModule.sendButtons = async (to, text, buttons, _t, _p, opts = {}) =>
-        { responses.push({ type: 'buttons', text, buttons, ...opts }); };
-      waModule.sendList = async (to, text, label, sections, _t, _p, opts = {}) =>
-        { responses.push({ type: 'list', text, label, sections, ...opts }); };
-
-      try {
-        await botEngine.handle({ phone, text: message, buttonId: button_id, tenant });
-      } finally {
-        waModule.sendText = origSendText;
-        waModule.sendButtons = origSendButtons;
-        waModule.sendList = origSendList;
-        releaseMutex();
-      }
+      const responses = await runBotTest({ tenant, phone, message, buttonId: button_id });
 
       res.json({ ok: true, phone, message, tenant: tenant.name, responses });
     } catch (err) {

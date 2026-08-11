@@ -775,6 +775,34 @@ router.delete('/bot-sessions/:phone', adminOnly, async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// ── BOT TESTER (dashboard "Test Bot" tab) ──────────────────────
+// Runs a message through the real bot engine for the LOGGED-IN admin's own
+// tenant, same as POST /api/webhook/test but authenticated by the dashboard's
+// JWT instead of a shared secret — that route is registered only outside
+// production (or with ENABLE_TEST_ENDPOINT=true), which prod normally doesn't
+// set, so the dashboard must not depend on it. See services/bot/testRunner.js.
+const botTestLimiter = require('express-rate-limit')({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: { error: 'Too many test requests. Slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+router.post('/bot-test', botTestLimiter, async (req, res) => {
+  try {
+    const { phone, message, button_id } = req.body;
+    if (!phone || !/^[0-9]{7,20}$/.test(String(phone).replace(/[+\s]/g, ''))) {
+      return res.status(400).json({ error: 'Valid phone (7-20 digits) is required' });
+    }
+    if (!message && !button_id) return res.status(400).json({ error: 'message is required' });
+    const { runBotTest } = require('../services/bot/testRunner');
+    const responses = await runBotTest({
+      tenant: req.tenant, phone, message: message || '', buttonId: button_id,
+    });
+    res.json({ ok: true, phone, message, tenant: req.tenant.name, responses });
+  } catch (err) { handleError(res, err, 'POST /admin/bot-test'); }
+});
+
 // ── SEND WHATSAPP MESSAGE FROM DASHBOARD ──────────────────────
 router.post('/messages/send', adminOnly, async (req, res) => {
   try {

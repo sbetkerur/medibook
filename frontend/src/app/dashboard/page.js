@@ -266,7 +266,7 @@ export default function Dashboard() {
   const openWalkinModal = useCallback(() => {
     if (!hospitals.length) fetchHospitals();
     if (!doctors.length) fetchDoctors();
-    setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
+    setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
     setWalkinSlots([]);
     setShowWalkinModal(true);
   }, [hospitals.length, doctors.length]);
@@ -277,7 +277,7 @@ export default function Dashboard() {
   const [walkinSlots, setWalkinSlots] = useState([]);
   const [walkinSlotsLoading, setWalkinSlotsLoading] = useState(false);
   const [walkinForm, setWalkinForm] = useState({
-    patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '',
+    patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '',
     appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '',
   });
   const [walkinSaving, setWalkinSaving] = useState(false);
@@ -1277,7 +1277,7 @@ export default function Dashboard() {
         slot_id && slot_id !== '__manual__' ? { ...rest, slot_id } : rest);
       toast.success('Walk-in appointment created!');
       setShowWalkinModal(false);
-      setWalkinForm({ patient_phone: '', patient_name: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
+      setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
       setWalkinSlots([]);
       fetchAppointments();
       fetchStats();
@@ -2682,6 +2682,21 @@ export default function Dashboard() {
               <input value={walkinForm.patient_name} onChange={e => setWalkinForm(f => ({ ...f, patient_name: e.target.value }))}
                 placeholder="Full name (optional)"
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              {/* Only written when this phone+name pair creates a NEW patient
+                  profile, or fills in a blank on an existing one (COALESCE on
+                  the backend) — never overwrites a gender already on file. */}
+              <label className="block text-xs font-medium text-gray-700 mb-1">Gender</label>
+              <select value={walkinForm.gender} onChange={e => setWalkinForm(f => ({ ...f, gender: e.target.value }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="">— Unspecified —</option>
+                <option value="male">Male</option>
+                <option value="female">Female</option>
+                <option value="other">Other</option>
+              </select>
             </div>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

@@ -189,9 +189,9 @@ export default function AnalyticsTab() {
                       // 320px card is wide, leaving the bar negative space, so
                       // both narrow on phones. The amount stays nowrap because
                       // ₹1,50,000 has no break opportunity.
-                      <div key={d.name} className="flex items-center gap-2 sm:gap-3">
+                      <div key={d.doctor_name} className="flex items-center gap-2 sm:gap-3">
                         <span className="text-xs font-bold text-gray-400 w-4">#{i + 1}</span>
-                        <span className="text-sm text-gray-700 w-20 sm:w-28 truncate">Dr. {d.name}</span>
+                        <span className="text-sm text-gray-700 w-20 sm:w-28 truncate">Dr. {d.doctor_name}</span>
                         <div className="flex-1 min-w-0 h-2 bg-gray-100 rounded-full overflow-hidden">
                           <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${pct}%` }} />
                         </div>
@@ -208,10 +208,10 @@ export default function AnalyticsTab() {
                 <h4 className="text-sm font-semibold text-gray-700 mb-3">Revenue by Treatment</h4>
                 <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
                   {revenueData.by_treatment.slice(0, 6).map(t => (
-                    <div key={t.treatment} className="bg-gray-50 rounded-lg p-3">
-                      <div className="text-xs text-gray-500 truncate">{t.treatment}</div>
+                    <div key={t.category} className="bg-gray-50 rounded-lg p-3">
+                      <div className="text-xs text-gray-500 truncate">{t.category}</div>
                       <div className="text-sm font-bold text-gray-800 mt-1">₹{parseInt(t.revenue).toLocaleString('en-IN')}</div>
-                      <div className="text-xs text-gray-400">{t.count} appts</div>
+                      <div className="text-xs text-gray-400">{t.appointments} appts</div>
                     </div>
                   ))}
                 </div>

@@ -26,7 +26,11 @@ export default function TestBotTab({ isAdmin }) {
     setBotLoading(true);
     setBotResponse(null);
     try {
-      const { data } = await api.post('/webhook/test', { phone: botPhone, message: botMessage });
+      // Authenticated dashboard route — scoped to this admin's own tenant by the
+      // JWT, unlike /webhook/test which is unauthenticated and only registered
+      // outside production (or with ENABLE_TEST_ENDPOINT=true), which prod
+      // doesn't set. See routes/admin.js POST /bot-test.
+      const { data } = await api.post('/admin/bot-test', { phone: botPhone, message: botMessage });
       setBotResponse(data);
     } catch (err) {
       toast.error(err.response?.data?.error || 'Bot test failed');

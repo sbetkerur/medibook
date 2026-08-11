@@ -96,7 +96,7 @@ export default function RecordTreatmentModal({ appointment, onClose, onSaved }) 
               <option value="">Select the visit…</option>
               {recentAppts.map(a => (
                 <option key={a.id} value={a.id}>
-                  {a.patient_name} — Dr. {a.doctor_name} — {a.appointment_date}
+                  {a.patient_name}{a.patient_phone ? ` (${a.patient_phone})` : ''} — Dr. {a.doctor_name} — {a.appointment_date}
                 </option>
               ))}
             </select>

@@ -525,7 +525,7 @@ router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
 // ── CREATE APPOINTMENT (walk-in) ──────────────────────────────
 router.post('/appointments', adminOnly, validate(schemas.createAppointment), async (req, res) => {
   try {
-    const { patient_phone: rawPhone, patient_name, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, department_id } = req.body;
+    const { patient_phone: rawPhone, patient_name, gender, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, department_id } = req.body;
     // Strip leading '+' to match DB CHECK constraint: phone ~ '^[0-9]{7,20}$'
     const patient_phone = rawPhone.replace(/^\+/, '');
     const s = req.tenant.schema_name;
@@ -599,12 +599,13 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
         if (existingPatient.rows[0]) {
           patientId = existingPatient.rows[0].id;
           await client.query(
-            `UPDATE patients SET name=COALESCE($2, name), visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`,
-            [patientId, patient_name || null]);
+            `UPDATE patients SET name=COALESCE($2, name), gender=COALESCE($3, gender),
+             visit_count=visit_count+1, updated_at=NOW() WHERE id=$1`,
+            [patientId, patient_name || null, gender || null]);
         } else {
           const patientR = await client.query(
-            `INSERT INTO patients (phone, name, visit_count) VALUES ($1,$2,1) RETURNING id`,
-            [patient_phone, patient_name || null]);
+            `INSERT INTO patients (phone, name, gender, visit_count) VALUES ($1,$2,$3,1) RETURNING id`,
+            [patient_phone, patient_name || null, gender || null]);
           patientId = patientR.rows[0].id;
         }
 

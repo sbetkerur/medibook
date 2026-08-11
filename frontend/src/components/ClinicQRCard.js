@@ -164,9 +164,17 @@ export default function ClinicQRCard({ isAdmin }) {
               Booking link
               <span className="text-gray-400 font-normal ml-1">(for your website, Google listing or Instagram bio)</span>
             </label>
+            {/* The clickable form: clinic name as the link text, wa.me deep link
+                as the href — this is what actually goes on a website or bio,
+                where a bare URL reads worse than a named link. Opens in a new
+                tab since it hands off to WhatsApp, not somewhere in-app. */}
+            <a href={qr.link} target="_blank" rel="noopener noreferrer"
+              className="text-sm font-medium text-blue-700 hover:text-blue-800 hover:underline break-words">
+              {qr.clinic_name}
+            </a>
             {/* break-all, not truncate: a receptionist copying this by hand when
                 the clipboard is unavailable needs to see all of it. */}
-            <p className="text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 break-all">
+            <p className="mt-1.5 text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 break-all">
               {qr.link}
             </p>
           </div>

@@ -280,6 +280,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
                   <h3 className="font-semibold text-gray-900 text-sm break-words">{p.title}</h3>
                   <p className="text-xs text-gray-500 mt-0.5">
                     {p.patient_name}
+                    {p.patient_phone && <span className="text-gray-400"> · {p.patient_phone}</span>}
                     {p.tooth_ref && <> · tooth {p.tooth_ref}</>}
                   </p>
                 </div>
@@ -365,7 +366,12 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
         <Modal title={detail.treatment_plan.title} onClose={() => setDetail(null)} wide>
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3 text-sm">
-              <div><span className="text-gray-500 text-xs">Patient</span><p className="font-medium">{detail.treatment_plan.patient_name}</p></div>
+              <div><span className="text-gray-500 text-xs">Patient</span>
+                <p className="font-medium">{detail.treatment_plan.patient_name}</p>
+                {detail.treatment_plan.patient_phone && (
+                  <p className="text-xs text-gray-400">{detail.treatment_plan.patient_phone}</p>
+                )}
+              </div>
               <div><span className="text-gray-500 text-xs">Status</span><p><StatusPill status={detail.treatment_plan.status} /></p></div>
               <div><span className="text-gray-500 text-xs">Rendered by</span>
                 <p className="font-medium">{detail.treatment_plan.treating_doctor_name ? `Dr. ${detail.treatment_plan.treating_doctor_name}` : '—'}</p></div>

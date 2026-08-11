@@ -156,6 +156,9 @@ const schemas = {
     patient_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).required()
       .messages({ 'string.pattern.base': 'patient_phone must be 7-20 digits, optionally starting with +' }),
     patient_name: Joi.string().min(1).max(255).optional().allow('', null),
+    // Matches VALID_GENDERS in routes/patients.js — kept in sync manually since
+    // there's no shared constant file for cross-route Joi schemas.
+    gender: Joi.string().valid('male', 'female', 'other').optional().allow('', null),
     doctor_id: Joi.string().uuid().required(),
     hospital_id: Joi.string().uuid().required(),
     // Treatment booked for. Optional — falls back to the doctor's primary
