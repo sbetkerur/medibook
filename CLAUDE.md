@@ -428,13 +428,26 @@ receptionist's list. Clearing them is front-desk work, so `PATCH /requests/:id`
 is deliberately NOT `adminOnly`: gate it behind the owner and the list is never
 cleared and stops being trusted.
 
-**Orthodontics is scheduled by the clinic, not the patient.** Braces are 18–24
-monthly adjustments over two years and the next one is set at the chair, never
-chosen from a slot list. `treatment_plans.scheduling_mode` (`patient` | `clinic`)
-gates that: `clinic` plans are excluded from the nudge cron AND from the bot's
-treatment list, or the patient is chased 24 times for something they cannot
-book. `total_visits` caps at 60, not 30 — a two-year case is monthly
-adjustments plus bonding, debond and retainer reviews.
+**Orthodontics is self-bookable, on its own monthly cadence.** Braces are 18–24
+monthly adjustments over two years. Each adjustment is an ordinary chairside
+visit — nothing about the visit itself needs the dentist to hand-pick a date —
+so it goes through the same bot booking flow as any other sitting. What's
+different is the PACE: chasing an orthodontic patient on the short-course
+cadence (a nudge every week, up to 3 times) would nag them for an adjustment
+that isn't due for weeks and is a fast way to get the clinic's shared number
+blocked. `utils/treatmentPlan.js`'s `isOrthodonticDepartment` (a keyword match
+on the plan's department name — clinics type their own department names, so
+there's no id to key off) is checked in two places that must stay in step:
+`services/bot/treatmentFlow.js`'s `getOpenPlans`, which offers an orthodontic
+plan in the bot's treatment list regardless of `scheduling_mode`, and
+`jobs/treatmentNudges.js`, which runs `findPlansNeedingNudge` a SECOND time
+with its own thresholds — one nudge, 30 days after the last sitting, instead of
+the ordinary 3-day quiet period and 3-nudge cap. `treatment_plans.scheduling_mode`
+(`patient` | `clinic`) still exists for any OTHER course type a dentist wants
+scheduled purely at the chair (`clinic` plans stay excluded from the ordinary
+nudge cadence and the bot's treatment list) — orthodontics is simply no longer
+routed through it. `total_visits` caps at 60, not 30 — a two-year case is
+monthly adjustments plus bonding, debond and retainer reviews.
 
 **The consultation fee is quotable, not fixed.** Indian clinics waive it when the
 patient takes treatment, and they negotiate. A firm number shown in WhatsApp and

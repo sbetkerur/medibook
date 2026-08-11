@@ -10,6 +10,11 @@
  * This cron finds courses with a sitting still unbooked and no upcoming visit on
  * the calendar, and asks the patient to book it. The reply is handled by
  * botEngine's *Treatment* keyword, which walks them through dates and slots.
+ *
+ * Orthodontics/braces (utils/treatmentPlan.js isOrthodonticDepartment) is
+ * self-bookable too, but runs on its own cadence — one nudge, a month after
+ * the last sitting — instead of this cron's ordinary short-course one, since
+ * an adjustment is due roughly monthly, not every few days.
  */
 const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
@@ -36,6 +41,13 @@ const MIN_DAYS_BETWEEN_NUDGES = 7;
 // …and never more than this many times in total. A patient who has ignored
 // three messages has decided; continuing is what gets a clinic's number blocked.
 const MAX_NUDGES_PER_PLAN = 3;
+// Orthodontics/braces (utils/treatmentPlan.js isOrthodonticDepartment): an
+// adjustment is roughly monthly, so the short-course cadence above would chase
+// a patient weekly for something that isn't due yet. One nudge, a month after
+// the last sitting, matches how the course actually runs — and MIN_DAYS never
+// gets used in practice since nudge_count reaches the cap on the first send.
+const ORTHO_QUIET_DAYS_AFTER_VISIT = 30;
+const ORTHO_MAX_NUDGES_PER_PLAN = 1;
 // Cap per clinic per run, matching the feedback job — a clinic that has just
 // migrated a backlog of plans must not fire hundreds of messages in one minute.
 const NUDGE_BATCH_LIMIT = 25;
@@ -43,14 +55,22 @@ const NUDGE_BATCH_LIMIT = 25;
 // has it, sendPatientMessage falls back to plain text, which reaches only the
 // patients already inside the 24-hour window.
 const TREATMENT_NUDGE_TEMPLATE = 'treatment_sitting_reminder';
+// Same keyword match as utils/treatmentPlan.js's isOrthodonticDepartment,
+// spelled for Postgres — the department name is free text a clinic typed
+// themselves, so there's no id to key off.
+const ORTHO_DEPT_SQL = `dep.name ~* '(ortho|brace|aligner)'`;
 
 /**
- * Courses that need a nudge right now.
+ * Courses that need a nudge right now, for ONE cadence.
  *
  * Every condition here is a reason NOT to message someone, which is why they
- * live in SQL rather than in a filter after the fact.
+ * live in SQL rather than in a filter after the fact. Called twice by
+ * sendTreatmentNudges — once for the ordinary short-course cadence, once for
+ * orthodontics' monthly one — rather than folding both into one query with a
+ * per-row CASE, so each cadence's thresholds stay simple named parameters
+ * instead of duplicated conditional expressions.
  */
-async function findPlansNeedingNudge(schema) {
+async function findPlansNeedingNudge(schema, { orthoOnly, maxNudges, minDaysBetweenNudges, quietDaysAfterVisit, limit }) {
   const r = await tenantQuery(schema, `
     SELECT tp.id, tp.title, tp.total_visits, tp.nudge_count,
            p.phone, p.name AS patient_name,
@@ -59,16 +79,17 @@ async function findPlansNeedingNudge(schema) {
            COUNT(a.id) FILTER (WHERE a.status <> 'cancelled')::int AS booked_visits
     FROM treatment_plans tp
     JOIN patients p ON p.id = tp.patient_id
+    LEFT JOIN departments dep ON dep.id = tp.department_id
     LEFT JOIN doctors d ON d.id = tp.treating_doctor_id AND d.is_active = true
     LEFT JOIN hospitals h ON h.id = tp.hospital_id
     LEFT JOIN appointments a ON a.treatment_plan_id = tp.id
     WHERE tp.status IN ('proposed','in_progress')
-      -- Orthodontics is 18-24 monthly adjustments and the next one is set by
-      -- the dentist at the chair ("come back in four weeks"), never chosen by
-      -- the patient from a slot list. Nudging them to self-book a monthly
-      -- adjustment is wrong for the single biggest course type in an Indian
-      -- practice, and it is 24 unwanted messages per patient.
-      AND tp.scheduling_mode = 'patient'
+      -- 'clinic' mode (chair-scheduled courses) is still excluded from the
+      -- ordinary cadence — EXCEPT orthodontics, which is always self-bookable
+      -- (services/bot/treatmentFlow.js) and just runs on its own, slower
+      -- cadence instead of being excluded outright.
+      AND (tp.scheduling_mode = 'patient' OR ${ORTHO_DEPT_SQL})
+      AND COALESCE(${ORTHO_DEPT_SQL}, false) = $5
       AND p.opted_out IS NOT TRUE
       AND p.deleted_at IS NULL
       AND tp.nudge_count < $1
@@ -92,7 +113,7 @@ async function findPlansNeedingNudge(schema) {
     HAVING COUNT(a.id) FILTER (WHERE a.status <> 'cancelled') < tp.total_visits
     ORDER BY tp.updated_at
     LIMIT $4
-  `, [MAX_NUDGES_PER_PLAN, MIN_DAYS_BETWEEN_NUDGES, QUIET_DAYS_AFTER_VISIT, NUDGE_BATCH_LIMIT]);
+  `, [maxNudges, minDaysBetweenNudges, quietDaysAfterVisit, limit, orthoOnly]);
   return r.rows;
 }
 
@@ -101,7 +122,16 @@ async function sendTreatmentNudges() {
     const settings = tenant.settings || {};
     if (settings.treatment_nudges_enabled === false) return;
 
-    const plans = await findPlansNeedingNudge(tenant.schema_name);
+    const plans = [
+      ...await findPlansNeedingNudge(tenant.schema_name, {
+        orthoOnly: false, maxNudges: MAX_NUDGES_PER_PLAN, minDaysBetweenNudges: MIN_DAYS_BETWEEN_NUDGES,
+        quietDaysAfterVisit: QUIET_DAYS_AFTER_VISIT, limit: NUDGE_BATCH_LIMIT,
+      }),
+      ...await findPlansNeedingNudge(tenant.schema_name, {
+        orthoOnly: true, maxNudges: ORTHO_MAX_NUDGES_PER_PLAN, minDaysBetweenNudges: ORTHO_QUIET_DAYS_AFTER_VISIT,
+        quietDaysAfterVisit: ORTHO_QUIET_DAYS_AFTER_VISIT, limit: NUDGE_BATCH_LIMIT,
+      }),
+    ];
     for (const plan of plans) {
       // The budget gate sits OUTSIDE the try, because `continue` from inside it
       // would still run the finally and burn one of the plan's three attempts
@@ -213,4 +243,6 @@ module.exports = {
   QUIET_DAYS_AFTER_VISIT,
   MIN_DAYS_BETWEEN_NUDGES,
   MAX_NUDGES_PER_PLAN,
+  ORTHO_QUIET_DAYS_AFTER_VISIT,
+  ORTHO_MAX_NUDGES_PER_PLAN,
 };

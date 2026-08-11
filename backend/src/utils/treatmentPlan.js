@@ -115,6 +115,28 @@ function canTransitionPlan(from, to) {
   return Boolean(PLAN_TRANSITIONS[from]?.includes(to));
 }
 
+/**
+ * Is this department orthodontics/braces?
+ *
+ * The department a clinic creates for this work is free text they typed
+ * themselves (the demo seed calls it "Orthodontics & Braces"; another clinic
+ * might call it just "Orthodontics" or "Braces & Aligners"), so there is no id
+ * to key off — a keyword match is the only thing that survives a clinic's own
+ * naming. Same keyword set botEngine.js uses to route a patient's chief
+ * complaint to this department.
+ *
+ * Used to give orthodontic courses their own patient-booking and nudge rules:
+ * unlike a root canal's few-days-apart sittings, an adjustment is roughly
+ * monthly, so the plan is always self-bookable (regardless of
+ * scheduling_mode) and nudged once, a month after the last sitting, rather
+ * than the short-course cadence — which would chase a patient weekly for an
+ * adjustment that isn't due yet and risks the clinic's shared number getting
+ * blocked (services/messageBudget.js).
+ */
+function isOrthodonticDepartment(name) {
+  return /ortho|brace|aligner/i.test(String(name || ''));
+}
+
 function toInt(v, fallback) {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : fallback;
@@ -127,4 +149,5 @@ module.exports = {
   nextFreeVisitNumber,
   derivePlanStatus,
   canTransitionPlan,
+  isOrthodonticDepartment,
 };

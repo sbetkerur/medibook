@@ -17,7 +17,7 @@
  */
 process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 const {
-  planProgress, derivePlanStatus, canTransitionPlan, PLAN_TRANSITIONS,
+  planProgress, derivePlanStatus, canTransitionPlan, PLAN_TRANSITIONS, isOrthodonticDepartment,
 } = require('../src/utils/treatmentPlan');
 
 let passed = 0, failed = 0;
@@ -125,6 +125,15 @@ check('in_progress can still be cancelled', canTransitionPlan('in_progress', 'ca
 check('a completed plan cannot go back to in_progress',
   canTransitionPlan('completed', 'in_progress'), false);
 check('an unknown status transitions nowhere', canTransitionPlan('nonsense', 'completed'), false);
+
+// ── Orthodontics detection (always self-bookable, monthly nudge cadence) ──
+check('the seeded department name matches', isOrthodonticDepartment('Orthodontics & Braces'), true);
+check('a clinic that just calls it "Orthodontics" still matches', isOrthodonticDepartment('Orthodontics'), true);
+check('"Braces & Aligners" matches on the alternate keyword', isOrthodonticDepartment('Braces & Aligners'), true);
+check('case does not matter', isOrthodonticDepartment('ORTHODONTICS'), true);
+check('an unrelated department does not match', isOrthodonticDepartment('Root Canal Treatment'), false);
+check('a plan with no department at all does not match', isOrthodonticDepartment(null), false);
+check('"General Dentistry" does not false-positive', isOrthodonticDepartment('General Dentistry'), false);
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

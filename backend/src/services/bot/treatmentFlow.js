@@ -34,10 +34,13 @@ async function getOpenPlans(schema, phone) {
     LEFT JOIN appointments a ON a.treatment_plan_id = tp.id
     WHERE p.phone = $1 AND p.deleted_at IS NULL
       AND tp.status IN ('proposed','in_progress')
-      -- Clinic-scheduled courses (ortho) are booked at the chair. Offering the
-      -- patient a slot list for their next adjustment invites a booking the
-      -- dentist did not plan, at a date the treatment is not ready for.
-      AND tp.scheduling_mode = 'patient'
+      -- 'clinic' mode is for courses the dentist schedules at the chair on
+      -- clinical judgement (not a date the patient can pick). Orthodontics is
+      -- the one exception: it's ALWAYS patient-bookable regardless of
+      -- scheduling_mode — the visit itself is routine (a chairside
+      -- adjustment), it's just due about once a month, which jobs/treatmentNudges.js
+      -- accounts for with its own, much slower nudge cadence.
+      AND (tp.scheduling_mode = 'patient' OR dep.name ~* '(ortho|brace|aligner)')
     GROUP BY tp.id, dep.name, h.name, d.name, d.qualification, d.consultation_fee, d.specialization
     HAVING COUNT(a.id) FILTER (WHERE a.status <> 'cancelled') < tp.total_visits
     ORDER BY tp.created_at DESC
@@ -66,10 +69,11 @@ async function showTreatmentPlans(phone, schema, tenant, send, ctx = {}) {
   const plans = await getOpenPlans(schema, phone);
 
   if (!plans.length) {
+    // Orthodontic courses are included in getOpenPlans like any other, so
+    // reaching here means there is genuinely nothing open — including braces —
+    // not that ortho was filtered out.
     await send.text(
       'You have no treatment sittings waiting to be booked.\n\n' +
-      'If you are having braces or aligners, your next visit is arranged by the ' +
-      'dentist at your appointment — there is nothing for you to book here.\n\n' +
       'Reply *Menu* to book an ordinary appointment.'
     );
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
