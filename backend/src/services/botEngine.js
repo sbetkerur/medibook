@@ -39,6 +39,7 @@ const {
 
 const {
   showMyAppointments,
+  sendWhichOne,
   handleRescheduleSelect,
   handleRescheduleDate,
   handleRescheduleSlot,
@@ -399,25 +400,15 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   // before confirmation.
   const atRestingState = session.state === STATES.IDLE || session.state === STATES.MAIN_MENU;
   if (atRestingState && /^reschedule$/i.test(input) && !isGreeting) {
-    const patient = await getPatient(schema, phone);
-    if (!patient) {
-      await send.text('You have no appointments with us yet.\n\nReply *Menu* to book one.');
-      await updateSession(schema, phone, STATES.IDLE, {});
-      return;
-    }
-    await send.text('Which one? Send its booking ID — it looks like *MB12AB3*.');
-    await updateSession(schema, phone, STATES.RESCHEDULE_SELECT, {});
+    // sendWhichOne's own "nothing to change" text covers the no-appointments
+    // case, so no separate getPatient existence check is needed here.
+    const sent = await sendWhichOne(phone, schema, send, ctx, 'Move which appointment?');
+    await updateSession(schema, phone, sent ? STATES.RESCHEDULE_SELECT : STATES.IDLE, sent ? ctx : {});
     return;
   }
   if (atRestingState && /^cancel appointment$/i.test(input) && !isGreeting) {
-    const patient = await getPatient(schema, phone);
-    if (!patient) {
-      await send.text('You have no appointments with us yet.\n\nReply *Menu* to book one.');
-      await updateSession(schema, phone, STATES.IDLE, {});
-      return;
-    }
-    await send.text('Which one? Send its booking ID — it looks like *MB12AB3*.');
-    await updateSession(schema, phone, STATES.CANCEL_SELECT, {});
+    const sent = await sendWhichOne(phone, schema, send, ctx, 'Cancel which appointment?');
+    await updateSession(schema, phone, sent ? STATES.CANCEL_SELECT : STATES.IDLE, sent ? ctx : {});
     return;
   }
 
@@ -733,13 +724,15 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     // would erroneously match /btn_0/ and trigger the reschedule prompt.
     const hasUpcoming = Array.isArray(ctx._appts) && ctx._appts.length > 0;
     if (hasUpcoming && /reschedule|btn_0/i.test(choice)) {
-      await send.text('Which one? Send its booking ID — it looks like *MB12AB3*.');
-      await updateSession(schema, phone, STATES.RESCHEDULE_SELECT, ctx);
+      // Re-queries rather than trusting ctx._appts (bare ids, no date/doctor) —
+      // sendWhichOne needs the fuller row to build a legible list anyway.
+      const sent = await sendWhichOne(phone, schema, send, ctx, 'Move which appointment?');
+      await updateSession(schema, phone, sent ? STATES.RESCHEDULE_SELECT : STATES.IDLE, sent ? ctx : {});
       return;
     }
     if (hasUpcoming && /cancel|btn_1/i.test(choice)) {
-      await send.text('Which one? Send its booking ID — it looks like *MB12AB3*.');
-      await updateSession(schema, phone, STATES.CANCEL_SELECT, ctx);
+      const sent = await sendWhichOne(phone, schema, send, ctx, 'Cancel which appointment?');
+      await updateSession(schema, phone, sent ? STATES.CANCEL_SELECT : STATES.IDLE, sent ? ctx : {});
       return;
     }
     await sendMainMenu(send, tenant, await getPatient(schema, phone).catch(() => null));
@@ -747,7 +740,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return;
   }
   if (session.state === STATES.RESCHEDULE_SELECT) {
-    return handleRescheduleSelect(phone, schema, tenant, send, ctx, input);
+    return handleRescheduleSelect(phone, schema, tenant, send, ctx, choice, input);
   }
   if (session.state === STATES.RESCHEDULE_DATE) {
     return handleRescheduleDate(phone, schema, tenant, send, ctx, choice);
@@ -759,7 +752,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     return handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice);
   }
   if (session.state === STATES.CANCEL_SELECT) {
-    return handleCancelSelect(phone, schema, tenant, send, ctx, input);
+    return handleCancelSelect(phone, schema, tenant, send, ctx, choice, input);
   }
   if (session.state === STATES.CANCEL_REASON) {
     // Note: signature is (phone, schema, tenant, send, ctx, input, buttonId)

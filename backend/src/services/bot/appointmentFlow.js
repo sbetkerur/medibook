@@ -114,7 +114,79 @@ async function showMyAppointments(phone, schema, tenant, send) {
     { _appts: upcomingR.rows.map(a => a.booking_id) });
 }
 
-async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
+/**
+ * "Which one?" — the patient's upcoming CONFIRMED bookings as a TAPPABLE
+ * list (radio-button style), not a code to remember and type. Each row's id
+ * IS the booking id, so a tap flows straight into handleRescheduleSelect /
+ * handleCancelSelect's lookup with no separate id-mapping step — unlike the
+ * date/slot lists elsewhere, whose row ids are opaque and get resolved back
+ * through a cache. The description carries date, doctor and (when more than
+ * one booking shares the phone — family booking) the patient's name, so a
+ * tap stays unambiguous.
+ *
+ * Re-queries rather than trusting a caller's cached ctx._appts: a clinic may
+ * have cancelled or completed the booking between the My Appointments list
+ * and this tap, and this is also reused by the "reschedule"/"cancel
+ * appointment" shortcuts, which never showed a list at all.
+ *
+ * Returns true when a list was sent (caller should move to the *_SELECT
+ * state), false when there was nothing to offer (caller should stay IDLE).
+ */
+async function sendWhichOne(phone, schema, send, ctx, header) {
+  const appts = (await tenantQuery(schema,
+    `SELECT a.booking_id, a.appointment_date, a.appointment_time,
+            d.name AS doctor_name, p.name AS patient_name
+     FROM appointments a
+     JOIN doctors d ON d.id = a.doctor_id
+     JOIN patients p ON p.id = a.patient_id
+     WHERE p.phone=$1 AND p.deleted_at IS NULL AND a.status='confirmed'
+       AND (a.appointment_date + COALESCE(a.appointment_time, '23:59'::time)) >= timezone('Asia/Kolkata', NOW())
+     ORDER BY a.appointment_date, a.appointment_time
+     LIMIT 5`,
+    [phone])).rows;
+
+  if (!appts.length) {
+    await send.text('You have no appointments we can change right now.\n\nReply *Menu* to go back.');
+    return false;
+  }
+
+  const multiplePatients = new Set(appts.map(a => a.patient_name)).size > 1;
+  const rows = appts.map(a => {
+    let dt = a.appointment_date;
+    try { dt = format(parseISO(a.appointment_date), 'EEE, d MMM'); } catch {}
+    const time = (a.appointment_time || '').slice(0, 5);
+    const nameSuffix = multiplePatients && a.patient_name ? ` · ${a.patient_name}` : '';
+    return { id: a.booking_id, title: a.booking_id, description: `${dt} ${time} · Dr. ${a.doctor_name}${nameSuffix}` };
+  });
+  await send.list('Tap the one you mean.', 'Pick a booking', [{ title: 'Your appointments', rows }],
+    { header, footer: 'Reply Menu to go back' });
+  // Cached in the order sent so a numbered reply ("1", "2", …) still resolves
+  // when sendList degrades to its numbered-text fallback (whatsapp.js).
+  ctx._select_appts = appts.map(a => a.booking_id);
+  return true;
+}
+
+/**
+ * Resolve a RESCHEDULE_SELECT/CANCEL_SELECT reply to a booking id.
+ *
+ * Three shapes, in order of trust: a tap on sendWhichOne's list (choice IS
+ * the booking id already, verified against what was actually offered); the
+ * numbered-text fallback sendList degrades to on failure; and free-typed
+ * text — a patient who types the code straight from their confirmation
+ * message without ever seeing the list, or answers the no-appointments
+ * example prompt.
+ */
+function resolveBookingIdChoice(ctx, choice, input) {
+  const cached = ctx._select_appts || [];
+  const tapped = String(choice || '').trim().toUpperCase();
+  if (cached.includes(tapped)) return tapped;
+  const n = parseChoiceNumber(input);
+  if (n >= 1 && n <= cached.length) return cached[n - 1];
+  return String(input || '').trim().toUpperCase();
+}
+
+async function handleRescheduleSelect(phone, schema, tenant, send, ctx, choice, input) {
+  const bookingId = resolveBookingIdChoice(ctx, choice, input);
   // Only allow the patient who owns the booking to reschedule it.
   const appt = await tenantQuery(schema,
     `SELECT a.*, d.name as doctor_name, d.slot_duration_minutes
@@ -122,7 +194,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, input) {
      JOIN doctors d ON d.id=a.doctor_id
      JOIN patients p ON p.id=a.patient_id
      WHERE a.booking_id=$1 AND a.status='confirmed' AND p.phone=$2`,
-    [input.toUpperCase(), phone]);
+    [bookingId, phone]);
   if (!appt.rows[0]) {
     await send.text('Booking ID not found or already cancelled. Please try again.\n\nReply *Menu* to go back.');
     return;
@@ -381,7 +453,7 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       await client.query(
         `UPDATE appointments SET
            slot_id=$1, appointment_date=$2, appointment_time=$3,
-           reminder_24h_sent=false, reminder_2h_sent=false, updated_at=NOW()
+           reminder_24h_sent=false, updated_at=NOW()
          WHERE id=$4`,
         [ctx.reschedule_new_slot_id, ctx.reschedule_new_date, ctx.reschedule_new_time, ctx.reschedule_appt_id]
       );
@@ -431,14 +503,15 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
   await updateSession(schema, phone, STATES.IDLE, {});
 }
 
-async function handleCancelSelect(phone, schema, tenant, send, ctx, input) {
+async function handleCancelSelect(phone, schema, tenant, send, ctx, choice, input) {
+  const bookingId = resolveBookingIdChoice(ctx, choice, input);
   // Only allow the patient who owns the booking to cancel it.
   const appt = await tenantQuery(schema,
     `SELECT a.*, d.name as doctor_name FROM appointments a
      JOIN doctors d ON d.id=a.doctor_id
      JOIN patients p ON p.id=a.patient_id
      WHERE a.booking_id=$1 AND a.status='confirmed' AND p.phone=$2`,
-    [input.toUpperCase(), phone]);
+    [bookingId, phone]);
   if (!appt.rows[0]) {
     await send.text('Booking ID not found or already cancelled. Please try again.\n\nReply *Menu* to go back.');
     return;
@@ -541,7 +614,7 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
   const wantsMove = !isNegative && (btnIdx === 0 || /\bmove\b|\breschedul|^1$/i.test(choice));
   if (wantsMove) {
     await updateSession(schema, phone, STATES.IDLE, {});
-    return handleRescheduleSelect(phone, schema, tenant, send, {}, ctx.cancel_booking_id);
+    return handleRescheduleSelect(phone, schema, tenant, send, {}, null, ctx.cancel_booking_id);
   }
 
   if (!isNegative && (btnIdx === 1 || /yes|cancel|^2$/.test(choice))) {
@@ -590,6 +663,7 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
 
 module.exports = {
   showMyAppointments,
+  sendWhichOne,
   handleRescheduleSelect,
   handleRescheduleDate,
   handleRescheduleSlot,
