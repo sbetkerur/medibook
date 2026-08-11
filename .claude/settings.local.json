@@ -318,7 +318,20 @@
       "Bash(grep -n \"hospital_id: v\\\\|setWalkinForm\\(f => \\({ ...f, hospital_id\" src/app/dashboard/page.js)",
       "PowerShell(node backend/tests/templateContract.unit.test.js)",
       "PowerShell(cd backend *)",
-      "PowerShell($sp='C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\e740d952-6bb1-4ccc-8f75-8c59026ed5ca\\\\scratchpad'; git commit -F \"$sp\\\\msg1.txt\"; if \\($?\\) { git add backend/src/services/whatsapp.js backend/src/utils/templateButtons.js backend/tests/templateContract.unit.test.js docs/whatsapp-templates.md .claude/settings.local.json; git commit -F \"$sp\\\\msg2.txt\" })"
+      "PowerShell($sp='C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\e740d952-6bb1-4ccc-8f75-8c59026ed5ca\\\\scratchpad'; git commit -F \"$sp\\\\msg1.txt\"; if \\($?\\) { git add backend/src/services/whatsapp.js backend/src/utils/templateButtons.js backend/tests/templateContract.unit.test.js docs/whatsapp-templates.md .claude/settings.local.json; git commit -F \"$sp\\\\msg2.txt\" })",
+      "PowerShell($b = railway deployment list --service backend --json 2>&1 | Out-String; $b.Substring\\(0, [Math]::Min\\(900, $b.Length\\)\\))",
+      "PowerShell(Poll *)",
+      "PowerShell(try { $h = Invoke-RestMethod https://api.pragatisolutions.com/health -TimeoutSec 25; \"BACKEND: $\\($h.status\\) db=$\\($h.db\\) redis=$\\($h.redis\\) uptime=$\\($h.uptime\\)\" } catch { \"BACKEND ERR: $\\($_.Exception.Message\\)\" }; try { $p = Invoke-RestMethod https://app.pragatisolutions.com/api/proxy/health -TimeoutSec 25; \"PROXY: $\\($p.status\\) uptime=$\\($p.uptime\\)\" } catch { \"PROXY ERR: $\\($_.Exception.Message\\)\" }; try { $l = Invoke-WebRequest https://app.pragatisolutions.com/login -TimeoutSec 25; \"LOGIN: $\\($l.StatusCode\\)\" } catch { \"LOGIN ERR: $\\($_.Exception.Message\\)\" })",
+      "PowerShell(try { $l = Invoke-WebRequest https://app.pragatisolutions.com/login -TimeoutSec 25 -UseBasicParsing; \"LOGIN: $\\($l.StatusCode\\)\" } catch { \"LOGIN ERR: $\\($_.Exception.Message\\)\" })",
+      "Bash(sed -E 's/^\\(SUPER_ADMIN_PASSWORD\\)=.*/\\\\1=<set, redacted>/')",
+      "Bash(cd *)",
+      "Bash(nslookup -type=TXT pragatisolutions.com)",
+      "Bash(nslookup -type=TXT _dmarc.pragatisolutions.com)",
+      "Bash(nslookup -type=MX pragatisolutions.com)",
+      "PowerShell(Test-NetConnection *)",
+      "Bash(powershell -NoProfile -Command \"Get-Process node -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime, Path\")",
+      "Bash(mkdir -p \"/c/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/abc71730-be65-4977-823e-5eab6f46f162/scratchpad\")",
+      "Bash(git show *)"
     ]
   }
 }
