@@ -25,7 +25,6 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
       name: settings.clinic_name || '',
       notification_prefs: {
         reminder_24h_enabled: settings.settings?.reminder_24h_enabled,
-        reminder_2h_enabled: settings.settings?.reminder_2h_enabled,
         show_consultation_fee: settings.settings?.show_consultation_fee,
       },
       notify_phone: settings.notify_phone || '',

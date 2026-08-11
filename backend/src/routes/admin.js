@@ -493,9 +493,9 @@ router.post('/clinic-qr/regenerate', adminOnly, async (req, res) => {
 // way to set them and no UI that reads them.
 const PLATFORM_ONLY_SETTINGS_KEYS = ['rate_limits', 'alert_webhook_url'];
 // Non-admins get only what the dashboard actually consumes:
-// frontend/src/components/tabs/SettingsTab.js reads exactly these three from
-// `settings.settings` and nothing else (the toggles are admin-write anyway).
-const NON_ADMIN_SETTINGS_KEYS = ['reminder_24h_enabled', 'reminder_2h_enabled'];
+// frontend/src/components/tabs/SettingsTab.js reads exactly this from
+// `settings.settings` and nothing else (the toggle is admin-write anyway).
+const NON_ADMIN_SETTINGS_KEYS = ['reminder_24h_enabled'];
 
 function visibleSettings(rawSettings, role) {
   const src = rawSettings || {};

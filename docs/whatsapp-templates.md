@@ -12,7 +12,7 @@ Create these in **Meta Business Manager → WhatsApp Manager → Message templat
 
 ## Every template that must exist
 
-Ten. Create them all — the product has a message for each and **none of them
+Nine. Create them all — the product has a message for each and **none of them
 reaches anybody without its template**, because every one is sent outside a
 conversation the patient started.
 
@@ -20,42 +20,51 @@ conversation the patient started.
 |---|---|---|---|---|
 | 1 | `appointment_confirmed_v4` | 5 | booking completes | 2 |
 | 2 | `appointment_reminder_24h_v3` | 4 | the day before | 3 |
-| 3 | `appointment_reminder_2h_v3` | 3 | a couple of hours before | — |
-| 4 | `appointment_feedback_request` | 3 | day after a completed visit | 3 |
-| 5 | `appointment_missed_rebook` | 3 | day after a no-show | 1 |
-| 6 | `treatment_sitting_reminder` | 5 | course unfinished, nothing booked | 1 |
-| 7 | `patient_recall_checkup` | 2 | six-month check-up loop | 1 |
-| 8 | `payment_receipt` | 6 | a payment is recorded | — |
-| 9 | `treatment_sitting_booked` | 7 | the desk books the next sitting | 2 |
-| 10 | `clinic_staff_alert` | 2 | alerts + Monday summary, **to staff** | — |
+| 3 | `appointment_feedback_request` | 3 | day after a completed visit | 3 |
+| 4 | `appointment_missed_rebook` | 3 | day after a no-show | 1 |
+| 5 | `treatment_sitting_reminder` | 5 | course unfinished, nothing booked | 1 |
+| 6 | `patient_recall_checkup` | 2 | six-month check-up loop | 1 |
+| 7 | `payment_receipt` | 6 | a payment is recorded | — |
+| 8 | `treatment_sitting_booked` | 7 | the desk books the next sitting | 2 |
+| 9 | `clinic_staff_alert` | 2 | alerts + Monday summary, **to staff** | — |
 
-**1 carries a `_v4` suffix, 2 and 3 a `_v3` one, and 8, 9 and 10 have never been
-submitted.** Six of the ten, then, are names Meta has not approved yet — until
+**1 carries a `_v4` suffix, 2 a `_v3` one, and 7, 8 and 9 have never been
+submitted.** Five of the nine, then, are names Meta has not approved yet — until
 it does, those messages do not arrive at all.
 
-A template cannot be renamed in WhatsApp Manager. **1, 2 and 3 are therefore
-created fresh under the new names**, and the previous `appointment_confirmed_v3`,
-`appointment_reminder_24h` and `appointment_reminder_2h` keep working right up
-until this code deploys, at which point they are dead — nothing looks them up.
-Create and get the new names approved BEFORE deploying, or every booking
-confirmation and every reminder falls back to plain text in the gap, which Meta
-rejects for anyone outside the 24-hour window. Delete the superseded ones only
-once the new ones are live; a deleted template cannot be recovered, and while
-they exist they are a working rollback.
+A template cannot be renamed in WhatsApp Manager. **1 and 2 are therefore
+created fresh under the new names**, and the previous `appointment_confirmed_v3`
+and `appointment_reminder_24h` keep working right up until this code deploys, at
+which point they are dead — nothing looks them up. Create and get the new names
+approved BEFORE deploying, or every booking confirmation and every reminder
+falls back to plain text in the gap, which Meta rejects for anyone outside the
+24-hour window. Delete the superseded ones only once the new ones are live; a
+deleted template cannot be recovered, and while they exist they are a working
+rollback.
+
+> **The 2-hour reminder and the 1-2h post-appointment follow-up are retired.**
+> `appointment_reminder_2h_v3` (and the old `appointment_reminder_2h`) is no
+> longer sent by any code path — `jobs/reminders.js` no longer has a 2-hour
+> block at all, and the post-appointment follow-up cron that used to fire
+> `appointment_feedback_request` early is gone too. Delete both from WhatsApp
+> Manager whenever convenient; nothing looks them up any more, so there is no
+> cutover to coordinate. A same-day booking now gets no appointment reminder at
+> all — the 24-hour one is gated on a future date, and there is currently no
+> substitute for same-day.
 
 The other three:
 
-- **10 is the urgent one.** It fails *100% of the time*, not occasionally. A
+- **9 is the urgent one.** It fails *100% of the time*, not occasionally. A
   clinic owner never messages the shared number — that is the point of the QR —
   so they are permanently outside the 24-hour window. Every booking alert and
   every Monday summary is currently rejected in silence.
-- **8** fails whenever a payment is recorded more than 24 hours after the
+- **7** fails whenever a payment is recorded more than 24 hours after the
   patient last wrote, which is most of them.
-- **9** fails whenever the receptionist books a sitting for a patient who is not
+- **8** fails whenever the receptionist books a sitting for a patient who is not
   mid-conversation, which is most of them.
 
-4–7 were re-submitted on 2026-08-05 (clinic name added to 4, 5 and 6). If you
-have not done that yet, do it in the same sitting as the `_v3` three.
+3–6 were re-submitted on 2026-08-05 (clinic name added to 3, 4 and 5). If you
+have not done that yet, do it in the same sitting as the `_v3` two.
 
 > **Deploy the code and the approvals together.** An approved template invoked
 > with the wrong number of parameters fails the send *entirely*, and the
@@ -86,11 +95,11 @@ scrolls back to check.
 ## Filling in the form
 
 The **Create template** form asks for these, in this order. Everything below is
-per-template; the values for each of the ten are in the sections after.
+per-template; the values for each of the nine are in the sections after.
 
 | Form field | What to do |
 |---|---|
-| **Category** | `Utility` for all ten. Not Marketing — it costs more and is suppressed for anyone who opted out of marketing, which would silently kill the recall. |
+| **Category** | `Utility` for all nine. Not Marketing — it costs more and is suppressed for anyone who opted out of marketing, which would silently kill the recall. |
 | **Name** | Copy the heading exactly, e.g. `appointment_reminder_24h_v3`. Lowercase, digits and underscores only — the code looks it up by this string, `_v3` suffix included. |
 | **Languages** | `English` → the code sends language code `en`. **Not** `English (US)`, which is `en_US` and will not match. |
 | **Header** | Change the dropdown from `None` to **Text**, then paste the header line. Leave "Add variable" alone — every header is static. |
@@ -250,47 +259,10 @@ Smile Dental - Banjara Hills
 
 ---
 
-## 3. `appointment_reminder_2h_v3`
+## 3. `appointment_feedback_request`
 
-A couple of hours before. `jobs/reminders.js` (2-hour block)
-
-| Variable | Value | Example |
-|---|---|---|
-| `{{1}}` | Dentist name | `Kavitha Reddy` |
-| `{{2}}` | Time | `11:30` |
-| `{{3}}` | Branch name | `Smile Dental - Banjara Hills` |
-
-**Header** — `⏰ Later today`
-
-**Body**
-```
-Your appointment with Dr. {{1}} is at *{{2}}*.
-
-{{3}} — see you shortly.
-```
-
-**Sample values**
-```
-Kavitha Reddy
-11:30
-Smile Dental - Banjara Hills
-```
-
-> `{{3}}` is why `jobs/reminders.js` now joins `hospitals` in the 2-hour query.
-> It did not before, so this parameter would have been `undefined` — and Meta
-> fails the whole send on an undefined parameter rather than dropping it.
-
-**Footer** — `Reply STOP to turn off reminders`
-
-**Buttons** — none. Two hours out, a cancel button invites a cancellation the
-clinic can no longer refill.
-
----
-
-## 4. `appointment_feedback_request`
-
-The day after a completed visit. Sent by BOTH `sendFeedbackRequests` and
-`sendPostAppointmentFollowup` in `jobs/reminders.js`.
+The day after a completed visit. Sent by `sendFeedbackRequests` in
+`jobs/reminders.js`.
 
 | Variable | Value | Example |
 |---|---|---|
@@ -329,10 +301,10 @@ Smile Dental Clinic
 
 ---
 
-## 5. `appointment_missed_rebook`
+## 4. `appointment_missed_rebook`
 
 Sent instead of the feedback request when a visit was marked no-show.
-`jobs/reminders.js` → `sendPostAppointmentFollowup`
+`jobs/reminders.js` → `sendFeedbackRequests`
 
 | Variable | Value | Example |
 |---|---|---|
@@ -357,7 +329,7 @@ Smile Dental Clinic
 ```
 
 > This template and `appointment_feedback_request` are chosen between at the
-> same call site in `sendPostAppointmentFollowup`, so their parameter lists must
+> same call site in `sendFeedbackRequests`, so their parameter lists must
 > stay the same shape — `{{3}}` was added to both together.
 
 **Footer** — `Reply STOP to turn off these messages`
@@ -374,7 +346,7 @@ Smile Dental Clinic
 
 ---
 
-## 6. `treatment_sitting_reminder`
+## 5. `treatment_sitting_reminder`
 
 "Your next sitting isn't booked yet." `jobs/treatmentNudges.js`
 
@@ -419,7 +391,7 @@ Smile Dental Clinic
 
 ---
 
-## 7. `patient_recall_checkup`
+## 6. `patient_recall_checkup`
 
 The six-month check-up loop. `jobs/recalls.js`
 
@@ -455,7 +427,7 @@ Smile Dental - Banjara Hills
 
 ---
 
-## 8. `payment_receipt`
+## 7. `payment_receipt`
 
 Sent the moment a payment is recorded against a treatment.
 `routes/treatmentPlans.js` → `POST /treatment-plans/:id/payments`
@@ -511,7 +483,7 @@ Smile Dental Clinic
 
 ---
 
-## 9. `treatment_sitting_booked`
+## 8. `treatment_sitting_booked`
 
 The receptionist books the next sitting of a course from the dashboard.
 `routes/treatmentPlans.js` → `POST /treatment-plans/:id/visits`
@@ -567,7 +539,7 @@ Smile Dental - Banjara Hills
 
 ---
 
-## 10. `clinic_staff_alert`
+## 9. `clinic_staff_alert`
 
 Every alert to the clinic's own staff: new booking, cancellation, and the Monday
 summary. `services/bot/utils.js` → `notifyAdminWhatsApp`

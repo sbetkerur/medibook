@@ -72,9 +72,9 @@ broadcasts.
    assumption will be that everything is down.
 4. **Inbound may still arrive.** A restricted number often still receives. Those
    messages queue and the bot answers when sending resumes; nothing is lost.
-5. **Reminders self-heal.** `reminder_24h_sent` / `reminder_2h_sent` are only set
-   after a successful send, so the hourly cron retries. A multi-day outage means
-   some reminders are simply skipped — it does not mean a stuck queue.
+5. **Reminders self-heal.** `reminder_24h_sent` is only set after a successful
+   send, so the hourly cron retries. A multi-day outage means some reminders
+   are simply skipped — it does not mean a stuck queue.
 
 ## Getting a clinic's data out
 

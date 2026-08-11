@@ -25,7 +25,6 @@ const DOC = fs.readFileSync('C:/claude_projects/medibook/docs/whatsapp-templates
 const SRC = {
   'appointment_confirmed_v4':     ['src/services/whatsapp.js', 'sendBookingConfirmationTemplate'],
   'appointment_reminder_24h_v3':  ['src/jobs/reminders.js', null],
-  'appointment_reminder_2h_v3':   ['src/jobs/reminders.js', null],
   'appointment_feedback_request': ['src/jobs/reminders.js', null],
   'appointment_missed_rebook':    ['src/jobs/reminders.js', null],
   'treatment_sitting_reminder':   ['src/jobs/treatmentNudges.js', null],

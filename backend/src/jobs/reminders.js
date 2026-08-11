@@ -30,242 +30,123 @@ async function sendReminders() {
     // ── CONFIGURABLE REMINDER TIMING ────────────────────────────
     const settings = tenant.settings || {};
     const reminder24hEnabled = settings.reminder_24h_enabled !== false; // default true
-    const reminder2hEnabled  = settings.reminder_2h_enabled  !== false; // default true
     const hours24 = parseInt(settings.reminder_hours_before_24) || 24;
-    const hours2  = parseInt(settings.reminder_hours_before_2)  || 2;
 
-    if (!reminder24hEnabled && !reminder2hEnabled) return;
+    if (!reminder24hEnabled) return;
 
     // ── 24-HOUR REMINDERS ──────────────────────────────────
-    if (reminder24hEnabled) {
-      // Match on the appointment TIMESTAMP entering the N-hour window, not on a
-      // whole-date comparison. The old check
-      //   appointment_date = (NOW() + 24h)::DATE
-      // matched ALL of tomorrow's appointments at the first hourly run after
-      // midnight, so patients received "reminders" at 00:30 IST — up to 33 hours
-      // early and in the middle of the night. With the timestamp window, a 9 AM
-      // appointment enters the window at ~9 AM the day before. The date > today
-      // guard keeps the old "only remind for future days" semantics (same-day
-      // bookings are covered by the 2-hour reminder), and reminder_24h_sent
-      // prevents duplicates across cron runs.
-      const r24 = await tenantQuery(tenant.schema_name, `
-        SELECT a.id, a.booking_id, a.appointment_date, a.appointment_time,
-               p.phone, p.name as patient_name,
-               d.name as doctor_name, h.name as hospital_name,
-               dep.pre_visit_checklist,
-               tp.title AS treatment_title, tp.total_visits, a.visit_number
-        FROM appointments a
-        JOIN patients p ON p.id=a.patient_id
-        JOIN doctors d ON d.id=a.doctor_id
-        JOIN hospitals h ON h.id=a.hospital_id
-        LEFT JOIN treatment_plans tp ON tp.id=a.treatment_plan_id
-        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
-        WHERE a.status='confirmed'
-          AND a.reminder_24h_sent=false
-          AND a.appointment_date > (NOW() AT TIME ZONE $2)::date
-          AND timezone($2, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '09:00:00'))::timestamp)
-              <= NOW() + make_interval(hours => $1::int)
-          AND p.opted_out IS NOT TRUE
-      `, [String(hours24), TIMEZONE]);
+    // Match on the appointment TIMESTAMP entering the N-hour window, not on a
+    // whole-date comparison. The old check
+    //   appointment_date = (NOW() + 24h)::DATE
+    // matched ALL of tomorrow's appointments at the first hourly run after
+    // midnight, so patients received "reminders" at 00:30 IST — up to 33 hours
+    // early and in the middle of the night. With the timestamp window, a 9 AM
+    // appointment enters the window at ~9 AM the day before. The date > today
+    // guard keeps the old "only remind for future days" semantics.
+    // reminder_24h_sent prevents duplicates across cron runs.
+    //
+    // NOTE: a same-day booking gets NO appointment reminder at all — this is
+    // the only one, and it is gated on the appointment being on a FUTURE
+    // date. That used to be covered by the (now removed) 2-hour reminder;
+    // there is no substitute today.
+    const r24 = await tenantQuery(tenant.schema_name, `
+      SELECT a.id, a.booking_id, a.appointment_date, a.appointment_time,
+             p.phone, p.name as patient_name,
+             d.name as doctor_name, h.name as hospital_name,
+             dep.pre_visit_checklist,
+             tp.title AS treatment_title, tp.total_visits, a.visit_number
+      FROM appointments a
+      JOIN patients p ON p.id=a.patient_id
+      JOIN doctors d ON d.id=a.doctor_id
+      JOIN hospitals h ON h.id=a.hospital_id
+      LEFT JOIN treatment_plans tp ON tp.id=a.treatment_plan_id
+      LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
+      WHERE a.status='confirmed'
+        AND a.reminder_24h_sent=false
+        AND a.appointment_date > (NOW() AT TIME ZONE $2)::date
+        AND timezone($2, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '09:00:00'))::timestamp)
+            <= NOW() + make_interval(hours => $1::int)
+        AND p.opted_out IS NOT TRUE
+    `, [String(hours24), TIMEZONE]);
 
-      for (const appt of r24.rows) {
+    for (const appt of r24.rows) {
+      try {
+        let dt = appt.appointment_date;
+        try { dt = format(parseISO(appt.appointment_date), 'EEE, d MMM'); } catch {}
+
+        // Use checklist already fetched via LEFT JOIN in the main query
+        const departmentChecklist = appt.pre_visit_checklist
+          ? `\n\n📋 *Checklist for your visit:*\n${appt.pre_visit_checklist}`
+          : '';
+
+        // A treatment sitting is not an interchangeable appointment — "visit 2
+        // of 3 for your root canal" is what makes a patient keep it, and what
+        // stops them cancelling it as a duplicate of the one they remember.
+        const treatmentLine = appt.treatment_title
+          ? `🦷 *${appt.treatment_title}*` +
+            (appt.visit_number && appt.total_visits ? ` — visit ${appt.visit_number} of ${appt.total_visits}` : '') + `\n`
+          : '';
+
+        // Kept word-for-word in step with the `appointment_reminder_24h_v3`
+        // template (docs/whatsapp-templates.md). This is the text a patient
+        // gets whenever the template is not approved — which is every clinic
+        // until their WhatsApp account is set up — so the two drifting apart
+        // means half the patients get the polished version and half don't.
+        //
+        // The old wall of generic advice ("bring X-rays, tell us about
+        // medications, don't eat beforehand") is gone: sent identically to
+        // everyone, every time, it is what trains people to stop reading.
+        // The per-treatment checklist below is the part that is actually
+        // specific, and it survives.
+        const reminderText =
+          `🔔 *Your appointment is tomorrow*\n\n` +
+          treatmentLine +
+          `🦷 *${dt} at ${(appt.appointment_time || '').slice(0, 5)}*\n` +
+          `with Dr. ${appt.doctor_name}\n\n` +
+          `At ${appt.hospital_name}` +
+          `${departmentChecklist}\n\n` +
+          `Arriving 10 minutes early helps us start on time. If you can't make it, tell us now and we'll offer the slot to someone who's waiting.\n\n` +
+          `Reply *Yes* to confirm, or *Reschedule* / *Cancel Appointment*.`;
+
         try {
-          let dt = appt.appointment_date;
-          try { dt = format(parseISO(appt.appointment_date), 'EEE, d MMM'); } catch {}
-
-          // Use checklist already fetched via LEFT JOIN in the main query
-          const departmentChecklist = appt.pre_visit_checklist
-            ? `\n\n📋 *Checklist for your visit:*\n${appt.pre_visit_checklist}`
-            : '';
-
-          // A treatment sitting is not an interchangeable appointment — "visit 2
-          // of 3 for your root canal" is what makes a patient keep it, and what
-          // stops them cancelling it as a duplicate of the one they remember.
-          const treatmentLine = appt.treatment_title
-            ? `🦷 *${appt.treatment_title}*` +
-              (appt.visit_number && appt.total_visits ? ` — visit ${appt.visit_number} of ${appt.total_visits}` : '') + `\n`
-            : '';
-
-          // Kept word-for-word in step with the `appointment_reminder_24h_v3`
-          // template (docs/whatsapp-templates.md). This is the text a patient
-          // gets whenever the template is not approved — which is every clinic
-          // until their WhatsApp account is set up — so the two drifting apart
-          // means half the patients get the polished version and half don't.
-          //
-          // The old wall of generic advice ("bring X-rays, tell us about
-          // medications, don't eat beforehand") is gone: sent identically to
-          // everyone, every time, it is what trains people to stop reading.
-          // The per-treatment checklist below is the part that is actually
-          // specific, and it survives.
-          const reminderText =
-            `🔔 *Your appointment is tomorrow*\n\n` +
-            treatmentLine +
-            `🦷 *${dt} at ${(appt.appointment_time || '').slice(0, 5)}*\n` +
-            `with Dr. ${appt.doctor_name}\n\n` +
-            `At ${appt.hospital_name}` +
-            `${departmentChecklist}\n\n` +
-            `Arriving 10 minutes early helps us start on time. If you can't make it, tell us now and we'll offer the slot to someone who's waiting.\n\n` +
-            `Reply *Yes* to confirm, or *Reschedule* / *Cancel Appointment*.`;
-
-          try {
-            await sendPatientTemplate(
-              tenant.schema_name,
-              appt.phone,
-              'appointment_reminder_24h_v3',
-              [{
-                type: 'body',
-                parameters: [
-                  { type: 'text', text: appt.doctor_name },
-                  { type: 'text', text: dt },
-                  { type: 'text', text: (appt.appointment_time || '').slice(0, 5) },
-                  { type: 'text', text: appt.hospital_name },
-                ]
-              }],
-              reminderText,
-              // Index-aligned with the template's three quick replies. The
-              // labels read like sentences; these are what the engine matches.
-              ['Yes', 'Reschedule', 'Cancel appointment']
-            );
-          } catch (_templateErr) {
-            await sendPatientText(tenant.schema_name, appt.phone, reminderText);
-          }
-          await tenantQuery(tenant.schema_name,
-            `UPDATE appointments SET reminder_24h_sent=true WHERE id=$1`, [appt.id]);
-          logger.info(`24h reminder sent: ${appt.booking_id}`);
-
-          // Insert pending confirmation record (will be updated when patient replies)
-          await tenantQuery(tenant.schema_name, `
-            INSERT INTO reminder_confirmations (appointment_id, phone)
-            VALUES ($1, $2)
-            ON CONFLICT (appointment_id) DO NOTHING
-          `, [appt.id, appt.phone]).catch(e => logger.warn('Failed to insert reminder confirmation record', { appointment_id: appt.id, error: e.message }));
-
-          // The reply ("yes"/"no") must come back to THIS clinic even if the
-          // patient's shared-number session now points at another one. 48h
-          // covers the appointment itself plus a late answer.
-          await recordPendingReply(appt.phone, tenant.id, KINDS.CONFIRMATION, 48);
-        } catch (err) {
-          logger.error(`24h reminder failed for ${appt.booking_id}`, { error: err.message });
+          await sendPatientTemplate(
+            tenant.schema_name,
+            appt.phone,
+            'appointment_reminder_24h_v3',
+            [{
+              type: 'body',
+              parameters: [
+                { type: 'text', text: appt.doctor_name },
+                { type: 'text', text: dt },
+                { type: 'text', text: (appt.appointment_time || '').slice(0, 5) },
+                { type: 'text', text: appt.hospital_name },
+              ]
+            }],
+            reminderText,
+            // Index-aligned with the template's three quick replies. The
+            // labels read like sentences; these are what the engine matches.
+            ['Yes', 'Reschedule', 'Cancel appointment']
+          );
+        } catch (_templateErr) {
+          await sendPatientText(tenant.schema_name, appt.phone, reminderText);
         }
-      }
-    }
+        await tenantQuery(tenant.schema_name,
+          `UPDATE appointments SET reminder_24h_sent=true WHERE id=$1`, [appt.id]);
+        logger.info(`24h reminder sent: ${appt.booking_id}`);
 
-    // ── 2-HOUR REMINDERS ────────────────────────────────────
-    if (reminder2hEnabled) {
-      // Combine appointment_date + appointment_time into a timezone-aware timestamp
-      // and compare against UTC NOW(). This correctly handles windows that cross
-      // midnight — e.g. nowTime=23:00 IST, windowEnd=01:00 IST next day — where the
-      // old TIME-only comparison (appointment_time > '23:00' AND <= '01:00') is always
-      // false and silently skips all reminders for late-evening appointments.
-      const r2 = await tenantQuery(tenant.schema_name, `
-        SELECT a.id, a.booking_id, a.appointment_date::text as appointment_date, a.appointment_time,
-               p.phone, p.name as patient_name, d.name as doctor_name,
-               -- hospitals is joined for hospital_name, which the 2h reminder
-               -- needs for the same reason the 24h one does: on a shared number
-               -- a message that never names the clinic is genuinely ambiguous.
-               -- It is also a TEMPLATE parameter, and Meta rejects the whole
-               -- send when a parameter is undefined — so a missing join here
-               -- silences the reminder rather than merely shortening it.
-               h.name as hospital_name,
-               dep.pre_visit_checklist,
-               tp.title AS treatment_title, tp.total_visits, a.visit_number
-        FROM appointments a
-        JOIN patients p ON p.id=a.patient_id
-        JOIN doctors d ON d.id=a.doctor_id
-        JOIN hospitals h ON h.id=a.hospital_id
-        LEFT JOIN treatment_plans tp ON tp.id=a.treatment_plan_id
-        LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
-        WHERE a.status='confirmed'
-          AND a.reminder_2h_sent=false
-          AND timezone($1, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '00:00:00'))::timestamp)
-              BETWEEN NOW() AND NOW() + ($2 || ' hours')::interval
-          AND p.opted_out IS NOT TRUE
-      `, [TIMEZONE, String(hours2)]);
+        // Insert pending confirmation record (will be updated when patient replies)
+        await tenantQuery(tenant.schema_name, `
+          INSERT INTO reminder_confirmations (appointment_id, phone)
+          VALUES ($1, $2)
+          ON CONFLICT (appointment_id) DO NOTHING
+        `, [appt.id, appt.phone]).catch(e => logger.warn('Failed to insert reminder confirmation record', { appointment_id: appt.id, error: e.message }));
 
-      // The window crosses midnight (see comment above), so an appointment in it
-      // is either today or tomorrow IST — never claim "Today" for a post-midnight one.
-      const todayIST = format(toZonedTime(new Date(), TIMEZONE), 'yyyy-MM-dd');
-
-      for (const appt of r2.rows) {
-        const dayLabel = appt.appointment_date === todayIST ? 'Today' : 'Tomorrow';
-        try {
-          // Use checklist already fetched via LEFT JOIN in the main query (no extra DB round-trip)
-          const departmentChecklist = appt.pre_visit_checklist
-            ? `\n\n📋 *Checklist for your visit:*\n${appt.pre_visit_checklist}`
-            : '';
-          // The hourly cron fires this anywhere within the next ${hours2}h window,
-          // so state the exact time rather than an imprecise "in N hours".
-          const treatmentLine = appt.treatment_title
-            ? `🦷 *${appt.treatment_title}*` +
-              (appt.visit_number && appt.total_visits ? ` — visit ${appt.visit_number} of ${appt.total_visits}` : '') + `\n`
-            : '';
-          // In step with the `appointment_reminder_2h_v3` template. Two hours out
-          // there is nothing useful left to instruct — the patient is already
-          // on their way — so this says the time and gets out of the way.
-          const reminderText =
-            `⏰ *Later today*\n\n` +
-            treatmentLine +
-            `Your appointment with Dr. ${appt.doctor_name} is at *${(appt.appointment_time || '').slice(0, 5)}*` +
-            (dayLabel === 'Tomorrow' ? ' tomorrow' : '') + `.` +
-            `${departmentChecklist}\n\n` +
-            `${appt.hospital_name} — see you shortly.`;
-
-          // Try template first, fall back to plain text with pre-visit checklist
-          try {
-            await sendPatientTemplate(
-              tenant.schema_name,
-              appt.phone,
-              'appointment_reminder_2h_v3',
-              [{
-                type: 'body',
-                parameters: [
-                  { type: 'text', text: appt.doctor_name },
-                  { type: 'text', text: (appt.appointment_time || '').slice(0, 5) },
-                  // {{3}} — added so a reminder from a shared number says who
-                  // it is from. Appended, not inserted, so the existing
-                  // placeholders keep their numbers.
-                  { type: 'text', text: appt.hospital_name },
-                ]
-              }],
-              reminderText,
-              // Index-aligned with the template's three quick replies. The
-              // labels read like sentences; these are what the engine matches.
-              ['Yes', 'Reschedule', 'Cancel appointment']
-            );
-          } catch (_templateErr) {
-            await sendPatientText(tenant.schema_name, appt.phone, reminderText);
-          }
-          await tenantQuery(tenant.schema_name,
-            `UPDATE appointments SET reminder_2h_sent=true WHERE id=$1`, [appt.id]);
-          logger.info(`2h reminder sent: ${appt.booking_id}`);
-
-          // The same two records the 24h path writes. This message offers
-          // "Yes / Reschedule / Cancel appointment", so it is a clinic-initiated
-          // QUESTION and needs both, or the answer has nowhere to land:
-          //
-          //  - without reminder_confirmations, handleReminderConfirmation finds
-          //    no open row and drops the "yes" even in the right clinic. That
-          //    is not an edge case: a SAME-DAY booking never gets a 24h
-          //    reminder (its query is gated on appointment_date > today), so
-          //    for those patients this is the only message they receive;
-          //  - without recordPendingReply, a patient who has since searched for
-          //    another clinic on the shared number has their reply resolved
-          //    against that clinic's schema and silently lost.
-          //
-          // ON CONFLICT DO NOTHING: when a 24h reminder did go out, its row is
-          // already here and still open.
-          await tenantQuery(tenant.schema_name, `
-            INSERT INTO reminder_confirmations (appointment_id, phone)
-            VALUES ($1, $2)
-            ON CONFLICT (appointment_id) DO NOTHING
-          `, [appt.id, appt.phone]).catch(e => logger.warn('Failed to insert reminder confirmation record', { appointment_id: appt.id, error: e.message }));
-
-          // Shorter than the 24h path's 48h: this fires ~2h out, so anything
-          // still unanswered a day later is not an answer to this question.
-          await recordPendingReply(appt.phone, tenant.id, KINDS.CONFIRMATION, 24);
-        } catch (err) {
-          logger.error(`2h reminder failed for ${appt.booking_id}`, { error: err.message });
-        }
+        // The reply ("yes"/"no") must come back to THIS clinic even if the
+        // patient's shared-number session now points at another one. 48h
+        // covers the appointment itself plus a late answer.
+        await recordPendingReply(appt.phone, tenant.id, KINDS.CONFIRMATION, 48);
+      } catch (err) {
+        logger.error(`24h reminder failed for ${appt.booking_id}`, { error: err.message });
       }
     }
   });
@@ -313,105 +194,17 @@ async function handleReminderConfirmation(schemaName, phone, text) {
   }
 }
 
-// Post-appointment follow-up: send feedback request 1-2 hours after appointment ends
-async function sendPostAppointmentFollowup() {
-  await forEachActiveTenantParallel('sendPostApptFollowup', async (tenant) => {
-    // Check feature flag — default to disabled on error so we don't spam tenants
-    // who haven't opted in
-    try {
-      const { isEnabled } = require('../utils/featureFlags');
-      if (!await isEnabled(tenant.id, 'post_appointment_followup')) return;
-    } catch (flagErr) {
-      logger.warn('Feature flag check failed for post_appointment_followup — skipping tenant', {
-        tenant_id: tenant.id, error: flagErr.message,
-      });
-      return;
-    }
-
-    // Use timezone-aware comparison for the same midnight-crossing reason as the 2h
-    // reminder above: time-only comparison fails when the 1–2 hour window straddles
-    // midnight (e.g. it is 01:30 IST, so 1h-ago = 00:30 and 2h-ago = 23:30).
-    const appts = await tenantQuery(tenant.schema_name, `
-      SELECT a.id, a.booking_id, a.patient_id, p.phone, p.name as patient_name, d.name as doctor_name
-      FROM appointments a
-      JOIN patients p ON p.id = a.patient_id
-      JOIN doctors d ON d.id = a.doctor_id
-      WHERE a.status = 'confirmed'
-        AND timezone($1, (a.appointment_date::text || ' ' || COALESCE(a.appointment_time::text, '00:00:00'))::timestamp)
-            BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'
-        AND a.follow_up_sent IS NOT TRUE
-        AND p.opted_out IS NOT TRUE
-      LIMIT $2
-    `, [TIMEZONE, FEEDBACK_BATCH_LIMIT]);
-
-    for (const appt of appts.rows) {
-      try {
-        const firstName = appt.patient_name ? appt.patient_name.split(' ')[0] : 'there';
-        // Over budget: this patient has already had a week's worth of messages
-        // from this clinic. Skipping leaves feedback_request_sent false, so it
-        // is reconsidered on a later run rather than lost.
-        if (!await canSendDiscretionary(tenant.schema_name, appt.phone, budgetFor(tenant))) continue;
-
-        // Template-first: a feedback request goes out the day AFTER the visit,
-        // by which point the patient is outside Meta's 24-hour window and a
-        // plain text send is rejected. Same reasoning as the reminders above,
-        // which have always done this.
-        await sendPatientMessage(tenant.schema_name, appt.phone, {
-          template: 'appointment_feedback_request',
-          buttonPayloads: ['5', '3', '1'],
-          components: [{
-            type: 'body',
-            parameters: [
-              { type: 'text', text: firstName },
-              { type: 'text', text: appt.doctor_name },
-              { type: 'text', text: tenant.name },
-            ],
-          }],
-          // In step with the `appointment_feedback_request` template. The full
-          // 1–5 legend is dropped: five labelled lines to ask one question is
-          // the definition of a message people scroll past. The scale still
-          // accepts 1–5; it just isn't recited.
-          text:
-            `⭐ *How did we do?*\n\n` +
-            `Hi ${firstName}, we hope Dr. ${appt.doctor_name} at ${tenant.name} took good care of you yesterday.\n\n` +
-            `Reply with a number from *1* (poor) to *5* (excellent). It goes only to the clinic — nothing is published anywhere.`,
-        });
-        // Trigger feedback state in bot session.
-        // Use the appointment's OWN patient_id. This used to re-look-up by phone
-        // (`SELECT id FROM patients WHERE phone=$1`), but patients.phone is
-        // deliberately non-unique for family booking — so a parent booking for a
-        // child filed the feedback against whichever profile Postgres returned
-        // first. sendFeedbackRequests below already carries patient_id correctly.
-        const { triggerFeedback } = require('../services/botEngine');
-        await triggerFeedback(tenant.schema_name, appt.phone, appt.id, appt.patient_id, appt.doctor_name);
-        // The rating flow was armed in THIS tenant's bot session — make sure a
-        // bare "4" finds its way back here (24h; a rating older than that is
-        // not worth hijacking a message for).
-        await recordPendingReply(appt.phone, tenant.id, KINDS.FEEDBACK, 24);
-        // Mark LAST, once the reply is actually routable — same policy as
-        // sendFeedbackRequests below and as reminder_*_sent. recordPendingReply
-        // writes to the PUBLIC schema, a different failure domain from this
-        // tenant-schema flag: setting the flag first meant a throw in there
-        // consumed the appointment with nothing recorded, no retry on the next
-        // run, and the patient's bare "4" landing in whichever clinic their
-        // shared-number session happened to point at.
-        await tenantQuery(tenant.schema_name,
-          `UPDATE appointments SET follow_up_sent=true WHERE id=$1`, [appt.id]);
-        logger.info(`Post-appointment follow-up sent: ${appt.booking_id}`);
-      } catch (err) {
-        logger.error(`Follow-up failed for ${appt.booking_id}`, { error: err.message });
-      }
-    }
-  });
-}
-
 // Trigger feedback collection for appointments completed/no_show yesterday
 async function sendFeedbackRequests() {
   const { triggerFeedback } = require('../services/botEngine');
 
   await forEachActiveTenantParallel('sendFeedbackRequests', async (tenant) => {
-    // Skip appointments that already received the 2-hour post-appointment
-    // follow-up (follow_up_sent) so patients aren't asked for feedback twice.
+    // follow_up_sent is a leftover from the (now removed) post-appointment
+    // follow-up cron, which used to ask for feedback 1-2h after the visit.
+    // Kept here purely so an appointment that already got THAT ask, back when
+    // it existed, is not asked again by this one — nothing sets the flag true
+    // any more, so for every appointment created after its removal this
+    // condition is always satisfied.
     const appts = await tenantQuery(tenant.schema_name, `
       SELECT a.id, a.status, a.appointment_date::text AS appointment_date,
              p.phone, p.id as patient_id, p.name as patient_name, d.name as doctor_name
@@ -438,8 +231,8 @@ async function sendFeedbackRequests() {
         -- Independent sanity bound on the visit itself. Without it, a clinic
         -- finally tidying up months-old records would blast "how was your visit?"
         -- at patients who came in last spring. 30 days is the outer edge of a
-        -- rating a patient can still meaningfully give; the '1 day' end leaves
-        -- same-day visits to the 2-hour follow-up above.
+        -- rating a patient can still meaningfully give; the '1 day' end means a
+        -- visit completed today is asked about starting tomorrow's run, not today's.
         AND a.appointment_date BETWEEN ${IST_TODAY_SQL} - INTERVAL '30 days'
                                    AND ${IST_TODAY_SQL} - INTERVAL '1 day'
         AND a.follow_up_sent IS NOT TRUE
@@ -652,16 +445,6 @@ function startReminderCron() {
     });
   });
 
-  // Post-appointment follow-up: every 30 minutes
-  const followupTask = cron.schedule('*/30 * * * *', async () => {
-    await withCronLock('cron:post_appt_followup', 1740, async () => {
-      try { await sendPostAppointmentFollowup(); } catch (err) {
-        logger.error('Post-appointment follow-up cron error', { error: err.message });
-      }
-    });
-  });
-  logger.info('Post-appointment follow-up cron registered (every 30 minutes)');
-
   // Weekly summary: Mondays 8 AM IST (02:30 UTC)
   const digestTask = cron.schedule('30 2 * * 1', async () => {
     await withCronLock('cron:weekly_digest', 3600, async () => {
@@ -679,14 +462,13 @@ function startReminderCron() {
   logger.info('Reminder cron registered (runs hourly)');
   logger.info('Feedback cron registered (daily at 10 AM IST)');
   logger.info('Weekly summary cron registered (Mondays 8 AM IST)');
-  return [reminderTask, feedbackTask, followupTask, digestTask];
+  return [reminderTask, feedbackTask, digestTask];
 }
 
 module.exports = {
   startReminderCron,
   sendReminders,
   sendFeedbackRequests,
-  sendPostAppointmentFollowup,
   sendWeeklyDigests,
   handleReminderConfirmation,
 };

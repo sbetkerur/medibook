@@ -133,9 +133,7 @@ const schemas = {
       // negotiate. A firm number quoted in WhatsApp and not charged at the desk
       // is an argument the receptionist has to have.
       show_consultation_fee: Joi.boolean(),
-      reminder_2h_enabled: Joi.boolean(),
       reminder_hours_before_24: Joi.number().integer().min(1).max(168),
-      reminder_hours_before_2: Joi.number().integer().min(1).max(24),
     }).optional(),
     notify_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).optional().allow('', null)
       .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +917795676142)' }),
