@@ -94,13 +94,19 @@ export default function DoctorPage() {
 
   async function saveNotes() {
     if (!selectedAppt) return;
+    // Capture the target id/value up front: if the receptionist selects a
+    // different patient while this request is in flight, `selectedAppt` in
+    // the closure below would resolve to whoever is selected when the
+    // response arrives, not who the request was actually for.
+    const apptId = selectedAppt.id;
+    const notesToSave = notes;
     setSaving(true);
     try {
-      await api.patch(`/admin/appointments/${selectedAppt.id}`, { notes });
+      await api.patch(`/admin/appointments/${apptId}`, { notes: notesToSave });
       setAppointments(prev =>
-        prev.map(a => a.id === selectedAppt.id ? { ...a, notes } : a)
+        prev.map(a => a.id === apptId ? { ...a, notes: notesToSave } : a)
       );
-      setSelectedAppt(prev => ({ ...prev, notes }));
+      setSelectedAppt(prev => (prev?.id === apptId ? { ...prev, notes: notesToSave } : prev));
       toast.success('Notes saved');
     } catch {
       toast.error('Failed to save notes');
@@ -111,13 +117,14 @@ export default function DoctorPage() {
 
   async function markComplete() {
     if (!selectedAppt) return;
+    const apptId = selectedAppt.id;
     setCompleting(true);
     try {
-      await api.patch(`/admin/appointments/${selectedAppt.id}`, { status: 'completed' });
+      await api.patch(`/admin/appointments/${apptId}`, { status: 'completed' });
       setAppointments(prev =>
-        prev.map(a => a.id === selectedAppt.id ? { ...a, status: 'completed' } : a)
+        prev.map(a => a.id === apptId ? { ...a, status: 'completed' } : a)
       );
-      setSelectedAppt(prev => ({ ...prev, status: 'completed' }));
+      setSelectedAppt(prev => (prev?.id === apptId ? { ...prev, status: 'completed' } : prev));
       toast.success('Appointment marked as completed');
     } catch {
       toast.error('Failed to update status');

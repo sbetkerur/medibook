@@ -9,6 +9,7 @@ const IST = 'Asia/Kolkata';
 const wa = require('../whatsapp');
 const { SLOT_LOOKAHEAD_DAYS, CRON_LOOKAHEAD_DAYS } = require('../../utils/errors');
 const { offerRequest } = require('./requestFlow');
+const { nextFreeVisitNumber } = require('../../utils/treatmentPlan');
 const {
   STATES,
   fuzzyFind,
@@ -669,7 +670,6 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       await updateSession(schema, phone, STATES.IDLE, ctx);
       await offerRequest(send, 'That is a long wait.');
       return;
-      await updateSession(schema, phone, STATES.IDLE, {});
     }
     return;
   }
@@ -1142,17 +1142,22 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
         `SELECT id, status, total_visits FROM treatment_plans WHERE id=$1 FOR UPDATE`,
         [ctx.treatment_plan_id]);
       const counts = await client.query(`
-        SELECT COUNT(*) FILTER (WHERE status <> 'cancelled')::int AS booked_visits
-        FROM appointments WHERE treatment_plan_id = $1
+        SELECT visit_number FROM appointments
+        WHERE treatment_plan_id = $1 AND status <> 'cancelled'
       `, [ctx.treatment_plan_id]);
       const live = lockedPlan.rows[0];
-      const booked = counts.rows[0].booked_visits;
+      const usedVisitNumbers = counts.rows.map(r => r.visit_number);
+      const booked = usedVisitNumbers.length;
       if (!live || !['proposed', 'in_progress'].includes(live.status) || booked >= live.total_visits) {
         const err = new Error('PLAN_NOT_BOOKABLE');
         err.code = 'PLAN_NOT_BOOKABLE';
         throw err;
       }
-      planVisitNumber = booked + 1;
+      // Fill the gap left by a cancelled sitting rather than booked+1, or a
+      // rebooking after a mid-course cancellation collides with the visit
+      // number a later sitting already holds (idx_appt_plan_visit_no) and the
+      // patient can never get past this screen. Mirrors routes/treatmentPlans.js.
+      planVisitNumber = nextFreeVisitNumber(usedVisitNumbers, booked);
     }
 
     // Atomic slot lock. The time predicate re-checks that the slot hasn't

@@ -209,6 +209,14 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
     const oldR = await tenantQuery(s, `SELECT name, is_active, hospital_id, department_id FROM doctors WHERE id=$1`, [req.params.id]);
     if (!oldR.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
 
+    // Same check POST /doctors does — without it a bogus/deactivated hospital_id
+    // silently orphans the doctor from every hospital join and derails
+    // effectiveHospitalId below (used for the department-membership check).
+    if (hospital_id) {
+      const hospCheck = await tenantQuery(s, `SELECT id FROM hospitals WHERE id=$1 AND is_active=true AND deleted_at IS NULL`, [hospital_id]);
+      if (!hospCheck.rows[0]) return res.status(400).json({ error: 'Hospital not found' });
+    }
+
     // Deactivating through this route must clear the same bar DELETE /doctors/:id
     // does. It didn't: is_active went straight through COALESCE below, so an
     // admin who flipped the toggle on the edit form instead of using Deactivate

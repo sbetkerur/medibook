@@ -411,7 +411,7 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
   // word "reschedule" and would otherwise match the positive pattern below.
   // btn_1/btn_0 are matched by index now, not as substrings of the raw id.
   const isNegative = btnIdx === 1 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^2$/i.test(choice);
-  if (!isNegative && (btnIdx === 0 || /yes|reschedule|confirm|^1$/.test(choice))) {
+  if (!isNegative && (btnIdx === 0 || /^(yes|reschedule|confirm)$|^1$/.test(choice))) {
     // Atomic: lock appointment row + lock new slot + release old slot + update appointment
     const rescheduled = await tenantTransaction(schema, async (client) => {
       // Lock the appointment and re-check it is still confirmed — an admin may have
@@ -611,13 +611,13 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
   // 2. Yes, cancel it / 3. No, keep it", and without this a patient replying
   // "1" fell through to "Still on — nothing has changed", the opposite of what
   // they picked, with nothing to tell them so.
-  const wantsMove = !isNegative && (btnIdx === 0 || /\bmove\b|\breschedul|^1$/i.test(choice));
+  const wantsMove = !isNegative && (btnIdx === 0 || /^(move|reschedule)$|^1$/i.test(choice));
   if (wantsMove) {
     await updateSession(schema, phone, STATES.IDLE, {});
     return handleRescheduleSelect(phone, schema, tenant, send, {}, null, ctx.cancel_booking_id);
   }
 
-  if (!isNegative && (btnIdx === 1 || /yes|cancel|^2$/.test(choice))) {
+  if (!isNegative && (btnIdx === 1 || /^(yes|cancel)$|^2$/.test(choice))) {
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(
         `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,

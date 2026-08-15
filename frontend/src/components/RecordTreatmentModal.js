@@ -137,7 +137,7 @@ export default function RecordTreatmentModal({ appointment, onClose, onSaved }) 
                 {label}
               </button>
             ))}
-            <input type="number" min="1" max="30" value={form.total_visits}
+            <input type="number" min="1" max="60" value={form.total_visits}
               onChange={e => setForm(f => ({ ...f, total_visits: e.target.value }))}
               aria-label="Number of sittings"
               className="w-16 h-10 border border-gray-300 rounded-lg px-2 text-sm" />

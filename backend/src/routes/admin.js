@@ -495,7 +495,11 @@ const PLATFORM_ONLY_SETTINGS_KEYS = ['rate_limits', 'alert_webhook_url'];
 // Non-admins get only what the dashboard actually consumes:
 // frontend/src/components/tabs/SettingsTab.js reads exactly this from
 // `settings.settings` and nothing else (the toggle is admin-write anyway).
-const NON_ADMIN_SETTINGS_KEYS = ['reminder_24h_enabled'];
+// show_consultation_fee also has to reach non-admin logins: the dentist
+// picker and confirmation screen must not disagree with what the Settings
+// tab displays to a staff/dentist login, or a staff member sees the toggle
+// as permanently "on" regardless of what an admin actually set.
+const NON_ADMIN_SETTINGS_KEYS = ['reminder_24h_enabled', 'show_consultation_fee'];
 
 function visibleSettings(rawSettings, role) {
   const src = rawSettings || {};
@@ -539,6 +543,8 @@ router.get('/settings', async (req, res) => {
     const notifyPhone = userR.status === 'fulfilled' ? (userR.value.rows[0]?.notify_phone || '') : '';
     res.json({
       clinic_name: t.name,
+      slug: t.slug,
+      status: t.status,
       owner_email: t.owner_email,
       plan: t.plan,
       wa_configured: !!(process.env.META_PHONE_NUMBER_ID && process.env.META_ACCESS_TOKEN),
@@ -788,7 +794,7 @@ const botTestLimiter = require('express-rate-limit')({
   standardHeaders: true,
   legacyHeaders: false,
 });
-router.post('/bot-test', botTestLimiter, async (req, res) => {
+router.post('/bot-test', adminOnly, botTestLimiter, async (req, res) => {
   try {
     const { phone, message, button_id } = req.body;
     if (!phone || !/^[0-9]{7,20}$/.test(String(phone).replace(/[+\s]/g, ''))) {

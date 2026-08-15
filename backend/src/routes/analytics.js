@@ -159,8 +159,8 @@ router.get('/analytics/revenue', makeAnalyticsLimiter(), async (req, res) => {
         GROUP BY COALESCE(dep.name, 'General') ORDER BY revenue DESC
       `, [months]),
       tenantQuery(s, `
-        SELECT d.name AS doctor_name,
-               COALESCE(dep.name, d.specialization, 'General') AS specialization,
+        SELECT d.id AS doctor_id, d.name AS doctor_name,
+               COALESCE(MAX(dep.name), d.specialization, 'General') AS specialization,
                COUNT(*)::int AS appointments,
                COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)), 0)::int AS revenue
         FROM appointments a
@@ -169,7 +169,11 @@ router.get('/analytics/revenue', makeAnalyticsLimiter(), async (req, res) => {
         WHERE a.status IN ('confirmed','completed')
           AND a.appointment_date >= ${IST_TODAY_SQL} - ($1 * INTERVAL '1 month')
           AND a.appointment_date <= ${IST_TODAY_SQL}
-        GROUP BY d.name, dep.name, d.specialization
+        -- Grouped by doctor ONLY (not department): a doctor spanning several
+        -- departments (CLAUDE.md's multi-department dentists) previously split
+        -- into one row per department here, understating their true revenue
+        -- and duplicating them in the ranking / React key.
+        GROUP BY d.id, d.name, d.specialization
         ORDER BY revenue DESC LIMIT 10
       `, [months]),
     ]);

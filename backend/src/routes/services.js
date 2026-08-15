@@ -28,11 +28,13 @@ router.get('/services', async (req, res) => {
     }
     const where = ['1=1'];
     const params = [];
-    if (hospital_id) { params.push(hospital_id); where.push(`hospital_id=$${params.length}`); }
-    if (!include_inactive) where.push('is_active=true');
-    if (category) { params.push(category); where.push(`category=$${params.length}`); }
+    if (hospital_id) { params.push(hospital_id); where.push(`cs.hospital_id=$${params.length}`); }
+    if (!include_inactive) where.push('cs.is_active=true');
+    if (category) { params.push(category); where.push(`cs.category=$${params.length}`); }
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT * FROM clinic_services WHERE ${where.join(' AND ')} ORDER BY category NULLS LAST, name`,
+      `SELECT cs.*, h.name AS hospital_name FROM clinic_services cs
+       LEFT JOIN hospitals h ON h.id = cs.hospital_id
+       WHERE ${where.join(' AND ')} ORDER BY cs.category NULLS LAST, cs.name`,
       params);
     res.json({ services: r.rows });
   } catch (err) { handleError(res, err); }
@@ -58,9 +60,12 @@ router.post('/services', adminOnly, async (req, res) => {
 
 router.patch('/services/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
-    const { name, description, category, duration_minutes, price, is_active } = req.body;
+    const { name, description, category, duration_minutes, price, is_active, hospital_id } = req.body;
     if (name !== undefined && typeof name !== 'string') {
       return res.status(400).json({ error: 'name must be a string' });
+    }
+    if (hospital_id !== undefined && hospital_id !== null && !UUID_RE.test(hospital_id)) {
+      return res.status(400).json({ error: 'Invalid hospital_id format' });
     }
     const sets = [], params = [];
     if (name !== undefined)             { params.push(name.trim());             sets.push(`name=$${params.length}`); }
@@ -69,6 +74,7 @@ router.patch('/services/:id', adminOnly, validateUUID(), async (req, res) => {
     if (duration_minutes !== undefined) { params.push(parseInt(duration_minutes) || 30); sets.push(`duration_minutes=$${params.length}`); }
     if (price !== undefined)            { params.push(parseInt(price) || 0);    sets.push(`price=$${params.length}`); }
     if (is_active !== undefined)        { params.push(Boolean(is_active));      sets.push(`is_active=$${params.length}`); }
+    if (hospital_id !== undefined)      { params.push(hospital_id || null);     sets.push(`hospital_id=$${params.length}`); }
     if (!sets.length) return res.json({ message: 'nothing to update' });
     params.push(req.params.id);
     const r = await tenantQuery(req.tenant.schema_name,
@@ -110,11 +116,15 @@ router.get('/holidays', async (req, res) => {
     }
     const where = ['1=1'];
     const params = [];
-    if (hospital_id) { params.push(hospital_id); where.push(`hospital_id=$${params.length}`); }
+    if (hospital_id) { params.push(hospital_id); where.push(`ch.hospital_id=$${params.length}`); }
     if (from) { params.push(from); where.push(`holiday_date >= $${params.length}`); }
     if (to)   { params.push(to);   where.push(`holiday_date <= $${params.length}`); }
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT * FROM clinic_holidays WHERE ${where.join(' AND ')} ORDER BY holiday_date`, params);
+      // hospital_name so a branch-specific holiday doesn't read as clinic-wide
+      // in the dashboard — a NULL hospital_id genuinely IS every branch.
+      `SELECT ch.*, h.name AS hospital_name FROM clinic_holidays ch
+       LEFT JOIN hospitals h ON h.id = ch.hospital_id
+       WHERE ${where.join(' AND ')} ORDER BY holiday_date`, params);
     res.json({ holidays: r.rows });
   } catch (err) { handleError(res, err); }
 });

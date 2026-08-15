@@ -15,6 +15,7 @@
  */
 const { tenantQuery } = require('../../db');
 const { STATES, parseChoiceNumber, updateSession, clinicPhoneLine } = require('./utils');
+const { nextFreeVisitNumber } = require('../../utils/treatmentPlan');
 
 /** Plans the patient can still book a sitting on, newest first. */
 async function getOpenPlans(schema, phone) {
@@ -25,7 +26,8 @@ async function getOpenPlans(schema, phone) {
            h.name AS hospital_name,
            d.name AS doctor_name, d.qualification, d.consultation_fee, d.specialization,
            COUNT(a.id) FILTER (WHERE a.status = 'completed')::int AS completed_visits,
-           COUNT(a.id) FILTER (WHERE a.status <> 'cancelled')::int AS booked_visits
+           COUNT(a.id) FILTER (WHERE a.status <> 'cancelled')::int AS booked_visits,
+           array_remove(array_agg(a.visit_number) FILTER (WHERE a.status <> 'cancelled'), NULL) AS used_visit_numbers
     FROM treatment_plans tp
     JOIN patients p ON p.id = tp.patient_id
     LEFT JOIN departments dep ON dep.id = tp.department_id
@@ -51,7 +53,7 @@ async function getOpenPlans(schema, phone) {
 
 /** "visit 2 of 3" — the only thing the patient actually needs to recognise. */
 function planLabel(plan) {
-  return `${plan.title} — visit ${plan.booked_visits + 1} of ${plan.total_visits}`;
+  return `${plan.title} — visit ${nextFreeVisitNumber(plan.used_visit_numbers, plan.booked_visits)} of ${plan.total_visits}`;
 }
 
 /**
@@ -87,7 +89,7 @@ async function showTreatmentPlans(phone, schema, tenant, send, ctx = {}) {
   const rows = plans.map(p => ({
     id: `plan:${p.id}`,
     title: p.title.slice(0, 24),
-    description: `Visit ${p.booked_visits + 1} of ${p.total_visits}`
+    description: `Visit ${nextFreeVisitNumber(p.used_visit_numbers, p.booked_visits)} of ${p.total_visits}`
       + (p.doctor_name ? ` · Dr. ${p.doctor_name}` : ''),
   }));
   await send.list(
@@ -120,7 +122,7 @@ async function handleSelectTreatmentPlan(phone, schema, tenant, send, ctx, choic
           rows: plans.map(p => ({
             id: `plan:${p.id}`,
             title: p.title.slice(0, 24),
-            description: `Visit ${p.booked_visits + 1} of ${p.total_visits}`,
+            description: `Visit ${nextFreeVisitNumber(p.used_visit_numbers, p.booked_visits)} of ${p.total_visits}`,
           })),
         }]
       );
@@ -155,7 +157,7 @@ async function startPlanBooking(phone, schema, tenant, send, ctx, plan) {
     return true;
   }
 
-  const nextVisit = plan.booked_visits + 1;
+  const nextVisit = nextFreeVisitNumber(plan.used_visit_numbers, plan.booked_visits);
   await send.text(
     `*${planLabel(plan)}*\n\n` +
     `with Dr. ${plan.doctor_name}${plan.specialization ? ` · ${plan.specialization}` : ''}\n` +

@@ -133,7 +133,7 @@ export default function OverviewTab({
           />
           <StatCard
             label="Revenue (30d)"
-            value={analyticsSummary ? `₹${Number(analyticsSummary.revenue_30d || 0).toLocaleString('en-IN')}` : '—'}
+            value={analyticsSummary ? `₹${Number(analyticsSummary.revenue || 0).toLocaleString('en-IN')}` : '—'}
             icon="💰"
             color="border-yellow-500"
             sub={analyticsSummary ? `${analyticsSummary.no_show_rate || 0}% no-show` : undefined}

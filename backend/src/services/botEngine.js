@@ -380,6 +380,9 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     if (elapsed > SESSION_EXPIRY_MS) {
       await updateSession(schema, phone, STATES.IDLE, {});
       session.state = STATES.IDLE;
+      ctx = {}; // clear the in-process copy too, or a stale hospital/doctor
+      // from the abandoned flow leaks into whatever this "fresh" message does
+      // next (e.g. a callback request wrongly attributed to an old branch).
       // Fall through — treat this message as a fresh start
     }
   }
@@ -570,7 +573,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     STATES.SELECT_DATE, STATES.SELECT_SLOT, STATES.SELECT_PATIENT,
     STATES.COLLECT_NAME, STATES.COLLECT_DOB,
     STATES.COLLECT_GENDER, STATES.COLLECT_EMAIL, STATES.COLLECT_CHIEF_COMPLAINT,
-    STATES.CONFIRM_BOOKING,
+    STATES.CONFIRM_BOOKING, STATES.SELECT_TREATMENT_PLAN,
   ];
   if (BOOKING_STATES.includes(session.state)) {
     // Explicit typed escape keywords

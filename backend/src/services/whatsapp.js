@@ -56,11 +56,13 @@ function recordSuccess(phoneId) {
   const cb = getCircuit(phoneId);
   cb.failures = 0;
   cb.state = 'CLOSED';
+  cb.probing = false;
 }
 
 function recordFailure(phoneId) {
   const cb = getCircuit(phoneId);
   cb.failures++;
+  cb.probing = false;
   // Re-open from HALF_OPEN (test call failed) as well as from CLOSED (threshold hit)
   if (cb.failures >= CB_FAILURE_THRESHOLD && (cb.state === 'CLOSED' || cb.state === 'HALF_OPEN')) {
     cb.state = 'OPEN';
@@ -73,9 +75,20 @@ function isCircuitOpen(phoneId) {
   const cb = getCircuit(phoneId);
   if (cb.state === 'OPEN') {
     if (Date.now() - cb.openedAt > CB_RESET_MS) {
-      cb.state = 'HALF_OPEN';
-      logger.info(`Circuit breaker HALF_OPEN for phoneId ${phoneId} — testing`);
-      return false; // allow one test call
+      // Only the caller that flips state to HALF_OPEN gets to make the probe
+      // call — every other caller in the same tick would otherwise also see
+      // state !== 'OPEN' and fall through, turning "test one call" into a
+      // thundering herd right as the breaker reopens. `probing` gates that:
+      // it's cleared again in recordSuccess/recordFailure once the probe
+      // resolves, so a stuck probe (network hang) still eventually times out
+      // via the caller's own request timeout and unblocks via recordFailure.
+      if (cb.state !== 'HALF_OPEN') {
+        cb.state = 'HALF_OPEN';
+        cb.probing = true;
+        logger.info(`Circuit breaker HALF_OPEN for phoneId ${phoneId} — testing`);
+        return false; // allow this one test call
+      }
+      return cb.probing; // a probe is already in flight — block the rest
     }
     return true; // still open
   }

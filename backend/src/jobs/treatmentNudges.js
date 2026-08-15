@@ -30,6 +30,7 @@ const { canSendDiscretionary, budgetFor } = require('../services/messageBudget')
 // is looked up in whichever clinic the patient last searched for.
 const { KINDS, recordPendingReply } = require('../services/pendingReply');
 const { maskPhone } = require('../services/bot/utils');
+const { nextFreeVisitNumber } = require('../utils/treatmentPlan');
 const logger = require('../utils/logger');
 
 // Wait this long after the last sitting before asking. Nudging the morning
@@ -76,7 +77,8 @@ async function findPlansNeedingNudge(schema, { orthoOnly, maxNudges, minDaysBetw
            p.phone, p.name AS patient_name,
            d.name AS doctor_name,
            h.name AS hospital_name,
-           COUNT(a.id) FILTER (WHERE a.status <> 'cancelled')::int AS booked_visits
+           COUNT(a.id) FILTER (WHERE a.status <> 'cancelled')::int AS booked_visits,
+           array_remove(array_agg(a.visit_number) FILTER (WHERE a.status <> 'cancelled'), NULL) AS used_visit_numbers
     FROM treatment_plans tp
     JOIN patients p ON p.id = tp.patient_id
     LEFT JOIN departments dep ON dep.id = tp.department_id
@@ -146,7 +148,7 @@ async function sendTreatmentNudges() {
       if (!await canSendDiscretionary(tenant.schema_name, plan.phone, budgetFor(tenant))) continue;
 
       try {
-        const nextVisit = plan.booked_visits + 1;
+        const nextVisit = nextFreeVisitNumber(plan.used_visit_numbers, plan.booked_visits);
         const isFirst = plan.booked_visits === 0;
 
         // In step with the `treatment_sitting_reminder` template.

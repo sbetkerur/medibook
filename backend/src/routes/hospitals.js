@@ -137,6 +137,8 @@ router.post('/departments', adminOnly, validate(schemas.createDepartment), async
   try {
     const { name, hospital_id, description } = req.body;
     const s = req.tenant.schema_name;
+    const hospCheck = await tenantQuery(s, `SELECT id FROM hospitals WHERE id=$1 AND is_active=true AND deleted_at IS NULL`, [hospital_id]);
+    if (!hospCheck.rows[0]) return res.status(400).json({ error: 'Hospital not found' });
     const r = await tenantQuery(s,
       `INSERT INTO departments (hospital_id, name, description) VALUES ($1,$2,$3) RETURNING *`,
       [hospital_id, name, description]);

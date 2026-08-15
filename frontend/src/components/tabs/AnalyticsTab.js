@@ -167,7 +167,7 @@ export default function AnalyticsTab() {
               <div>
                 <h4 className="text-sm font-semibold text-gray-700 mb-3">Monthly Revenue (₹)</h4>
                 <ResponsiveContainer width="100%" height={180}>
-                  <BarChart data={revenueData.monthly.map(m => ({ month: m.month?.slice(0, 7), revenue: parseInt(m.revenue) || 0 }))}>
+                  <BarChart data={revenueData.monthly.map(m => ({ month: m.month, revenue: parseInt(m.revenue) || 0 }))}>
                     <XAxis dataKey="month" tick={{ fontSize: 10 }} />
                     <YAxis tick={{ fontSize: 10 }} tickFormatter={v => `₹${(v/1000).toFixed(0)}k`} width={50} />
                     <Tooltip formatter={(v) => [`₹${v.toLocaleString('en-IN')}`, 'Revenue']} />
@@ -189,7 +189,7 @@ export default function AnalyticsTab() {
                       // 320px card is wide, leaving the bar negative space, so
                       // both narrow on phones. The amount stays nowrap because
                       // ₹1,50,000 has no break opportunity.
-                      <div key={d.doctor_name} className="flex items-center gap-2 sm:gap-3">
+                      <div key={d.doctor_id || d.doctor_name} className="flex items-center gap-2 sm:gap-3">
                         <span className="text-xs font-bold text-gray-400 w-4">#{i + 1}</span>
                         <span className="text-sm text-gray-700 w-20 sm:w-28 truncate">Dr. {d.doctor_name}</span>
                         <div className="flex-1 min-w-0 h-2 bg-gray-100 rounded-full overflow-hidden">

@@ -76,6 +76,9 @@ if (!process.env.FRONTEND_URL) {
     logger.warn('FRONTEND_URL not set — using default http://localhost:3000 for CORS and email links');
   }
 }
+if (!process.env.METRICS_SECRET && process.env.NODE_ENV === 'production') {
+  logger.warn('METRICS_SECRET is not set — /metrics is reachable by anyone with queue depth, tenant count and memory stats. Set METRICS_SECRET to require a bearer token.');
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
