@@ -16,7 +16,7 @@ const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 const { KINDS, findPendingReplyTenant, clearPendingReply } = require('../services/pendingReply');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { sendPatientText } = require('../services/outbound');
-const { extractEntryCode } = require('../utils/entryCode');
+const { extractEntryCode, normalizeEntryCode } = require('../utils/entryCode');
 const { normalizeTemplateButton } = require('../utils/templateButtons');
 
 const testEndpointLimiter = rateLimit({
@@ -132,6 +132,106 @@ router.get('/webhook/whatsapp', (req, res) => {
   res.sendStatus(403);
 });
 
+// ── DEV/TEST ROUTING BY ENTRY CODE ───────────────────────────
+// One WhatsApp number means Meta delivers EVERY message to one webhook, so the
+// environment cannot be chosen at the transport layer the way a second number
+// would choose it. The split therefore has to happen here, in the production
+// message path, which is the most critical code in the system — so every rule
+// below exists to keep it from ever touching a real patient:
+//
+//   * inert unless BOTH env vars are set. Prod is the only deployment that sets
+//     them; dev leaves TEST_ROUTE_URL unset, which is also what stops a
+//     forwarded message being forwarded again.
+//   * every failure path falls THROUGH to normal production handling. A dev
+//     environment that is down, slow or misconfigured must look exactly like a
+//     dev environment that was never configured.
+//   * routing is decided per MESSAGE, not per POST. Meta batches deliveries,
+//     and a batch can span phones — routing the whole payload on one phone's
+//     state would silently drop a real patient's message into dev.
+//
+// The forwarded payload is re-signed with META_APP_SECRET, which both
+// environments share, so dev receives it through its ordinary webhook and
+// verifies it like any other Meta delivery. That is what keeps this a
+// prod-only change: dev needs no code, no endpoint and no extra secret.
+const TEST_ROUTE_URL = process.env.TEST_ROUTE_URL || '';
+const TEST_ENTRY_CODES = new Set(
+  String(process.env.TEST_ENTRY_CODES || '')
+    .split(',').map(s => normalizeEntryCode(s)).filter(Boolean)
+);
+const TEST_ROUTE_ENABLED = !!(TEST_ROUTE_URL && TEST_ENTRY_CODES.size);
+// Only the FIRST message of a conversation carries a code; "yes" and "Thursday"
+// do not. Affinity is what keeps the rest of the conversation in the same
+// environment. 24h matches the WhatsApp customer-service window, after which a
+// patient has to say something that starts a conversation again anyway.
+const TEST_AFFINITY_TTL_S = 86400;
+
+async function testAffinity(phone, set) {
+  try {
+    const client = require('../utils/redisClient').getClient();
+    if (!client) return false;                       // no Redis → prod, always
+    const key = `testroute:${phone}`;
+    if (set === true)  { await client.set(key, '1', 'EX', TEST_AFFINITY_TTL_S); return true; }
+    if (set === false) { await client.del(key); return false; }
+    return (await client.get(key)) === '1';
+  } catch {
+    return false;                                    // fail open to production
+  }
+}
+
+/** The text a routing decision can be made from. Codes only ever arrive typed. */
+function routingText(msg) {
+  if (msg?.type === 'text') return msg.text?.body || '';
+  return '';
+}
+
+/**
+ * True when this message belongs to the dev/test environment.
+ *
+ * A recognised TEST code claims the phone; any OTHER valid code releases it,
+ * which mirrors the product's own rule that scanning a different clinic's QR
+ * moves you — a patient who scans a real clinic's poster must land in
+ * production even if they were poking at the demo a minute earlier.
+ */
+async function shouldRouteToTest(phone, msg) {
+  const ref = extractEntryCode(routingText(msg));
+  if (ref) {
+    if (TEST_ENTRY_CODES.has(ref.code)) { await testAffinity(phone, true); return true; }
+    await testAffinity(phone, false);
+    return false;
+  }
+  return testAffinity(phone);
+}
+
+/** Re-sign a single message as its own Meta delivery and hand it to dev. */
+async function forwardToTestEnv(entryId, value, msg) {
+  const body = JSON.stringify({
+    object: 'whatsapp_business_account',
+    entry: [{
+      id: entryId,
+      changes: [{
+        field: 'messages',
+        value: {
+          messaging_product: value.messaging_product,
+          metadata: value.metadata,
+          contacts: value.contacts,
+          messages: [msg],
+        },
+      }],
+    }],
+  });
+  const headers = { 'Content-Type': 'application/json', 'x-medibook-forwarded': '1' };
+  const secret = process.env.META_APP_SECRET;
+  if (secret) {
+    headers['x-hub-signature-256'] =
+      'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
+  }
+  const res = await fetch(TEST_ROUTE_URL, {
+    method: 'POST', headers, body,
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error(`test env responded ${res.status}`);
+}
+
 // ── INCOMING MESSAGES (POST) ──────────────────────────────────
 router.post('/webhook/whatsapp', async (req, res) => {
   // Acknowledge immediately — Meta requires response within 3 seconds
@@ -229,6 +329,26 @@ router.post('/webhook/whatsapp', async (req, res) => {
         // A value can carry both statuses and messages — process both.
         for (const msg of value.messages || []) {
           try {
+            // Dev/test split. Guarded so a forwarded message can never bounce
+            // back, and wrapped so that ANY failure — Redis, network, a dev
+            // environment mid-deploy — falls through to production rather than
+            // losing the message. Silence here would be indistinguishable from
+            // a patient who never wrote.
+            if (TEST_ROUTE_ENABLED && !req.headers['x-medibook-forwarded']) {
+              let routed = false;
+              try {
+                if (await shouldRouteToTest((msg.from || '').replace(/^\+/, ''), msg)) {
+                  await forwardToTestEnv(entry?.id, value, msg);
+                  routed = true;
+                  logger.info('Message routed to dev/test environment', { msgId: msg?.id });
+                }
+              } catch (routeErr) {
+                logger.warn('Dev/test routing failed — handling in production instead', {
+                  msgId: msg?.id, error: routeErr.message,
+                });
+              }
+              if (routed) continue;
+            }
             await processIncomingMessageSerialized(msg);
           } catch (msgErr) {
             logger.error('Webhook message processing failed', { msgId: msg?.id, error: msgErr.message });
