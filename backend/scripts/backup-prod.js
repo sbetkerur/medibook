@@ -13,10 +13,11 @@
  * so pg_restore -j can be used) and keeps the most recent KEEP files.
  *
  * WHICH pg_dump: production runs Postgres 18 and a client older than the server
- * refuses to dump at all. A native pg_dump of version 18+ is used when one is on
- * PATH; otherwise the work happens inside postgres:18-alpine, which means Docker
- * Desktop has to be running. Installing the PostgreSQL 18 client tools removes
- * that dependency and makes this work headless.
+ * refuses to dump at all. A native pg_dump 18+ is used when one can be found —
+ * which is the normal path, since the PostgreSQL 18 client tools are installed
+ * on this machine. Docker is only the fallback for a machine without them, and
+ * is never needed for a routine backup. (Restoring still uses a container: see
+ * verify-backup.js, which needs a throwaway server to restore INTO.)
  */
 const { execSync, execFileSync } = require('child_process');
 const fs = require('fs');
@@ -49,13 +50,34 @@ function prodUrl() {
   return line.slice(line.indexOf('=') + 1).trim();
 }
 
-/** A native pg_dump new enough for the server, or null. */
+/**
+ * Locate a native pg_dump new enough for the server: {exe, major} or null.
+ *
+ * Deliberately does NOT rely on PATH alone. The Windows PostgreSQL installer
+ * does not add itself to PATH, and a scheduled task runs with a different
+ * environment from an interactive shell — so "it works in my terminal" is not
+ * evidence the nightly job will find it. Well-known install locations are
+ * probed directly, and PG_DUMP override wins over everything.
+ */
 function nativeDump() {
-  try {
-    const v = execFileSync('pg_dump', ['--version'], { encoding: 'utf8', timeout: 15000 });
-    const major = Number((v.match(/(\d+)/) || [])[1]);
-    return major >= MIN_SERVER_MAJOR ? major : null;
-  } catch { return null; }
+  const candidates = [];
+  if (process.env.PG_DUMP) candidates.push(process.env.PG_DUMP);
+  candidates.push('pg_dump');                       // PATH, if it happens to be there
+  for (const base of ['C:\\Program Files\\PostgreSQL', 'C:\\Program Files (x86)\\PostgreSQL']) {
+    try {
+      for (const ver of fs.readdirSync(base).sort((a, b) => Number(b) - Number(a))) {
+        candidates.push(path.join(base, ver, 'bin', 'pg_dump.exe'));
+      }
+    } catch { /* not installed there */ }
+  }
+  for (const exe of candidates) {
+    try {
+      const v = execFileSync(exe, ['--version'], { encoding: 'utf8', timeout: 15000 });
+      const major = Number((v.match(/(\d+)/) || [])[1]);
+      if (major >= MIN_SERVER_MAJOR) return { exe, major };
+    } catch { /* not there, or too old */ }
+  }
+  return null;
 }
 
 function dockerReady() {
@@ -63,8 +85,8 @@ function dockerReady() {
   catch { return false; }
 }
 
-function dumpNative(url, target) {
-  execFileSync('pg_dump', ['-Fc', '--no-owner', '--no-acl', '-d', url, '-f', target],
+function dumpNative(exe, url, target) {
+  execFileSync(exe, ['-Fc', '--no-owner', '--no-acl', '-d', url, '-f', target],
     { timeout: 900000, stdio: ['ignore', 'ignore', 'pipe'] });
 }
 
@@ -104,10 +126,10 @@ function main() {
       + `${MIN_SERVER_MAJOR}+ is on PATH. Start Docker Desktop, or install the `
       + 'PostgreSQL 18 client tools to make this work without Docker.');
   }
-  log(`starting backup -> ${name}  (via ${native ? `native pg_dump ${native}` : 'docker ' + IMAGE})`);
+  log(`starting backup -> ${name}  (via ${native ? `pg_dump ${native.major}` : 'docker ' + IMAGE})`);
 
   const url = prodUrl();
-  if (native) dumpNative(url, target); else dumpDocker(url, target);
+  if (native) dumpNative(native.exe, url, target); else dumpDocker(url, target);
 
   const size = fs.statSync(target).size;
   // A custom-format dump of an empty-but-migrated database is still tens of KB.
