@@ -95,8 +95,43 @@ function isCircuitOpen(phoneId) {
   return false;
 }
 
+// ── Outbound allowlist (non-production safety) ───────────────────────────────
+// Every environment shares ONE WhatsApp number, so a dev deployment holds the
+// production access token and sends as the clinic-facing number. It also runs
+// the same reminder / nudge / recall / feedback crons on a timer — which message
+// people who never wrote in. A copy of production's data therefore turns a test
+// environment into something that texts real patients from the real number.
+//
+// WHATSAPP_ALLOWED_RECIPIENTS is the seatbelt: set it in dev to a comma-separated
+// list of numbers you own, and nothing else can be reached, whatever the database
+// happens to contain. Unset — which is how production runs — imposes no limit.
+//
+// This is deliberately the LAST gate before the HTTP call rather than a check in
+// the crons: it covers the bot's replies, every cron, every future sender, and
+// anything added by hand. There is exactly one way out to Meta and this is it.
+const ALLOWED_RECIPIENTS = new Set(
+  String(process.env.WHATSAPP_ALLOWED_RECIPIENTS || '')
+    .split(',').map(s => s.replace(/\D/g, '')).filter(Boolean)
+);
+
+function recipientAllowed(to) {
+  if (!ALLOWED_RECIPIENTS.size) return true;          // production: no restriction
+  return ALLOWED_RECIPIENTS.has(String(to || '').replace(/\D/g, ''));
+}
+
 // ── Core send helper ──────────────────────────────────────────────────────────
 async function _send(payload, accessToken, phoneNumberId) {
+  if (!recipientAllowed(payload?.to)) {
+    // Swallowed rather than thrown. A throw here would surface to a patient as
+    // "something went wrong at our end" and would mark cron rows as failed,
+    // which is misleading — nothing went wrong, the send was deliberately
+    // withheld. Callers get a null message id, exactly as they would from a
+    // send that Meta accepted but never delivered.
+    logger.warn('Outbound suppressed — recipient not in WHATSAPP_ALLOWED_RECIPIENTS', {
+      to: String(payload?.to || '').slice(0, 4) + '…',
+    });
+    return { data: { messages: [] } };
+  }
   const { instance, phoneId } = getAxiosInstance(accessToken, phoneNumberId);
 
   if (isCircuitOpen(phoneId)) {

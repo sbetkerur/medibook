@@ -415,14 +415,33 @@ const server = app.listen(PORT, () => {
     // Only ONE backup cron is registered (backupManager's spawn()-based daily
     // job) — slotGenerator.js's exec()-based weekly startBackupReminderCron was
     // removed as a duplicate, drifting implementation of the same job.
+    // Crons that message patients who did NOT write in — reminders, feedback
+    // requests, treatment nudges, recalls. Every environment shares ONE WhatsApp
+    // number, so a non-production deployment holding a copy of real data would
+    // text real people from the clinic-facing number on a timer, and they would
+    // have no way to tell it came from a test system.
+    //
+    // Replying to somebody who messaged first is always safe — they chose to
+    // start the conversation, and that is what keeps the demo clinic working in
+    // dev. It is the UNSOLICITED sends that need switching off, which is why
+    // this gate sits here and not on the send path. (For a genuinely isolated
+    // environment, WHATSAPP_ALLOWED_RECIPIENTS in services/whatsapp.js is the
+    // stronger control — it also covers replies.)
+    const patientCrons = process.env.DISABLE_PATIENT_CRONS === 'true' ? [] : [
+      ...startReminderCron(),
+      startTreatmentNudgeCron(),
+      startRecallCron(),
+    ];
+    if (process.env.DISABLE_PATIENT_CRONS === 'true') {
+      logger.warn('Patient-facing crons disabled (DISABLE_PATIENT_CRONS=true) — '
+        + 'reminders, treatment nudges and recalls will not be sent from this deployment.');
+    }
     cronTasks = [
       ...startSlotGeneratorCron(),
-      ...startReminderCron(),
       startWebhookRetryCron(),
       startBackupCron(),
       startSessionCleanerCron(),
-      startTreatmentNudgeCron(),
-      startRecallCron(),
+      ...patientCrons,
     ];
     startBotWorker();
   }
