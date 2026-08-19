@@ -17,8 +17,14 @@
  * Run: node tests/templateContract.unit.test.js   (no DB, no network)
  */
 const fs = require('fs');
+// Resolved from this file, not from an absolute path. The paths below used to be
+// hardcoded to one developer's C:\ drive, so the suite passed locally and could
+// only ever fail anywhere else — which is exactly what it did on the first CI run.
+const path = require('path');
+const BACKEND = path.resolve(__dirname, '..');
+const REPO = path.resolve(BACKEND, '..');
 // Normalised: the doc is CRLF and every anchor below matches on a bare \n.
-const DOC = fs.readFileSync('C:/claude_projects/medibook/docs/whatsapp-templates.md', 'utf8')
+const DOC = fs.readFileSync(path.join(REPO, 'docs', 'whatsapp-templates.md'), 'utf8')
   .split('\r\n').join('\n');
 
 // name -> how many parameters the sender pushes, read off the source.
@@ -61,7 +67,7 @@ function docSamples(name) {
 
 console.log('\nDoc vs. code — template parameter counts\n');
 for (const [name, [file]] of Object.entries(SRC)) {
-  const src = fs.readFileSync('C:/claude_projects/medibook/backend/' + file, 'utf8');
+  const src = fs.readFileSync(path.join(BACKEND, file), 'utf8');
   // A template name appears more than once per file — in the doc-reference
   // comment above the call as well as in the call itself — so every occurrence
   // is tried and the first that yields a parameter block wins. Anchoring on
@@ -140,7 +146,7 @@ for (const [name, [file]] of Object.entries(SRC)) {
     .map(cells => ({ label: cells[0].replace(/`/g, ''), payload: cells[1].replace(/`/g, '') }));
   if (!rows.length) continue;
 
-  const src = fs.readFileSync('C:/claude_projects/medibook/backend/' + file, 'utf8');
+  const src = fs.readFileSync(path.join(BACKEND, file), 'utf8');
   for (const { label, payload } of rows) {
     check(`${name}: label "${label}" → "${payload}"`,
       normalizeTemplateButton(label) === payload,
