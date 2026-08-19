@@ -1,0 +1,68 @@
+# Runs the unit suites on every push and PR.
+#
+# These are the suites that need no database: each one pins an invariant that
+# would otherwise reach a clinic — entry-code routing, the bot's copy contract,
+# WhatsApp template parameters, slot planning, the doctor/department join, and
+# the stale-confirmation button indices. Until now nothing ran them but a human
+# remembering to, and `npm test` covers only bot.test.js (which needs Postgres).
+#
+# Deliberately NOT included: bot.test.js, entryFlow.test.js and the other
+# DB-backed suites. They need Postgres, Redis, a migrated schema and a seeded
+# tenant, and a flaky integration job that everyone learns to ignore is worse
+# than no job at all. Add them once there is a stable fixture to point at.
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches backend/Dockerfile (node:20-alpine) — a suite that passes
+          # here must be passing on the runtime that actually ships.
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install
+        working-directory: backend
+        run: npm ci
+
+      - name: Syntax check every source file
+        working-directory: backend
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            node --check "$f" || { echo "::error file=$f::syntax error"; fail=1; }
+          done < <(find src -name '*.js')
+          exit $fail
+
+      - name: Unit suites
+        working-directory: backend
+        run: |
+          fail=0
+          shopt -s nullglob
+          for f in tests/*.unit.test.js; do
+            echo "── $f"
+            if node "$f"; then
+              echo "   PASS"
+            else
+              echo "::error file=backend/$f::suite failed"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::one or more unit suites failed"
+            exit 1
+          fi
