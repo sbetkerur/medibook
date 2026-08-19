@@ -331,7 +331,30 @@
       "PowerShell(Test-NetConnection *)",
       "Bash(powershell -NoProfile -Command \"Get-Process node -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime, Path\")",
       "Bash(mkdir -p \"/c/Users/sande/AppData/Local/Temp/claude/C--claude-projects-medibook/abc71730-be65-4977-823e-5eab6f46f162/scratchpad\")",
-      "Bash(git show *)"
+      "Bash(git show *)",
+      "WebFetch(domain:app.pragatisolutions.com)",
+      "WebFetch(domain:api.pragatisolutions.com)",
+      "WebFetch(domain:pragatisolutions.com)",
+      "Bash(where pandoc *)",
+      "Bash(where wkhtmltopdf *)",
+      "Bash(python --version)",
+      "Bash(pip show *)",
+      "Read(//tmp/**)",
+      "Bash(cd C:\\\\Users\\\\sande\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--claude-projects-medibook\\\\77e85022-fb9e-4539-9fec-b38fecf9a154\\\\scratchpad *)",
+      "PowerShell($p = Get-Process chrome -ErrorAction SilentlyContinue; if \\($p\\) { \"chrome.exe running: $\\($p.Count\\) processes\"; \"Oldest start: $\\(\\($p | Sort-Object StartTime | Select-Object -First 1\\).StartTime\\)\" } else { \"chrome.exe NOT running\" })",
+      "PowerShell($id='fcoeoabgfenejglbffodgkkbkcdhcgfn'; $sp=\"$env:LOCALAPPDATA\\\\Google\\\\Chrome\\\\User Data\\\\Default\\\\Secure Preferences\"; if\\(Test-Path $sp\\){ $j=Get-Content $sp -Raw | ConvertFrom-Json; $e=$j.extensions.settings.$id; if\\($e\\){ \"state=$\\($e.state\\)  \\(1=enabled, 0=disabled\\)\"; \"disable_reasons=$\\($e.disable_reasons\\)\"; \"install_time=$\\($e.install_time\\)\" } else { \"extension id not found in Secure Preferences\" } } else { \"Secure Preferences not found\" })",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(awk '{print $5\" bytes\"}')",
+      "Bash(PYTHONIOENCODING=utf-8 python lay.py about)",
+      "Bash(PYTHONIOENCODING=utf-8 python lay.py contact)",
+      "Bash(grep -o -E '\\\\.animation[^{]{0,60}\\\\{[^}]{0,200}' home.html)",
+      "Bash(grep -o -E 'opacity:\\\\s*0[^.;]{0,3}[;}]' home.html)",
+      "Artifact",
+      "Bash(export PYTHONIOENCODING=utf-8)",
+      "Bash(python3 dump2.py home.json home)",
+      "Bash(python3 dump2.py medibook.json medibook)",
+      "Bash(python3 dump2.py about.json about)",
+      "Bash(python3 dump2.py contact.json contact)"
     ]
   }
 }
