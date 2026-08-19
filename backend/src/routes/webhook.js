@@ -139,9 +139,12 @@ router.get('/webhook/whatsapp', (req, res) => {
 // message path, which is the most critical code in the system — so every rule
 // below exists to keep it from ever touching a real patient:
 //
-//   * inert unless BOTH env vars are set. Prod is the only deployment that sets
-//     them; dev leaves TEST_ROUTE_URL unset, which is also what stops a
-//     forwarded message being forwarded again.
+//   * inert unless TEST_ROUTE_URL is set. Prod is the only deployment that sets
+//     it; dev leaves it unset, which is also what stops a forwarded message
+//     being forwarded again.
+//   * production is asked FIRST and dev is only the fallback, so onboarding a
+//     real clinic needs no routing change — the moment its code exists in
+//     prod's `tenants`, that code stops being forwarded.
 //   * every failure path falls THROUGH to normal production handling. A dev
 //     environment that is down, slow or misconfigured must look exactly like a
 //     dev environment that was never configured.
@@ -158,7 +161,10 @@ const TEST_ENTRY_CODES = new Set(
   String(process.env.TEST_ENTRY_CODES || '')
     .split(',').map(s => normalizeEntryCode(s)).filter(Boolean)
 );
-const TEST_ROUTE_ENABLED = !!(TEST_ROUTE_URL && TEST_ENTRY_CODES.size);
+// Enabled by the forward URL alone. TEST_ENTRY_CODES is optional now that an
+// unrecognised code falls through to dev on its own — the list only exists for
+// codes that must NEVER resolve in production, whatever production contains.
+const TEST_ROUTE_ENABLED = !!TEST_ROUTE_URL;
 // Only the FIRST message of a conversation carries a code; "yes" and "Thursday"
 // do not. Affinity is what keeps the rest of the conversation in the same
 // environment. 24h matches the WhatsApp customer-service window, after which a
@@ -187,19 +193,46 @@ function routingText(msg) {
 /**
  * True when this message belongs to the dev/test environment.
  *
- * A recognised TEST code claims the phone; any OTHER valid code releases it,
- * which mirrors the product's own rule that scanning a different clinic's QR
- * moves you — a patient who scans a real clinic's poster must land in
- * production even if they were poking at the demo a minute earlier.
+ * Production is asked FIRST and dev is the fallback, so no list has to be kept
+ * in step with what dev contains:
+ *
+ *   1. a code on TEST_ENTRY_CODES  → dev, always. This is the typed demo
+ *      shortcut (TRYMED); it must never resolve in production even if a clinic
+ *      is ever created there with the same code.
+ *   2. a code production KNOWS      → production. Checked without a status
+ *      filter on purpose: a suspended or deactivated clinic is still
+ *      production's to answer for, and must not leak into dev.
+ *   3. anything else                → dev. An unrecognised code is either a
+ *      dev clinic's QR or a typo, and dev answers "that code didn't match a
+ *      clinic" in exactly the words production would have used.
+ *
+ * A code is re-evaluated on every message that carries one, so scanning a real
+ * clinic's QR pulls a phone straight back out of dev — the same rule the
+ * product already applies when a patient scans a different clinic's poster.
+ * Only messages with NO code follow the stored affinity.
  */
 async function shouldRouteToTest(phone, msg) {
   const ref = extractEntryCode(routingText(msg));
-  if (ref) {
-    if (TEST_ENTRY_CODES.has(ref.code)) { await testAffinity(phone, true); return true; }
-    await testAffinity(phone, false);
-    return false;
+  if (!ref) return testAffinity(phone);
+
+  if (TEST_ENTRY_CODES.has(ref.code)) { await testAffinity(phone, true); return true; }
+
+  // Does production know this clinic at all? One indexed lookup, and only on
+  // the rare message that carries a code. A failure here must not strand the
+  // patient, so it is treated as "production's problem" and handled locally.
+  let knownHere = false;
+  try {
+    const r = await query(`SELECT 1 FROM tenants WHERE entry_code = $1 LIMIT 1`, [ref.code]);
+    knownHere = r.rowCount > 0;
+  } catch (err) {
+    logger.warn('Entry-code lookup failed during dev/test routing — keeping in production', {
+      error: err.message,
+    });
+    knownHere = true;
   }
-  return testAffinity(phone);
+
+  await testAffinity(phone, !knownHere);
+  return !knownHere;
 }
 
 /** Re-sign a single message as its own Meta delivery and hand it to dev. */
