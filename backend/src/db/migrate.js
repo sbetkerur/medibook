@@ -34,6 +34,245 @@ async function runMigration(client, version, name, sqlFn) {
   console.log(`  ✅ Migration ${version}: ${name}`);
 }
 
+// ── THE PUBLIC DEMO CLINIC ───────────────────────────────────────────────
+// A dentist reached through a professional directory cannot be sent a link, an
+// image or an attachment, so the only thing left to carry the pitch is the
+// product itself: they message a six-character code to the shared number and
+// are booking an appointment seconds later. That needs a real clinic on the
+// other end of the code, live in production, permanently.
+//
+// It cannot live in seed.js. That file is gated on SEED_DEMO_DATA, which
+// production sets to false precisely so a sales fixture can never overwrite a
+// real clinic's name, fees or admin password on every deploy. So it lives here,
+// where production data fix-ups belong — but it inherits exactly the same
+// discipline, and the rule it follows is CREATE-ONLY:
+//
+//   * nothing below ever UPDATEs a name, fee, schedule or department. Whoever
+//     tunes this clinic to demo better keeps their edits, because the next
+//     deploy has no opinion about them. That is the regression seed.js was
+//     rewritten to stop, and re-introducing it here would be the same bug in a
+//     new file.
+//   * the only two fields repaired on an existing tenant are the ones that make
+//     it REACHABLE — status and entry_code. A demo nobody can reach is not a
+//     demo, and both of those are ours rather than an operator's.
+//   * slots are topped up on every boot. They are the one thing that genuinely
+//     expires, and the insert is ON CONFLICT (doctor_id, slot_date, start_time)
+//     DO NOTHING, so re-running costs nothing and repairs a demo whose grid ran
+//     dry because the nightly cron was wedged.
+//
+// Set DEMO_TENANT=false to skip it (a private staging copy, or a test database
+// that should hold nothing but its own fixtures).
+const DEMO_SLUG        = 'pragati-demo';
+const DEMO_SCHEMA      = 'tenant_pragati_demo';
+const DEMO_CLINIC_NAME = 'Pragati Dental Studio';
+// Every character is in the entry-code alphabet (utils/entryCode.js), which
+// excludes 0/O, 1/I/L and U — that is what rules out the obvious candidates
+// DENTAL, SMILES and TRYNOW. Fixed rather than generated: it is printed in
+// outreach that cannot be edited once sent, so it has to survive every deploy.
+const DEMO_ENTRY_CODE  = 'TRYMED';
+// Matches SLOT_LOOKAHEAD_DAYS, so the date picker is full rather than showing
+// the two or three days a shorter window would leave.
+const DEMO_SLOT_DAYS   = 14;
+
+// Every department here is the primary or the secondary of a dentist below.
+// A treatment with nobody behind it is a dead end in the picker — the patient
+// chooses it and gets an empty dentist list — so the two lists are kept in step
+// deliberately. Add a department here without adding someone who renders it and
+// the demo breaks in the one place a prospect is looking.
+const DEMO_DEPARTMENTS = [
+  'General Dentistry',
+  'Root Canal Treatment',
+  'Orthodontics & Braces',
+  'Cosmetic Dentistry',
+];
+
+// `also` is the rest of the bookable set (doctor_departments); `dept` is the
+// primary. The general dentist carries root canals because that is how Indian
+// practices actually run — the GP does the simple ones and refers the hard
+// cases to the endodontist on staff.
+const DEMO_DOCTORS = [
+  { name: 'Ananya Rao',    spec: 'General Dentist', qual: 'BDS',
+    dept: 'General Dentistry',     also: ['Root Canal Treatment'], fee: 300, duration: 30 },
+  { name: 'Vikram Shetty', spec: 'Endodontist',     qual: 'BDS, MDS (Endodontics)',
+    dept: 'Root Canal Treatment',  also: [],                       fee: 700, duration: 45 },
+  { name: 'Nisha Menon',   spec: 'Orthodontist',    qual: 'BDS, MDS (Orthodontics)',
+    dept: 'Orthodontics & Braces', also: ['Cosmetic Dentistry'],   fee: 600, duration: 45 },
+];
+
+async function ensureDemoTenant() {
+  if (process.env.DEMO_TENANT === 'false') {
+    console.log('⏭  Demo clinic skipped (DEMO_TENANT=false)');
+    return;
+  }
+
+  const { query, tenantQuery } = require('./index');
+  const { createTenantSchema, runTenantMigrations } = require('./tenantMigrate');
+
+  let tenant = (await query(
+    `SELECT id FROM tenants WHERE slug=$1`, [DEMO_SLUG])).rows[0];
+
+  if (!tenant) {
+    // billing_monthly = 0, not NULL. Every revenue read is
+    // COALESCE(t.billing_monthly, p.price_monthly), so leaving it NULL would
+    // book this fixture as ₹1,799 of MRR in the super-admin dashboard and in
+    // every report built on top of it. A demo clinic that inflates the one
+    // number the business is judged by is worse than no demo clinic.
+    //
+    // 'professional' rather than 'starter' because three dentists is one more
+    // than Starter allows. A demo tenant sitting over its own plan cap is
+    // exactly the fixture that teaches the wrong rule.
+    tenant = (await query(`
+      INSERT INTO tenants
+        (name, slug, schema_name, owner_email, plan, status, city, entry_code, billing_monthly)
+      VALUES ($1, $2, $3, 'contactus@pragatisolutions.com', 'professional', 'active',
+              'Bengaluru', $4, 0)
+      RETURNING id
+    `, [DEMO_CLINIC_NAME, DEMO_SLUG, DEMO_SCHEMA, DEMO_ENTRY_CODE])).rows[0];
+    await createTenantSchema(DEMO_SCHEMA);
+    await runTenantMigrations(DEMO_SCHEMA);
+    console.log(`✅ Demo clinic created: ${DEMO_CLINIC_NAME} (code ${DEMO_ENTRY_CODE})`);
+  } else {
+    // Repaired only when actually wrong, and only these two. A deactivated
+    // tenant detaches every patient session that reaches it, and a drifted
+    // entry code means the code already printed in outreach answers "that code
+    // didn't match a clinic" — which reads to the reader as a broken product.
+    // The collision catch matters: if a real clinic ever holds this code, the
+    // unique index refuses the update and the demo yields rather than the boot
+    // failing. Everything else this fixture owns is left exactly as found.
+    await query(
+      `UPDATE tenants SET status='active' WHERE id=$1 AND status<>'active'`, [tenant.id]);
+    await query(
+      `UPDATE tenants SET entry_code=$2 WHERE id=$1 AND entry_code IS DISTINCT FROM $2`,
+      [tenant.id, DEMO_ENTRY_CODE]
+    ).catch(err => console.warn(`⚠️  Demo entry code not applied: ${err.message}`));
+  }
+
+  // ── BRANCH ──────────────────────────────────────────────────────────────
+  // One branch on purpose: the bot skips the "which branch?" step entirely when
+  // a clinic has only one, and every step removed is a step a dentist
+  // evaluating this in sixty seconds does not have to sit through.
+  //
+  // The phone number is Pragati's own, deliberately. The bot hands out the
+  // branch number wherever it tells a patient to call — the emergency reply
+  // most of all, where it is the only useful instruction — so a prospect
+  // prodding at the demo reaches a human instead of a placeholder.
+  let branch = (await tenantQuery(DEMO_SCHEMA,
+    `SELECT id FROM hospitals WHERE name=$1`, [DEMO_CLINIC_NAME])).rows[0];
+  if (!branch) {
+    branch = (await tenantQuery(DEMO_SCHEMA, `
+      INSERT INTO hospitals (name, address, city, phone)
+      VALUES ($1, $2, 'Bengaluru', $3) RETURNING id
+    `, [DEMO_CLINIC_NAME, '2nd Floor, 100 Feet Road, Indiranagar', '+91 7795676142'])).rows[0];
+  }
+
+  // ── DEPARTMENTS (per branch) ────────────────────────────────────────────
+  const deptIds = {};
+  for (const name of DEMO_DEPARTMENTS) {
+    const found = (await tenantQuery(DEMO_SCHEMA,
+      `SELECT id FROM departments WHERE name=$1 AND hospital_id=$2`,
+      [name, branch.id])).rows[0];
+    deptIds[name] = found
+      ? found.id
+      : (await tenantQuery(DEMO_SCHEMA,
+          `INSERT INTO departments (hospital_id, name) VALUES ($1,$2) RETURNING id`,
+          [branch.id, name])).rows[0].id;
+  }
+
+  // ── DENTISTS ────────────────────────────────────────────────────────────
+  const doctorIds = [];
+  for (const d of DEMO_DOCTORS) {
+    const existing = (await tenantQuery(DEMO_SCHEMA,
+      `SELECT id FROM doctors WHERE name=$1 AND hospital_id=$2`,
+      [d.name, branch.id])).rows[0];
+    if (existing) { doctorIds.push(existing.id); continue; }
+
+    const created = (await tenantQuery(DEMO_SCHEMA, `
+      INSERT INTO doctors
+        (hospital_id, department_id, name, specialization, qualification,
+         consultation_fee, slot_duration_minutes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
+    `, [branch.id, deptIds[d.dept], d.name, d.spec, d.qual, d.fee, d.duration])).rows[0];
+    doctorIds.push(created.id);
+
+    // The bookable set, written in the same pass that creates the doctor. The
+    // primary is listed explicitly rather than left to the backfill in
+    // tenantMigrate: the bot lists dentists through doctor_departments ONLY, so
+    // a doctor created without these rows is unbookable over WhatsApp until the
+    // next restart — and the whole point of this fixture is that it works the
+    // first time someone tries it.
+    for (const deptName of [d.dept, ...d.also]) {
+      if (!deptIds[deptName]) continue;
+      await tenantQuery(DEMO_SCHEMA,
+        `INSERT INTO doctor_departments (doctor_id, department_id)
+         VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [created.id, deptIds[deptName]]);
+    }
+
+    // Mon–Sat, generous hours so the grid is never thin. Written only for a
+    // dentist this block just created: a re-run must never DELETE and re-insert
+    // the way a true reset does, or a session someone added to make the demo
+    // more convincing disappears on the next deploy.
+    //
+    // hospital_id is left NULL on every row. planDoctorSlots falls back to
+    // doctors.hospital_id (`sched.hospitalId || doc.hospital_id`), which is
+    // correct for a resident dentist at a single-branch clinic — and it means
+    // no doctor_hospitals rows are needed either.
+    for (let dow = 1; dow <= 5; dow++) {
+      await tenantQuery(DEMO_SCHEMA, `
+        INSERT INTO doctor_schedules
+          (doctor_id, day_of_week, start_time, end_time, is_working,
+           lunch_start_time, lunch_end_time)
+        VALUES ($1,$2,'10:00','19:00',true,'14:00','15:00')
+        ON CONFLICT (doctor_id, day_of_week, start_time) DO NOTHING
+      `, [created.id, dow]);
+    }
+    await tenantQuery(DEMO_SCHEMA, `
+      INSERT INTO doctor_schedules
+        (doctor_id, day_of_week, start_time, end_time, is_working)
+      VALUES ($1,6,'10:00','14:00',true)
+      ON CONFLICT (doctor_id, day_of_week, start_time) DO NOTHING
+    `, [created.id]);
+  }
+
+  // ── DASHBOARD LOGIN ─────────────────────────────────────────────────────
+  // Optional: the WhatsApp demo — the only part the outreach depends on — needs
+  // no user at all. This exists so the dashboard can be shown on a call.
+  //
+  // Insert-only, and the password is never logged. Without DEMO_ADMIN_PASSWORD
+  // the row is still created, with a random password nobody knows, because a
+  // user that EXISTS can be given a known password through the audited
+  // super-admin reset (POST /superadmin/tenants/:id/users/:userId/reset-password)
+  // whereas a user that does not exist cannot. Printing a generated password
+  // here instead would put it in Railway's retained logs forever.
+  const adminPassword = process.env.DEMO_ADMIN_PASSWORD
+    || require('crypto').randomBytes(24).toString('base64url');
+  const adminRow = await tenantQuery(DEMO_SCHEMA, `
+    INSERT INTO users (email, password_hash, name, role, notify_phone)
+    VALUES ('demo@pragatisolutions.com', $1, 'Demo Clinic Admin', 'admin', $2)
+    ON CONFLICT (email) DO NOTHING
+  `, [await bcrypt.hash(adminPassword, 12), process.env.DEMO_NOTIFY_PHONE || null]);
+  if (adminRow.rowCount > 0 && !process.env.DEMO_ADMIN_PASSWORD) {
+    console.log('ℹ️  Demo dashboard user created with a random password — set one via '
+      + 'the super-admin reset endpoint, or set DEMO_ADMIN_PASSWORD and recreate.');
+  }
+
+  // ── SLOTS ───────────────────────────────────────────────────────────────
+  // Topped up every boot, never cleared. The DELETE that seed.js runs first is
+  // right for a fixture being reset and wrong here: it would drop availability
+  // out from under anyone mid-booking, and this clinic is deliberately exposed
+  // to strangers who may be part-way through the flow as a deploy lands.
+  const { generateSlotsForDoctor } = require('../jobs/slotGenerator');
+  let slots = 0;
+  for (const id of doctorIds) {
+    slots += await generateSlotsForDoctor(DEMO_SCHEMA, id, false, DEMO_SLOT_DAYS);
+  }
+  // `slots` is what generateSlotsForDoctor PLANNED, not what it inserted — the
+  // insert is ON CONFLICT DO NOTHING, so on a steady-state boot this number is
+  // the size of the grid rather than a count of new rows. Worded to say so.
+  console.log(`✅ Demo clinic ready: ${DEMO_DOCTORS.length} dentists, `
+    + `${slots} slot(s) across ${DEMO_SLOT_DAYS} days, code ${DEMO_ENTRY_CODE}`);
+}
+
 async function migrate() {
   const client = await pool.connect();
   try {
@@ -796,7 +1035,24 @@ async function migrate() {
       console.error('Failed to run tenant schema migrations:', err.message);
     }
 
+    // ── DEMO CLINIC ──────────────────────────────────────────────
+    // After the loop above, so an existing demo schema is already migrated
+    // before this touches it. Never fatal, for the same reason the entry-code
+    // backfill is not: entrypoint.sh runs migrate under `set -e`, and a missing
+    // sales fixture must not stop a clinic's real appointments from booting.
+    try {
+      await ensureDemoTenant();
+    } catch (err) {
+      console.warn('⚠️  Demo clinic not provisioned:', err.message);
+    }
+
   } finally {
+    // generateSlotsForDoctor's public-holiday cache opens the shared Redis
+    // client, and its live socket keeps the event loop alive after the pool
+    // closes — the hang seed.js documents. entrypoint.sh runs migrate → seed →
+    // start on every boot, so a migrate that never exits blocks the deployment.
+    // A no-op when nothing opened a client.
+    try { require('../utils/redisClient').closeClient(); } catch { /* not fatal */ }
     await client.query(`SELECT pg_advisory_unlock(824619001)`).catch(() => {});
     // Put the pool's own limits back before the connection is reused. If that
     // fails the connection is NOT fit to return — it would go back carrying
