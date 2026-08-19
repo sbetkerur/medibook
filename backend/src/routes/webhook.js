@@ -258,11 +258,32 @@ async function forwardToTestEnv(entryId, value, msg) {
     headers['x-hub-signature-256'] =
       'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
   }
-  const res = await fetch(TEST_ROUTE_URL, {
-    method: 'POST', headers, body,
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`test env responded ${res.status}`);
+  // Two failure modes, and they must NOT be treated alike.
+  //
+  // Dev ACKs before it processes (as production does — Meta allows 3 seconds),
+  // so once the bytes have arrived dev owns the message. If the reply is merely
+  // slow or lost and production then handles it too, the patient gets two
+  // answers from two environments.
+  //
+  // A connection-level failure means dev never received it, and falling through
+  // to production is right. A TIMEOUT means dev probably has it, so we report
+  // the message as handled and log loudly instead — the one case where silence
+  // beats a duplicate, because a duplicate is the visible failure.
+  try {
+    const res = await fetch(TEST_ROUTE_URL, {
+      method: 'POST', headers, body,
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`test env responded ${res.status}`);
+  } catch (err) {
+    const delivered = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+    if (delivered) {
+      logger.error('Forward to dev/test timed out AFTER sending — not retrying in production '
+        + 'to avoid answering the patient twice', { error: err.message });
+      return;                       // treat as handled
+    }
+    throw err;                      // never left the building — production takes it
+  }
 }
 
 // ── INCOMING MESSAGES (POST) ──────────────────────────────────
