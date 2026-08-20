@@ -122,7 +122,6 @@ async function createTenantSchema(schemaName) {
         note_category VARCHAR(50) DEFAULT 'general',
         notes TEXT,
         reminder_24h_sent BOOLEAN DEFAULT false,
-        reminder_2h_sent BOOLEAN DEFAULT false,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
@@ -248,8 +247,8 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_appt_doctor_date ON appointments(doctor_id, appointment_date);
       CREATE INDEX IF NOT EXISTS idx_appt_patient_status ON appointments(patient_id, status, appointment_date DESC);
       CREATE INDEX IF NOT EXISTS idx_appt_reminder_24h ON appointments(appointment_date, reminder_24h_sent) WHERE status='confirmed' AND reminder_24h_sent=false;
-      -- No idx_appt_reminder_2h: the 2-hour reminder was removed and nothing
-      -- reads reminder_2h_sent any more. See the DROP in runTenantMigrations.
+      -- No 2-hour reminder index: the feature and its column are both gone.
+      -- runTenantMigrations drops the column from schemas that predate this.
       CREATE INDEX IF NOT EXISTS idx_slots_doctor_date_status ON time_slots(doctor_id, slot_date, status);
       -- Hospital-scoped indexes (Today's Schedule + slot listing)
       CREATE INDEX IF NOT EXISTS idx_appt_hospital_date ON appointments(hospital_id, appointment_date DESC);
@@ -586,22 +585,32 @@ async function runTenantMigrations(schemaName) {
       DROP INDEX IF EXISTS idx_patients_phone_active;
     `);
 
-    // The 2-hour reminder was removed (see jobs/reminders.js), and nothing in
-    // the application has read `reminder_2h_sent` since. Its partial index
-    // survived, and its predicate — status='confirmed' AND
-    // reminder_2h_sent=false — matches essentially EVERY row at insert time,
-    // so every appointment ever booked has been paying to maintain an index no
-    // query uses. Dropped rather than left as harmless clutter because the cost
-    // is on the write path and grows with every clinic onboarded.
+    // The last of the 2-hour reminder, removed as a feature in 7863f9b.
     //
-    // The COLUMN stays. Dropping it is the one irreversible step here, and it
-    // still records which appointments got the old reminder before the feature
-    // went; `follow_up_sent` is kept for exactly the same reason and IS still
-    // read. DROP INDEX is idempotent, so this is safe to re-run every boot —
-    // and under the 5s lock_timeout set above it fails fast rather than
-    // queueing an ACCESS EXCLUSIVE request behind live readers.
-    await client.query(`DROP INDEX IF EXISTS idx_appt_reminder_2h;`)
-      .catch(e => logger.warn('Could not drop idx_appt_reminder_2h — will retry next boot', {
+    // Nothing in the application has read `reminder_2h_sent` since — not a
+    // query, not a write, not the frontend — while its partial index carried a
+    // predicate (status='confirmed' AND reminder_2h_sent=false) matching
+    // essentially every row at insert time, so every appointment ever booked
+    // paid to maintain an index no query used.
+    //
+    // This is a DELIBERATE, IRREVERSIBLE drop, which is the only way a column
+    // should ever go. What makes it safe to take now rather than never:
+    //   * production holds no clinics yet, so no real appointment carries a
+    //     value here — the historical record this column existed to preserve
+    //     is empty. Doing it after the first clinic onboards would be a
+    //     genuine data decision; doing it now costs nothing.
+    //   * `follow_up_sent` looks identical and is NOT dropped: it is still read
+    //     by sendFeedbackRequests as a guard against re-asking someone who was
+    //     already asked by the old post-visit cron. Similar shape, different
+    //     answer — which is the whole reason to check each one rather than
+    //     sweep them together.
+    //
+    // Dropping the column takes its index with it, so no separate DROP INDEX is
+    // needed. IF EXISTS makes this a no-op on every boot after the first, and
+    // the 5s lock_timeout set above means it fails fast and retries next boot
+    // rather than queueing an ACCESS EXCLUSIVE request behind live readers.
+    await client.query(`ALTER TABLE appointments DROP COLUMN IF EXISTS reminder_2h_sent;`)
+      .catch(e => logger.warn('Could not drop reminder_2h_sent — will retry next boot', {
         schema: schemaName, error: e.message,
       }));
 

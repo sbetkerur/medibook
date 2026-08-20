@@ -1,15 +1,16 @@
-# Runs the unit suites on every push and PR.
+# Runs the test suites on every push and PR.
 #
-# These are the suites that need no database: each one pins an invariant that
-# would otherwise reach a clinic — entry-code routing, the bot's copy contract,
-# WhatsApp template parameters, slot planning, the doctor/department join, and
-# the stale-confirmation button indices. Until now nothing ran them but a human
-# remembering to, and `npm test` covers only bot.test.js (which needs Postgres).
+# Two jobs, deliberately separate:
 #
-# Deliberately NOT included: bot.test.js, entryFlow.test.js and the other
-# DB-backed suites. They need Postgres, Redis, a migrated schema and a seeded
-# tenant, and a flaky integration job that everyone learns to ignore is worse
-# than no job at all. Add them once there is a stable fixture to point at.
+#   unit        — no database, seconds. Each suite pins an invariant that would
+#                 otherwise reach a clinic. This is the gate that must stay fast
+#                 and must never be flaky, because a job people learn to ignore
+#                 protects nothing.
+#   integration — Postgres + Redis + a booted backend, exercising the real bot
+#                 engine, the real webhook route and the real HTTP API. Slower,
+#                 and allowed to be: it covers the paths a unit test cannot,
+#                 like entry-code routing, which happens in webhook.js BEFORE
+#                 the engine is reached.
 name: tests
 
 on:
@@ -66,3 +67,110 @@ jobs:
             echo "::error::one or more unit suites failed"
             exit 1
           fi
+
+  integration:
+    name: integration suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # No `needs: unit` on purpose: when both break, seeing both failures in one
+    # run is worth more than saving a couple of runner-minutes.
+
+    services:
+      postgres:
+        # 18 to match production. A client or server version drift between CI
+        # and prod is exactly the class of bug CI is supposed to catch.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: medibook_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/medibook_test
+      REDIS_URL: redis://localhost:6379
+      # Long enough to clear the 32-character floor index.js enforces. Test-only
+      # values, and named so nobody mistakes them for anything else.
+      JWT_SECRET: ci-only-jwt-secret-not-a-real-key-32chars
+      ENCRYPTION_KEY: ci-only-encryption-key-not-a-real-key-32
+      # development, NOT production: the prod guards demand a real META_APP_SECRET
+      # and a non-localhost FRONTEND_URL, both of which are the guards working
+      # correctly against a mislabelled environment (docker-compose.yml documents
+      # the same trade-off).
+      NODE_ENV: development
+      PORT: '3001'
+      # The public demo clinic is a sales fixture, not a test fixture. Leaving it
+      # on would add a second tenant to every CI run for no coverage.
+      DEMO_TENANT: 'false'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install
+        working-directory: backend
+        run: npm ci
+
+      - name: Migrate
+        working-directory: backend
+        run: npm run migrate
+
+      - name: Seed the demo tenant
+        working-directory: backend
+        # bot.test.js looks up slug 'demo-clinic' and entryFlow.test.js needs its
+        # fixed TESTME entry code. Outside production seed.js runs unconditionally.
+        run: npm run seed
+
+      - name: Start the backend
+        working-directory: backend
+        run: |
+          node src/index.js > /tmp/backend.log 2>&1 &
+          echo $! > /tmp/backend.pid
+          for i in $(seq 1 40); do
+            if curl -sf -m 3 http://localhost:3001/health > /dev/null; then
+              echo "backend up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::backend never became healthy"
+          tail -60 /tmp/backend.log
+          exit 1
+
+      - name: Integration suites
+        working-directory: backend
+        env:
+          TEST_API_BASE: http://localhost:3001/api/webhook/whatsapp
+        run: |
+          fail=0
+          for f in tests/bot.test.js tests/entryFlow.test.js tests/api.test.js; do
+            echo "── $f"
+            if node "$f"; then
+              echo "   PASS"
+            else
+              echo "::error file=backend/$f::suite failed"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Backend log (on failure)
+        if: failure()
+        run: tail -120 /tmp/backend.log || true
+
+      - name: Stop the backend
+        if: always()
+        run: kill "$(cat /tmp/backend.pid)" 2>/dev/null || true
