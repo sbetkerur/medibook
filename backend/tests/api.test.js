@@ -29,6 +29,21 @@ function req(method, path, body, token) {
 
 async function run() {
   let pass = 0, fail = 0;
+
+  // The main menu is defined by what it OFFERS, not by how it is worded. Two
+  // tests here used to require the literal word "Welcome", which a patient the
+  // clinic has never met has not been shown for a long time — they get "Book an
+  // appointment, check an existing one, or manage a booking" instead. Copy is
+  // meant to change; the three things the clinic can do are not.
+  function assertMainMenu(resp, label = 'not the main menu') {
+    const buttons = (resp.buttons || []).join(' | ').toLowerCase();
+    for (const want of ['book', 'my appointments', 'address']) {
+      if (!buttons.includes(want)) {
+        throw new Error(`${label}: missing "${want}" in [${resp.buttons || []}]`);
+      }
+    }
+  }
+
   async function test(name, fn) {
     try {
       await fn();
@@ -211,12 +226,16 @@ async function run() {
   });
 
   console.log('\n=== BOT TEST ENDPOINT ===');
-  await test('Hi message returns Welcome with buttons', async () => {
+  // Asserts the MEANING — that a greeting lands on the main menu and offers the
+  // three things the clinic can do — not the wording. This test used to require
+  // the literal word "Welcome", which a patient the clinic has never met has not
+  // been shown for some time: they get "Book an appointment, check an existing
+  // one, or manage a booking" instead. Copy is meant to change; the menu is not.
+  await test('Hi lands on the main menu with the three actions', async () => {
     const r = await req('POST', '/api/webhook/test', { phone: '919111000001', message: 'Hi' });
     if (r.status !== 200) throw new Error('status ' + r.status);
     if (!r.body.responses.length) throw new Error('no responses');
-    const text = r.body.responses[0].text || '';
-    if (!text.includes('Welcome')) throw new Error('no Welcome: ' + text.slice(0, 100));
+    assertMainMenu(r.body.responses[0]);
     console.log('     type:' + r.body.responses[0].type + ' buttons:' + r.body.responses[0].buttons.length);
   });
 
@@ -251,8 +270,7 @@ async function run() {
     await tenantQuery(schema, 'UPDATE bot_sessions SET state = $1, context = $2 WHERE phone = $3', ['select_doctor', '{}', '919111000005']);
     const r = await req('POST', '/api/webhook/test', { phone: '919111000005', message: 'Hi' });
     if (r.status !== 200) throw new Error('status ' + r.status);
-    const text = r.body.responses[0].text || '';
-    if (!text.includes('Welcome')) throw new Error('Hi did not reset to welcome: ' + text.slice(0, 100));
+    assertMainMenu(r.body.responses[0], 'Hi did not reset to the main menu');
     console.log('     state reset confirmed');
   });
 
@@ -280,16 +298,20 @@ async function run() {
     console.log('     error:' + r.body.error);
   });
 
-  await test('POST /auth/forgot-password with bad email returns 400', async () => {
-    const r = await req('POST', '/api/auth/forgot-password', { email: 'notanemail' });
-    if (r.status !== 400) throw new Error('expected 400 got ' + r.status);
+  // Self-service password recovery is GONE, deliberately: it delivered a link by
+  // email, and WhatsApp is the only channel out. These two tests asserted the
+  // endpoints still answered, so they failed the moment the feature was removed —
+  // and nothing ran them, so nobody noticed. Now they assert the removal, which
+  // is the property that actually matters: the only reset paths are the audited
+  // admin one (POST /admin/staff/:id/reset-password) and the super-admin one.
+  await test('POST /auth/forgot-password is gone (email recovery was removed)', async () => {
+    const r = await req('POST', '/api/auth/forgot-password', { email: 'nonexistent@example.com' });
+    if (r.status !== 404) throw new Error('expected 404 got ' + r.status);
   });
 
-  await test('POST /auth/forgot-password with valid email returns 200 (no enumeration)', async () => {
-    const r = await req('POST', '/api/auth/forgot-password', { email: 'nonexistent@example.com' });
-    if (r.status !== 200) throw new Error('expected 200 got ' + r.status);
-    if (!r.body.success) throw new Error('no success field');
-    console.log('     email enumeration protected: same response for known/unknown email');
+  await test('POST /auth/reset-password is gone too', async () => {
+    const r = await req('POST', '/api/auth/reset-password', { token: 'x', password: 'Whatever@123' });
+    if (r.status !== 404) throw new Error('expected 404 got ' + r.status);
   });
 
   console.log('\n─────────────────────────────────');
