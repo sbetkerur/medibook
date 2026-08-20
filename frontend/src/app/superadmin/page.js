@@ -2,6 +2,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import api, { clearSessionTimers } from '@/lib/api';
+import BrandMark from '@/components/BrandMark';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
@@ -228,7 +229,10 @@ export default function SuperAdminPage() {
       {/* Top nav */}
       <nav className="bg-white border-b border-gray-200 px-4 sm:px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <span className="text-xl font-bold text-blue-600">🏥 MediBook</span>
+          <span className="flex items-center gap-2">
+            <BrandMark className="w-6 h-6 shrink-0" />
+            <span className="text-xl font-bold text-blue-600">MediBook</span>
+          </span>
           <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full font-medium">Super Admin</span>
         </div>
         <button onClick={logout}

@@ -2,6 +2,7 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import api, { getApiError, resetSessionTimers } from '@/lib/api';
+import BrandMark from '@/components/BrandMark';
 import toast from 'react-hot-toast';
 
 export default function LoginPage() {
@@ -53,11 +54,10 @@ export default function LoginPage() {
       <div className="w-full max-w-md">
         {/* Logo */}
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-blue-600 rounded-2xl mb-4 shadow-lg">
-            <span className="text-3xl">🏥</span>
-          </div>
+          <BrandMark className="w-16 h-16 mx-auto mb-4 drop-shadow-lg" />
           <h1 className="text-2xl font-bold text-gray-900">MediBook</h1>
           <p className="text-gray-500 text-sm mt-1">WhatsApp Appointment System</p>
+          <p className="text-gray-400 text-xs mt-2">from Pragati Solutions</p>
         </div>
 
         <div className="bg-white rounded-2xl shadow-xl p-6 sm:p-8">

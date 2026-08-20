@@ -5,6 +5,7 @@ import api, { clearSessionTimers, resetSessionTimers } from '@/lib/api';
 import { todayIST } from '@/lib/dateIST';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import TermsGate from '@/components/TermsGate';
+import BrandMark from '@/components/BrandMark';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
 import Modal from '@/components/ui/Modal';
@@ -1324,7 +1325,10 @@ export default function Dashboard() {
       `}>
         <div className="p-5 border-b border-gray-100 flex items-center justify-between">
           <div>
-            <div className="text-xl font-bold text-blue-600">🏥 MediBook</div>
+            <div className="flex items-center gap-2">
+              <BrandMark className="w-6 h-6 shrink-0" />
+              <span className="text-xl font-bold text-blue-600">MediBook</span>
+            </div>
             <div className="text-xs text-gray-400 mt-1 truncate">{user?.tenant || 'Admin Portal'}</div>
           </div>
           {/* Same reasoning as the hamburger: icon-only, and the only way to
