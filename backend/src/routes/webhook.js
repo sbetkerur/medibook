@@ -1036,3 +1036,8 @@ module.exports.resolveAskingTenant = resolveAskingTenant;
 // clinic — with the QR as the only way in, a detached patient with no poster in
 // front of them has no way back (see tests/entryCode.unit.test.js).
 module.exports.SWITCH_CLINIC_RE = SWITCH_CLINIC_RE;
+// Exported for tests: this decides, for every inbound message, which
+// ENVIRONMENT answers a patient. It runs in the production message path, so the
+// rule that matters most is the one that is invisible in normal operation —
+// every uncertainty resolves to production (see tests/devRouting.unit.test.js).
+module.exports.shouldRouteToTest = shouldRouteToTest;

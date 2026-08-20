@@ -248,7 +248,8 @@ async function createTenantSchema(schemaName) {
       CREATE INDEX IF NOT EXISTS idx_appt_doctor_date ON appointments(doctor_id, appointment_date);
       CREATE INDEX IF NOT EXISTS idx_appt_patient_status ON appointments(patient_id, status, appointment_date DESC);
       CREATE INDEX IF NOT EXISTS idx_appt_reminder_24h ON appointments(appointment_date, reminder_24h_sent) WHERE status='confirmed' AND reminder_24h_sent=false;
-      CREATE INDEX IF NOT EXISTS idx_appt_reminder_2h ON appointments(appointment_date, appointment_time, reminder_2h_sent) WHERE status='confirmed' AND reminder_2h_sent=false;
+      -- No idx_appt_reminder_2h: the 2-hour reminder was removed and nothing
+      -- reads reminder_2h_sent any more. See the DROP in runTenantMigrations.
       CREATE INDEX IF NOT EXISTS idx_slots_doctor_date_status ON time_slots(doctor_id, slot_date, status);
       -- Hospital-scoped indexes (Today's Schedule + slot listing)
       CREATE INDEX IF NOT EXISTS idx_appt_hospital_date ON appointments(hospital_id, appointment_date DESC);
@@ -585,12 +586,30 @@ async function runTenantMigrations(schemaName) {
       DROP INDEX IF EXISTS idx_patients_phone_active;
     `);
 
+    // The 2-hour reminder was removed (see jobs/reminders.js), and nothing in
+    // the application has read `reminder_2h_sent` since. Its partial index
+    // survived, and its predicate — status='confirmed' AND
+    // reminder_2h_sent=false — matches essentially EVERY row at insert time,
+    // so every appointment ever booked has been paying to maintain an index no
+    // query uses. Dropped rather than left as harmless clutter because the cost
+    // is on the write path and grows with every clinic onboarded.
+    //
+    // The COLUMN stays. Dropping it is the one irreversible step here, and it
+    // still records which appointments got the old reminder before the feature
+    // went; `follow_up_sent` is kept for exactly the same reason and IS still
+    // read. DROP INDEX is idempotent, so this is safe to re-run every boot —
+    // and under the 5s lock_timeout set above it fails fast rather than
+    // queueing an ACCESS EXCLUSIVE request behind live readers.
+    await client.query(`DROP INDEX IF EXISTS idx_appt_reminder_2h;`)
+      .catch(e => logger.warn('Could not drop idx_appt_reminder_2h — will retry next boot', {
+        schema: schemaName, error: e.message,
+      }));
+
     // New composite indexes for reminder cron and common query patterns
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_appt_doctor_date        ON appointments(doctor_id, appointment_date);
       CREATE INDEX IF NOT EXISTS idx_appt_patient_status     ON appointments(patient_id, status, appointment_date DESC);
       CREATE INDEX IF NOT EXISTS idx_appt_reminder_24h       ON appointments(appointment_date, reminder_24h_sent) WHERE status='confirmed' AND reminder_24h_sent=false;
-      CREATE INDEX IF NOT EXISTS idx_appt_reminder_2h        ON appointments(appointment_date, appointment_time, reminder_2h_sent) WHERE status='confirmed' AND reminder_2h_sent=false;
       CREATE INDEX IF NOT EXISTS idx_slots_doctor_date_status ON time_slots(doctor_id, slot_date, status);
       CREATE INDEX IF NOT EXISTS idx_appt_hospital_date       ON appointments(hospital_id, appointment_date DESC);
       CREATE INDEX IF NOT EXISTS idx_patients_created         ON patients(created_at DESC);

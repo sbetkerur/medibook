@@ -108,7 +108,13 @@ function isCircuitOpen(phoneId) {
 //
 // This is deliberately the LAST gate before the HTTP call rather than a check in
 // the crons: it covers the bot's replies, every cron, every future sender, and
-// anything added by hand. There is exactly one way out to Meta and this is it.
+// anything added by hand — every path that puts CONTENT in front of a patient
+// goes through _send.
+//
+// markRead() below posts to Meta without passing through here, and is meant to:
+// it delivers no content, only a read receipt on a message the patient already
+// sent, so it cannot reach anybody who did not write in first. Any NEW sender
+// must go through _send, or it is outside this guard.
 const ALLOWED_RECIPIENTS = new Set(
   String(process.env.WHATSAPP_ALLOWED_RECIPIENTS || '')
     .split(',').map(s => s.replace(/\D/g, '')).filter(Boolean)
