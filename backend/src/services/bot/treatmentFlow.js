@@ -32,7 +32,19 @@ async function getOpenPlans(schema, phone) {
     JOIN patients p ON p.id = tp.patient_id
     LEFT JOIN departments dep ON dep.id = tp.department_id
     LEFT JOIN hospitals h ON h.id = tp.hospital_id
+    -- online_bookable, not just is_active: these are different questions, and
+    -- this is a bot query listing a dentist to a PATIENT, so it owes the same
+    -- filter every dentist list in bookingFlow.js applies. A visiting
+    -- orthodontist with is_active=true / online_bookable=false is exactly the
+    -- case the product describes — very much on staff, deliberately not
+    -- pickable off a menu — and they are routinely the treating dentist on a
+    -- braces plan. Without this the bot offered them, took the booking, and
+    -- silently overrode the clinic's setting. Dropping the join to NULL here
+    -- makes doctor_name NULL, which is precisely what startPlanBooking's guard
+    -- already tests, and its copy ("not taking online bookings at the moment")
+    -- was written for this case and never fired.
     LEFT JOIN doctors d ON d.id = tp.treating_doctor_id AND d.is_active = true
+                       AND d.online_bookable = true
     LEFT JOIN appointments a ON a.treatment_plan_id = tp.id
     WHERE p.phone = $1 AND p.deleted_at IS NULL
       AND tp.status IN ('proposed','in_progress')

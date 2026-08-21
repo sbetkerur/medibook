@@ -611,13 +611,23 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
   // 2. Yes, cancel it / 3. No, keep it", and without this a patient replying
   // "1" fell through to "Still on — nothing has changed", the opposite of what
   // they picked, with nothing to tell them so.
-  const wantsMove = !isNegative && (btnIdx === 0 || /^(move|reschedule)$|^1$/i.test(choice));
+  // The button LABELS are accepted as typed text too ("move it instead"), not
+  // just the bare verb. WhatsApp keeps the card tappable but people also retype
+  // what they see, and an anchored `^(move|reschedule)$` answered them with
+  // "Still on — nothing has changed" — the same opposite-of-what-they-picked
+  // failure the `^1$` note above describes.
+  const wantsMove = !isNegative && (btnIdx === 0 || /^(move|reschedule)\b|^1$/i.test(choice));
   if (wantsMove) {
     await updateSession(schema, phone, STATES.IDLE, {});
     return handleRescheduleSelect(phone, schema, tenant, send, {}, null, ctx.cancel_booking_id);
   }
 
-  if (!isNegative && (btnIdx === 1 || /^(yes|cancel)$|^2$/.test(choice))) {
+  // Same widening as wantsMove above: "yes, cancel it" is the button's own
+  // label, and an anchored `^(yes|cancel)$` did not match it — so a patient who
+  // typed exactly what the button said was told "Still on — nothing has
+  // changed" and their appointment stayed on the book. The negative test above
+  // still runs FIRST, so "no, keep it" and "yes but keep it" are unaffected.
+  if (!isNegative && (btnIdx === 1 || /^(yes|cancel)\b|^2$/i.test(choice))) {
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(
         `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,

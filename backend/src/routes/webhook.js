@@ -746,6 +746,32 @@ async function processIncomingMessage(msg) {
       text = 'Hi';
       buttonId = null;
       isQrArrival = true;
+    } else if (entryRef?.tagged) {
+      // A TAGGED code that resolved to nothing. This must be answered here, not
+      // fall through: the patient physically scanned a poster, and if they are
+      // already attached to another clinic the branch below would hand the scan
+      // message to THAT clinic's engine as ordinary free text — so someone
+      // standing in Clinic B's waiting room gets Clinic A's main menu, headed
+      // with Clinic A's name, and never learns the scan failed. The clinic may
+      // be deactivated, the poster may predate a regenerated code, or the
+      // lookup above may have caught a DB blip (it .catch()es to null).
+      //
+      // Nothing is detached. Per CLAUDE.md only a successful scan of a
+      // DIFFERENT clinic's code clears tenant_id; a failed scan must leave the
+      // patient exactly where they were, or a bad poster strands them.
+      //
+      // Sent with wa.sendText rather than through services/outbound.js even
+      // when a clinic IS attached: this is not that clinic speaking, and
+      // logging it into their history would show the front desk a conversation
+      // about a rival's QR code that they never had.
+      await wa.sendText(phone,
+        // Word for word the same message the unattached branch below sends. Two
+        // near-identical wordings of one message is how copy drifts, and this
+        // one is reproduced verbatim in docs/MediBook-Patient-Lifecycle-WhatsApp.docx.
+        `*That code didn't match a clinic*\n\nNo clinic is using the code *${entryRef.code}*. The poster may be out of date — worth asking at the clinic's front desk for their current QR code.`,
+        null, null
+      ).catch(err => logger.error('Failed to send unmatched-code reply', { error: err.message }));
+      return;
     } else if (attachedTenantId) {
       const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [attachedTenantId]);
       tenant = r.rows[0] || null;
@@ -773,9 +799,17 @@ async function processIncomingMessage(msg) {
       // as this clinic pointing them elsewhere rather than as a directory
       // offering alternatives.
       if (isSwitchClinic) {
-        await sendPatientText(tenant.schema_name, phone,
-          `This is *${tenant.name}*.\n\nIf you're trying to reach a different practice, scan the QR code at their reception and it will open a chat with them.\n\nReply *Menu* to carry on here.`
-        ).catch(err => logger.warn('Failed to send switch-clinic reply', { error: err.message }));
+        // Opt-out is checked for the same reason the unsupported-type reply
+        // below checks it: this send happens outside botEngine and so never
+        // meets the engine's own check. Without it, a patient who sent STOP —
+        // and was answered with "we will not message you here again" — gets an
+        // unsolicited message from that very clinic, on a number whose block
+        // rate every other clinic shares.
+        if (!await isOptedOut(tenant.schema_name, phone)) {
+          await sendPatientText(tenant.schema_name, phone,
+            `This is *${tenant.name}*.\n\nIf you're trying to reach a different practice, scan the QR code at their reception and it will open a chat with them.\n\nReply *Menu* to carry on here.`
+          ).catch(err => logger.warn('Failed to send switch-clinic reply', { error: err.message }));
+        }
         return;
       }
     } else {

@@ -336,7 +336,17 @@ const STAFF_ALERT_TEMPLATE = 'clinic_staff_alert';
 async function notifyAdminWhatsApp(schema, tenant, message) {
   try {
     const adminUsers = await tenantQuery(schema,
-      `SELECT notify_phone FROM users WHERE role = 'admin' AND is_active = true AND notify_phone IS NOT NULL LIMIT 3`);
+      // ORDER BY, and a ceiling that is a safety valve rather than a policy.
+      // This function is documented — and named — as fanning out to ALL admins
+      // with a notify_phone, but it was `LIMIT 3` with no ORDER BY: a
+      // four-partner practice had one partner silently cut out of every booking
+      // and cancellation alert, and because an unordered LIMIT may return rows
+      // in any order, WHICH partner could change from one call to the next. The
+      // row count is bounded by the clinic's own admin staff anyway.
+      `SELECT notify_phone FROM users
+        WHERE role = 'admin' AND is_active = true AND notify_phone IS NOT NULL
+        ORDER BY created_at ASC
+        LIMIT 10`);
     if (!adminUsers.rows.length) return;
     // Shared phone — use global META_* env vars
     const wa = require('../whatsapp');

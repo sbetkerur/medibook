@@ -323,8 +323,20 @@ async function handleSelectHospital(phone, schema, tenant, send, ctx, choice, in
     //    a substring check ran first turned "2" (meaning branch 2, as the
     //    numbered text fallback instructs) into a match on branch 1.
     (!isNaN(numChoice) && numChoice >= 1 && numChoice <= hospitalRows.length ? hospitalRows[numChoice - 1] : null) ||
-    // 4. All typed words present in name ("smile banjara" → "Smile Dental - Banjara Hills")
-    (words.length > 1 && hospitalRows.find(r => words.every(w => (r.name || '').toLowerCase().includes(w)))) ||
+    // 4. All typed words present in name ("smile banjara" → "Smile Dental -
+    //    Banjara Hills") — but ONLY when exactly one branch matches. This used
+    //    .find(), the one ambiguity-by-list-order bypass left in this chain:
+    //    with "MediSmile — Jubilee Hills" and "MediSmile — Jubilee Hills
+    //    Annexe" on the books, "medismile jubilee" is contained in both and the
+    //    patient was silently booked at whichever sorted first, with the
+    //    appointment, the confirmation address and the 24h reminder all naming
+    //    a branch they never chose. fuzzyFind refuses exactly this (see
+    //    tests/fuzzyFind.unit.test.js); rule 4 must too, and fall through to the
+    //    re-prompt below.
+    (words.length > 1 ? (() => {
+      const matches = hospitalRows.filter(r => words.every(w => (r.name || '').toLowerCase().includes(w)));
+      return matches.length === 1 ? matches[0] : null;
+    })() : null) ||
     // 5. Exact / unique-substring / fuzzy match. fuzzyFind rather than a raw
     //    .includes(): the latter had no length floor, so a single character
     //    selected whichever branch happened to be first.

@@ -484,12 +484,26 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
 
   // ── MAIN MENU ────────────────────────────────────────────────
   if (session.state === STATES.MAIN_MENU) {
-    if (/\bbook\b|btn_0/i.test(choice) || choice === '1') {
+    // My Appointments is tested FIRST and ANCHORED. It used to be
+    // `/\bappointment\b|\bmy\b/` tested after Book, which matched any sentence
+    // containing the word "my" or "appointment" — so "I need an appointment",
+    // the single most natural thing to type after scanning a poster, was
+    // answered "We have no appointments under this number yet", and "my tooth
+    // pain" never reached detectIntent's complaint routing at all. Anchoring
+    // keeps the deliberate ways of asking (the button, the numbered fallback,
+    // and someone typing the words on their own) and leaves every real sentence
+    // to Book and detectIntent below. The optional non-letter prefix is for a
+    // patient echoing the button's own title, emoji and all.
+    if (/btn_1/i.test(choice) || choice === '2' ||
+        /^[^a-z]*(my|mine|my appointments?|my bookings?|appointments?|bookings?)$/i.test(choice.trim())) {
+      return showMyAppointments(phone, schema, tenant, send);
+    }
+    // `\bappointment\b` belongs here, below the anchored test above: a sentence
+    // that mentions an appointment and is not one of the fixed phrases above is
+    // someone asking for one.
+    if (/\bbook\b|\bappointment\b|btn_0/i.test(choice) || choice === '1') {
       const intents = detectIntent(input);
       return startBooking(phone, schema, tenant, send, intents ? { ...ctx, ...intents } : ctx);
-    }
-    if (/\bappointment\b|\bmy\b|btn_1/i.test(choice) || choice === '2') {
-      return showMyAppointments(phone, schema, tenant, send);
     }
     // "status" stays a keyword — patients were told it for months — but it now
     // goes where it should always have gone: the list of THEIR appointments,
@@ -593,8 +607,15 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     // gender, Skip, ✅ Confirm, …) carries a buttonId. Genuinely stale taps (e.g. an
     // old date row while in SELECT_SLOT) fall through to the current state handler,
     // whose "option not found" fallback re-prompts or exits cleanly.
+    // The titles must match the three the menu actually renders (botEngine.js:94
+    // and bookingFlow.js's two cancelled-booking menus). "Check Status" was the
+    // old third button and was replaced by "📍 Address & Phone"; leaving the
+    // dead title here meant a patient mid-booking who scrolled up and tapped
+    // the live "Address & Phone" card fell through to the current step handler
+    // instead, and was answered "I could not tell which time you meant" — from
+    // every booking state.
     const staleMainMenuButton =
-      /book appointment|my appointments|check status/i.test(input);
+      /book appointment|my appointments|address & phone/i.test(input);
 
     if (staleMainMenuButton) {
       await sendMainMenu(send, tenant, await getPatient(schema, phone).catch(() => null));
