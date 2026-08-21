@@ -54,7 +54,20 @@ async function performTokenRefresh(failedAccessToken) {
       throw e;
     }
     try {
-      const { data } = await axios.post(`${API_PROXY_BASE}/auth/refresh`, { refresh_token: refreshToken });
+      // An explicit timeout, because this is a BARE axios call — it does not
+      // inherit the `api` instance's 15s, and axios defaults to no timeout at
+      // all. It also runs while holding the cross-tab Web Lock and with every
+      // 401'd request parked on failedQueue, so a backend that accepts the
+      // connection and never answers (an ordinary moment during a redeploy)
+      // used to wedge the whole dashboard: Save buttons stuck on "Saving…" with
+      // no toast, proactiveRefresh short-circuiting on isRefreshing, and other
+      // tabs blocked on the same lock. Timing out lets processQueue reject and
+      // the failure actually surface.
+      const { data } = await axios.post(
+        `${API_PROXY_BASE}/auth/refresh`,
+        { refresh_token: refreshToken },
+        { timeout: 15000 },
+      );
       if (!data.token) throw new Error('Refresh response missing token');
       localStorage.setItem('token', data.token);
       if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);

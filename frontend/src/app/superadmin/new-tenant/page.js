@@ -126,11 +126,17 @@ export default function NewTenantPage() {
             <p className="text-xs font-semibold text-blue-700 mb-3">Setup Checklist</p>
             <ol className="text-sm text-blue-800 space-y-2">
               <li>1. Save the credentials above — the password cannot be recovered</li>
-              <li>2. Configure WhatsApp in Meta Developer Console if not done</li>
-              <li>3. Set webhook URL: <code className="bg-blue-100 px-1 rounded break-all">/api/webhook/whatsapp</code></li>
-              <li>4. Log in as clinic admin and add doctors &amp; schedules</li>
-              <li>5. Generate appointment slots from the Slots tab</li>
-              <li>6. Test the bot via the Bot Tester tab</li>
+              <li>2. Log in as clinic admin and add doctors &amp; schedules</li>
+              <li>3. Generate appointment slots from the Slots tab</li>
+              {/* Printing the QR is the step that makes the clinic reachable at
+                  all, and it was missing from this list entirely. The Bot Tester
+                  passes tenant_slug directly and so bypasses entry-code routing —
+                  meaning an operator could work this checklist end to end, watch
+                  the bot answer, and still hand over a clinic no patient can
+                  reach. Called out last because it is the one to leave with the
+                  clinic, not because it is optional. */}
+              <li>4. Test the bot via the Bot Tester tab</li>
+              <li className="font-semibold">5. Print the clinic&apos;s QR card — Settings → Your WhatsApp QR code. Patients can only reach this clinic by scanning it.</li>
             </ol>
           </div>
 
@@ -301,7 +307,13 @@ export default function NewTenantPage() {
               </div>
               <div className="bg-green-50 border border-green-200 rounded-xl p-4 text-sm text-green-800 space-y-2">
                 <p className="font-semibold">✅ Shared WhatsApp Number Active</p>
-                <p className="text-xs">This platform uses one shared WhatsApp phone number for all clinics. Patients are routed to their chosen clinic automatically via a clinic-selection menu.</p>
+                {/* The clinic-selection menu this used to describe was removed
+                    deliberately — it answered a clinic's own patients with a
+                    picker listing the competitors down the road. The QR code is
+                    now the ONLY way a patient reaches a clinic, so an operator
+                    who reads "routed automatically" and never prints it hands
+                    over a clinic that literally cannot be contacted. */}
+                <p className="text-xs">This platform uses one shared WhatsApp phone number for all clinics. Each clinic is reached by scanning <strong>its own QR code</strong>, which pre-fills the clinic&apos;s entry code — there is no clinic-selection menu, so a clinic whose QR is not printed anywhere cannot be reached at all.</p>
                 <p className="text-xs">To update the global WhatsApp credentials, set <code className="bg-green-100 px-1 rounded">META_PHONE_NUMBER_ID</code> and <code className="bg-green-100 px-1 rounded">META_ACCESS_TOKEN</code> in the server environment variables.</p>
               </div>
             </div>

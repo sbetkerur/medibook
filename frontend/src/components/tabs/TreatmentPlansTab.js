@@ -48,7 +48,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
   const [plans, setPlans] = useState([]);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState('outstanding');
-  const [doctors, setDoctors] = useState([]);
+
 
   const [detail, setDetail] = useState(null);        // { treatment_plan, visits }
   const [showCreate, setShowCreate] = useState(false);
@@ -84,16 +84,20 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
 
   useEffect(() => { fetchPlans(); }, [fetchPlans]);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const { data } = await api.get('/admin/doctors');
-        setDoctors(data.doctors || []);
-      } catch { /* silent */ }
-    })();
-  }, []);
+  // (No doctors fetch here. This tab rendered nothing from it — the dentist
+  // picker lives in RecordTreatmentModal, which fetches its own — so every
+  // visit to the Treatments tab spent an authenticated round trip, and a slice
+  // of the tenant's rate-limit budget, on a list nothing read.)
 
   async function openDetail(id) {
+    // Cleared on the way IN as well as on close. consentNote was only reset
+    // after a successful POST, so a note typed for one plan and abandoned
+    // (interrupted mid-sentence, modal closed) stayed mounted and pre-filled the
+    // amber consent box for the NEXT plan opened. Pressing "Record consent"
+    // there writes one patient's explanation into another patient's audited
+    // consent record — the one record whose whole value is being an accurate
+    // account of what was explained to whom.
+    setConsentNote('');
     try {
       // One round-trip each for money and lab work rather than folding them
       // into the plan payload: the list view needs neither, and it keeps the
@@ -363,7 +367,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
 
       {/* ── PLAN DETAIL ── */}
       {detail && (
-        <Modal title={detail.treatment_plan.title} onClose={() => setDetail(null)} wide>
+        <Modal title={detail.treatment_plan.title} onClose={() => { setDetail(null); setConsentNote(''); }} wide>
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div><span className="text-gray-500 text-xs">Patient</span>

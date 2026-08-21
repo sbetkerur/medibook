@@ -103,15 +103,16 @@ export default function DayCloseTab() {
             <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Collected today</p>
             <p className="mt-1 text-3xl font-bold text-gray-900">{money(data.collected_total)}</p>
             <p className="mt-2 text-xs text-gray-500">
-              {money(a.fees_collected)} in consultation fees marked paid, plus {money(treatmentTotal)} in treatment payments.
+              {money(a.fees_completed)} in consultation fees for the {a.completed || 0} appointment{a.completed === 1 ? '' : 's'} seen today, plus {money(treatmentTotal)} in treatment payments.
             </p>
-            {a.fees_completed > a.fees_collected && (
-              // The gap between "seen" and "paid" is the thing a receptionist
-              // wants flagged before she locks up, not buried in a report.
-              <p className="mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                {money(a.fees_completed - a.fees_collected)} of consultation fees are still marked unpaid.
-              </p>
-            )}
+            {/* There used to be a "still marked unpaid" amber line here, driven by
+                appointments.payment_status. Nothing in the product ever writes
+                that column, so the line fired on every clinic, every day, always
+                claiming 100% of consultation fees were unpaid — and the headline
+                above it read ₹0. A number that is wrong every single time is
+                worse than no number: it is what teaches a receptionist to stop
+                reading the screen. If per-appointment payment marking is ever
+                built, bring the split back then. */}
           </div>
 
           {/* ── By method: cash vs the drawer ────────────────── */}

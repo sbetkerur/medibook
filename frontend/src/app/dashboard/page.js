@@ -259,7 +259,7 @@ export default function Dashboard() {
   // receptionist books a real slot that gets locked rather than free-typing a
   // time the bot has no idea is taken.
   useEffect(() => {
-    const { doctor_id, appointment_date } = walkinForm;
+    const { doctor_id, appointment_date, hospital_id } = walkinForm;
     // Clear any previously picked slot — it belongs to the old doctor/date and
     // would otherwise still be submitted after the selector visually resets.
     setWalkinForm(f => (f.slot_id ? { ...f, slot_id: '', appointment_time: '' } : f));
@@ -269,12 +269,21 @@ export default function Dashboard() {
     api.get(`/admin/slots?doctor_id=${doctor_id}&date=${appointment_date}`)
       .then(({ data }) => {
         if (cancelled) return;
-        setWalkinSlots((data.slots || []).filter(s => s.status === 'available'));
+        // Also filtered to the SELECTED branch. /admin/slots is keyed on
+        // doctor+date only, and a visiting consultant's slots for one date all
+        // belong to whichever branch they sit at that day — but a dentist who
+        // splits a weekday across two branches has both in this response. The
+        // backend's slot lock requires time_slots.hospital_id to equal the
+        // hospital_id submitted, so offering the other branch's times here just
+        // produced a 409 after the receptionist had already taken the patient's
+        // details. Slots with no branch stamped (legacy rows) are kept.
+        setWalkinSlots((data.slots || []).filter(s =>
+          s.status === 'available' && (!hospital_id || !s.hospital_id || s.hospital_id === hospital_id)));
       })
       .catch(() => { if (!cancelled) setWalkinSlots([]); })
       .finally(() => { if (!cancelled) setWalkinSlotsLoading(false); });
     return () => { cancelled = true; };
-  }, [showWalkinModal, walkinForm.doctor_id, walkinForm.appointment_date]);
+  }, [showWalkinModal, walkinForm.doctor_id, walkinForm.appointment_date, walkinForm.hospital_id]);
 
 
   // Bulk appointment update state
@@ -1020,7 +1029,15 @@ export default function Dashboard() {
     const load = async () => {
       try {
         if (tab === 'appointments') await fetchAppointments();
-        else if (tab === 'doctors') await fetchDoctors();
+        else if (tab === 'doctors') {
+          // `settings` is the sole input to DoctorsTab's "Dentist limit
+          // reached" banner, and it was only ever fetched by the Settings tab —
+          // so on any session where Settings had not been opened the prop was
+          // null and the warning could not appear at all. A Starter clinic at
+          // its 2-dentist cap therefore filled in the whole Add Doctor form
+          // before the server rejected it. Fetched once and reused.
+          await Promise.all([fetchDoctors(), settings ? Promise.resolve() : fetchSettings()]);
+        }
         else if (tab === 'patients') await fetchPatients();
         else if (tab === 'analytics') await fetchAnalyticsSummary();
         else if (tab === 'services') { if (!hospitals.length) await fetchHospitals(); }
@@ -1038,18 +1055,33 @@ export default function Dashboard() {
     load();
   }, [tab]);
 
-  // Auto-refresh: Overview stats every 60s, Appointments every 60s
+  // Auto-refresh: Overview stats every 60s, Appointments every 60s.
+  //
+  // Mounted ONCE. This used to depend on [tab, fetchStats], which tore both
+  // timers down and started fresh ones on every tab switch — defeating, for the
+  // tab itself, exactly what the fetchAppointmentsRef indirection above was
+  // introduced to fix for filter changes. A receptionist flipping between
+  // Overview and Appointments every 20-30 seconds (the normal rhythm on a busy
+  // morning) never let either interval reach 60s, so nothing auto-refreshed at
+  // all and a booking the bot took five minutes ago stayed invisible until she
+  // pressed Refresh. The callbacks read the current tab through a ref instead.
+  const tabRef = useRef(tab);
+  useEffect(() => { tabRef.current = tab; }, [tab]);
+
+  const fetchStatsRef = useRef(fetchStats);
+  useEffect(() => { fetchStatsRef.current = fetchStats; }, [fetchStats]);
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) return;
     const statsInterval = setInterval(() => {
-      if (tab === 'overview') fetchStats(true);
+      if (tabRef.current === 'overview') fetchStatsRef.current(true);
     }, 60000);
     const apptInterval = setInterval(() => {
-      if (tab === 'appointments') fetchAppointmentsRef.current();
+      if (tabRef.current === 'appointments') fetchAppointmentsRef.current();
     }, 60000);
     return () => { clearInterval(statsInterval); clearInterval(apptInterval); };
-  }, [tab, fetchStats]);
+  }, []);
 
   useEffect(() => {
     if (tab === 'appointments') { setApptPage(1); fetchAppointments(1); }
@@ -1407,7 +1439,13 @@ export default function Dashboard() {
                 <div className="absolute right-0 top-full mt-2 w-72 max-w-[calc(100vw-1rem)] sm:w-80 bg-white border border-gray-200 rounded-xl shadow-xl z-50 overflow-hidden">
                   <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
                     <span className="font-semibold text-sm text-gray-800">Recent Bookings</span>
-                    <button onClick={() => { setShowNotifDropdown(false); setNotifCount(0); }}
+                    {/* Clears the LIST as well as the badge. Zeroing the count
+                        alone left up to 20 already-acknowledged bookings in the
+                        panel, so when the next one arrived the badge read 1 and
+                        the dropdown showed 21 entries with nothing marking which
+                        was new — and the pile survived every subsequent clear.
+                        notifSeenKeys already stops the poll re-inserting them. */}
+                    <button onClick={() => { setShowNotifDropdown(false); setNotifCount(0); setNotifications([]); }}
                       className="text-xs text-blue-600 hover:underline">Clear</button>
                   </div>
                   <div className="max-h-64 overflow-y-auto divide-y divide-gray-50">
@@ -1861,10 +1899,21 @@ export default function Dashboard() {
             <div className="text-center text-gray-400 py-10">Loading slots...</div>
           ) : slots.length ? (
             <>
+              {/* Admin-gated, matching SlotsTab and the server: PATCH
+                  /admin/slots/:id is adminOnly. The View Slots button that opens
+                  this modal is deliberately NOT admin-gated, so a receptionist
+                  read "Click available to block", clicked, and got a red "Admin
+                  access required" toast — while the Slots tab correctly greyed
+                  the same tiles out. The product contradicted itself about who
+                  may block a slot. */}
               <p className="text-xs text-gray-500">
-                Click <span className="text-green-600 font-medium">available</span> to block.
-                Click <span className="text-orange-500 font-medium">blocked</span> to unblock.
-                <span className="text-blue-600 font-medium"> Booked</span> slots cannot be changed.
+                {isAdmin ? (<>
+                  Click <span className="text-green-600 font-medium">available</span> to block.
+                  Click <span className="text-orange-500 font-medium">blocked</span> to unblock.
+                  <span className="text-blue-600 font-medium"> Booked</span> slots cannot be changed.
+                </>) : (
+                  'View only — an admin can block or unblock slots.'
+                )}
               </p>
               {/* 4 columns at 320px leaves ~46px of content per tile, which the
                   word "available" overflows. Drop to 3 on the narrowest screens. */}
@@ -1876,11 +1925,15 @@ export default function Dashboard() {
                     blocked:   'bg-orange-100 text-orange-700 border-orange-200 hover:bg-orange-200 cursor-pointer',
                     expired:   'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed opacity-50',
                   };
-                  const clickable = slot.status === 'available' || slot.status === 'blocked';
+                  const clickable = isAdmin && (slot.status === 'available' || slot.status === 'blocked');
                   return (
                     <button key={slot.id}
                       onClick={() => clickable && toggleSlotStatus(slot)}
-                      className={`border rounded-lg px-2 py-2 text-xs font-medium text-center transition ${style[slot.status] || style.expired}`}>
+                      disabled={!clickable}
+                      // The style map hardcodes cursor-pointer for available and
+                      // blocked, so without this a non-admin still gets a tile
+                      // that looks and feels clickable.
+                      className={`border rounded-lg px-2 py-2 text-xs font-medium text-center transition ${style[slot.status] || style.expired} ${clickable ? '' : 'cursor-not-allowed hover:bg-inherit'}`}>
                       <div>{slot.start_time?.slice(0, 5)}</div>
                       <div className="opacity-70 capitalize mt-0.5">{slot.status}</div>
                     </button>
@@ -2348,7 +2401,18 @@ export default function Dashboard() {
               <select value={walkinForm.doctor_id} onChange={e => setWalkinForm(f => ({ ...f, doctor_id: e.target.value }))}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                 <option value="">— Select —</option>
-                {doctors.filter(d => !walkinForm.hospital_id || d.hospital_id === walkinForm.hospital_id).map(d => (
+                {/* Filtered on every branch the dentist sits at (hospital_ids
+                    from GET /admin/doctors), not just their primary. Matching on
+                    d.hospital_id alone hid visiting consultants from the branch
+                    they actually hold their clinic at: pick Whitefield on a
+                    Thursday and the Thursday dentist was simply not in the list,
+                    while picking their primary branch instead offered their
+                    Whitefield slots and then 409'd on submit. Falls back to the
+                    primary so an older API response still behaves as before. */}
+                {doctors.filter(d => !walkinForm.hospital_id
+                    || (Array.isArray(d.hospital_ids) && d.hospital_ids.length
+                          ? d.hospital_ids.includes(walkinForm.hospital_id)
+                          : d.hospital_id === walkinForm.hospital_id)).map(d => (
                   <option key={d.id} value={d.id}>Dr. {d.name}</option>
                 ))}
               </select>

@@ -10,6 +10,18 @@ export default function LoginPage() {
   const [mode, setMode] = useState('clinic'); // 'clinic' | 'super'
   const [form, setForm] = useState({ email: '', password: '', tenant_slug: '' });
   const [loading, setLoading] = useState(false);
+  // lib/api.js redirects here as /login?reason=expired when a session runs out
+  // with no refresh token left. Nothing read the parameter, so the expiry was
+  // silent: a staff member who left the dashboard open over lunch came back to a
+  // plain login screen mid-shift, assumed a fault, and rang the owner.
+  //
+  // Read from window.location in an effect rather than with useSearchParams:
+  // this page is statically prerendered, and useSearchParams would force it
+  // behind a Suspense boundary for one line of copy.
+  const [sessionExpired, setSessionExpired] = useState(false);
+  useEffect(() => {
+    setSessionExpired(new URLSearchParams(window.location.search).get('reason') === 'expired');
+  }, []);
 
   async function handleLogin(e) {
     e.preventDefault();
@@ -76,6 +88,12 @@ export default function LoginPage() {
               </button>
             ))}
           </div>
+
+          {sessionExpired && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              Your session timed out. Please sign in again — nothing was lost.
+            </div>
+          )}
 
           <form onSubmit={handleLogin} className="space-y-4">
             {mode === 'clinic' && field('Clinic ID', 'tenant_slug', 'text', 'e.g. demo-clinic')}
