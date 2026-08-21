@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { query, tenantQuery } = require('../db');
 const { forEachActiveTenantParallel } = require('../utils/tenantUtils');
-const { format, parseISO, subWeeks } = require('date-fns');
+const { format, parseISO, subDays } = require('date-fns');
 const { toZonedTime, IST_TODAY_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
@@ -302,25 +302,40 @@ async function sendFeedbackRequests() {
           }],
           text: message,
         });
-        // Only arm the rating flow for completed visits — no_show patients got
-        // a rebook nudge, not a rating request.
-        if (appt.status !== 'no_show') {
-          await triggerFeedback(
-            tenant.schema_name,
-            appt.phone,
-            appt.id,
-            appt.patient_id,
-            appt.doctor_name
-          );
-          // Same reason as the follow-up above: the rating must come back to
-          // the clinic whose session is armed for it. no_show patients got a
-          // rebook nudge, not a question, so nothing to wait for.
-          await recordPendingReply(appt.phone, tenant.id, KINDS.FEEDBACK, 24);
-        }
-        // Mark AFTER a successful send so a failed send is retried on the next
-        // run rather than silently consumed (same policy as reminder_*_sent).
+        // Marked the moment the send SUCCEEDS, and before the bookkeeping
+        // below. It still means "not sent, try next run" if sendPatientMessage
+        // threw — but the message has now definitely gone out, and anything
+        // that fails after this point must not buy the patient a second copy.
+        // With the flag set last, a transient failure in triggerFeedback or
+        // recordPendingReply left it false while the "⭐ How did we do?" message
+        // was already delivered, and the row still matched the window on the
+        // next two daily runs: three rating requests for one visit, which is
+        // exactly what the once-a-month-per-patient rule exists to prevent.
         await tenantQuery(tenant.schema_name,
           `UPDATE appointments SET feedback_request_sent=true WHERE id=$1`, [appt.id]);
+
+        // Only arm the rating flow for completed visits — no_show patients got
+        // a rebook nudge, not a rating request. Its own try: failing to arm the
+        // session costs this one rating, and that is strictly better than
+        // re-sending the request to get it.
+        if (appt.status !== 'no_show') {
+          try {
+            await triggerFeedback(
+              tenant.schema_name,
+              appt.phone,
+              appt.id,
+              appt.patient_id,
+              appt.doctor_name
+            );
+            // Same reason as the follow-up above: the rating must come back to
+            // the clinic whose session is armed for it. no_show patients got a
+            // rebook nudge, not a question, so nothing to wait for.
+            await recordPendingReply(appt.phone, tenant.id, KINDS.FEEDBACK, 24);
+          } catch (armErr) {
+            logger.warn(`Feedback sent but rating flow not armed for appointment ${appt.id}`,
+              { error: armErr.message });
+          }
+        }
         logger.info(`Feedback request sent for appointment ${appt.id}`);
       } catch (err) {
         logger.error(`Feedback request failed for appointment ${appt.id}`, { error: err.message });
@@ -344,8 +359,16 @@ async function sendFeedbackRequests() {
  */
 async function sendWeeklyDigests() {
   const nowIST = toZonedTime(new Date(), TIMEZONE);
-  const rangeEnd   = format(nowIST, 'yyyy-MM-dd');
-  const rangeStart = format(subWeeks(nowIST, 1), 'yyyy-MM-dd');
+  // The window ends YESTERDAY and spans exactly 7 days. It used to run
+  // subWeeks(now,1) .. now, which with an inclusive SQL BETWEEN on a DATE column
+  // is EIGHT days with a Monday at each end: last Monday was counted twice (it
+  // had already been reported in the previous digest), and TODAY was counted
+  // too — at 08:00 none of today's appointments have happened, so they inflated
+  // `total` and `revenue` while contributing nothing to `completed`, and the
+  // owner read "23 appointments · 3 completed" for a week that went fine. The
+  // message calls itself "Last week", so it must not contain today.
+  const rangeEnd   = format(subDays(nowIST, 1), 'yyyy-MM-dd');
+  const rangeStart = format(subDays(nowIST, 7), 'yyyy-MM-dd');
 
   await forEachActiveTenantParallel('sendWeeklyDigests', async (tenant) => {
     try {
@@ -363,8 +386,17 @@ async function sendWeeklyDigests() {
         // Treatment advised and never booked — revenue already agreed and
         // sitting idle. This is the number that makes the message worth opening.
         tenantQuery(tenant.schema_name, `
-          SELECT COUNT(*)::int AS n FROM treatment_plans
-           WHERE status NOT IN ('completed','cancelled','declined')
+          -- Must match GET /treatment-plans?outstanding=true exactly, because
+          -- that queue is what this line tells the owner to go and work. Without
+          -- the visit-count condition it counted every live plan, including ones
+          -- whose remaining sittings are already on the calendar — so the digest
+          -- said "12 treatments advised and not yet booked" and the dashboard
+          -- queue it points at showed none. A number that disagrees with the
+          -- screen is a number that stops being read.
+          SELECT COUNT(*)::int AS n FROM treatment_plans tp
+           WHERE tp.status IN ('proposed','in_progress')
+             AND (SELECT COUNT(*) FROM appointments a
+                   WHERE a.treatment_plan_id = tp.id AND a.status <> 'cancelled') < tp.total_visits
         `).catch(() => ({ rows: [{ n: null }] })),
       ]);
 

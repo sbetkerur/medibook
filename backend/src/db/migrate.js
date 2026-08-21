@@ -507,6 +507,10 @@ async function migrate() {
         token VARCHAR(255) UNIQUE NOT NULL,
         expires_at TIMESTAMPTZ NOT NULL,
         used BOOLEAN DEFAULT false,
+        -- When it was redeemed. Reuse detection needs this to separate a
+        -- replayed stolen token from two of the user's own tabs racing; see
+        -- migration 28 and routes/auth.js.
+        used_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);
@@ -678,12 +682,14 @@ async function migrate() {
           enabled BOOLEAN NOT NULL,
           PRIMARY KEY (tenant_id, flag_key)
         );
+        -- Only flags with an actual reader in the codebase. Three more were
+        -- seeded here originally (sms_fallback_enabled, google_sheets_export,
+        -- post_appointment_followup); nothing ever called isEnabled() for any
+        -- of them, so they were toggles that did nothing — see migration 27,
+        -- which removes them from databases that already have them.
         INSERT INTO feature_flags (key, description, default_value) VALUES
-          ('sms_fallback_enabled', 'Send SMS when WhatsApp delivery fails', false),
           ('voice_transcription_enabled', 'Transcribe audio messages via Whisper', false),
-          ('skip_public_holidays', 'Skip Indian public holidays in slot generation', false),
-          ('google_sheets_export', 'Push nightly analytics to Google Sheets webhook', false),
-          ('post_appointment_followup', 'Send WhatsApp follow-up 1h after appointment', true)
+          ('skip_public_holidays', 'Skip Indian public holidays in slot generation', false)
         ON CONFLICT (key) DO NOTHING;
       `);
     });
@@ -963,6 +969,45 @@ async function migrate() {
       await client.query(`
         ALTER TABLE tenants ADD COLUMN IF NOT EXISTS entry_code VARCHAR(16);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_entry_code ON tenants(entry_code);
+      `);
+    });
+
+    // Version 27: drop three feature flags that nothing has ever read.
+    //
+    // `isEnabled()` is called for exactly two keys — skip_public_holidays and
+    // voice_transcription_enabled. The other three were seeded by migration 7
+    // and are live, clickable toggles on the super-admin flags panel that do
+    // nothing at all: an operator answering a clinic's complaint about message
+    // volume can switch off "Send WhatsApp follow-up 1h after appointment",
+    // get {success:true}, and change nothing, because that cron was removed.
+    //
+    // sms_fallback_enabled is worse than dead: it advertises a second delivery
+    // channel, which the product deliberately does not have. WhatsApp is the
+    // only channel out, so that every patient message is reachable in
+    // wa_messages; a toggle implying otherwise invites someone to build it.
+    //
+    // A NEW version rather than an edit to migration 7's body: 7 has already
+    // recorded itself on every existing database and will never run again.
+    // tenant_feature_flags rows cascade on the FK.
+    await runMigration(client, 27, 'drop_dead_feature_flags', async () => {
+      await client.query(`
+        DELETE FROM feature_flags
+         WHERE key IN ('sms_fallback_enabled', 'google_sheets_export', 'post_appointment_followup');
+      `);
+    });
+
+    // Version 28: when a refresh token was redeemed.
+    //
+    // Needed to tell a STOLEN token being replayed from two of the user's own
+    // tabs racing on the same token. Both look identical to the reuse check in
+    // routes/auth.js — a hit on a row that is already used — but the first
+    // should end the session everywhere and the second must not. The client
+    // serialises refreshes with a Web Lock, and has an explicit fallback path
+    // for browsers where locks are unavailable, so the race is real. `used`
+    // alone carries no time, hence this column.
+    await runMigration(client, 28, 'refresh_token_used_at', async () => {
+      await client.query(`
+        ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
       `);
     });
 

@@ -43,6 +43,15 @@ async function retryFailedWebhooks() {
     LIMIT 20
   `);
 
+  // The purge runs FIRST, and unconditionally. It used to sit at the bottom of
+  // this function behind `if (!r.rows.length) return;`, so it only ever ran on a
+  // tick that also found pending retries. On a healthy platform that is never:
+  // one bad afternoon's rows are drained within the hour, and from then on every
+  // 5-minute tick returned before reaching it — so the table only grew, holding
+  // each patient's phone number and message text indefinitely for messages that
+  // were successfully delivered days ago.
+  await purgeOldWebhookRecords();
+
   if (!r.rows.length) return;
   logger.info(`Retrying ${r.rows.length} failed webhooks`);
 
@@ -137,8 +146,10 @@ async function retryFailedWebhooks() {
       }
     }
   }
+}
 
-  // Purge old succeeded/failed records older than 7 days
+/** Drop succeeded/failed records older than 7 days. Called on every tick. */
+async function purgeOldWebhookRecords() {
   await query(`
     DELETE FROM failed_webhooks
     WHERE status IN ('succeeded','failed') AND created_at < NOW() - INTERVAL '7 days'

@@ -143,14 +143,26 @@ function matchesWeekOfMonth(weeks, date) {
   return weeks.includes(weekOfMonth(date));
 }
 
-/** Wrap a promise with a hard timeout */
+/**
+ * Wrap a promise with a hard REPORTING deadline.
+ *
+ * Note what this does and does not do. Promise.race abandons the slow promise;
+ * it cannot cancel it, so the tenant's generation keeps running (and keeps
+ * holding pool connections) after the cron has logged a timeout and moved on.
+ * That is a known limit — bounding the work itself needs a cancellation flag
+ * threaded into generateSlotsForTenant.
+ *
+ * What it must not also do is leak the timer. The handle was never cleared, so
+ * every tenant that finished quickly still left a live 30s timeout behind: at
+ * 500 tenants that is 500 pending timers per run, all of which keep the event
+ * loop alive and delay a SIGTERM shutdown by up to the full timeout.
+ */
 function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms)
-    ),
-  ]);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // Flush accumulated slot tuples in a single multi-value INSERT
@@ -261,6 +273,28 @@ async function generateSlotsForTenant(schema) {
      LEFT JOIN doctor_hospitals dh
        ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
       AND s.hospital_id IS NULL
+      -- Scoped exactly as tenantMigrate.js's backfill scopes itself, and for
+      -- the same reason. /doctors/:id/schedule writes a doctor_hospitals row
+      -- ONLY for a session that names a branch, so a Tuesday split of
+      -- "10-13 at branch B / 17-21 at primary (NULL)" has exactly ONE dh row.
+      -- Joining on weekday alone hands that row to the 17:00 session too, and
+      -- the whole evening at the main clinic is generated, told to patients,
+      -- and holiday-checked as branch B. If any session that weekday names a
+      -- branch, the NULLs beside it mean "primary branch" and must be left
+      -- alone; only a genuinely legacy weekday (every session NULL) may fall
+      -- back to dh.
+      AND NOT EXISTS (
+        SELECT 1 FROM doctor_schedules s2
+         WHERE s2.doctor_id = d.id AND s2.day_of_week = s.day_of_week
+           AND s2.hospital_id IS NOT NULL
+      )
+      -- And only when that weekday is unambiguous. Two dh rows for one day
+      -- would otherwise MULTIPLY the session into two planned rows, and
+      -- flushSlots' ON CONFLICT DO NOTHING would keep whichever branch landed
+      -- first — the original two-branch bug, re-entering through the join
+      -- instead of the schedule table.
+      AND (SELECT COUNT(*) FROM doctor_hospitals dh2
+            WHERE dh2.doctor_id = d.id AND dh2.day_of_week = s.day_of_week) = 1
      WHERE d.is_active=true AND s.is_working=true`);
 
   if (!doctors.rows.length) return 0;
@@ -612,6 +646,28 @@ async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = C
      LEFT JOIN doctor_hospitals dh
        ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
       AND s.hospital_id IS NULL
+      -- Scoped exactly as tenantMigrate.js's backfill scopes itself, and for
+      -- the same reason. /doctors/:id/schedule writes a doctor_hospitals row
+      -- ONLY for a session that names a branch, so a Tuesday split of
+      -- "10-13 at branch B / 17-21 at primary (NULL)" has exactly ONE dh row.
+      -- Joining on weekday alone hands that row to the 17:00 session too, and
+      -- the whole evening at the main clinic is generated, told to patients,
+      -- and holiday-checked as branch B. If any session that weekday names a
+      -- branch, the NULLs beside it mean "primary branch" and must be left
+      -- alone; only a genuinely legacy weekday (every session NULL) may fall
+      -- back to dh.
+      AND NOT EXISTS (
+        SELECT 1 FROM doctor_schedules s2
+         WHERE s2.doctor_id = d.id AND s2.day_of_week = s.day_of_week
+           AND s2.hospital_id IS NOT NULL
+      )
+      -- And only when that weekday is unambiguous. Two dh rows for one day
+      -- would otherwise MULTIPLY the session into two planned rows, and
+      -- flushSlots' ON CONFLICT DO NOTHING would keep whichever branch landed
+      -- first — the original two-branch bug, re-entering through the join
+      -- instead of the schedule table.
+      AND (SELECT COUNT(*) FROM doctor_hospitals dh2
+            WHERE dh2.doctor_id = d.id AND dh2.day_of_week = s.day_of_week) = 1
      WHERE d.id=$1 AND d.is_active=true AND s.is_working=true`,
     [doctorId]);
 

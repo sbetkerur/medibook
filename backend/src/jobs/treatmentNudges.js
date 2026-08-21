@@ -45,10 +45,19 @@ const MAX_NUDGES_PER_PLAN = 3;
 // Orthodontics/braces (utils/treatmentPlan.js isOrthodonticDepartment): an
 // adjustment is roughly monthly, so the short-course cadence above would chase
 // a patient weekly for something that isn't due yet. One nudge, a month after
-// the last sitting, matches how the course actually runs — and MIN_DAYS never
-// gets used in practice since nudge_count reaches the cap on the first send.
+// the last sitting, matches how the course actually runs. "One" is per GAP, not
+// per plan — see the orthoOnly clause in findPlansNeedingNudge, which is what
+// makes the allowance reset each time the patient attends a sitting.
 const ORTHO_QUIET_DAYS_AFTER_VISIT = 30;
-const ORTHO_MAX_NUDGES_PER_PLAN = 1;
+// A LIFETIME BACKSTOP, not the cadence gate. The per-gap rule ("one nudge, and
+// not until the patient has attended another sitting") is enforced by the
+// orthoOnly clause in findPlansNeedingNudge, because nudge_count only ever
+// increments and so cannot express "one per gap" on its own. This value used to
+// be 1, which the counter then read as one nudge for the ENTIRE two-year
+// course. 30 is above the 24-ish adjustments of the longest real case — and
+// total_visits itself caps at 60 — so it bounds a runaway without ever being
+// reached by a course running normally.
+const ORTHO_MAX_NUDGES_PER_PLAN = 30;
 // Cap per clinic per run, matching the feedback job — a clinic that has just
 // migrated a backlog of plans must not fire hundreds of messages in one minute.
 const NUDGE_BATCH_LIMIT = 25;
@@ -94,8 +103,30 @@ async function findPlansNeedingNudge(schema, { orthoOnly, maxNudges, minDaysBetw
       AND COALESCE(${ORTHO_DEPT_SQL}, false) = $5
       AND p.opted_out IS NOT TRUE
       AND p.deleted_at IS NULL
+      -- The lifetime cap. For the ordinary short-course cadence this is exactly
+      -- what is wanted and what CLAUDE.md documents: three messages ignored
+      -- means the patient has decided, and a fourth is how a clinic's number
+      -- gets blocked.
       AND tp.nudge_count < $1
       AND (tp.last_nudge_at IS NULL OR tp.last_nudge_at < NOW() - make_interval(days => $2::int))
+      -- …but for ORTHODONTICS the cap must be per GAP, not per plan. A braces
+      -- course is 18-24 monthly adjustments over two years, and the documented
+      -- cadence is "one nudge, 30 days after the last sitting" — i.e. one per
+      -- missed adjustment. nudge_count only ever increments, so with
+      -- ORTHO_MAX_NUDGES_PER_PLAN = 1 the condition above allowed exactly ONE
+      -- nudge for the whole two years: the patient was chased once after
+      -- sitting 3, booked sittings 4-8, and was then never nudged again for the
+      -- remaining ~14 adjustments. Requiring the last nudge to predate the most
+      -- recent sitting restarts the allowance every time the patient actually
+      -- attends, which is the behaviour the constant was named for.
+      ${orthoOnly ? `AND (
+        tp.last_nudge_at IS NULL
+        OR tp.last_nudge_at < (
+             SELECT MAX(seen.appointment_date)::timestamptz
+               FROM appointments seen
+              WHERE seen.treatment_plan_id = tp.id AND seen.status <> 'cancelled'
+           )
+      )` : ''}
       -- Nothing already on the calendar: a patient with an upcoming sitting
       -- gets the ordinary 24h reminder, not a "you haven't booked" message.
       AND NOT EXISTS (

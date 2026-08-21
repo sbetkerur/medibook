@@ -45,7 +45,14 @@ const DEFAULT_WINDOW_DAYS = 7;
  * @returns {Promise<boolean>}
  */
 async function canSendDiscretionary(schema, phone, opts = {}) {
-  const max = Number.isInteger(opts.max) && opts.max > 0 ? opts.max : DEFAULT_MAX;
+  // `>= 0`, not `> 0`. Zero is the one value that means "send this patient
+  // nothing discretionary at all", and it was the only value the guard threw
+  // away: budgetFor faithfully returned max:0 and this line replaced it with the
+  // default 6. So a clinic whose outreach was deliberately halted — the lever
+  // you reach for when Meta drops the shared number's quality rating — carried
+  // on sending up to six messages a week per patient, with nothing to show the
+  // setting had been ignored. `sent >= max` short-circuits correctly at 0.
+  const max = Number.isInteger(opts.max) && opts.max >= 0 ? opts.max : DEFAULT_MAX;
   const days = Number.isInteger(opts.windowDays) && opts.windowDays > 0
     ? opts.windowDays : DEFAULT_WINDOW_DAYS;
   try {

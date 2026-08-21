@@ -44,6 +44,9 @@ function getClient(accessToken, phoneNumberId) {
 const _circuits = new Map(); // phoneNumberId -> { state, failures, openedAt }
 const CB_FAILURE_THRESHOLD = 8;  // raised from 5 — transient blips shouldn't open the circuit
 const CB_RESET_MS = 30 * 1000;   // reduced from 60s — recover faster after a hiccup
+// Longer than any single Meta request can take (axios timeout in _send), so it
+// only ever fires for a probe that returned without recording an outcome.
+const CB_PROBE_TIMEOUT_MS = 60 * 1000;
 
 function getCircuit(phoneId) {
   if (!_circuits.has(phoneId)) {
@@ -73,6 +76,27 @@ function recordFailure(phoneId) {
 
 function isCircuitOpen(phoneId) {
   const cb = getCircuit(phoneId);
+  // HALF_OPEN is tested FIRST, as its own state. It used to be checked with
+  // `if (cb.state !== 'HALF_OPEN')` nested INSIDE `if (cb.state === 'OPEN')`,
+  // where it is always true — so `return cb.probing` was unreachable and
+  // `probing` was dead state. Worse, once the first caller flipped the breaker
+  // to HALF_OPEN every subsequent caller failed the `=== 'OPEN'` test entirely
+  // and fell through to `return false` at the bottom: allowed. With the hourly
+  // crons running tenants five at a time, "test one call" was in practice five
+  // or more calls fired at a Meta that was still down.
+  if (cb.state === 'HALF_OPEN') {
+    // A probe that never records an outcome would otherwise wedge the breaker
+    // shut forever, which the old (broken) code could not do because it let
+    // everyone through. recordSuccess/recordFailure normally clear `probing`
+    // within the caller's own request timeout; CB_PROBE_TIMEOUT_MS is the
+    // backstop for a path that returns without recording either.
+    if (cb.probing && Date.now() - (cb.probeStartedAt || 0) > CB_PROBE_TIMEOUT_MS) {
+      logger.warn(`Circuit breaker probe for phoneId ${phoneId} never reported — allowing a fresh probe`);
+      cb.probeStartedAt = Date.now();
+      return false;
+    }
+    return cb.probing; // a probe is already in flight — block everyone else
+  }
   if (cb.state === 'OPEN') {
     if (Date.now() - cb.openedAt > CB_RESET_MS) {
       // Only the caller that flips state to HALF_OPEN gets to make the probe
@@ -82,13 +106,11 @@ function isCircuitOpen(phoneId) {
       // it's cleared again in recordSuccess/recordFailure once the probe
       // resolves, so a stuck probe (network hang) still eventually times out
       // via the caller's own request timeout and unblocks via recordFailure.
-      if (cb.state !== 'HALF_OPEN') {
-        cb.state = 'HALF_OPEN';
-        cb.probing = true;
-        logger.info(`Circuit breaker HALF_OPEN for phoneId ${phoneId} — testing`);
-        return false; // allow this one test call
-      }
-      return cb.probing; // a probe is already in flight — block the rest
+      cb.state = 'HALF_OPEN';
+      cb.probing = true;
+      cb.probeStartedAt = Date.now();
+      logger.info(`Circuit breaker HALF_OPEN for phoneId ${phoneId} — testing`);
+      return false; // allow this one test call
     }
     return true; // still open
   }
@@ -374,4 +396,9 @@ module.exports = {
   sendBookingConfirmationTemplate,
   getAxiosInstance, // exported for testing
   resetCircuit,
+  // Exported for tests/circuitBreaker.unit.test.js. The HALF_OPEN gate is the
+  // difference between probing Meta with ONE call after an outage and firing
+  // every queued cron send at a service that is still down, and it was silently
+  // unreachable for a long time — worth pinning.
+  isCircuitOpen, recordSuccess, recordFailure,
 };
