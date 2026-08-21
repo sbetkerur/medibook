@@ -7,7 +7,15 @@
  * kept apart, because conflating them double-counts revenue (see
  * `treatment_payments` in CLAUDE.md):
  *
- *   - CONSULTATION fees, recorded per appointment (`appointments.effective_fee`)
+ *   - CONSULTATION fees, per appointment. `appointments.effective_fee` is an
+ *     OVERRIDE (a negotiated or waived fee); it defaults to 0 and no code path
+ *     writes it today, so the fee actually charged is the doctor's
+ *     `consultation_fee`. Summing effective_fee raw — which this route used to
+ *     do — therefore reported ₹0 of consultation income every single day, and
+ *     the drawer never matched. Use the same
+ *     `COALESCE(NULLIF(effective_fee,0), consultation_fee)` expression the five
+ *     analytics queries and the weekly digest already use, or day-close and the
+ *     revenue chart disagree about the same day.
  *   - TREATMENT payments, recorded against a course as a whole
  *
  * Broken down by method, because that is the actual reconciliation: cash in the
@@ -41,14 +49,18 @@ router.get('/day-close', async (req, res) => {
       // arrived is a no-show, not revenue.
       tenantQuery(s, `
         SELECT COUNT(*)::int AS total,
-               COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
-               COUNT(*) FILTER (WHERE status = 'no_show')::int   AS no_show,
-               COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
-               COUNT(*) FILTER (WHERE status = 'confirmed')::int AS still_open,
-               COALESCE(SUM(effective_fee) FILTER (WHERE status = 'completed'), 0)::int AS fees_completed,
-               COALESCE(SUM(effective_fee) FILTER (WHERE status = 'completed' AND payment_status = 'paid'), 0)::int AS fees_collected
-          FROM appointments
-         WHERE appointment_date = ${dayExpr}
+               COUNT(*) FILTER (WHERE a.status = 'completed')::int AS completed,
+               COUNT(*) FILTER (WHERE a.status = 'no_show')::int   AS no_show,
+               COUNT(*) FILTER (WHERE a.status = 'cancelled')::int AS cancelled,
+               COUNT(*) FILTER (WHERE a.status = 'confirmed')::int AS still_open,
+               COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee))
+                          FILTER (WHERE a.status = 'completed'), 0)::int AS fees_completed
+          FROM appointments a
+          -- LEFT, not INNER: the counts above are of APPOINTMENTS, and an inner
+          -- join would silently drop any row whose doctor was hard-deleted,
+          -- making the day's headline count wrong to fix the money column.
+          LEFT JOIN doctors d ON d.id = a.doctor_id
+         WHERE a.appointment_date = ${dayExpr}
       `, params),
 
       // Treatment payments taken today, whatever course they belong to.
@@ -67,7 +79,8 @@ router.get('/day-close', async (req, res) => {
       tenantQuery(s, `
         SELECT d.name AS doctor_name,
                COUNT(*)::int AS seen,
-               COALESCE(SUM(a.effective_fee) FILTER (WHERE a.status = 'completed'), 0)::int AS fees
+               COALESCE(SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee))
+                          FILTER (WHERE a.status = 'completed'), 0)::int AS fees
           FROM appointments a JOIN doctors d ON d.id = a.doctor_id
          WHERE a.appointment_date = ${dayExpr}
            AND a.status IN ('completed', 'confirmed')
@@ -84,10 +97,18 @@ router.get('/day-close', async (req, res) => {
       appointments: a,
       treatment_payments: { by_method: treatment.rows, total: treatmentTotal },
       by_doctor: byDoctor.rows,
-      // The number to count the drawer against. Consultation fees marked paid
-      // plus treatment money taken today — the two streams added ONCE, which is
-      // the whole reason they are reported separately above.
-      collected_total: (a.fees_collected || 0) + treatmentTotal,
+      // The number to count the drawer against: consultation fees for the
+      // appointments that actually happened today, plus treatment money taken
+      // today — the two streams added ONCE, which is the whole reason they are
+      // reported separately above.
+      //
+      // There is deliberately no paid/unpaid split. `payment_status` exists on
+      // the table but nothing in the product writes it, so the old
+      // `fees_collected` was structurally always 0 and the dashboard told every
+      // clinic that 100% of its consultation fees were unpaid. Reporting one
+      // honest number beats reporting a distinction the product cannot make; if
+      // per-appointment payment marking is ever added, split this again then.
+      collected_total: (a.fees_completed || 0) + treatmentTotal,
     });
   } catch (err) { handleError(res, err); }
 });

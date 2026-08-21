@@ -5,7 +5,7 @@ const { validate, schemas } = require('../middleware/validate');
 const { VALID_APPOINTMENT_STATUSES, APPOINTMENT_TRANSITIONS, UUID_RE, validateUUID, handleError } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
-const { setTenantId } = require('../utils/requestContext');
+
 const { derivePlanStatus } = require('../utils/treatmentPlan');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 
@@ -20,7 +20,7 @@ const { IST_TODAY_SQL } = require('../utils/dateTz');
 // Other admin route files won't carry tenantId in their logs until the same
 // line is added there too.
 router.use((req, res, next) => {
-  if (req.tenant?.id) setTenantId(req.tenant.id);
+  // (tenantId is stamped centrally by tenantMiddleware — see middleware/auth.js)
   next();
 });
 
@@ -538,12 +538,32 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
       return res.status(400).json({ error: 'appointment_date cannot be in the past' });
     }
 
-    // Verify doctor exists, is active, and belongs to the specified hospital
+    // Verify the doctor exists, is active, and actually SITS at the specified
+    // branch — which is not the same as it being their primary branch.
+    //
+    // This used to be `hospital_id=$2` against doctors.hospital_id alone, which
+    // made a visiting consultant impossible to walk in. Their slots are stamped
+    // with the SESSION's branch (doctor_schedules.hospital_id — see
+    // jobs/slotGenerator.js), while this check demanded their primary, and the
+    // slot lock further down demands time_slots.hospital_id=$3. For a doctor who
+    // does Tuesdays at Whitefield and is based at Indiranagar, no value of
+    // hospital_id satisfies both: pass Whitefield and this check rejects them,
+    // pass Indiranagar and the slot lock 409s. The desk's only way through was
+    // "Other time", which reserves nothing and leaves the slot open to the bot —
+    // i.e. the double-booking this route exists to prevent.
     const doctorCheck = await tenantQuery(s,
-      `SELECT id FROM doctors WHERE id=$1 AND hospital_id=$2 AND is_active=true`,
+      `SELECT d.id FROM doctors d
+        WHERE d.id=$1 AND d.is_active=true
+          AND (
+            d.hospital_id=$2
+            OR EXISTS (SELECT 1 FROM doctor_schedules ds
+                        WHERE ds.doctor_id=d.id AND ds.hospital_id=$2)
+            OR EXISTS (SELECT 1 FROM doctor_hospitals dh
+                        WHERE dh.doctor_id=d.id AND dh.hospital_id=$2)
+          )`,
       [doctor_id, hospital_id]);
     if (!doctorCheck.rows[0]) {
-      return res.status(400).json({ error: 'Doctor not found or does not belong to the specified hospital' });
+      return res.status(400).json({ error: 'Doctor not found, or does not work at the specified branch' });
     }
 
     // Optional: which treatment this visit is for. Must be one the doctor actually
@@ -809,6 +829,15 @@ router.post('/appointments/:id/followup', adminOnly, validateUUID(), async (req,
           appointmentDate: slot.slot_date,
           appointmentTime: slot.start_time,
           visitType: orig.visit_type,
+          // A follow-up is for the SAME treatment as the visit it follows.
+          // Omitting this let bookingCore fall back to the doctor's primary
+          // department — the fallback reserved for the walk-in desk, where
+          // nobody chose a treatment — so an endodontic follow-up booked with a
+          // GP whose primary is General Dentistry was relabelled: the receipt
+          // printed "General Dentistry" and "by treatment" analytics credited
+          // the revenue to the wrong category. POST /appointments already
+          // passes department_id; these two paths must not disagree.
+          departmentId: orig.department_id || null,
           notes: notes || 'Follow-up appointment',
         });
 

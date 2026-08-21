@@ -157,6 +157,14 @@ router.patch('/departments/:id', adminOnly, validateUUID(), async (req, res) => 
       WHERE id=$3 AND is_active=true RETURNING *
     `, [name || null, description || null, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Department not found' });
+    // Audited like POST and DELETE on the same resource. Renaming a department
+    // changes what patients are offered in the bot's treatment picker, and for
+    // orthodontics it also changes the NUDGE CADENCE — isOrthodonticDepartment
+    // is a keyword match on this very name, so renaming "Orthodontics" to
+    // "Braces & Aligners" or to "Smile Correction" quietly moves every plan
+    // under it between the monthly and the weekly chase.
+    await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_DEPARTMENT', 'department', req.params.id,
+      null, { name, description }, req.ip);
     res.json({ department: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });

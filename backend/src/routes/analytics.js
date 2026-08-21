@@ -373,25 +373,15 @@ router.get('/analytics/export', adminOnly, makeAnalyticsLimiter(), async (req, r
   } catch (err) { handleError(res, err); }
 });
 
-// ── GOOGLE SHEETS WEBHOOK PUSH ────────────────────────────────
-// Route is mounted at /api/admin — path must be /settings/sheets-webhook
-// (not /admin/settings/sheets-webhook which would produce /api/admin/admin/...)
-// adminOnly: this mutates tenant settings, same as PATCH /settings.
-// NOTE: nothing consumes google_sheets_webhook_url yet — the push feature is
-// not implemented. Kept so saved URLs survive until it is (or remove both).
-router.post('/settings/sheets-webhook', adminOnly, async (req, res) => {
-  try {
-    const { url } = req.body;
-    if (!url || typeof url !== 'string' || !url.startsWith('https://')) {
-      return res.status(400).json({ error: 'Invalid webhook URL — must be https://' });
-    }
-    // Store in tenant settings
-    await query(
-      `UPDATE tenants SET settings = settings || $1 WHERE id = $2`,
-      [JSON.stringify({ google_sheets_webhook_url: url }), req.tenant.id]
-    );
-    res.json({ success: true, message: 'Google Sheets webhook URL saved' });
-  } catch (err) { handleError(res, err); }
-});
+// (There was a POST /settings/sheets-webhook here. It is gone, along with the
+// `google_sheets_export` feature flag that gated a push nobody wrote — see
+// migration 27. Nothing read google_sheets_webhook_url, no dashboard screen
+// called the route, and it was the one write into tenants.settings that bypassed
+// the deliberate Joi allowlist on PATCH /settings: any https:// string of any
+// length went straight in. That blob is loaded and cached by tenantMiddleware on
+// EVERY request for the tenant and returned in full by GET /settings, so a
+// multi-megabyte value there degrades every request the clinic makes. If the
+// Sheets push is ever built, add the key to the updateSettings schema so there
+// stays exactly one write path into settings.)
 
 module.exports = router;

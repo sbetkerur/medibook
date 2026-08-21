@@ -4,7 +4,7 @@ const rateLimit = require('express-rate-limit');
 const { tenantQuery } = require('../db');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
-const { setTenantId } = require('../utils/requestContext');
+
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const logger = require('../utils/logger');
 
@@ -14,7 +14,7 @@ const logger = require('../utils/logger');
 // matching comment in routes/appointments.js for why this lives per-route-file
 // rather than once in index.js's request-context setup.
 router.use((req, res, next) => {
-  if (req.tenant?.id) setTenantId(req.tenant.id);
+  // (tenantId is stamped centrally by tenantMiddleware — see middleware/auth.js)
   next();
 });
 
@@ -474,6 +474,11 @@ router.post('/patients/import', adminOnly, importLimiter, async (req, res) => {
   try {
     const { csv_data } = req.body; // base64 or raw CSV string
     if (!csv_data) return res.status(400).json({ error: 'csv_data is required (raw CSV or base64)' });
+    // See the same guard in routes/doctors.js: .includes() below throws on a
+    // non-string, turning a client mistake into a 500 with no explanation.
+    if (typeof csv_data !== 'string') {
+      return res.status(400).json({ error: 'csv_data must be a raw CSV or base64 string' });
+    }
 
     let rawCsv = csv_data;
     // Detect base64

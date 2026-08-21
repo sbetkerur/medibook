@@ -523,7 +523,14 @@ router.get('/settings', async (req, res) => {
       // ORDER BY is required for "primary hospital" to mean the same row here as
       // it does in PATCH /settings — an unordered LIMIT 1 can return either row.
       tenantQuery(t.schema_name,
-        `SELECT * FROM hospitals WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`),
+        // is_active, not just deleted_at. DELETE /hospitals/:id deactivates
+        // (is_active=false) and nothing in the codebase ever stamps
+        // hospitals.deleted_at, so filtering on deleted_at alone always returned
+        // the OLDEST branch — including one the clinic has closed. A clinic that
+        // shut its original branch then saw the dead branch's address and phone
+        // as "the clinic's", while the bot's clinicPhoneLine (which does filter
+        // is_active) quoted the live one.
+        `SELECT * FROM hospitals WHERE is_active=true AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`),
       query(`SELECT * FROM plans WHERE id=$1`, [t.plan]),
       Promise.all([
         tenantQuery(t.schema_name, `SELECT COUNT(*) FROM doctors WHERE is_active=true`),
@@ -596,7 +603,9 @@ router.patch('/settings', adminOnly, validate(schemas.updateSettings), async (re
       if (phone !== undefined)   { hospParams.push(phone || null);   hospUpdates.push(`phone=$${hospParams.length}`); }
       const updated = await tenantQuery(req.tenant.schema_name, `
         UPDATE hospitals SET ${hospUpdates.join(',')}
-        WHERE id = (SELECT id FROM hospitals WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1)
+        -- Must select the SAME row GET /settings displays, or the admin edits
+        -- one branch and reads back another (see the note there on is_active).
+        WHERE id = (SELECT id FROM hospitals WHERE is_active=true AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1)
         RETURNING id
       `, hospParams);
       if (!updated.rows[0]) {
@@ -742,7 +751,7 @@ router.post('/onboarding/complete', adminOnly, async (req, res) => {
 router.get('/access-logs', adminOnly, async (req, res) => {
   try {
     const { page = 1, limit = 50 } = req.query;
-    const safeLimit = Math.min(parseInt(limit) || 50, 200);
+    const safeLimit = Math.min(Math.max(parseInt(limit) || 50, 1), 200);
     const offset = (Math.max(parseInt(page) || 1, 1) - 1) * safeLimit;
     const r = await query(`
       SELECT * FROM admin_access_logs
@@ -852,7 +861,27 @@ router.post('/messages/send', adminOnly, async (req, res) => {
     // the patient's conversation, and it used to be the one outbound message
     // that left no trace anywhere except the audit log.
     const { sendPatientText } = require('../services/outbound');
-    await sendPatientText(req.tenant.schema_name, normalised, message);
+    try {
+      await sendPatientText(req.tenant.schema_name, normalised, message);
+    } catch (sendErr) {
+      // wa.sendText re-throws Meta's error, so this used to reach handleError as
+      // a bare "Internal server error" — for the single most ORDINARY outcome
+      // of this route. Meta only allows free-form text inside the 24-hour
+      // customer service window, and a receptionist messaging a patient who
+      // last wrote three days ago is not a server fault. Nothing was written to
+      // wa_messages either (sendPatientText logs only on success), so the staff
+      // member could not tell whether it went, and typically sent it again.
+      const meta = sendErr.response?.data?.error;
+      const reEngagement = meta?.code === 131047 || meta?.code === 470;
+      logger.warn('Staff WhatsApp send failed', {
+        tenant: req.tenant.slug, code: meta?.code, error: meta?.message || sendErr.message,
+      });
+      return res.status(reEngagement ? 409 : 502).json({
+        error: reEngagement
+          ? 'WhatsApp only allows a free-text message within 24 hours of the patient\'s last message to you. Nothing was sent — ask them to message the clinic first, or ring them.'
+          : 'WhatsApp did not accept the message. Nothing was sent; try again shortly.',
+      });
+    }
     await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
       'SEND_WA_MESSAGE', 'patient', normalised, null, { message: message.slice(0, 100) }, req.ip);
     res.json({ success: true, phone: normalised });
@@ -863,7 +892,7 @@ router.post('/messages/send', adminOnly, async (req, res) => {
 router.get('/audit-logs', adminOnly, async (req, res) => {
   try {
     const { from, to, action, resource_type, page = 1, limit = 50, export: doExport } = req.query;
-    const safeLimit = Math.min(parseInt(limit) || 50, 200);
+    const safeLimit = Math.min(Math.max(parseInt(limit) || 50, 1), 200);
     const offset = (Math.max(parseInt(page) || 1, 1) - 1) * safeLimit;
     const s = req.tenant.schema_name;
 

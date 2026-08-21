@@ -92,7 +92,18 @@ router.patch('/requests/:id', validateUUID(), async (req, res) => {
       .catch(e => logger.warn('Request audit failed', { error: e.message }));
 
     res.json({ request: r.rows[0] });
-  } catch (err) { handleError(res, err); }
+  } catch (err) {
+    // idx_clinic_requests_one_open allows ONE open row per (phone, kind), so
+    // re-opening an old request while a newer one is already open raises 23505
+    // — which handleError turned into a bare 500. The receptionist needs to be
+    // told that the newer request is the live one, not shown a server fault.
+    if (err.code === '23505') {
+      return res.status(409).json({
+        error: 'This patient already has a newer open request of the same kind. Clear that one first, or work from it instead.',
+      });
+    }
+    handleError(res, err);
+  }
 });
 
 module.exports = router;

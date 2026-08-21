@@ -73,9 +73,28 @@ router.get('/doctors', async (req, res) => {
       tenantQuery(schema, `
         SELECT d.*, dep.name as department_name, h.name as hospital_name,
                COALESCE(dept_agg.departments, '[]'::json) as departments,
+               -- EVERY branch this dentist sits at, not just their primary.
+               -- A visiting consultant is based at one branch and holds clinics
+               -- at others, and their slots carry the SESSION's branch, so any
+               -- caller filtering dentists by hospital_id alone (the walk-in
+               -- modal did) hides them from the very branch the patient is
+               -- standing in. Primary is included so a doctor with no sessions
+               -- yet still resolves.
+               COALESCE(hosp_agg.hospital_ids, '[]'::json) as hospital_ids,
                COALESCE(appt_agg.total, 0)::int as total_appointments,
                COALESCE(slot_agg.available, 0)::int as available_slots
         FROM doctors d
+        LEFT JOIN (
+          SELECT doctor_id, json_agg(DISTINCT hospital_id) AS hospital_ids
+            FROM (
+              SELECT id AS doctor_id, hospital_id FROM doctors WHERE hospital_id IS NOT NULL
+              UNION
+              SELECT doctor_id, hospital_id FROM doctor_schedules WHERE hospital_id IS NOT NULL
+              UNION
+              SELECT doctor_id, hospital_id FROM doctor_hospitals WHERE hospital_id IS NOT NULL
+            ) all_h
+           GROUP BY doctor_id
+        ) hosp_agg ON hosp_agg.doctor_id=d.id
         LEFT JOIN departments dep ON dep.id=d.department_id
         LEFT JOIN hospitals h ON h.id=d.hospital_id
         LEFT JOIN (
@@ -157,6 +176,14 @@ router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, r
       return inserted;
     });
 
+    // Audited: adding a dentist consumes the plan's doctor quota and changes who
+    // patients can be booked with. GET /audit-logs is the clinic's only
+    // attribution record, and PATCH/DELETE on this same resource already write
+    // to it — a create that does not is the gap an owner hits when the seat
+    // count does not match the staff they remember hiring.
+    await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
+      'CREATE_DOCTOR', 'doctor', r.rows[0].id, null,
+      { name: r.rows[0].name, hospital_id: r.rows[0].hospital_id, department_ids: deptIds }, req.ip);
     res.json({ doctor: { ...r.rows[0], department_ids: deptIds } });
   } catch (err) {
     if (err.isQuota) {
@@ -224,7 +251,20 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
     // department and dentist lists all filter is_active=true, so those patients
     // could no longer see or reschedule their own appointment, and the guard
     // written to prevent exactly that never ran.
-    if (is_active === false && oldR.rows[0].is_active === true) {
+    // Normalised to a real boolean (or null) BEFORE the guard, exactly as
+    // is_visiting and online_bookable are below. This route has no Joi schema,
+    // so `{"is_active":"false"}` used to skip the strict `=== false` test here
+    // and still reach `is_active=COALESCE($6,is_active)`, where Postgres
+    // happily coerced the string — deactivating a dentist who had upcoming
+    // appointments, which is the one thing this guard exists to prevent. A
+    // non-boolean, non-null value is now rejected rather than coerced, so
+    // `{"is_active":"maybe"}` is a 400 instead of a 500 from the driver.
+    if (is_active !== undefined && is_active !== null && typeof is_active !== 'boolean') {
+      return res.status(400).json({ error: 'is_active must be true or false' });
+    }
+    const isActive = typeof is_active === 'boolean' ? is_active : null;
+
+    if (isActive === false && oldR.rows[0].is_active === true) {
       const upcoming = await tenantQuery(s,
         `SELECT COUNT(*)::int AS n FROM appointments
          WHERE doctor_id=$1 AND status='confirmed' AND appointment_date >= ${IST_TODAY_SQL}`,
@@ -281,7 +321,7 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
           -- The desk can still book anyone, either way.
           online_bookable=COALESCE($13::boolean,online_bookable)
         WHERE id=$9 RETURNING *
-      `, [name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active,
+      `, [name, specialization, qualification, consultation_fee, slot_duration_minutes, isActive,
           primaryDeptId, hospital_id || null, req.params.id, pricingRulesVal, clearingPrimary,
           typeof is_visiting === 'boolean' ? is_visiting : null,
           typeof online_bookable === 'boolean' ? online_bookable : null]);
@@ -296,7 +336,7 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
       return updated;
     });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_DOCTOR', 'doctor', req.params.id,
-      oldR.rows[0], { name, is_active, department_ids: replacingSet ? deptIds : undefined }, req.ip);
+      oldR.rows[0], { name, is_active: isActive, department_ids: replacingSet ? deptIds : undefined }, req.ip);
     res.json({ doctor: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
@@ -346,6 +386,20 @@ router.get('/doctors/:id/schedule', validateUUID(), async (req, res) => {
        LEFT JOIN doctor_hospitals dh
          ON dh.doctor_id = s.doctor_id AND dh.day_of_week = s.day_of_week
         AND s.hospital_id IS NULL
+        -- Same scoping as the backfill in tenantMigrate.js and the two slot
+        -- generation queries. A deliberate NULL sitting BESIDE a session that
+        -- names a branch means "the primary branch", not "that branch": on a
+        -- Tuesday split 10-13 at B / 17-21 at primary there is exactly one dh
+        -- row, and handing it to the evening session made the dashboard show
+        -- both sessions at B. That is the reading a client then POSTs back,
+        -- which writes the wrong branch into doctor_schedules for good.
+        AND NOT EXISTS (
+          SELECT 1 FROM doctor_schedules s2
+           WHERE s2.doctor_id = s.doctor_id AND s2.day_of_week = s.day_of_week
+             AND s2.hospital_id IS NOT NULL
+        )
+        AND (SELECT COUNT(*) FROM doctor_hospitals dh2
+              WHERE dh2.doctor_id = s.doctor_id AND dh2.day_of_week = s.day_of_week) = 1
        WHERE s.doctor_id=$1 ORDER BY s.day_of_week, s.start_time`, [req.params.id]);
     res.json({ schedule: r.rows });
   } catch (err) { handleError(res, err); }
@@ -786,6 +840,12 @@ router.post('/doctors/import', adminOnly, async (req, res) => {
   try {
     const { csv_data } = req.body;
     if (!csv_data) return res.status(400).json({ error: 'csv_data is required' });
+    // Type-checked before .includes() below, which throws a TypeError on any
+    // non-string and surfaces as a bare 500 — a mis-wired client sending an
+    // array or a number deserves to be told what the field wants.
+    if (typeof csv_data !== 'string') {
+      return res.status(400).json({ error: 'csv_data must be a raw CSV or base64 string' });
+    }
 
     let rawCsv = csv_data;
     if (!csv_data.includes('\n') && !csv_data.includes(',')) {
@@ -890,6 +950,11 @@ router.post('/doctors/import', adminOnly, async (req, res) => {
       }
     }
 
+    // Audited for the same reason POST /patients/import already is: a CSV can
+    // add dozens of dentists in one call, and that is precisely the event an
+    // owner later cannot account for against their plan's seat count.
+    await writeAuditLog(s, req.user.id, req.user.role,
+      'IMPORT_DOCTORS', 'doctor', null, null, { imported, skipped }, req.ip);
     res.json({ imported, skipped, errors: errors.slice(0, 20) });
   } catch (err) { handleError(res, err); }
 });
@@ -936,7 +1001,13 @@ router.patch('/doctors/:id/pricing', adminOnly, validateUUID(), async (req, res)
     if (typeof returning_patient_fee === 'number') pricingRules.returning_patient_fee = returning_patient_fee;
     if (Object.keys(pricingRules).length > 0) {
       params.push(JSON.stringify(pricingRules));
-      updates.push(`pricing_rules=$${params.length}`);
+      // MERGE (`||`), not replace. This route builds a fresh object containing
+      // only the keys present in the body, so a plain `pricing_rules=$N` wiped
+      // every rule the caller did not happen to send: PATCH {new_patient_fee:600}
+      // against {new_patient_fee:500, returning_patient_fee:300} silently
+      // deleted the returning-patient fee, with nothing in the audit log to show
+      // what happened.
+      updates.push(`pricing_rules = COALESCE(pricing_rules, '{}'::jsonb) || $${params.length}::jsonb`);
     }
     if (!updates.length) return res.status(400).json({ error: 'No pricing fields provided' });
     params.push(req.params.id);
@@ -944,6 +1015,10 @@ router.patch('/doctors/:id/pricing', adminOnly, validateUUID(), async (req, res)
       `UPDATE doctors SET ${updates.join(',')} WHERE id=$${params.length} AND is_active=true RETURNING id, name, consultation_fee, pricing_rules`,
       params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
+    // Audited like every other mutating doctor route in this file — a change to
+    // what a patient is charged should not be the one that leaves no trace.
+    await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_DOCTOR_PRICING', 'doctor', req.params.id,
+      null, { consultation_fee, ...pricingRules }, req.ip);
     res.json({ doctor: r.rows[0] });
   } catch (err) { handleError(res, err, 'PATCH /doctors/:id/pricing'); }
 });
@@ -1004,6 +1079,12 @@ router.post('/doctors/:id/locations', adminOnly, validateUUID(), async (req, res
           SET start_time=EXCLUDED.start_time, end_time=EXCLUDED.end_time
       `, [req.params.id, hospital_id, day_of_week, start_time, end_time]);
     });
+    // Audited: this decides which BRANCH a whole weekday's slots are stamped
+    // with, and it silently deletes the conflicting row for that day. A change
+    // here moves a visiting consultant's clinic without touching the schedule
+    // screen, so it must be attributable.
+    await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_DOCTOR_LOCATION', 'doctor', req.params.id,
+      null, { hospital_id, day_of_week, start_time, end_time }, req.ip);
     res.json({ success: true });
   } catch (err) { handleError(res, err, 'POST /doctors/:id/locations'); }
 });

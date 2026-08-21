@@ -100,7 +100,17 @@ router.patch('/recalls/:id', validateUUID(), async (req, res) => {
       `UPDATE patient_recalls SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Recall not found' });
     res.json({ recall: r.rows[0] });
-  } catch (err) { handleError(res, err, 'PATCH /recalls/:id'); }
+  } catch (err) {
+    // Partial unique index on (patient_id, reason) WHERE status='due' — moving
+    // a recall back to 'due' when the patient already has one raises 23505.
+    // Same reasoning as PATCH /requests/:id: name the cause, don't 500.
+    if (err.code === '23505') {
+      return res.status(409).json({
+        error: 'This patient already has a recall due for the same reason.',
+      });
+    }
+    handleError(res, err, 'PATCH /recalls/:id');
+  }
 });
 
 router.delete('/recalls/:id', adminOnly, validateUUID(), async (req, res) => {

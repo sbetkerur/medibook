@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 const { query, tenantQuery, validateSchemaName } = require('../db');
 const { createTenantSchema, runTenantMigrations } = require('../db/tenantMigrate');
 const { authMiddleware, invalidateTenantCache } = require('../middleware/auth');
-const { validate, schemas } = require('../middleware/validate');
+const { validate, schemas, checkPasswordPolicy } = require('../middleware/validate');
 const { validateUUID, UUID_RE } = require('../utils/errors');
 const logger = require('../utils/logger');
 const { handleError } = require('../utils/errors');
@@ -109,9 +109,17 @@ router.get('/stats', async (req, res) => {
       }
     } catch (_) {}
 
-    const SCHEMA_RE = /^tenant_[a-z0-9_]+$/;
+    // validateSchemaName, not a local copy of its regex. The interpolations
+    // below are the only raw `"${schema}".table` writes outside db/index.js, so
+    // they must clear the SAME bar — and the copy that used to live here had
+    // already dropped the 63-byte identifier check, which is the half that stops
+    // two tenants whose names share a long prefix from being truncated by
+    // Postgres into ONE physical schema and counted twice in the platform
+    // totals.
     const tenantSchemas = await query(`SELECT schema_name FROM tenants WHERE status='active'`);
-    const validSchemas = tenantSchemas.rows.filter(t => SCHEMA_RE.test(t.schema_name));
+    const validSchemas = tenantSchemas.rows.filter(t => {
+      try { validateSchemaName(t.schema_name); return true; } catch { return false; }
+    });
     const invalidCount = tenantSchemas.rows.length - validSchemas.length;
     if (invalidCount > 0) {
       logger.warn(`Cross-tenant stats: skipping ${invalidCount} tenant(s) with a schema_name that failed validation`, { invalidCount });
@@ -579,27 +587,54 @@ router.get('/billing', async (req, res) => {
     // wrong revenue number actually gets looked at, so the tenants dragging it
     // out of true are listed right next to it.
     //
-    // Branch counts live in each tenant's own schema, so this is one query per
-    // active tenant, run concurrently and caught INDIVIDUALLY so a single schema mid-migration
-    // degrades to "unknown branch count" instead of taking the billing page
-    // down. Acceptable here because /billing is an on-demand admin view, not a
-    // hot path.
+    // Branch counts live in each tenant's own schema. This used to be one
+    // tenantQuery per active tenant fired concurrently through Promise.all —
+    // and every tenantQuery takes its own pool.connect(). At 200 tenants that is
+    // 200 simultaneous connect() calls against a pool of 20, so one super admin
+    // opening the billing page starved live bot and webhook traffic until the
+    // 10s connectionTimeoutMillis started rejecting it: patient messages failing
+    // for the duration of an internal page load.
+    //
+    // Batched with UNION ALL on ONE connection instead, exactly as GET /stats
+    // already does. Batches are caught individually so a single schema
+    // mid-migration degrades to "unknown branch count" for that batch rather
+    // than taking the page down.
     const billableR = await query(`
       SELECT t.id, t.name, t.slug, t.schema_name, t.plan, t.billing_monthly, p.price_monthly
         FROM tenants t LEFT JOIN plans p ON p.id = t.plan
        WHERE t.status = 'active'
     `);
 
-    const alerts = (await Promise.all(billableR.rows.map(async (t) => {
-      let branches = null;
+    // Same bar as every other raw `"${schema}".table` interpolation in this file.
+    const billable = billableR.rows.filter(t => {
+      try { validateSchemaName(t.schema_name); return true; } catch { return false; }
+    });
+
+    const branchCounts = new Map(); // tenant id -> branch count
+    const BILLING_BATCH_SIZE = 100;
+    for (let i = 0; i < billable.length; i += BILLING_BATCH_SIZE) {
+      const batch = billable.slice(i, i + BILLING_BATCH_SIZE);
       try {
-        const r = await tenantQuery(t.schema_name,
-          `SELECT COUNT(*) FROM hospitals WHERE is_active=true AND deleted_at IS NULL`);
-        branches = parseInt(r.rows[0].count);
+        const parts = batch.map(t => `
+          SELECT '${t.id}'::uuid AS tenant_id,
+                 COUNT(*)::int AS branches
+            FROM "${t.schema_name}".hospitals
+           WHERE is_active=true AND deleted_at IS NULL`);
+        const r = await query(parts.join(' UNION ALL '));
+        for (const row of r.rows) branchCounts.set(row.tenant_id, row.branches);
       } catch (err) {
-        logger.warn('billing drift: branch count failed', { tenant: t.slug, error: err.message });
-        return null; // unknown branch count — can't judge, don't guess
+        // One unreadable schema fails its whole batch. Those tenants are simply
+        // absent from branchCounts and skipped below — "can't judge, don't
+        // guess", the same outcome the per-tenant catch produced.
+        logger.warn('billing drift: branch count batch failed', {
+          from: batch[0]?.slug, size: batch.length, error: err.message,
+        });
       }
+    }
+
+    const alerts = billable.map((t) => {
+      const branches = branchCounts.get(t.id);
+      if (branches == null) return null; // unknown branch count — can't judge
       const listPrice = t.price_monthly ?? null;
       const flag = billingDriftFlag({ listPrice, billingMonthly: t.billing_monthly, branches });
       if (!flag) return null;
@@ -615,7 +650,7 @@ router.get('/billing', async (req, res) => {
         expected_max: listPrice != null ? listPrice * branches : null,
         flag,
       };
-    }))).filter(Boolean);
+    }).filter(Boolean);
 
     res.json({
       mrr_total: mrr,
@@ -985,10 +1020,12 @@ router.post('/tenants/:id/users/:userId/reset-password', resetTenantPasswordLimi
     if (!tenantR.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
     const tenant = tenantR.rows[0];
 
-    const password = req.body?.password || crypto.randomBytes(9).toString('base64url');
-    if (typeof password !== 'string' || password.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    }
+    // base64url of 9 random bytes always contains a digit and mixed case in
+    // practice, but it is not guaranteed to — so the generated password is
+    // checked by the same rule as a supplied one rather than assumed to pass.
+    const password = req.body?.password || crypto.randomBytes(9).toString('base64url') + 'aA1';
+    const pwErr = checkPasswordPolicy(password);
+    if (pwErr) return res.status(400).json({ error: pwErr });
 
     const hash = await bcrypt.hash(password, 12);
     const upd = await tenantQuery(tenant.schema_name,

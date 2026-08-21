@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const { query } = require('../db');
 const { ERRORS } = require('../utils/errors');
 const logger = require('../utils/logger');
+const { setTenantId } = require('../utils/requestContext');
 
 // ── In-memory tenant cache (5s TTL) ──────────────────────────
 // Avoids a DB round-trip on every authenticated request.
@@ -72,6 +73,7 @@ async function tenantMiddleware(req, res, next) {
         return res.status(403).json({ error: 'Tenant not found or inactive' });
       }
       req.tenant = cached.tenant;
+      setTenantId(cached.tenant.id);
 
       // IP allowlist check (only if tenant has allowlist configured)
       const clientIp = (req.ip || req.connection?.remoteAddress || '').replace('::ffff:', '');
@@ -90,6 +92,14 @@ async function tenantMiddleware(req, res, next) {
     if (!r.rows[0]) return res.status(403).json({ error: 'Tenant not found or inactive' });
 
     req.tenant = r.rows[0];
+    // Stamped HERE, on both the cache-hit and cache-miss paths, because this is
+    // the one place every /api/admin request resolves its tenant. It used to be
+    // called from routes/appointments.js and routes/patients.js only, so a 500
+    // raised in any of the other dozen admin routers logged a requestId with no
+    // tenantId — and an operator triaging a multi-clinic incident could not tell
+    // which clinic the failure belonged to. Worse than absent: present for two
+    // routers and missing for the rest reads as an unreliable field.
+    setTenantId(r.rows[0].id);
     tenantCache.set(tenantId, { tenant: r.rows[0], expiresAt: Date.now() + TENANT_CACHE_TTL_MS });
 
     // IP allowlist check (only if tenant has allowlist configured)

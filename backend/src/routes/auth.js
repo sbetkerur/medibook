@@ -42,7 +42,10 @@ router.post('/auth/superadmin/login', loginLimiter, validate(schemas.loginStrict
     const { email, password } = req.body;
     const normalizedEmail = (email || '').trim().toLowerCase();
     const r = await query(`SELECT * FROM super_admins WHERE email=$1`, [normalizedEmail]);
-    if (!r.rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!r.rows[0]) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH); // equalise timing
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     const valid = await bcrypt.compare(password, r.rows[0].password_hash);
     if (!valid) {
       await query(`INSERT INTO admin_access_logs (email, event, ip_address, user_agent) VALUES ($1,'login_failed',$2,$3)`,
@@ -57,7 +60,8 @@ router.post('/auth/superadmin/login', loginLimiter, validate(schemas.loginStrict
     );
     await query(`INSERT INTO admin_access_logs (user_id, email, event, ip_address, user_agent) VALUES ($1,$2,'login_success',$3,$4)`,
       [r.rows[0].id, r.rows[0].email, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
-    const refreshToken = await issueRefreshToken(r.rows[0].id, 'super_admin').catch(() => null);
+    const refreshToken = await issueRefreshToken(r.rows[0].id, 'super_admin')
+      .catch(e => { logger.error('Refresh token issue failed', { user_id: r.rows[0].id, role: 'super_admin', error: e.message }); return null; });
     res.json({ token, refresh_token: refreshToken, user: { email: r.rows[0].email, name: r.rows[0].name, role: 'super_admin' } });
   } catch (err) {
     handleError(res, err);
@@ -72,11 +76,17 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
     const normalizedSlug = (tenant_slug || '').trim();
     if (!normalizedSlug) return res.status(400).json({ error: 'Clinic ID required' });
     const tenantR = await query(`SELECT * FROM tenants WHERE slug=$1 AND status='active'`, [normalizedSlug]);
-    if (!tenantR.rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!tenantR.rows[0]) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH); // equalise timing
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     const tenant = tenantR.rows[0];
     const userR = await tenantQuery(tenant.schema_name,
       `SELECT * FROM users WHERE email=$1 AND is_active=true`, [normalizedEmail]);
-    if (!userR.rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!userR.rows[0]) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH); // equalise timing
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     const valid = await bcrypt.compare(password, userR.rows[0].password_hash);
     if (!valid) {
       await query(`INSERT INTO admin_access_logs (email, tenant_id, event, ip_address, user_agent) VALUES ($1,$2,'login_failed',$3,$4)`,
@@ -91,7 +101,12 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
     );
     await query(`INSERT INTO admin_access_logs (user_id, email, tenant_id, event, ip_address, user_agent) VALUES ($1,$2,$3,'login_success',$4,$5)`,
       [userR.rows[0].id, userR.rows[0].email, tenant.id, req.ip, req.headers['user-agent']]).catch(e => logger.warn('Audit log failed', { error: e.message }));
-    const refreshToken = await issueRefreshToken(userR.rows[0].id, userR.rows[0].role, tenant.id).catch(() => null);
+    // Logged, not swallowed. Returning 200 with a null refresh token is
+    // defensible — the access token works and the user gets on with their day —
+    // but the silence was not: an hour later they are bounced to the login
+    // screen mid-shift with nothing anywhere explaining why.
+    const refreshToken = await issueRefreshToken(userR.rows[0].id, userR.rows[0].role, tenant.id)
+      .catch(e => { logger.error('Refresh token issue failed', { user_id: userR.rows[0].id, role: userR.rows[0].role, tenant: tenant.slug, error: e.message }); return null; });
     res.json({
       token,
       refresh_token: refreshToken,
@@ -145,6 +160,22 @@ async function withRowLock(selectSql, selectParams, callback) {
   }
 }
 
+// A real bcrypt hash of a value nobody knows, compared against on the
+// user-not-found and tenant-not-found paths so all three login outcomes cost
+// the same. Without it a 401 that skipped bcrypt returned in ~2ms while a wrong
+// password took ~200ms (cost 12), which turns the login form into an oracle:
+// fast means "no such clinic slug" or "no such staff email", slow means "that IS
+// a live account here". The 10-per-15-min IP limiter slows enumeration but does
+// not remove the signal, and the pairs it yields feed credential stuffing.
+// Generated once at module load rather than per request.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('timing-equalisation-placeholder', 12);
+
+// How recently a refresh token must have been redeemed for a second
+// presentation of it to count as the user's own tabs racing rather than a
+// replay. Long enough to cover a lock-less double refresh and a slow network,
+// far shorter than any window a stolen token is used in.
+const REFRESH_RACE_GRACE_SECONDS = 15;
+
 // Helper: issue a refresh token (30-day, one-time-use). Only the SHA-256 hash
 // is persisted; the raw token goes to the client.
 async function issueRefreshToken(userId, userRole, tenantId = null) {
@@ -185,12 +216,69 @@ router.post('/auth/refresh', refreshLimiter, async (req, res) => {
        FOR UPDATE`,
       [hashToken(refresh_token)],
       async (client, row) => {
-        if (!row) return { abort: true, status: 401, body: { error: 'Invalid or expired refresh token' } };
-        await client.query(`UPDATE refresh_tokens SET used=true WHERE id=$1`, [row.id]);
+        if (!row) {
+          // REUSE DETECTION. A miss has two very different causes: a token that
+          // never existed, and one that was already redeemed. Rotation alone
+          // does not protect a stolen token — the thief redeems RT1 first and
+          // gets RT2, the real user's RT1 then 401s, they simply log in again,
+          // and the thief keeps rotating RT2 -> RT3 -> ... for the full 30 days
+          // with nothing anywhere recording that a used token was replayed.
+          //
+          // A replayed used token means the family is compromised, so the whole
+          // family is revoked: both parties are forced to re-authenticate, which
+          // is a minor annoyance for the legitimate user and the end of the
+          // session for the thief. Looked up inside the same transaction as the
+          // rotation so a concurrent redeem cannot slip between the two reads.
+          const replayed = await client.query(
+            `SELECT user_id, user_role, tenant_id,
+                    (used_at IS NOT NULL AND used_at > NOW() - make_interval(secs => $2::int)) AS just_now
+               FROM refresh_tokens
+              WHERE token=$1 AND used=true`,
+            [hashToken(refresh_token), REFRESH_RACE_GRACE_SECONDS]
+          );
+          const hit = replayed.rows[0];
+          // A token redeemed moments ago is the user's own tabs racing, not a
+          // thief. The client serialises refreshes with a Web Lock and carries
+          // an explicit fallback for browsers without them, so this genuinely
+          // happens — and treating it as theft would log people out of a working
+          // session at random. The thief's replay comes minutes to days after
+          // the redeem it followed, well outside this window, so detection is
+          // kept. A plain 401 sends the racing tab down api.js's existing
+          // "another tab already rotated it" recovery path.
+          if (hit && !hit.just_now) {
+            // Detected here, acted on after the transaction: `abort` ROLLBACKs,
+            // so a revocation written inside it would be undone.
+            return {
+              abort: true, status: 401,
+              body: { error: 'This session has been ended for security. Please sign in again.' },
+              reuse: { userId: hit.user_id, userRole: hit.user_role, tenantId: hit.tenant_id },
+            };
+          }
+          return { abort: true, status: 401, body: { error: 'Invalid or expired refresh token' } };
+        }
+        await client.query(`UPDATE refresh_tokens SET used=true, used_at=NOW() WHERE id=$1`, [row.id]);
         return { value: row };
       }
     );
-    if (outcome.abort) return res.status(outcome.status).json(outcome.body);
+    if (outcome.abort) {
+      if (outcome.reuse) {
+        // Revoke every outstanding token for this user, then record it where an
+        // operator triaging the account will actually look.
+        await query(
+          `UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`,
+          [outcome.reuse.userId]
+        ).catch(e => logger.error('Refresh reuse: family revocation failed', { error: e.message }));
+        await query(
+          `INSERT INTO admin_access_logs (user_id, tenant_id, event, ip_address, user_agent)
+           VALUES ($1,$2,'refresh_token_reuse',$3,$4)`,
+          [outcome.reuse.userId, outcome.reuse.tenantId, req.ip, req.headers['user-agent']]
+        ).catch(e => logger.warn('Audit log failed', { error: e.message }));
+        logger.warn('Refresh token reuse detected — revoked token family', {
+          user_id: outcome.reuse.userId, role: outcome.reuse.userRole, ip: req.ip,
+        });
+      }
+      return res.status(outcome.status).json(outcome.body);
+    }
     const rt = outcome.value;
 
     let tokenPayload = { id: rt.user_id, role: rt.user_role };

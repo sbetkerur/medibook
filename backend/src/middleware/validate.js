@@ -32,15 +32,13 @@ const schemas = {
     password: Joi.string().min(6).required(),
   }),
 
-  resetPassword: Joi.object({
-    token: Joi.string().required(),
-    password: Joi.string().min(8)
-      .pattern(/[A-Z]/, 'uppercase letter')
-      .pattern(/[a-z]/, 'lowercase letter')
-      .pattern(/[0-9]/, 'digit')
-      .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
-      .required(),
-  }),
+  // (There was a `resetPassword` schema here, for a token-based flow that no
+  // longer exists: /auth/forgot-password and /auth/reset-password delivered
+  // their link by email and went with services/email.js. It had no consumer,
+  // and leaving it in place invited a maintainer to conclude the token path was
+  // still live and rebuild the email dependency around it. The only recovery
+  // paths now are POST /admin/staff/:id/reset-password and the super-admin one,
+  // both of which hand the new password over once, in the response.)
 
   changePassword: Joi.object({
     current_password: Joi.string().required(),
@@ -204,4 +202,26 @@ const schemas = {
   }),
 };
 
-module.exports = { validate, schemas };
+/**
+ * The same password policy the Joi schemas above enforce, for the one route
+ * that cannot use them.
+ *
+ * POST /superadmin/tenants/:id/users/:userId/reset-password takes an OPTIONAL
+ * password (it generates one when none is given), so it validates by hand — and
+ * it only ever checked `length >= 8`. An operator could set "password" there and
+ * the clinic admin would then be refused that same value by /auth/change-password,
+ * which does apply the rules. One definition, used by both.
+ *
+ * @returns {string|null} an error message, or null when the password is fine.
+ */
+function checkPasswordPolicy(password) {
+  if (typeof password !== 'string' || password.length < 8) {
+    return 'Password must be at least 8 characters';
+  }
+  if (!/[A-Z]/.test(password)) return 'Password must contain at least one uppercase letter';
+  if (!/[a-z]/.test(password)) return 'Password must contain at least one lowercase letter';
+  if (!/[0-9]/.test(password)) return 'Password must contain at least one digit';
+  return null;
+}
+
+module.exports = { validate, schemas, checkPasswordPolicy };

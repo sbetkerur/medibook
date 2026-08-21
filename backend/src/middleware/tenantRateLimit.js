@@ -44,6 +44,49 @@ function getEndpointLimit(tenant, reqPath, planLimit) {
 const ALERT_DEBOUNCE_MS = 5 * 60 * 1000; // at most one alert per tenant per 5 minutes
 const lastAlertSentAt = new Map(); // tenantId -> timestamp
 
+// ── In-process fallback counter ───────────────────────────────────────────────
+// REDIS_URL is documented as optional, and utils/redisClient.js says callers
+// "already treat a throw as fall back to the in-process limiter". Nothing here
+// did: incrWithTTL threw REDIS_NOT_CONFIGURED on EVERY request, the catch below
+// logged a warning and called next(), and so a Redis-less deployment had no
+// per-tenant limit at all — the plan cap, the 90%-usage alert and the IP-abuse
+// block were all unreachable — while writing one warn line per request into a
+// 10 MB × 5 rotating log.
+//
+// Single-process only, which is the honest bound: without Redis there is no
+// shared counter to have. It is a real limit for the common single-instance
+// deployment, and strictly better than none for any other.
+const _localCounts = new Map(); // key -> count
+let _localWindow = 0;
+
+function localIncr(key) {
+  const window = Math.floor(Date.now() / 60000);
+  if (window !== _localWindow) {
+    // Whole-map clear on rollover: every key embeds the window, so nothing from
+    // a previous minute can still be wanted, and this keeps the map from
+    // growing without bound on a busy multi-tenant instance.
+    _localCounts.clear();
+    _localWindow = window;
+  }
+  const n = (_localCounts.get(key) || 0) + 1;
+  _localCounts.set(key, n);
+  return n;
+}
+
+// Logged once per process, not once per request.
+let _warnedNoRedis = false;
+function noteRedisUnavailable(err, tenantId) {
+  if (err?.code === 'REDIS_NOT_CONFIGURED') {
+    if (!_warnedNoRedis) {
+      _warnedNoRedis = true;
+      logger.warn('tenantRateLimit: REDIS_URL unset — using the in-process counter (per-instance, not shared)');
+    }
+    return 'fallback';
+  }
+  logger.warn('tenantRateLimit: Redis error, failing open', { tenantId, error: err.message });
+  return 'open';
+}
+
 // Send alert webhook (fire-and-forget)
 async function sendRateLimitAlert(tenant, endpoint, count, limit) {
   const alertUrl = tenant?.settings?.alert_webhook_url;
@@ -120,7 +163,17 @@ module.exports = async function tenantRateLimit(req, res, next) {
 
     // Atomic INCR + EXPIRE — avoids leaving a TTL-less counter if the process
     // dies between the two calls (which would rate-limit the tenant forever).
-    const count = await incrWithTTL(key, 65);
+    // With no Redis configured this falls back to the in-process counter above
+    // rather than failing open on every request; a genuine Redis ERROR (a blip
+    // on a configured instance) still fails open, which is the right call for a
+    // guard that must never take the dashboard down.
+    let count;
+    try {
+      count = await incrWithTTL(key, 65);
+    } catch (err) {
+      if (noteRedisUnavailable(err, tenantId) !== 'fallback') return next();
+      count = localIncr(key);
+    }
 
     res.setHeader('X-RateLimit-Limit', limit);
     res.setHeader('X-RateLimit-Remaining', Math.max(0, limit - count));
@@ -131,7 +184,12 @@ module.exports = async function tenantRateLimit(req, res, next) {
       const abuseKey = `ratelimit:abuse:${clientIp}`;
       let abuseCount = 0;
       try {
-        abuseCount = await incrWithTTL(abuseKey, 5 * 60);
+        try {
+          abuseCount = await incrWithTTL(abuseKey, 5 * 60);
+        } catch (err) {
+          if (err?.code !== 'REDIS_NOT_CONFIGURED') throw err;
+          abuseCount = localIncr(abuseKey);
+        }
         if (abuseCount >= 10) {
           await recordIPAbuse(clientIp, `Rate limit exceeded ${abuseCount} times for tenant ${tenantId}`);
         }
@@ -153,7 +211,9 @@ module.exports = async function tenantRateLimit(req, res, next) {
       setImmediate(() => sendRateLimitAlert(req.tenant, req.path, count, limit));
     }
   } catch (err) {
-    logger.warn('tenantRateLimit: Redis error, failing open', { tenantId, error: err.message });
+    // Anything else that went wrong in here (a DB read for the IP block, a
+    // header write) must not take the clinic's dashboard offline.
+    logger.warn('tenantRateLimit: failing open', { tenantId, error: err.message });
   }
 
   next();
