@@ -33,6 +33,9 @@ cd backend && node tests/slotPlanner.unit.test.js
 cd backend && node tests/billingDrift.unit.test.js   # per-branch billing staleness
 cd backend && node tests/doctorDepartments.unit.test.js  # multi-department doctors
 cd backend && node tests/treatmentPlan.unit.test.js      # multi-visit treatment courses
+cd backend && node tests/circuitBreaker.unit.test.js     # HALF_OPEN lets ONE probe through
+cd backend && node tests/messageBudget.unit.test.js      # budget 0 means none, not "default"
+cd backend && node tests/rateLimitFallback.unit.test.js  # per-tenant cap with no Redis
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -396,7 +399,15 @@ the account owner.
 **`GET /day-close` is the end-of-day count.** Consultation fees and treatment
 payments stay SEPARATE (conflating them double-counts revenue) and are added
 once into `collected_total`, broken down by method so the drawer can be counted
-against the cash line. IST throughout — `created_at` is a TIMESTAMPTZ and is
+against the cash line. The consultation half uses
+`COALESCE(NULLIF(a.effective_fee,0), d.consultation_fee)` — the same expression
+the analytics queries and the weekly digest use. `effective_fee` is an OVERRIDE
+column that nothing currently writes, so summing it raw reported ₹0 of
+consultation income every day. For the same reason there is deliberately no
+paid/unpaid split: `payment_status` has no writer either, so the old
+`fees_collected` was structurally always 0 and told every clinic that 100% of
+its fees were unpaid. If per-appointment payment marking is ever built, split it
+again then — and give `payment_status` a writer in the same change. IST throughout — `created_at` is a TIMESTAMPTZ and is
 compared in Asia/Kolkata, or a clinic closing at 21:00 sees yesterday.
 
 **A working day is a LIST of sessions.** An Indian dentist routinely does 10–1
@@ -442,7 +453,13 @@ there's no id to key off) is checked in two places that must stay in step:
 plan in the bot's treatment list regardless of `scheduling_mode`, and
 `jobs/treatmentNudges.js`, which runs `findPlansNeedingNudge` a SECOND time
 with its own thresholds — one nudge, 30 days after the last sitting, instead of
-the ordinary 3-day quiet period and 3-nudge cap. `treatment_plans.scheduling_mode`
+the ordinary 3-day quiet period and 3-nudge cap. "One nudge" is per GAP, not per
+plan, and cannot be expressed with `nudge_count`, which only ever increments:
+with `ORTHO_MAX_NUDGES_PER_PLAN` as the gate it meant one nudge for the whole
+two-year course, so a patient chased once after sitting 3 was never chased again
+for the remaining ~14 adjustments. The gate is instead "no nudge since the most
+recent non-cancelled sitting", which resets each time the patient actually
+attends; the constant survives only as a lifetime backstop. `treatment_plans.scheduling_mode`
 (`patient` | `clinic`) still exists for any OTHER course type a dentist wants
 scheduled purely at the chair (`clinic` plans stay excluded from the ordinary
 nudge cadence and the bot's treatment list) — orthodontics is simply no longer
@@ -475,7 +492,29 @@ alternate weeks are `{1,3,5}`, and NULL/empty means every week —
 `matchesWeekOfMonth` FAILS OPEN on anything empty or malformed, because reading
 "no restriction" as "no weeks" would erase a dentist's whole calendar.
 (3) `isBlockedDay(dateStr, hospitalId)` takes the branch, so a holiday at one
-branch can't close the day the doctor spends at the other. `POST
+branch can't close the day the doctor spends at the other.
+
+The `doctor_hospitals` fallback is scoped in FOUR places that must stay
+identical — `tenantMigrate.js`'s backfill, both `slotGenerator` queries and
+`GET /doctors/:id/schedule`. A session whose `hospital_id` is deliberately NULL
+means "the doctor's PRIMARY branch", and `/doctors/:id/schedule` writes a
+`doctor_hospitals` row only for a session that names a branch. So on a Tuesday
+split "10–13 at branch B / 17–21 at primary (NULL)" there is exactly ONE `dh`
+row, and joining it on weekday alone hands branch B to the evening session too:
+the whole evening at the main clinic is generated, told to patients and
+holiday-checked as B. The fallback therefore applies only where NO session that
+weekday names a branch, and only where that weekday has exactly one `dh` row
+(two would MULTIPLY the session and `ON CONFLICT DO NOTHING` would keep an
+arbitrary branch).
+
+Consequence for the desk: a walk-in with a visiting consultant is booked at the
+branch they SIT at that day, not their primary. `POST /appointments` accepts any
+branch the doctor works at (primary, `doctor_schedules` or `doctor_hospitals`) —
+requiring the primary while the slot lock requires `time_slots.hospital_id` made
+the two conditions unsatisfiable for a visiting doctor, so no combination could
+book them into a real slot. `GET /doctors` returns `hospital_ids` (every branch
+worked) for the same reason; filtering a dentist list on `hospital_id` alone
+hides visiting consultants from the branch the patient is standing in. `POST
 /doctors/:id/schedule` writes both tables together and is the only UI for
 either; `seed.js` clears both so a re-seed is a true reset. The
 `(doctor_id, slot_date, start_time)` unique index also means a visiting doctor
@@ -559,7 +598,14 @@ only releases those.
 
 **Auth.** JWTs (1h, `jti` for blacklist-based revocation) + rotating one-time
 refresh tokens (30d). Refresh AND password-reset tokens are stored as SHA-256
-hashes only. Auth + tenant + per-tenant rate-limit middleware are applied ONCE
+hashes only. Rotation alone does not protect a STOLEN refresh token — the thief
+redeems first, the real user's 401 looks like an ordinary expiry, and the thief
+rotates on for 30 days. So a miss is re-checked against `used=true`: a replay
+revokes every outstanding token for that user and writes a
+`refresh_token_reuse` row to `admin_access_logs`. A token redeemed within
+`REFRESH_RACE_GRACE_SECONDS` is exempt — that is the user's own tabs racing
+(the client serialises with a Web Lock but carries a fallback for browsers
+without one), and treating it as theft would log people out at random. Auth + tenant + per-tenant rate-limit middleware are applied ONCE
 in `index.js` for `/api/admin` and `/api/v1/admin` — route files must not
 re-apply them. Mutating admin routes use `adminOnly`; validate route UUIDs with
 `validateUUID()` / shared `UUID_RE` from `utils/errors.js`.
@@ -584,7 +630,9 @@ Required in prod (startup fails or warns otherwise): `DATABASE_URL`,
 from it, so without it no clinic can be reached at all and the dashboard shows
 `configured:false`). Optional: `REDIS_URL`
 (queues, cron locks and shared rate-limit counters all degrade to in-process
-fallbacks without it — nothing probes localhost), `OPENAI_API_KEY` (voice transcription),
+fallbacks without it — nothing probes localhost; `tenantRateLimit` keeps a
+per-process counter, which is a real limit for a single instance and the honest
+bound for more than one, and logs the condition ONCE rather than per request), `OPENAI_API_KEY` (voice transcription),
 `SENTRY_DSN`, `METRICS_SECRET`, `BACKUP_DIR`, `TIMEZONE`,
 `WEBHOOK_RATE_LIMIT_PER_MIN` (default 2000; per-IP, and Meta delivers every
 tenant's traffic from a shared IP pool, so this is effectively platform-wide).
