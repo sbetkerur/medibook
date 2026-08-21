@@ -156,7 +156,16 @@ jobs:
           TEST_API_BASE: http://localhost:3001/api/webhook/whatsapp
         run: |
           fail=0
-          for f in tests/bot.test.js tests/entryFlow.test.js tests/api.test.js; do
+          # smoke.test.js is included deliberately. It was written, then run by
+          # nothing — so it drifted nine assertions behind the product (asking
+          # for a booking ID the bot stopped requesting, expecting the word
+          # "Welcome" that is now reserved for a QR arrival, tapping a confirm
+          # button whose index shifted when "Move it instead" was added) while
+          # the flows it covers worked perfectly. It is the only suite that
+          # drives a whole patient journey end to end — provision a clinic, book,
+          # then cancel — so it earns a place here, and being here is what stops
+          # it drifting again.
+          for f in tests/bot.test.js tests/entryFlow.test.js tests/api.test.js tests/smoke.test.js; do
             echo "── $f"
             if node "$f"; then
               echo "   PASS"

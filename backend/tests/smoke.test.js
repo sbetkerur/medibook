@@ -247,11 +247,16 @@ async function testBotFlow() {
     assert(status === 200, `Got ${status}`);
     const r = data.responses;
     assert(Array.isArray(r) && r.length > 0, 'No responses');
-    const welcome = r.find(m => m.text?.includes('Welcome'));
-    assert(welcome, `No Welcome message. Got: ${JSON.stringify(r)}`);
+    // Asserted on MEANING, not wording (the house rule in CLAUDE.md's
+    // conversation-design section). The word "Welcome" is reserved for a QR
+    // ARRIVAL — an ordinary "Hi" later in the thread deliberately does not use
+    // it, and tests/botFlow.unit.test.js pins that distinction. What matters
+    // here is that a greeting lands on the clinic's main menu.
+    const menu = r.find(m => m.buttons?.length);
+    assert(menu, `No menu card. Got: ${JSON.stringify(r)}`);
     assert(
-      welcome.buttons?.some(b => b.includes('Book')),
-      `No Book button. Buttons: ${JSON.stringify(welcome.buttons)}`
+      menu.buttons?.some(b => /book/i.test(b)),
+      `No Book button. Buttons: ${JSON.stringify(menu.buttons)}`
     );
   });
 
@@ -301,74 +306,51 @@ async function testBotFlow() {
     assert(hasSlot, `Expected slot list. Got: ${JSON.stringify(r)}`);
   });
 
-  await test('Selecting time slot (09:00) proceeds to patient details', async () => {
-    const { data } = await bot('09:00');
-    const r = data.responses;
-    assert(r?.length > 0, 'No response');
-    const hasNext = r.some(m =>
-      m.text?.includes('Name') || m.text?.includes('Booking Summary') ||
-      m.text?.includes('Confirm')
-    );
-    assert(hasNext, `Expected name prompt or confirmation. Got: ${JSON.stringify(r)}`);
-  });
+  // ── PATIENT DETAILS, DRIVEN BY WHAT IS ASKED ─────────────────
+  //
+  // This used to be six tests hard-coding one exact step order — slot, name,
+  // DOB, gender, email, reason — and each asserted on the literal wording of
+  // its prompt. The flow has since changed (gender and email are no longer
+  // collected during booking; the chief complaint follows the date of birth)
+  // and the copy was rewritten to read as questions rather than form labels, so
+  // four of the six failed while the booking itself worked perfectly. A suite
+  // that cries wolf on a working flow is one people stop reading.
+  //
+  // Instead: answer whatever the bot actually asks, up to a bounded number of
+  // turns, and assert on the thing that matters — that a patient can get from a
+  // chosen slot to the confirmation screen. Recognition is by MEANING, per
+  // CLAUDE.md's rule that copy may move between header, body and footer.
+  await test('A chosen slot leads through patient details to the confirmation', async () => {
+    let { data } = await bot('09:00');
+    let r = data.responses;
+    assert(r?.length > 0, 'No response to the slot selection');
 
-  await test('Entering patient name proceeds to DOB', async () => {
-    const { data } = await bot('Test Patient');
-    const r = data.responses;
-    assert(r?.length > 0, 'No response');
-    // Could be DOB prompt (new patient) or confirmation (returning patient)
-    const hasNext = r.some(m =>
-      m.text?.includes('Birth') || m.text?.includes('DD/MM') ||
-      m.text?.includes('Booking Summary') || m.text?.includes('Confirm') ||
-      m.text?.includes('Gender')
-    );
-    assert(hasNext, `Expected DOB or next step. Got: ${JSON.stringify(r)}`);
-  });
+    const asked = (msgs, re) => msgs.some(m =>
+      re.test([m.text, m.header, m.footer, ...(m.buttons || [])].filter(Boolean).join(' ')));
 
-  await test('Entering DOB (15/08/1990) proceeds to gender', async () => {
-    const { data } = await bot('15/08/1990');
-    const r = data.responses;
-    assert(r?.length > 0, 'No response');
-    const hasNext = r.some(m =>
-      m.text?.includes('Gender') || m.buttons?.includes('Male') ||
-      m.text?.includes('Booking Summary') || m.text?.includes('Confirm')
-    );
-    assert(hasNext, `Expected gender or confirmation. Got: ${JSON.stringify(r)}`);
-  });
+    const answers = [
+      [/name should the appointment be under|full name/i, 'Test Patient'],
+      [/date of birth/i,                                   '15/08/1990'],
+      [/own words|brings you in/i,                         'Checkup'],
+      [/gender/i,                                          'Male'],   // legacy step
+      [/e-?mail/i,                                         'Skip'],   // legacy step
+    ];
 
-  await test('Selecting gender prompts for email (or shows summary)', async () => {
-    const { data } = await bot('Male');
-    const r = data.responses;
-    assert(r?.length > 0, 'No response');
-    const hasNext = r.some(m =>
-      m.text?.includes('Email') || m.text?.includes('Booking Summary') ||
-      m.text?.includes('Confirm') || m.text?.includes('Doctor')
-    );
-    assert(hasNext, `Expected email prompt or booking summary. Got: ${JSON.stringify(r)}`);
-  });
+    const seen = [];
+    for (let turn = 0; turn < 8; turn++) {
+      if (asked(r, /check the details|confirm/i)) break;
+      const next = answers.find(([re]) => asked(r, re));
+      assert(next, `Booking stalled — nothing recognisable was asked. Got: ${JSON.stringify(r)}`);
+      seen.push(next[1]);
+      ({ data } = await bot(next[1]));
+      r = data.responses;
+      assert(r?.length > 0, `No response after answering "${next[1]}"`);
+    }
 
-  await test('Skipping email asks for reason for visit', async () => {
-    const { data } = await bot('Skip');
-    const r = data.responses;
-    assert(r?.length > 0, 'No response');
-    const hasReason = r.some(m =>
-      m.text?.includes('Reason') ||
-      m.buttons?.some(b => b.includes('Checkup') || b.includes('Pain'))
-    );
-    assert(hasReason, `Expected reason-for-visit prompt. Got: ${JSON.stringify(r)}`);
+    assert(asked(r, /check the details|confirm/i),
+      `Never reached the confirmation. Answered ${JSON.stringify(seen)}; last: ${JSON.stringify(r)}`);
+    console.log(`       → answered: ${seen.join(' → ')}`);
   });
-
-  await test('Selecting reason for visit shows booking summary', async () => {
-    const { data } = await bot('Checkup / Cleaning');
-    const r = data.responses;
-    assert(r?.length > 0, 'No response');
-    const hasSummary = r.some(m =>
-      m.text?.includes('review') || m.text?.includes('Confirm') ||
-      m.buttons?.some(b => b.includes('Confirm'))
-    );
-    assert(hasSummary, `Expected booking summary. Got: ${JSON.stringify(r)}`);
-  });
-
   await test('Confirming booking creates appointment with Booking ID', async () => {
     const { data } = await bot('Yes');
     const r = data.responses;
@@ -393,39 +375,50 @@ async function testBotFlow() {
 
   // ── CANCELLATION FLOW ─────────────────────────────────────────
   if (bookingId) {
-    await test('Cancel flow prompts for Booking ID', async () => {
+    // The cancel journey, as it actually works now.
+    //
+    // These four tests used to assume the patient types a BOOKING ID and that
+    // the confirm step is a two-button yes/no. Both were deliberately changed:
+    // no patient keeps a booking ID, so the bot lists their appointments to tap;
+    // and the confirm step now LEADS with "Move it instead", because a good
+    // share of people who ring to cancel take another slot. That shifted every
+    // button index by one, which is exactly how the old final test ended up
+    // tapping "No, keep it" and then reporting the cancellation as broken.
+    await test('Cancel offers the patient their bookings to pick from', async () => {
       const { data } = await bot('Cancel');
       const r = data.responses;
       assert(r?.length > 0, 'No response');
-      const hasPrompt = r.some(m => m.text?.includes('Booking ID') || m.text?.includes('cancel'));
-      assert(hasPrompt, `Expected booking ID prompt. Got: ${JSON.stringify(r)}`);
+      const offersBooking = r.some(m =>
+        JSON.stringify(m).includes(bookingId) || /which appointment|pick a booking/i.test(JSON.stringify(m)));
+      assert(offersBooking, `Expected the booking to be offered. Got: ${JSON.stringify(r)}`);
     });
 
-    await test('Entering Booking ID prompts for cancellation reason', async () => {
+    await test('Picking one asks WHY before anything is cancelled', async () => {
       const { data } = await bot(bookingId);
       const r = data.responses;
       assert(r?.length > 0, 'No response');
-      const hasConfirm = r.some(m => m.text?.includes(bookingId) || m.text?.includes('Cancel'));
-      assert(hasConfirm, `Expected cancel prompt. Got: ${JSON.stringify(r)}`);
+      const asksReason = r.some(m => /what changed|reason/i.test(JSON.stringify(m)));
+      assert(asksReason, `Expected the reason step. Got: ${JSON.stringify(r)}`);
     });
 
-    await test('Selecting reason shows final confirmation', async () => {
-      const { data } = await bot('', 'btn_1'); // Schedule conflict
+    await test('The confirm step offers to MOVE it before offering to cancel', async () => {
+      const { data } = await bot('Schedule conflict');
       const r = data.responses;
       assert(r?.length > 0, 'No response');
-      const hasConfirm = r.some(m => m.text?.toLowerCase().includes('sure') || m.text?.toLowerCase().includes('confirm'));
-      assert(hasConfirm, `Expected final confirm. Got: ${JSON.stringify(r)}`);
+      const btns = r.flatMap(m => m.buttons || []);
+      assert(btns.length >= 3, `Expected three options. Got: ${JSON.stringify(btns)}`);
+      assert(/move it/i.test(btns[0]),
+        `"Move it instead" must come FIRST — a cancellation call is a reschedule opportunity. Got: ${JSON.stringify(btns)}`);
+      assert(/cancel/i.test(btns[1]), `Button 1 should be cancel. Got: ${JSON.stringify(btns)}`);
+      assert(/keep/i.test(btns[2]),   `Button 2 should be keep. Got: ${JSON.stringify(btns)}`);
     });
 
-    await test('Confirming cancellation cancels the appointment', async () => {
-      const { data } = await bot('Yes, Cancel It');
+    await test('Confirming actually cancels the appointment', async () => {
+      const { data } = await bot('Yes, cancel it');
       const r = data.responses;
       assert(r?.length > 0, 'No response');
-      const cancelled = r.some(m =>
-        m.text?.toLowerCase().includes('cancelled') ||
-        m.text?.toLowerCase().includes('canceled')
-      );
-      assert(cancelled, `Expected cancellation message. Got: ${JSON.stringify(r)}`);
+      const cancelled = r.some(m => /cancell?ed/i.test(JSON.stringify(m)));
+      assert(cancelled, `Expected a cancellation message. Got: ${JSON.stringify(r)}`);
     });
   } else {
     skip('Cancel flow', 'no booking ID captured from previous step');
@@ -437,7 +430,10 @@ async function testBotFlow() {
     const { data } = await bot('Hi');
     const r = data.responses;
     assert(r?.length > 0, 'No response to Hi');
-    assert(r.some(m => m.text?.includes('Welcome')), `Hi did not reset to welcome. Got: ${JSON.stringify(r)}`);
+    // A reset means the MAIN MENU, not the word "Welcome" — see the greeting
+    // test above. The menu card carries the clinic's three actions.
+    assert(r.some(m => m.buttons?.some(b => /book/i.test(b))),
+      `Hi did not reset to the main menu. Got: ${JSON.stringify(r)}`);
   });
 
   await test('Unknown input returns fallback (not a crash)', async () => {

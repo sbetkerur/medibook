@@ -549,6 +549,59 @@ async function run() {
     assert.strictEqual(state(), 'select_department');
   });
 
+  // ── MAIN-MENU KEYWORD ROUTING ────────────────────────────────
+  // The My-Appointments test used to be /\bappointment\b|\bmy\b/ and ran BEFORE
+  // the Book test, so it swallowed any sentence containing either word. These
+  // pin the anchoring that replaced it.
+
+  await test('"I need an appointment" starts a booking, not the empty list', async () => {
+    db.sessions.delete(PHONE);
+    await send('Hi');
+    const r = await send('I need an appointment');
+    assert(!r.some(m => /no appointments with us yet/i.test(m.all || m.text)),
+      'a request to book was answered with "you have no bookings": ' + JSON.stringify(r));
+    assert(state() !== 'main_menu',
+      'expected the booking flow to have started, still at: ' + state());
+  });
+
+  await test('"my tooth pain" reaches complaint routing, not My Appointments', async () => {
+    db.sessions.delete(PHONE);
+    await send('Hi');
+    const r = await send('my tooth pain');
+    assert(!r.some(m => /no appointments with us yet/i.test(m.all || m.text)),
+      'the word "my" hijacked a symptom: ' + JSON.stringify(r));
+  });
+
+  await test('"my appointments" on its own still shows the list', async () => {
+    db.sessions.delete(PHONE);
+    await send('Hi');
+    const r = await send('my appointments');
+    assert(r.some(m => /no appointments with us yet|Your appointments/i.test(m.all || m.text)),
+      'the deliberate phrasing must still work: ' + JSON.stringify(r));
+  });
+
+  await test('the My Appointments BUTTON still works', async () => {
+    db.sessions.delete(PHONE);
+    await send('Hi');
+    const r = await send('🗓 My Appointments', 'btn_1_1700000000301');
+    assert(r.some(m => /no appointments with us yet|Your appointments/i.test(m.all || m.text)),
+      'button reply broke: ' + JSON.stringify(r));
+  });
+
+  // ── STALE MAIN-MENU BUTTON ───────────────────────────────────
+  // WhatsApp keeps every card tappable forever. The escape hatch listed the
+  // OLD third button ("Check Status"), which no longer exists, so a tap on the
+  // live "Address & Phone" card fell through to the current step handler.
+  await test('a stale "Address & Phone" tap mid-booking returns to the menu', async () => {
+    db.sessions.delete(PHONE);
+    await send('Hi');
+    await send('📅 Book Appointment', 'btn_0_1700000000401'); // → select_department
+    const r = await send('📍 Address & Phone', 'btn_2_1700000000001');
+    assert.strictEqual(state(), 'main_menu',
+      'a stale main-menu tap must reset to the menu, landed at: ' + state());
+    assert(r.some(m => m.type === 'buttons'), 'expected the menu card back: ' + JSON.stringify(r));
+  });
+
   console.log(`\nResults: ${pass} passed, ${fail} failed`);
   process.exit(fail > 0 ? 1 : 0);
 }

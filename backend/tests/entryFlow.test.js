@@ -164,6 +164,34 @@ function check(name, actual, expected) {
     // code: tagged works from any state, bare only from a standing start.
     await send(scanned, demo.entry_code);
     check('a BARE code does not move an attached patient', await clinicOf(scanned), other.slug);
+
+    // A TAGGED code that matches NO clinic, sent by a patient who is already
+    // attached to one. This used to fall through to the attached clinic's
+    // engine, which handed the scan message to it as ordinary free text: the
+    // patient standing in the other practice's waiting room got THIS clinic's
+    // main menu, headed with THIS clinic's name, and never learned the scan had
+    // failed. The poster may be stale, or the clinic deactivated.
+    //
+    // Two things are asserted, and both matter: the clinic must not change
+    // (a failed scan must never strand a patient — nothing detaches them), and
+    // the patient must be TOLD the code did not match rather than being quietly
+    // answered by the wrong practice.
+    const before = await clinicOf(scanned);
+    await send(scanned, `Hi, I'd like to book an appointment. #ZZZZZZ`);
+    check('a dead QR does not move an attached patient', await clinicOf(scanned), before);
+
+    const reply = (await query(
+      `SELECT content FROM ${schemaOf(demo)}.wa_messages
+        WHERE phone=$1 AND direction='out' ORDER BY created_at DESC LIMIT 1`, [scanned]
+    )).rows[0]?.content;
+    // The reply goes out unlogged (it is not the attached clinic speaking), so
+    // the check is that the attached clinic did NOT answer it as a menu.
+    if (reply === undefined) {
+      console.log('  ⏭  unmatched-code reply not checked (sends fail without live Meta credentials)');
+    } else {
+      check('the attached clinic did not answer a failed scan with its menu',
+        /didn't match a clinic/i.test(reply) || !/how can we help/i.test(reply), true);
+    }
   } else {
     console.log('  ⏭  clinic-switch cases skipped (only one active tenant)');
   }
