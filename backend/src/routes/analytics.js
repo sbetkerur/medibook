@@ -26,22 +26,32 @@ router.get('/analytics', makeAnalyticsLimiter(), async (req, res) => {
   try {
     const s = req.tenant.schema_name;
     const d = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
+    // Bounded at BOTH ends, like /analytics/summary and /analytics/revenue.
+    // Without the upper bound, every FUTURE confirmed appointment (slots are
+    // generated 60 days out) counted toward a chart labelled "(30 days)" — so
+    // "Top Dentists (30 days)" silently included bookings for next month, and
+    // its revenue figure double-counted them as money already taken, same as
+    // the bug already fixed on the other two endpoints.
     const [byDay, byDoctor, byStatus, byDept] = await Promise.all([
       tenantQuery(s, `
         SELECT appointment_date::text as date, COUNT(*) as count
         FROM appointments WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+          AND appointment_date <= ${IST_TODAY_SQL}
           AND status IN ('confirmed', 'completed')
         GROUP BY appointment_date ORDER BY appointment_date
       `, [d]),
       tenantQuery(s, `
         SELECT d.name, COUNT(a.id) as count, SUM(COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee)) as revenue
         FROM appointments a JOIN doctors d ON d.id=a.doctor_id
-        WHERE a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL AND a.status IN ('confirmed', 'completed')
+        WHERE a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+          AND a.appointment_date <= ${IST_TODAY_SQL}
+          AND a.status IN ('confirmed', 'completed')
         GROUP BY d.name ORDER BY count DESC LIMIT 10
       `, [d]),
       tenantQuery(s, `
         SELECT status, COUNT(*) as count FROM appointments
         WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+          AND appointment_date <= ${IST_TODAY_SQL}
           AND status != 'cancelled' GROUP BY status
       `, [d]),
       tenantQuery(s, `
@@ -49,6 +59,7 @@ router.get('/analytics', makeAnalyticsLimiter(), async (req, res) => {
         JOIN doctors d ON d.id=a.doctor_id
         LEFT JOIN departments dep ON dep.id=COALESCE(a.department_id, d.department_id)
         WHERE a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+          AND a.appointment_date <= ${IST_TODAY_SQL}
           AND a.status IN ('confirmed', 'completed')
         GROUP BY COALESCE(dep.name, 'General') ORDER BY count DESC
       `, [d]),
