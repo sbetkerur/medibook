@@ -53,11 +53,14 @@ export default function TestBotTab({ isAdmin }) {
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Message</label>
+          {/* POST /admin/bot-test is adminOnly server-side, so the Enter-to-send
+              shortcut must not fire for a non-admin either — see the button below. */}
           <input value={botMessage} onChange={e => setBotMessage(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && testBot()}
+            onKeyDown={e => e.key === 'Enter' && isAdmin && testBot()}
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             placeholder="Hi" />
         </div>
+        {isAdmin ? (<>
         <div className="flex flex-wrap gap-2">
           <button onClick={testBot} disabled={botLoading}
             className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition">
@@ -72,7 +75,6 @@ export default function TestBotTab({ isAdmin }) {
             ))}
           </div>
         </div>
-        {isAdmin && (
         <div className="pt-1 border-t border-gray-100 flex flex-wrap items-center justify-between gap-2">
           <span className="text-xs text-gray-400">If the bot gets stuck, reset the session to start fresh.</span>
           <button onClick={resetBotSession} disabled={botResetting}
@@ -80,6 +82,12 @@ export default function TestBotTab({ isAdmin }) {
             {botResetting ? 'Resetting...' : '🔄 Reset Session'}
           </button>
         </div>
+        </>) : (
+          // POST /admin/bot-test and DELETE /admin/bot-sessions/:phone are both
+          // adminOnly server-side. Rendering the Send button to staff/doctor
+          // roles offered an action that could only ever 403 — the same class of
+          // bug fixed elsewhere in this file for walk-ins and cancellation.
+          <p className="text-xs text-gray-400">Only clinic admins can test the bot.</p>
         )}
       </div>
 
