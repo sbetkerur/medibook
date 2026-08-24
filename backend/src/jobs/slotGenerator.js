@@ -437,7 +437,7 @@ async function cleanupExpiredSlots(schema) {
   try {
     const r = await tenantQuery(schema,
       `UPDATE time_slots SET status='expired'
-       WHERE slot_date < (timezone('Asia/Kolkata', NOW()))::date AND status='available'
+       WHERE slot_date < ${IST_TODAY_SQL} AND status='available'
        RETURNING id`);
     expiredCount = r.rows.length;
   } catch (err) {
