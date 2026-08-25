@@ -1269,6 +1269,18 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE treatment_plans ADD COLUMN IF NOT EXISTS consent_note TEXT;
     `);
 
+    // ── RESCHEDULE CAP ───────────────────────────────────────────
+    // "Reschedule" is cheap for a patient to tap and expensive for a clinic to
+    // absorb — every move holds a slot someone else could have taken while the
+    // old one goes back into the pool at the last minute. Capped at
+    // LIMITS.MAX_RESCHEDULES_PER_APPOINTMENT (appointmentFlow.handleRescheduleSelect);
+    // past that, cancel and rebook is a deliberate, visible decision rather
+    // than another tap. Only the bot moves an appointment's slot/date — there
+    // is no dashboard equivalent — so this counts exactly what that flow does.
+    await client.query(`
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reschedule_count INTEGER NOT NULL DEFAULT 0;
+    `);
+
   } finally {
     // RESET BOTH. statement_timeout is per-session state and the pool sets it
     // as a connection parameter (db/index.js), so a connection released after

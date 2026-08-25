@@ -201,6 +201,23 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, choice, 
     return;
   }
   const a = appt.rows[0];
+
+  // Cap on how many times ONE appointment can be moved. Reschedule is cheap
+  // for a patient to tap and expensive for a clinic to absorb — every move
+  // holds a slot someone else could have taken while the old one goes back
+  // into the pool at the last minute. Past the cap, cancel-and-rebook is a
+  // deliberate, visible decision rather than another free tap.
+  const { LIMITS } = require('../../utils/errors');
+  if ((a.reschedule_count || 0) >= LIMITS.MAX_RESCHEDULES_PER_APPOINTMENT) {
+    await send.text(
+      `This appointment has already been rescheduled ${LIMITS.MAX_RESCHEDULES_PER_APPOINTMENT} times, which is the most we allow.\n\n` +
+      `Please cancel it and book a fresh appointment instead — nothing has changed on this one.\n\n` +
+      `Reply *My* to see it and cancel from there.`
+    );
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
+
   // 2-hour minimum notice check — appointment_time is stored in IST; parse it
   // as IST before comparing to the current UTC wall-clock time.
   // Guard against null appointment_time (legacy rows) — skip the check rather
@@ -470,7 +487,7 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
       await client.query(
         `UPDATE appointments SET
            slot_id=$1, appointment_date=$2, appointment_time=$3,
-           reminder_24h_sent=false, updated_at=NOW()
+           reminder_24h_sent=false, reschedule_count=reschedule_count+1, updated_at=NOW()
          WHERE id=$4`,
         [ctx.reschedule_new_slot_id, ctx.reschedule_new_date, ctx.reschedule_new_time, ctx.reschedule_appt_id]
       );

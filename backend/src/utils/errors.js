@@ -91,6 +91,11 @@ const LIMITS = {
   // booking routes are NOT gated by this — a receptionist booking a real
   // patient's real appointments is not the threat model.
   MAX_OPEN_APPOINTMENTS_PER_PHONE: 3,
+  // Per-APPOINTMENT cap on WhatsApp reschedules (appointments.reschedule_count,
+  // appointmentFlow.handleRescheduleSelect). Past this, "cancel and rebook" is
+  // a deliberate decision instead of an unlimited free re-tap that keeps a
+  // slot held indefinitely while others go unoffered.
+  MAX_RESCHEDULES_PER_APPOINTMENT: 2,
   MAX_PATIENTS_PER_PAGE: 200,         // hard cap on patients list page size
   ANALYTICS_RATE_LIMIT_PER_MIN: 5,    // requests per minute per user for analytics endpoints
   SESSION_CONTEXT_MAX_BYTES: 10000,   // 10 KB; oversized context resets to idle
