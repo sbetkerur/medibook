@@ -84,6 +84,13 @@ const LIMITS = {
   QUEUE_BACKPRESSURE_THRESHOLD: 10000, // jobs; above this we fall back to sync processing
   SLOT_BATCH_SIZE: 100,               // rows per INSERT during slot generation
   MAX_BOOKINGS_PER_HOUR: 3,           // per patient phone; prevents bot abuse
+  // Standing cap on CONFIRMED-but-unresolved appointments per phone, WhatsApp
+  // only (see bookingFlow.completeBooking) — the hourly rate limit above stops
+  // a burst, but not someone booking one every 20 minutes to stay under it
+  // while quietly accumulating dozens of held slots. The admin/dashboard
+  // booking routes are NOT gated by this — a receptionist booking a real
+  // patient's real appointments is not the threat model.
+  MAX_OPEN_APPOINTMENTS_PER_PHONE: 3,
   MAX_PATIENTS_PER_PAGE: 200,         // hard cap on patients list page size
   ANALYTICS_RATE_LIMIT_PER_MIN: 5,    // requests per minute per user for analytics endpoints
   SESSION_CONTEXT_MAX_BYTES: 10000,   // 10 KB; oversized context resets to idle

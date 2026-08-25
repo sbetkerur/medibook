@@ -1096,6 +1096,30 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     }
   } catch (_) {} // rate limit check is non-fatal
 
+  // Standing cap: max N appointments open at once per phone, WhatsApp only.
+  // The rate limit above stops a burst; this stops the same abuse spread out
+  // slowly enough to dodge it — one booking every 20 minutes still reaches
+  // dozens of held slots by end of day. Counts every CONFIRMED appointment
+  // under this phone regardless of date (a past one the desk hasn't marked
+  // completed yet is still "open" from the clinic's point of view), across
+  // every patient profile sharing the number — family booking shares a phone,
+  // and the slots it holds are what this exists to protect.
+  try {
+    const openR = await tenantQuery(schema,
+      `SELECT COUNT(*) FROM appointments a
+       JOIN patients p ON p.id=a.patient_id
+       WHERE p.phone=$1 AND a.status='confirmed'`,
+      [phone]);
+    if (parseInt(openR.rows[0].count) >= LIMITS.MAX_OPEN_APPOINTMENTS_PER_PHONE) {
+      await send.text(
+        `You already have ${LIMITS.MAX_OPEN_APPOINTMENTS_PER_PHONE} appointments booked under this number — nothing new was booked.\n\n` +
+        `Reply *My Appointments* to reschedule or cancel one first, or call us if this is urgent.`
+        + await clinicPhoneLine(schema, ctx.hospital_id));
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
+  } catch (_) {} // open-appointment cap check is non-fatal, same as the rate limit above
+
   // Plan quota: block bookings once the clinic's monthly allowance is used up
   const quota = await checkMonthlyQuota(tenant);
   if (!quota.allowed) {
