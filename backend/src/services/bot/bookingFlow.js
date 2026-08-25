@@ -466,7 +466,7 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
       return;
     }
     await send.buttons('Booking cancelled — nothing has been reserved.\n\nWhat would you like to do?',
-      ['📅 Book Appointment', '🗓 My Appointments', '📍 Address & Phone']);
+      ['🗓 Book Appointment', '🗓 My Appointments', '📍 Address & Phone']);
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }
@@ -588,7 +588,7 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
       return;
     }
     await send.buttons('Booking cancelled — nothing has been reserved.\n\nWhat would you like to do?',
-      ['📅 Book Appointment', '🗓 My Appointments', '📍 Address & Phone']);
+      ['🗓 Book Appointment', '🗓 My Appointments', '📍 Address & Phone']);
     await updateSession(schema, phone, STATES.MAIN_MENU, {});
     return;
   }

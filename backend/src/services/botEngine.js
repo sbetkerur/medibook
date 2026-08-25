@@ -91,7 +91,7 @@ async function sendMainMenu(send, tenant, patient, lead, welcome) {
     : 'Book an appointment, check an existing one, or manage a booking — all here on WhatsApp.');
   return send.buttons(
     body,
-    ['📅 Book Appointment', '🗓 My Appointments', '📍 Address & Phone'],
+    ['🗓 Book Appointment', '🗓 My Appointments', '📍 Address & Phone'],
     // The header is the clinic's name on every interactive message, and it is
     // doing real work: the number is shared, so this is the only thing that
     // tells a patient whose desk they are talking to. The footer says "Menu"
@@ -820,7 +820,7 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
   // (triggerFeedback), and WhatsApp keeps every button it ever delivered
   // tappable forever — so a bare `btn_0` used to be read as "1 — Poor" no
   // matter which message it came off. A patient who scrolled up and tapped the
-  // clinic's still-live main menu "📅 Book Appointment" (btn_0) filed a 1-star
+  // clinic's still-live main menu "🗓 Book Appointment" (btn_0) filed a 1-star
   // review, lost their booking intent, and had their next message stored as the
   // complaint text. Same binding the cancel/reschedule confirms use.
   //

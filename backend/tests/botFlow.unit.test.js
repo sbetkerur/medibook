@@ -289,7 +289,7 @@ async function run() {
   });
 
   await test('Tapping Book button starts booking (single hospital → what do you need)', async () => {
-    const r = await send('📅 Book Appointment', 'btn_0_1700000000001');
+    const r = await send('🗓 Book Appointment', 'btn_0_1700000000001');
     assert(r.some(m => /What do you need/.test(m.all)), 'treatment picker not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_department');
   });
@@ -363,7 +363,7 @@ async function run() {
 
   await test('a dentist is NOT offered for a treatment they do not render', async () => {
     await send('Hi');
-    await send('📅 Book Appointment', 'btn_0_1700000000101');
+    await send('🗓 Book Appointment', 'btn_0_1700000000101');
     const r = await send('General Dentistry', 'dept-1');
     const picker = r.find(m => /Choose a dentist/.test(m.all));
     assert(picker, 'dentist picker not shown: ' + JSON.stringify(r));
@@ -376,7 +376,7 @@ async function run() {
 
   await test('choosing "not sure" auto-assigns the branch\'s generalist, no dentist picker shown', async () => {
     await send('Hi');
-    await send('📅 Book Appointment', 'btn_0_1700000000103');
+    await send('🗓 Book Appointment', 'btn_0_1700000000103');
     // "Not sure" now asks what brings them in FIRST — the answer can still
     // change who they see at that point, which it could not once the dentist,
     // day and time were already chosen.
@@ -398,7 +398,7 @@ async function run() {
 
   await test('typing "not sure" works as well as tapping it', async () => {
     await send('Hi');
-    await send('📅 Book Appointment', 'btn_0_1700000000104');
+    await send('🗓 Book Appointment', 'btn_0_1700000000104');
     await send('not sure');
     const r = await send('🔍 Checkup/Follow-up', 'btn_1_1700000000106');
     assert(!r.some(m => /Choose a dentist/.test(m.all)),
@@ -411,7 +411,7 @@ async function run() {
   // Back to the Orthodontics booking the rest of the flow continues from.
   await test('resuming the braces booking with the general dentist', async () => {
     await send('Hi');
-    await send('📅 Book Appointment', 'btn_0_1700000000102');
+    await send('🗓 Book Appointment', 'btn_0_1700000000102');
     const r = await send('Orthodontics & Braces', 'dept-2');
     assert(r.some(m => /Choose a dentist/.test(m.all)), 'dentist picker not shown: ' + JSON.stringify(r));
     assert.strictEqual(state(), 'select_doctor');
@@ -496,7 +496,7 @@ async function run() {
 
   await test('Stale MAIN MENU button during booking still exits to menu', async () => {
     await send('Hi');
-    await send('📅 Book Appointment', 'btn_0_1700000000008'); // back into select_department
+    await send('🗓 Book Appointment', 'btn_0_1700000000008'); // back into select_department
     const r = await send('🗓 My Appointments', 'btn_1_1700000000009');
     // Every main-menu send now goes through sendMainMenu, so this asserts the
     // shared shape (clinic name in the header) rather than one path's wording —
@@ -548,7 +548,7 @@ async function run() {
 
   await test('*Treatment* mid-booking does NOT hijack the flow', async () => {
     await send('Hi');
-    await send('📅 Book Appointment', 'btn_0_1700000000201'); // now at select_department
+    await send('🗓 Book Appointment', 'btn_0_1700000000201'); // now at select_department
     const r = await send('Treatment');
     // It is not a treatment list, and not a silent no-op — the department step
     // owns the message and re-asks.
@@ -602,7 +602,7 @@ async function run() {
   await test('a stale "Address & Phone" tap mid-booking returns to the menu', async () => {
     db.sessions.delete(PHONE);
     await send('Hi');
-    await send('📅 Book Appointment', 'btn_0_1700000000401'); // → select_department
+    await send('🗓 Book Appointment', 'btn_0_1700000000401'); // → select_department
     const r = await send('📍 Address & Phone', 'btn_2_1700000000001');
     assert.strictEqual(state(), 'main_menu',
       'a stale main-menu tap must reset to the menu, landed at: ' + state());
