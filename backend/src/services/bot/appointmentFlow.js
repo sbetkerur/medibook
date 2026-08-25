@@ -218,22 +218,38 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, choice, 
 
   // Use IST "today" so the date range is correct during the 5.5-hour window
   // between UTC midnight and IST midnight (new Date() would give yesterday in IST).
+  //
+  // Starts at TODAY, not tomorrow, and does NOT exclude the appointment's own
+  // date — "what about a different time, same day?" is the single most common
+  // reschedule ask (mirrors the receptionist's first move on a cancel call, see
+  // handleCancelConfirm). The old `slot_date != $4` filter blocked exactly
+  // that, with no comment anywhere justifying it; the appointment's own slot
+  // is 'booked', not 'available', so it never appears as an offered time
+  // anyway, and a day with nothing ELSE free simply produces no GROUP BY row —
+  // no separate zero-count check needed.
   const today = toZonedTime(new Date(), IST);
-  const startStr = format(addDays(today, 1), 'yyyy-MM-dd');
+  const startStr = format(today, 'yyyy-MM-dd');
   const endStr = format(addDays(today, SLOT_LOOKAHEAD_DAYS), 'yyyy-MM-dd');
 
   // Scoped to the appointment's own BRANCH, and the holiday check correlated on
   // the slot's branch — a visiting consultant's slots carry the branch that
   // weekday belongs to, so a doctor-only filter offers dates at the other
   // branch and a reschedule silently relocates the patient's appointment.
+  //
+  // Same-day guard (slot_date > start OR (slot_date = start AND start_time >
+  // now)): with the range now starting today, a same-day reschedule for an
+  // appointment later today must not count today's already-elapsed slots.
   const datesResult = await tenantQuery(schema, `
     SELECT slot_date::text AS date, COUNT(*) AS slots
     FROM time_slots
     WHERE doctor_id = $1
-      AND hospital_id = $5
+      AND hospital_id = $4
       AND slot_date BETWEEN $2 AND $3
-      AND slot_date != $4
       AND status = 'available'
+      AND (
+        slot_date > $2
+        OR start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time
+      )
       AND NOT EXISTS (
         SELECT 1 FROM doctor_leaves dl WHERE dl.doctor_id = $1 AND dl.leave_date = slot_date
       )
@@ -244,7 +260,7 @@ async function handleRescheduleSelect(phone, schema, tenant, send, ctx, choice, 
     GROUP BY slot_date
     ORDER BY slot_date
     LIMIT 7
-  `, [a.doctor_id, startStr, endStr, a.appointment_date, a.hospital_id]);
+  `, [a.doctor_id, startStr, endStr, a.hospital_id]);
 
   const dates = datesResult.rows.map(r => ({
     date: r.date,
