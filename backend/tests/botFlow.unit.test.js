@@ -383,7 +383,7 @@ async function run() {
     const asked = await send('🩺 Not sure yet', 'general_consult');
     assert(asked.some(m => /What brings you in/.test(m.all)),
       'complaint should be asked before booking on the consult path: ' + JSON.stringify(asked));
-    const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000105');
+    const r = await send('🔍 Checkup/Follow-up', 'btn_1_1700000000105');
     assert(!r.some(m => /Choose a dentist/.test(m.all)),
       'a patient who does not know what they need should not have to pick a NAME either: ' + JSON.stringify(r));
     // Priya Sharma is the branch's general dentist (matches "general" on both
@@ -400,7 +400,7 @@ async function run() {
     await send('Hi');
     await send('📅 Book Appointment', 'btn_0_1700000000104');
     await send('not sure');
-    const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000106');
+    const r = await send('🔍 Checkup/Follow-up', 'btn_1_1700000000106');
     assert(!r.some(m => /Choose a dentist/.test(m.all)),
       'typed "not sure" should also skip the dentist picker: ' + JSON.stringify(r));
     assert(r.some(m => /is free on these days/.test(m.all)),
@@ -465,7 +465,7 @@ async function run() {
 
   await test('Typed name → DOB → reason → confirmation summary', async () => {
     assert.strictEqual(state(), 'collect_chief_complaint');
-    const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000006');
+    const r = await send('🔍 Checkup/Follow-up', 'btn_1_1700000000006');
     const summary = r.find(m => /Check and confirm/.test(m.all));
     assert(summary, 'confirmation summary not shown: ' + JSON.stringify(r));
     confirmBtnId = summary.ids[0];

@@ -992,20 +992,21 @@ async function askChiefComplaint(phone, schema, send, ctx) {
   if (ctx.chief_complaint) {
     return showConfirmation(phone, schema, send, ctx, updateSession);
   }
-  // Unspaced slashes, matching complaintMap below verbatim: '🔍 Checkup / Cleaning'
-  // was 21 UTF-16 units against a 20-character button cap and arrived as
-  // "🔍 Checkup / Cleanin". Closing the spaces brings it to 19 and makes the
-  // label the patient taps identical to the value the clinic reads back.
+  // Unspaced slashes, matching complaintMap below verbatim: a spaced label
+  // runs over the 20-UTF-16-unit button cap and gets silently truncated by
+  // Meta. '🔍 Checkup/Follow-up' lands at exactly 20 — closing the spaces
+  // makes the label the patient taps identical to the value the clinic reads
+  // back.
   await send.buttons(
     'In your own words — it helps the dentist prepare.',
-    ['🚨 Pain/Emergency', '🔍 Checkup/Cleaning', '✨ Cosmetic/Other'],
+    ['🚨 Pain/Emergency', '🔍 Checkup/Follow-up', '✨ Cosmetic/Other'],
     { header: 'What brings you in?' }
   );
   await updateSession(schema, phone, STATES.COLLECT_CHIEF_COMPLAINT, ctx);
 }
 
 async function handleChiefComplaint(phone, schema, send, ctx, choice, input, updateSessionFn, tenant) {
-  const complaintMap = { btn_0: '🚨 Pain/Emergency', btn_1: '🔍 Checkup/Cleaning', btn_2: '✨ Cosmetic/Other' };
+  const complaintMap = { btn_0: '🚨 Pain/Emergency', btn_1: '🔍 Checkup/Follow-up', btn_2: '✨ Cosmetic/Other' };
   const matchedKey = Object.keys(complaintMap).find(k =>
     (choice || '').startsWith(k + '_') || choice === k
   );
