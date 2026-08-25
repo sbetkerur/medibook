@@ -529,6 +529,18 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
 
   ctx._doctors = doctors.rows;
 
+  // "Not sure yet" already skipped the treatment question because only the
+  // dentist can name one — asking the patient to then pick a NAME from a list
+  // is the same question in disguise. Auto-assign the branch's default
+  // generalist (the query above already orders general dentists first, by
+  // fee, then name — this is the same doctor who used to lead the list) and
+  // go straight to their available dates. proceedWithDoctor's own "nothing
+  // free" fallback still offers the rest of doctors.rows by name if the
+  // default generalist has no open slots.
+  if (isGeneralConsult) {
+    return proceedWithDoctor(phone, schema, tenant, send, ctx, doctors.rows[0], doctors.rows);
+  }
+
   // Treatment-specific advisory note
   const treatmentNotes = {
     'Root Canal Treatment':    'ℹ️ Root canal treatment typically requires *2–3 visits*. Please plan accordingly.',
@@ -544,9 +556,9 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
   // The heading already says "dentist" — repeating it in the body ("Select
   // Dentist / Available General Dentistry dentists:") said the same word three
   // times. The body now carries information the header cannot.
-  const doctorPrompt = isGeneralConsult
-    ? 'Anyone available, or pick a name you know.'
-    : `Everyone below treats ${dept.name.toLowerCase()}.`;
+  //
+  // isGeneralConsult is always false here — that path returns above.
+  const doctorPrompt = `Everyone below treats ${dept.name.toLowerCase()}.`;
   const feesOn = await showFeesEnabled(schema);
   await sendChoice(send, doctorPrompt, doctors.rows.map(d => doctorListRow(d, feesOn)),
     STEP('Choose a dentist'),
@@ -581,6 +593,13 @@ async function handleSelectDoctor(phone, schema, tenant, send, ctx, choice, inpu
     return;
   }
 
+  return proceedWithDoctor(phone, schema, tenant, send, ctx, doc, doctors);
+}
+
+// Shared by handleSelectDoctor (patient picked a name) and the "Not sure yet"
+// auto-assign path in handleSelectDept (patient never saw a dentist list) —
+// both end up here once a doctor has been decided, one way or the other.
+async function proceedWithDoctor(phone, schema, tenant, send, ctx, doc, doctors) {
   ctx.doctor_id = doc.id;
   ctx.doctor_name = doc.name;
 

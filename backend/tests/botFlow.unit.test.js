@@ -374,7 +374,7 @@ async function run() {
       + JSON.stringify(names));
   });
 
-  await test('choosing "not sure" offers EVERY dentist at the branch, not one specialty', async () => {
+  await test('choosing "not sure" auto-assigns the branch\'s generalist, no dentist picker shown', async () => {
     await send('Hi');
     await send('📅 Book Appointment', 'btn_0_1700000000103');
     // "Not sure" now asks what brings them in FIRST — the answer can still
@@ -382,13 +382,18 @@ async function run() {
     // day and time were already chosen.
     const asked = await send('🩺 Not sure yet', 'general_consult');
     assert(asked.some(m => /What brings you in/.test(m.all)),
-      'complaint should be asked before dentists on the consult path: ' + JSON.stringify(asked));
+      'complaint should be asked before booking on the consult path: ' + JSON.stringify(asked));
     const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000105');
-    const picker = r.find(m => /Choose a dentist/.test(m.all));
-    assert(picker, 'dentist picker not shown: ' + JSON.stringify(r));
-    const names = picker.buttons || (picker.sections?.[0].rows || []).map(r2 => r2.title);
-    assert(names.some(n => /Priya Sharma/.test(n)) && names.some(n => /Rahul Menon/.test(n)),
-      'a consultation should reach the whole clinic: ' + JSON.stringify(names));
+    assert(!r.some(m => /Choose a dentist/.test(m.all)),
+      'a patient who does not know what they need should not have to pick a NAME either: ' + JSON.stringify(r));
+    // Priya Sharma is the branch's general dentist (matches "general" on both
+    // specialization and department name) and sorts first in the auto-assign
+    // query, so she is who gets booked — Rahul Menon (the orthodontist) never
+    // appears here.
+    const dates = r.find(m => /is free on these days/.test(m.all));
+    assert(dates, 'auto-assigned doctor\'s date picker not shown: ' + JSON.stringify(r));
+    assert(/Priya Sharma/.test(dates.all), 'wrong dentist auto-assigned: ' + JSON.stringify(dates));
+    assert.strictEqual(state(), 'select_date');
   });
 
   await test('typing "not sure" works as well as tapping it', async () => {
@@ -396,9 +401,11 @@ async function run() {
     await send('📅 Book Appointment', 'btn_0_1700000000104');
     await send('not sure');
     const r = await send('🔍 Checkup/Cleaning', 'btn_1_1700000000106');
-    assert(r.some(m => /Choose a dentist/.test(m.all)),
-      'typed "not sure" did not reach dentist selection: ' + JSON.stringify(r));
-    assert.strictEqual(state(), 'select_doctor');
+    assert(!r.some(m => /Choose a dentist/.test(m.all)),
+      'typed "not sure" should also skip the dentist picker: ' + JSON.stringify(r));
+    assert(r.some(m => /is free on these days/.test(m.all)),
+      'typed "not sure" did not reach the auto-assigned doctor\'s dates: ' + JSON.stringify(r));
+    assert.strictEqual(state(), 'select_date');
   });
 
   // Back to the Orthodontics booking the rest of the flow continues from.
