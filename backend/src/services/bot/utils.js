@@ -1,7 +1,11 @@
 'use strict';
 
-const { tenantQuery } = require('../../db');
+const { tenantQuery, query } = require('../../db');
 const logger = require('../../utils/logger');
+const { format } = require('date-fns');
+const { toZonedTime } = require('../../utils/dateTz');
+
+const IST = 'Asia/Kolkata';
 
 const STATES = {
   IDLE: 'idle',
@@ -432,6 +436,30 @@ async function clinicPhoneLine(schemaName, hospitalId) {
   return phone ? `\n\n📞 *${phone}*` : '';
 }
 
+/**
+ * Would jobs/reminders.js's 24h reminder actually fire for an appointment on
+ * this date? Mirrors its own eligibility check exactly: the tenant must have
+ * 24h reminders on (default true), and the date must be strictly in the
+ * FUTURE — a same-day appointment gets no reminder at all (the 2-hour
+ * reminder that used to cover that case is gone). "We'll remind you the day
+ * before" is only true when both hold; promising it otherwise (a same-day
+ * booking or reschedule, or a clinic that has turned reminders off) is a
+ * promise the cron will never keep.
+ *
+ * Read fresh rather than trusted off the `tenant` object passed down — a bot
+ * session can sit open for hours after an admin flips the setting.
+ */
+async function reminder24hApplies(schemaName, appointmentDateStr) {
+  try {
+    const r = await query(`SELECT settings FROM tenants WHERE schema_name=$1`, [schemaName]);
+    if (r.rows[0]?.settings?.reminder_24h_enabled === false) return false;
+  } catch (err) {
+    logger.warn('Reminder-setting lookup failed — assuming reminders are on', { error: err.message });
+  }
+  const todayStr = format(toZonedTime(new Date(), IST), 'yyyy-MM-dd');
+  return appointmentDateStr > todayStr;
+}
+
 module.exports = {
   STATES,
   genBookingId,
@@ -451,4 +479,5 @@ module.exports = {
   notifyAdminWhatsApp,
   clinicPhone,
   clinicPhoneLine,
+  reminder24hApplies,
 };

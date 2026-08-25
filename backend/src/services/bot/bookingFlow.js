@@ -22,6 +22,7 @@ const {
   updateSession,
   logMessage,
   notifyAdminWhatsApp,
+  reminder24hApplies,
 } = require('./utils');
 
 /**
@@ -1349,6 +1350,11 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
   let dateLabel = ctx.appointment_date;
   try { dateLabel = format(parseISO(ctx.appointment_date), 'EEE, d MMM yyyy'); } catch {}
 
+  // "We'll remind you the day before" is a promise the 24h cron has to keep —
+  // it never fires for a same-day appointment, and a clinic can turn 24h
+  // reminders off entirely (see reminder24hApplies). Only said when true.
+  const willRemind = await reminder24hApplies(schema, ctx.appointment_date);
+
   // Send confirmation and post-transaction side-effects in parallel.
   const confirmationText =
     // This is the message a patient scrolls back to — and screenshots. It leads
@@ -1365,7 +1371,8 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
     `At ${ctx.hospital_name}\n` +
     `Booking ID *${bookingId}*\n\n` +
     `Please arrive 10 minutes early, and bring any previous X-rays or a list of your medicines.\n\n` +
-    `We'll remind you the day before. Reply *Menu* to reschedule or cancel.`;
+    (willRemind ? `We'll remind you the day before. ` : '') +
+    `Reply *Menu* to reschedule or cancel.`;
 
   await Promise.allSettled([
     // Enhancement 12: try approved WhatsApp template first (works outside 24h session window);

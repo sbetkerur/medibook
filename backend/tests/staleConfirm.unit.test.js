@@ -27,6 +27,9 @@ process.env.JWT_SECRET = 'unit-test-secret-at-least-32-chars-long!!';
 
 const path = require('path');
 const assert = require('assert');
+const { format } = require('date-fns');
+const { toZonedTime } = require('../src/utils/dateTz');
+const IST_TODAY = format(toZonedTime(new Date(), 'Asia/Kolkata'), 'yyyy-MM-dd');
 
 // ── In-memory tenant data ─────────────────────────────────────
 const db = {
@@ -397,6 +400,26 @@ async function run() {
     reset();
     await handleRescheduleConfirm(PHONE, SCHEMA, tenant, send, ctx, "no, don't reschedule");
     assert.strictEqual(db.appointments[0].rescheduled, false, texts());
+  });
+
+  // "We'll remind you the day before" is a promise the 24h cron has to keep —
+  // it never fires for a same-day appointment (see jobs/reminders.js), so the
+  // line must not appear when the reschedule lands on today.
+  await test('the reminder line is shown for a future date, omitted for a same-day move', async () => {
+    restoreAppointment();
+    let ctx = { ...(await rescheduleCtx()), reschedule_new_date: '2099-01-06' };
+    reset();
+    await handleRescheduleConfirm(PHONE, SCHEMA, tenant, send, ctx, 'yes');
+    assert(/remind you the day before/.test(texts()),
+      'a future-dated reschedule should still promise the 24h reminder: ' + texts());
+
+    restoreAppointment();
+    ctx = { ...(await rescheduleCtx()), reschedule_new_date: IST_TODAY };
+    reset();
+    await handleRescheduleConfirm(PHONE, SCHEMA, tenant, send, ctx, 'yes');
+    assert.strictEqual(db.appointments[0].rescheduled, true, 'same-day move should still succeed: ' + texts());
+    assert(!/remind you the day before/.test(texts()),
+      'a same-day reschedule promised a reminder that will never fire: ' + texts());
   });
 
   // ── DATE / SLOT re-prompts ──────────────────────────────────

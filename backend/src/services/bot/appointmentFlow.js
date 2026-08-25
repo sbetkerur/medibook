@@ -18,6 +18,7 @@ const {
   getPatients,
   updateSession,
   notifyAdminWhatsApp,
+  reminder24hApplies,
 } = require('./utils');
 
 async function showMyAppointments(phone, schema, tenant, send) {
@@ -488,14 +489,15 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
 
     let newDate = ctx.reschedule_new_date;
     try { newDate = format(parseISO(newDate), 'EEE, d MMM yyyy'); } catch {}
+    const willRemind = await reminder24hApplies(schema, ctx.reschedule_new_date);
     // Same shape as the booking confirmation — this replaces it in the
     // patient's chat as the message they scroll back to.
     await send.text(
       `✅ *Moved*\n\n` +
       `*${newDate}*\n` +
       `*${(ctx.reschedule_new_time || '').slice(0, 5)}* with Dr. ${ctx.reschedule_doctor_name}\n\n` +
-      `Booking ID *${ctx.reschedule_booking_id}*\n\n` +
-      `We'll remind you the day before.`
+      `Booking ID *${ctx.reschedule_booking_id}*` +
+      (willRemind ? `\n\nWe'll remind you the day before.` : '')
     );
     // Masked: logs/combined.log is persistent, and the booking id already
     // identifies the appointment for anyone who needs to look it up.
