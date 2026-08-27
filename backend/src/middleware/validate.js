@@ -222,6 +222,46 @@ const schemas = {
     // as PATCH /superadmin/tenants — this just lets it be set at creation.
     billing_monthly: Joi.number().integer().min(0).max(10000000).optional().allow(null),
   }),
+
+  // ── SELF-SERVE SIGNUP (routes/signup.js) ─────────────────────
+  // The public, unauthenticated create-your-own-clinic flow. `slug` matches
+  // createTenant's rule exactly (max 56 so schema_name stays ≤ 63 bytes).
+  // `owner_phone` is the WhatsApp number the OTP goes to — digits, optional '+'.
+  selfSignupStart: Joi.object({
+    name: Joi.string().min(2).max(255).required(),
+    slug: Joi.string().min(3).max(56).pattern(/^[a-z0-9-]+$/).required()
+      .messages({ 'string.pattern.base': 'Clinic ID may use only lowercase letters, numbers and hyphens' }),
+    owner_email: Joi.string().email().required(),
+    owner_name: Joi.string().min(2).max(255).required(),
+    owner_phone: Joi.string().pattern(/^[+]?[0-9]{8,20}$/).required()
+      .messages({ 'string.pattern.base': 'Enter a valid WhatsApp number (8–20 digits, optional +)' }),
+    owner_password: Joi.string().min(8)
+      .pattern(/[A-Z]/, 'uppercase letter')
+      .pattern(/[a-z]/, 'lowercase letter')
+      .pattern(/[0-9]/, 'digit')
+      .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
+      .required(),
+    plan: Joi.string().valid('starter', 'professional').default('starter'),
+  }),
+
+  selfSignupVerify: Joi.object({
+    owner_phone: Joi.string().pattern(/^[+]?[0-9]{8,20}$/).required(),
+    code: Joi.string().pattern(/^[0-9]{6}$/).required()
+      .messages({ 'string.pattern.base': 'Enter the 6-digit code from WhatsApp' }),
+  }),
+
+  // No card at signup — the trial is card-free. `signup_token` alone finishes
+  // provisioning; the card is taken later via POST /admin/billing/subscribe.
+  selfSignupConfirm: Joi.object({
+    signup_token: Joi.string().min(20).max(200).required(),
+  }),
+
+  // Adding a card to convert a trial (or clear past_due). adminOnly route.
+  billingSubscribeConfirm: Joi.object({
+    razorpay_payment_id: Joi.string().max(120).required(),
+    razorpay_subscription_id: Joi.string().max(120).required(),
+    razorpay_signature: Joi.string().max(256).required(),
+  }),
 };
 
 /**

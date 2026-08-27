@@ -17,6 +17,7 @@
  */
 const wa = require('./whatsapp');
 const { logMessage } = require('./bot/utils');
+const { withinDailyCap } = require('./sendCaps');
 const logger = require('../utils/logger');
 
 /** Send a plain text message and record it. Shared phone → global META_* env. */
@@ -87,7 +88,15 @@ function quickReplyComponents(payloads) {
  * @param {Array}  [opts.components] - template components
  * @param {string} opts.text         - the human-readable message, also the history entry
  */
-async function sendPatientMessage(schema, phone, { template, components, buttonPayloads, text }) {
+async function sendPatientMessage(schema, phone, { template, components, buttonPayloads, text, bypassCap }) {
+  // Staged per-tenant daily cap on clinic-initiated outreach. A young self-serve
+  // tenant blasting the shared number degrades delivery for every clinic on it
+  // (services/sendCaps.js). Fails open. `bypassCap` is for a genuinely
+  // transactional send that must never be withheld.
+  if (!bypassCap && !(await withinDailyCap(schema))) {
+    logger.warn('sendPatientMessage suppressed by new-tenant daily cap', { schema });
+    return { via: 'suppressed_cap' };
+  }
   if (template) {
     try {
       await sendPatientTemplate(schema, phone, template,

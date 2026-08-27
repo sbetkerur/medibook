@@ -14,6 +14,12 @@ const { handleError } = require('../utils/errors');
 // forgot-password allowance and the test suite starts failing with 429s.
 const skipInDev = () => process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development';
 
+// A tenant admin may sign in while the clinic is still being reviewed
+// (self-serve signup, awaiting super-admin approval) or is past_due on payment —
+// both need dashboard access to move forward. Same set middleware/auth.js
+// enforces on every /api/admin request. 'suspended' / 'inactive' cannot log in.
+const LOGIN_ALLOWED_STATUSES = ['active', 'pending_review', 'past_due'];
+
 // ── Login rate limiter — 10 attempts per 15 minutes per IP ────
 // Prevents brute-force and credential-stuffing attacks against both
 // tenant admin and super admin login endpoints.
@@ -75,7 +81,10 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
     const normalizedEmail = (email || '').trim().toLowerCase();
     const normalizedSlug = (tenant_slug || '').trim();
     if (!normalizedSlug) return res.status(400).json({ error: 'Clinic ID required' });
-    const tenantR = await query(`SELECT * FROM tenants WHERE slug=$1 AND status='active'`, [normalizedSlug]);
+    const tenantR = await query(
+      `SELECT * FROM tenants WHERE slug=$1 AND status = ANY($2::text[])`,
+      [normalizedSlug, LOGIN_ALLOWED_STATUSES]
+    );
     if (!tenantR.rows[0]) {
       await bcrypt.compare(password, DUMMY_PASSWORD_HASH); // equalise timing
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -117,7 +126,10 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
       // saved a round trip, but the dashboard reads GET /admin/terms on mount
       // anyway, so this only duplicated the rule in a second place where it
       // could drift. One source of truth; see routes/admin.js.
-      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug: normalizedSlug }
+      // tenant_status lets the dashboard show the right banner without an extra
+      // round trip: 'pending_review' (awaiting super-admin approval — patients
+      // can't reach the clinic yet) or 'past_due' (update payment).
+      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug: normalizedSlug, tenant_status: tenant.status }
     });
   } catch (err) {
     handleError(res, err);
@@ -186,6 +198,27 @@ async function issueRefreshToken(userId, userRole, tenantId = null) {
     [userId, userRole, tenantId, hashToken(token), expiresAt]
   );
   return token;
+}
+
+/**
+ * Mint a full session (access + refresh) for a tenant user — the same pair
+ * POST /auth/login returns. Exported so routes/signup.js can drop a freshly
+ * self-enrolled owner straight into the onboarding wizard without a second
+ * password prompt. `tenant` is a tenants row; `user` is a tenant-schema users row.
+ */
+async function issueSession(user, tenant) {
+  const jti = crypto.randomUUID();
+  const token = jwt.sign(
+    { id: user.id, email: user.email, role: user.role, tenant_id: tenant.id, tenant_slug: tenant.slug, jti },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+  const refresh_token = await issueRefreshToken(user.id, user.role, tenant.id).catch(() => null);
+  return {
+    token,
+    refresh_token,
+    user: { email: user.email, name: user.name, role: user.role, tenant: tenant.name, tenant_slug: tenant.slug, tenant_status: tenant.status },
+  };
 }
 
 // ── REFRESH TOKEN ─────────────────────────────────────────────
@@ -290,7 +323,7 @@ router.post('/auth/refresh', refreshLimiter, async (req, res) => {
     } else {
       if (!rt.tenant_id) return res.status(401).json({ error: 'Invalid refresh token' });
       const tenantR = await query(`SELECT slug, schema_name, status FROM tenants WHERE id=$1`, [rt.tenant_id]);
-      if (!tenantR.rows[0] || tenantR.rows[0].status !== 'active') {
+      if (!tenantR.rows[0] || !LOGIN_ALLOWED_STATUSES.includes(tenantR.rows[0].status)) {
         return res.status(401).json({ error: 'Tenant not found or inactive' });
       }
       const userR = await tenantQuery(tenantR.rows[0].schema_name,
@@ -402,4 +435,106 @@ router.post('/auth/change-password', changePasswordLimiter, authMiddleware, vali
 
 
 
+// ── PASSWORD RECOVERY — WHATSAPP CODE ────────────────────────
+// The email-based /auth/forgot-password + /auth/reset-password were removed with
+// services/email.js. This pair is their replacement over the ONLY channel this
+// product has: a 6-digit code to the staff member's own `notify_phone`.
+//
+// It does NOT reintroduce a second delivery channel in the sense CLAUDE.md
+// forbids — nothing patient-facing changes, no email, and the code is delivered
+// through the same WhatsApp sender everything else uses. A user with no
+// notify_phone on file still has the admin/super-admin reset paths.
+//
+// Enumeration-safe: the response is identical whether or not the account (or a
+// phone) exists.
+const { issueOtp, verifyOtp } = require('../services/otp');
+
+const forgotLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 5,
+  message: { error: 'Too many reset requests. Try again later.' },
+  standardHeaders: true, legacyHeaders: false, skip: skipInDev,
+});
+const resetLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 10,
+  message: { error: 'Too many attempts. Try again in an hour.' },
+  standardHeaders: true, legacyHeaders: false, skip: skipInDev,
+});
+
+const GENERIC_FORGOT_REPLY = {
+  message: 'If that account has a WhatsApp number on file, a reset code has been sent to it. It expires in 10 minutes.',
+};
+
+async function lookupResetTarget(tenant_slug, email) {
+  const slug = String(tenant_slug || '').trim();
+  const normEmail = String(email || '').trim().toLowerCase();
+  if (!slug || !normEmail) return null;
+  const tr = await query(
+    `SELECT * FROM tenants WHERE slug=$1 AND status = ANY($2::text[])`,
+    [slug, LOGIN_ALLOWED_STATUSES]
+  );
+  const tenant = tr.rows[0];
+  if (!tenant) return null;
+  const ur = await tenantQuery(tenant.schema_name,
+    `SELECT id, email, notify_phone FROM users WHERE email=$1 AND is_active=true`, [normEmail]);
+  const user = ur.rows[0];
+  if (!user || !user.notify_phone) return { tenant, user: user || null };
+  return { tenant, user };
+}
+
+router.post('/auth/forgot-password', forgotLimiter, async (req, res) => {
+  try {
+    const { tenant_slug, email } = req.body || {};
+    const target = await lookupResetTarget(tenant_slug, email);
+    if (target && target.user && target.user.notify_phone) {
+      const phone = String(target.user.notify_phone).replace(/[^\d]/g, '');
+      await issueOtp(phone, 'password_reset', {
+        tenant_id: target.tenant.id, user_id: target.user.id,
+      }).catch(e => logger.warn('forgot-password OTP issue failed', { error: e.message }));
+      logger.info('Password reset code requested', { tenant: target.tenant.slug });
+    }
+    return res.json(GENERIC_FORGOT_REPLY);
+  } catch (err) {
+    // Never leak — still answer generically.
+    logger.error('forgot-password error', { error: err.message });
+    return res.json(GENERIC_FORGOT_REPLY);
+  }
+});
+
+router.post('/auth/reset-password', resetLimiter, async (req, res) => {
+  try {
+    const { tenant_slug, email, code, new_password } = req.body || {};
+    const policyErr = require('../middleware/validate').checkPasswordPolicy(new_password);
+    if (policyErr) return res.status(400).json({ error: policyErr });
+
+    const target = await lookupResetTarget(tenant_slug, email);
+    if (!target || !target.user || !target.user.notify_phone) {
+      return res.status(400).json({ error: 'Invalid or expired reset code.' });
+    }
+    const phone = String(target.user.notify_phone).replace(/[^\d]/g, '');
+    const check = await verifyOtp(phone, 'password_reset', code);
+    if (!check.ok) return res.status(400).json({ error: check.error || 'Invalid or expired reset code.' });
+    // Bind the code to the exact account it was issued for.
+    if (check.payload?.user_id && check.payload.user_id !== target.user.id) {
+      return res.status(400).json({ error: 'Invalid or expired reset code.' });
+    }
+
+    const hash = await bcrypt.hash(new_password, 12);
+    await tenantQuery(target.tenant.schema_name,
+      `UPDATE users SET password_hash=$1 WHERE id=$2`, [hash, target.user.id]);
+    await query(`UPDATE refresh_tokens SET used=true WHERE user_id=$1 AND used=false`, [target.user.id])
+      .catch(e => logger.warn('reset-password: token revocation failed', { error: e.message }));
+    await query(
+      `INSERT INTO admin_access_logs (user_id, email, tenant_id, event, ip_address, user_agent)
+       VALUES ($1,$2,$3,'password_reset_whatsapp',$4,$5)`,
+      [target.user.id, target.user.email, target.tenant.id, req.ip, req.headers['user-agent']]
+    ).catch(() => {});
+    logger.info('Password reset via WhatsApp code', { tenant: target.tenant.slug });
+    res.json({ success: true, message: 'Password updated. Sign in with your new password.' });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
 module.exports = router;
+module.exports.issueSession = issueSession;
+module.exports.LOGIN_ALLOWED_STATUSES = LOGIN_ALLOWED_STATUSES;

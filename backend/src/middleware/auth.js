@@ -11,6 +11,23 @@ const { setTenantId } = require('../utils/requestContext');
 const TENANT_CACHE_TTL_MS = 5000;
 const tenantCache = new Map(); // key: tenantId → { tenant, expiresAt }
 
+// Which tenant statuses may reach the dashboard at all.
+//   active         — normal, live to patients.
+//   pending_review — a self-serve tenant that has paid and provisioned but is
+//                    NOT yet approved by a super admin. Let IN so the owner can
+//                    complete the onboarding wizard; the bot's entry-code lookup
+//                    still requires status='active', so patients cannot reach it
+//                    until POST /superadmin/tenants/:id/approve flips it.
+//   past_due       — a self-serve tenant whose card later failed. Let IN so the
+//                    owner can update payment (routes/billing.js);
+//                    jobs/billingDunning.js escalates it to 'suspended' after
+//                    the grace window.
+// Blocked: 'suspended' (kill switch / abuse), 'inactive' (deactivated),
+// 'pending_payment' (signup started, schema not built — no user row exists).
+// Outreach crons filter status='active' on their own, so pending_review /
+// past_due tenants are already excluded from every unsolicited send.
+const DASHBOARD_ALLOWED_STATUSES = new Set(['active', 'pending_review', 'past_due']);
+
 async function authMiddleware(req, res, next) {
   // Support token in Authorization header (normal) or ?token= query param.
   // The query-param form exists ONLY for EventSource (SSE), which can't set
@@ -68,7 +85,7 @@ async function tenantMiddleware(req, res, next) {
     // Check cache first — also recheck status in case tenant was suspended since last fetch
     const cached = tenantCache.get(tenantId);
     if (cached && cached.expiresAt > Date.now()) {
-      if (cached.tenant.status !== 'active') {
+      if (!DASHBOARD_ALLOWED_STATUSES.has(cached.tenant.status)) {
         tenantCache.delete(tenantId);
         return res.status(403).json({ error: 'Tenant not found or inactive' });
       }
@@ -88,8 +105,10 @@ async function tenantMiddleware(req, res, next) {
       return next();
     }
 
-    const r = await query(`SELECT * FROM tenants WHERE id=$1 AND status='active'`, [tenantId]);
-    if (!r.rows[0]) return res.status(403).json({ error: 'Tenant not found or inactive' });
+    const r = await query(`SELECT * FROM tenants WHERE id=$1`, [tenantId]);
+    if (!r.rows[0] || !DASHBOARD_ALLOWED_STATUSES.has(r.rows[0].status)) {
+      return res.status(403).json({ error: 'Tenant not found or inactive' });
+    }
 
     req.tenant = r.rows[0];
     // Stamped HERE, on both the cache-hit and cache-miss paths, because this is

@@ -80,6 +80,26 @@ if (!process.env.METRICS_SECRET && process.env.NODE_ENV === 'production') {
   logger.warn('METRICS_SECRET is not set — /metrics is reachable by anyone with queue depth, tenant count and memory stats. Set METRICS_SECRET to require a bearer token.');
 }
 
+// ── SELF-SERVE SIGNUP ────────────────────────────────────────
+// Off unless SELF_SIGNUP_ENABLED=true. When on, it needs a real Razorpay config
+// (a card-free trial still has to be able to CONVERT) and, for production
+// delivery, an OTP template — a clinic owner is always outside Meta's 24h
+// free-form window. Warn loudly rather than 500 at signup time.
+if (String(process.env.SELF_SIGNUP_ENABLED || 'false') === 'true') {
+  const { isConfigured: razorpayConfigured } = require('./services/razorpay');
+  if (!razorpayConfigured()) {
+    logger.warn('SELF_SIGNUP_ENABLED=true but Razorpay is not configured (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET / RAZORPAY_PLAN_*) — self-serve signup will report itself unavailable.');
+  }
+  if (!process.env.SIGNUP_OTP_TEMPLATE && process.env.NODE_ENV === 'production') {
+    logger.warn('SELF_SIGNUP_ENABLED=true but SIGNUP_OTP_TEMPLATE is not set — signup verification codes will not deliver to owners outside the 24h window.');
+  }
+  if (!process.env.RAZORPAY_WEBHOOK_SECRET && process.env.NODE_ENV === 'production') {
+    logger.warn('SELF_SIGNUP_ENABLED=true but RAZORPAY_WEBHOOK_SECRET is not set — subscription lifecycle events will be ignored; the daily dunning cron is the only reconciliation.');
+  }
+} else {
+  logger.info('Self-serve signup is disabled (set SELF_SIGNUP_ENABLED=true to enable).');
+}
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -236,6 +256,9 @@ app.use('/api/v1/admin', _auth, _tenant, tenantRateLimit);
 // ── ROUTES ────────────────────────────────────────────────────
 app.use('/api', require('./routes/auth'));
 app.use('/api', require('./routes/webhook'));
+// Public, unauthenticated: self-serve clinic signup (WhatsApp OTP + card-free
+// trial). Its own strict rate limiters live in the router.
+app.use('/api', require('./routes/signup'));
 // Split route files registered first so they take priority over legacy admin.js for their domains
 app.use('/api/admin', require('./routes/appointments'));
 app.use('/api/admin', require('./routes/doctors'));
@@ -250,6 +273,7 @@ app.use('/api/admin', require('./routes/recalls'));        // recare / check-up 
 app.use('/api/admin', require('./routes/requests'));       // patients the bot could not finish serving
 app.use('/api/admin', require('./routes/dayClose'));       // end-of-day cash reconciliation
 app.use('/api/admin', require('./routes/reports'));        // on-demand front-desk PDF reports
+app.use('/api/admin', require('./routes/billing'));        // self-serve subscription + paywall
 app.use('/api/admin', require('./routes/events'));    // SSE real-time dashboard
 app.use('/api/superadmin', require('./routes/superadmin'));
 
@@ -270,7 +294,9 @@ app.use('/api/v1/admin',    require('./routes/recalls'));
 app.use('/api/v1/admin',    require('./routes/requests'));
 app.use('/api/v1/admin',    require('./routes/dayClose'));
 app.use('/api/v1/admin',    require('./routes/reports'));
+app.use('/api/v1/admin',    require('./routes/billing'));
 app.use('/api/v1/admin',    require('./routes/events'));
+app.use('/api/v1',          require('./routes/signup'));
 app.use('/api/v1/superadmin', require('./routes/superadmin'));
 
 // ── HEALTH CHECK ──────────────────────────────────────────────
@@ -413,6 +439,7 @@ const server = app.listen(PORT, () => {
     const { startSessionCleanerCron } = require('./jobs/sessionCleaner');
     const { startTreatmentNudgeCron } = require('./jobs/treatmentNudges');
     const { startRecallCron } = require('./jobs/recalls');
+    const { startBillingDunningCron } = require('./jobs/billingDunning');
     // Track cron tasks so we can stop them gracefully before DB closes.
     // Only ONE backup cron is registered (backupManager's spawn()-based daily
     // job) — slotGenerator.js's exec()-based weekly startBackupReminderCron was
@@ -443,6 +470,9 @@ const server = app.listen(PORT, () => {
       startWebhookRetryCron(),
       startBackupCron(),
       startSessionCleanerCron(),
+      // Ends card-free trials, reconciles Razorpay subscriptions, enforces the
+      // past_due grace window. Safe no-op when no self-serve tenants exist.
+      startBillingDunningCron(),
       ...patientCrons,
     ];
     startBotWorker();

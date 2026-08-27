@@ -7,12 +7,30 @@ import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
+// Colour per tenant lifecycle state. active=green, pending_review=amber,
+// past_due=orange, suspended=red, pending_payment/other=grey.
+function statusBadgeCls(status) {
+  return {
+    active: 'bg-green-100 text-green-700',
+    pending_review: 'bg-amber-100 text-amber-700',
+    past_due: 'bg-orange-100 text-orange-700',
+    suspended: 'bg-red-100 text-red-600',
+    inactive: 'bg-gray-100 text-gray-500',
+    pending_payment: 'bg-gray-100 text-gray-500',
+  }[status] || 'bg-gray-100 text-gray-500';
+}
+
 export default function SuperAdminPage() {
   const router = useRouter();
   const [tab, setTab] = useState('tenants');
   const [tenants, setTenants] = useState([]);
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
+
+  // Self-serve clinics awaiting approval (status=pending_review).
+  const [review, setReview] = useState([]);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [approvingId, setApprovingId] = useState(null);
 
   // Suspension modal state
   const [suspendModal, setSuspendModal] = useState(null); // { tenant }
@@ -94,6 +112,7 @@ export default function SuperAdminPage() {
       ]);
       setTenants(t.data.tenants || []);
       setStats(s.data);
+      fetchReview();
     } catch { toast.error('Failed to load data'); }
     finally { setLoading(false); }
   }
@@ -129,28 +148,58 @@ export default function SuperAdminPage() {
       setSuspendReason('');
       return;
     }
-    // Reactivate immediately
     try {
-      await api.patch(`/superadmin/tenants/${tenant.id}`, { status: 'active' });
-      toast.success('Tenant reactivated');
+      if (tenant.status === 'pending_review') {
+        await api.post(`/superadmin/tenants/${tenant.id}/approve`);
+        toast.success('Clinic approved and live');
+      } else if (tenant.status === 'suspended') {
+        // The dedicated endpoint sends a self-serve clinic back to past_due
+        // (still needs to pay) rather than straight to active.
+        await api.post(`/superadmin/tenants/${tenant.id}/resume`);
+        toast.success('Tenant resumed');
+      } else {
+        await api.patch(`/superadmin/tenants/${tenant.id}`, { status: 'active' });
+        toast.success('Tenant activated');
+      }
       fetchAll();
-    } catch { toast.error('Failed to activate tenant'); }
+      fetchReview();
+    } catch (err) { toast.error(err.response?.data?.error || 'Failed to update tenant'); }
   }
 
   async function confirmSuspend() {
     if (!suspendModal) return;
     setSuspending(true);
     try {
-      await api.patch(`/superadmin/tenants/${suspendModal.tenant.id}`, {
-        status: 'suspended',
-        suspension_reason: suspendReason || null,
+      await api.post(`/superadmin/tenants/${suspendModal.tenant.id}/suspend`, {
+        reason: suspendReason || 'manual suspension',
       });
       toast.success('Tenant suspended');
       setSuspendModal(null);
       setSuspendReason('');
       fetchAll();
-    } catch { toast.error('Failed to suspend tenant'); }
+    } catch (err) { toast.error(err.response?.data?.error || 'Failed to suspend tenant'); }
     finally { setSuspending(false); }
+  }
+
+  async function fetchReview() {
+    setReviewLoading(true);
+    try {
+      const { data } = await api.get('/superadmin/tenants', { params: { status: 'pending_review', limit: 50 } });
+      setReview(data.tenants || []);
+    } catch { /* non-fatal */ }
+    finally { setReviewLoading(false); }
+  }
+
+  async function approveTenant(t) {
+    setApprovingId(t.id);
+    try {
+      await api.post(`/superadmin/tenants/${t.id}/approve`);
+      toast.success(`${t.name} approved and live`);
+      fetchReview();
+      fetchAll();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to approve');
+    } finally { setApprovingId(null); }
   }
 
   function openCityModal(tenant) {
@@ -359,6 +408,7 @@ export default function SuperAdminPage() {
         <div className="flex gap-1 bg-white rounded-xl shadow-sm p-1 border border-gray-100 overflow-x-auto">
           {[
             { id: 'tenants', label: '🏥 Tenants' },
+            { id: 'review', label: `⏳ Review${review.length ? ` (${review.length})` : ''}`, onClick: () => { setTab('review'); fetchReview(); } },
             { id: 'billing', label: '💰 Billing', onClick: () => { setTab('billing'); if (!billing) fetchBilling(); } },
             { id: 'rate_limits', label: '🚦 Rate Limits', onClick: () => { setTab('rate_limits'); if (!rateLimits) fetchRateLimits(); } },
             { id: 'backups', label: '💾 Backups', onClick: () => { setTab('backups'); if (!backups) fetchBackups(); } },
@@ -370,6 +420,48 @@ export default function SuperAdminPage() {
             </button>
           ))}
         </div>
+
+        {/* Approval queue — self-serve clinics that have signed up + started a
+            trial but cannot be reached by patients until approved here. */}
+        {tab === 'review' && (
+          <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+            <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+              <h2 className="font-semibold text-gray-800">Awaiting approval ({review.length})</h2>
+              <button onClick={fetchReview} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>
+            </div>
+            {reviewLoading ? (
+              <div className="px-5 py-12 text-center text-gray-400">Loading…</div>
+            ) : review.length === 0 ? (
+              <div className="px-5 py-12 text-center text-gray-400">Nothing waiting. New self-serve signups show up here.</div>
+            ) : (
+              <ul className="divide-y divide-gray-100">
+                {review.map(t => (
+                  <li key={t.id} className="px-5 py-4 flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="font-medium text-gray-900 break-words">{t.name}</div>
+                      <div className="font-mono text-xs text-blue-600 break-all">{t.slug}</div>
+                      <div className="text-xs text-gray-600 break-all">{t.owner_email}</div>
+                      <div className="text-xs text-gray-400 mt-0.5">
+                        {t.city || 'no city'} · {t.plan} · signed up {t.created_at ? format(parseISO(t.created_at), 'd MMM, HH:mm') : '—'}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${statusBadgeCls(t.status)}`}>{t.status}</span>
+                      <button onClick={() => approveTenant(t)} disabled={approvingId === t.id}
+                        className="px-4 py-2 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition">
+                        {approvingId === t.id ? 'Approving…' : 'Approve'}
+                      </button>
+                      <button onClick={() => { setSuspendModal({ tenant: t }); setSuspendReason(''); }}
+                        className="px-3 py-2 text-sm border border-red-200 text-red-600 rounded-lg hover:bg-red-50 transition">
+                        Reject
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
 
         {/* Tenants table */}
         {tab === 'tenants' && <div className="bg-white rounded-xl shadow-sm overflow-hidden">
@@ -405,9 +497,7 @@ export default function SuperAdminPage() {
                         <div className="font-mono text-xs text-blue-600 break-all">{t.slug}</div>
                         <div className="text-xs text-gray-600 break-all mt-0.5">{t.owner_email}</div>
                       </div>
-                      <span className={`px-2 py-0.5 text-xs rounded-full font-medium shrink-0 ${
-                        t.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600'
-                      }`}>{t.status}</span>
+                      <span className={`px-2 py-0.5 text-xs rounded-full font-medium shrink-0 ${statusBadgeCls(t.status)}`}>{t.status}</span>
                     </div>
                     {t.suspension_reason && (
                       <div className="text-xs text-red-400 break-words">{t.suspension_reason}</div>
@@ -454,7 +544,7 @@ export default function SuperAdminPage() {
                             ? 'text-red-600 border-red-200 bg-red-50 hover:bg-red-100'
                             : 'text-green-600 border-green-200 bg-green-50 hover:bg-green-100'
                         }`}>
-                        {t.status === 'active' ? 'Suspend' : 'Activate'}
+                        {t.status === 'active' ? 'Suspend' : t.status === 'pending_review' ? 'Approve' : t.status === 'suspended' ? 'Resume' : 'Activate'}
                       </button>
                       <button onClick={() => openPasswordModal(t)}
                         className="inline-flex items-center justify-center min-h-[40px] px-3 py-2 text-xs text-blue-600 border border-blue-200 bg-blue-50 rounded-lg hover:bg-blue-100 transition">
@@ -516,9 +606,7 @@ export default function SuperAdminPage() {
                         </td>
                         <td className="px-4 py-3">
                           <div>
-                            <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${
-                              t.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600'
-                            }`}>{t.status}</span>
+                            <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${statusBadgeCls(t.status)}`}>{t.status}</span>
                             {t.suspension_reason && (
                               <div className="text-xs text-red-400 mt-0.5 max-w-[120px] truncate" title={t.suspension_reason}>
                                 {t.suspension_reason}
@@ -562,7 +650,7 @@ export default function SuperAdminPage() {
                                   ? 'text-red-600 hover:bg-red-50'
                                   : 'text-green-600 hover:bg-green-50'
                               }`}>
-                              {t.status === 'active' ? 'Suspend' : 'Activate'}
+                              {t.status === 'active' ? 'Suspend' : t.status === 'pending_review' ? 'Approve' : t.status === 'suspended' ? 'Resume' : 'Activate'}
                             </button>
                             <button onClick={() => openPasswordModal(t)}
                               className="text-xs px-2 py-1 rounded text-blue-600 hover:bg-blue-50 transition whitespace-nowrap">

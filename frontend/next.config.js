@@ -48,13 +48,17 @@ const nextConfig = {
   },
   async headers() {
     // Since all API calls go through the Next.js rewrite proxy (/api/proxy/*),
-    // the browser only ever connects to 'self'. No external backend origin needed in CSP.
+    // the browser only ever connects to 'self' — EXCEPT for Razorpay Checkout,
+    // which is loaded as a hosted script + iframe and talks to Razorpay's own
+    // API/telemetry hosts directly. These four entries are the minimum Checkout
+    // needs and cannot be proxied (the SDK is served and sandboxed by Razorpay).
     const csp = [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://checkout.razorpay.com",
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob:",
-      "connect-src 'self'",
+      "connect-src 'self' https://api.razorpay.com https://checkout.razorpay.com https://lumberjack.razorpay.com",
+      "frame-src 'self' https://api.razorpay.com https://checkout.razorpay.com",
       "font-src 'self'",
       "object-src 'none'",
       "base-uri 'self'",

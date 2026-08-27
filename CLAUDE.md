@@ -36,6 +36,9 @@ cd backend && node tests/treatmentPlan.unit.test.js      # multi-visit treatment
 cd backend && node tests/circuitBreaker.unit.test.js     # HALF_OPEN lets ONE probe through
 cd backend && node tests/messageBudget.unit.test.js      # budget 0 means none, not "default"
 cd backend && node tests/rateLimitFallback.unit.test.js  # per-tenant cap with no Redis
+cd backend && node tests/razorpaySignature.unit.test.js  # self-serve billing: checkout + webhook HMACs
+cd backend && node tests/sendCaps.unit.test.js           # staged outbound caps for young tenants
+cd backend && node tests/otp.unit.test.js                # WhatsApp OTP: attempts, cooldown, single-use
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -645,7 +648,67 @@ dispatches `medibook:token-refreshed` — long-lived consumers (the dashboard's
 SSE `EventSource`, which carries the token in its URL) must listen and
 reconnect. `dashboard/page.js` is one large file; if you touch it
 substantially, prefer extracting tabs into `components/tabs/` (see
-`SlotsTab.js`).
+`SlotsTab.js`). The one third-party surface the CSP allows is
+`checkout.razorpay.com` (billing) — added narrowly in `next.config.js`.
+
+**Self-serve signup, and the super admin still approves.** A clinic can create
+its own account (`routes/signup.js`, `/signup`) — the super admin is no longer
+in the provisioning path, but is still the gate before patients can reach it.
+Off unless `SELF_SIGNUP_ENABLED=true` with a real Razorpay config. Full
+walkthrough and operator setup: `docs/self-serve-signup.md`.
+
+Identity is proven by a **WhatsApp one-time code** to the owner's own number
+(`services/otp.js`, `wa_otps`) — the ONLY verification channel this product has.
+This is not the second delivery channel CLAUDE.md forbids: nothing
+patient-facing changes and the code goes through the same WhatsApp sender.
+`/auth/forgot-password` + `/auth/reset-password` are back on the SAME mechanism
+(a code to the staff member's `notify_phone`) — the removed versions were
+*email*-based. Delivery is template-first (`SIGNUP_OTP_TEMPLATE`), because an
+owner is permanently outside Meta's 24-hour window.
+
+The trial is **card-free** (`SIGNUP_TRIAL_DAYS`, default 14). `/signup/confirm`
+provisions the tenant at status `pending_review` and starts the trial; the card
+is only taken later, via `POST /admin/billing/subscribe` → Razorpay Checkout →
+`/billing/subscribe/confirm`. Provisioning (`services/signupProvision.js`,
+`provisionTenant` / `provisionSelfServeTenant`) is the ONE implementation the
+super-admin `POST /superadmin/tenants` route also uses — two copies of
+schema+migrations+first-admin+entry-code is exactly the drift not to allow.
+
+**Tenant `status` is now a lifecycle, not a boolean.** `pending_payment`
+(signup mid-provision, no login), `pending_review` (paid/trialing, awaiting
+`POST /superadmin/tenants/:id/approve` — can log in and onboard, patients
+can't reach it), `active`, `past_due` (trial lapsed / payment failed — can log
+in and add a card), `suspended` (kill switch or grace elapsed), `inactive`.
+`middleware/auth.js` `DASHBOARD_ALLOWED_STATUSES` and `routes/auth.js`
+`LOGIN_ALLOWED_STATUSES` (`active` + `pending_review` + `past_due`) are the
+source of truth for who may log in; the bot's entry-code lookup still requires
+`status='active'`, and every outreach cron filters `status='active'` via
+`forEachActiveTenantParallel`, so `pending_review` / `past_due` clinics send
+nothing unsolicited without any cron change.
+
+**Billing lifecycle.** `tenant_billing` (one row per self-serve tenant) is the
+source of truth; `billing_events` dedups Razorpay webhooks on the
+`x-razorpay-event-id` header. `routes/webhook.js` `POST /webhook/razorpay`
+(HMAC-verified against `RAZORPAY_WEBHOOK_SECRET` on the raw body — same
+`req.rawBody` hook as the Meta webhook) moves a tenant `active`⇄`past_due` as
+the subscription's health changes, and never touches `pending_review` /
+`suspended`. `jobs/billingDunning.js` (06:15 IST) is the backstop and the
+enforcer: it ENDS lapsed card-free trials (`active` + `trialing` +
+`trial_end` passed → `past_due`), reconciles subscriptions, and after
+`SIGNUP_DUNNING_GRACE_DAYS` (default 7) moves `past_due` → `suspended`.
+
+**Staged send caps for young tenants** (`services/sendCaps.js`). A fresh
+self-serve tenant on the shared number is throttled to **100** clinic-initiated
+patient messages / rolling 24h for its first 7 days, **300** for its first 30,
+then uncapped — clock starts at `activated_at` (approval). Enforced in
+`services/outbound.js` `sendPatientMessage` only (the outreach path); appointment
+reminders and confirmations call the lower senders directly and stay ungated,
+exactly as `services/messageBudget.js` treats them. Fails OPEN.
+
+**Kill switch.** `POST /superadmin/tenants/:id/suspend {reason}` / `.../resume`
+— one call, audited, effective within the 5s tenant-cache TTL. `resume` on a
+self-serve clinic returns it to `past_due` (still owes payment) unless
+`?to=active`.
 
 ## Environment variables
 
@@ -665,6 +728,16 @@ bound for more than one, and logs the condition ONCE rather than per request), `
 `WEBHOOK_RATE_LIMIT_PER_MIN` (default 2000; per-IP, and Meta delivers every
 tenant's traffic from a shared IP pool, so this is effectively platform-wide).
 Frontend: `BACKEND_URL` (server-side, Railway).
+
+Self-serve signup (all optional; the feature is inert without them —
+`docs/self-serve-signup.md`): `SELF_SIGNUP_ENABLED` (master switch, default
+false), `SIGNUP_TRIAL_DAYS` (default 14), `SIGNUP_DUNNING_GRACE_DAYS` (default
+7), `SIGNUP_OTP_TEMPLATE` (+ `SIGNUP_OTP_TEMPLATE_HAS_BUTTON`, default true) —
+the WhatsApp template that delivers verification/reset codes, `RAZORPAY_KEY_ID` /
+`RAZORPAY_KEY_SECRET` / `RAZORPAY_WEBHOOK_SECRET`, `RAZORPAY_PLAN_STARTER` /
+`RAZORPAY_PLAN_PROFESSIONAL` (the two recurring plan ids created in the Razorpay
+dashboard, mirrored to `plans.razorpay_plan_id` on boot). `index.js` warns at
+startup when `SELF_SIGNUP_ENABLED=true` but any of these are missing.
 
 ## Testing without WhatsApp credentials
 

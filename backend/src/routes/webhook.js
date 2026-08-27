@@ -132,6 +132,109 @@ router.get('/webhook/whatsapp', (req, res) => {
   res.sendStatus(403);
 });
 
+// ── RAZORPAY WEBHOOK (self-serve billing lifecycle) ──────────
+// Mounted under the same /api/webhook prefix as the Meta webhook, so the raw
+// body captured by index.js's verify hook (req.rawBody) is available here too.
+// ACK immediately (Razorpay retries non-2xx), then process: dedup on the
+// x-razorpay-event-id header via billing_events, reconcile tenant_billing, and
+// move the tenant between 'active' and 'past_due' as the subscription's health
+// changes. 'pending_review', 'suspended' and 'inactive' are never overridden
+// here — only their billing row is updated.
+const razorpaySvc = require('../services/razorpay');
+
+const RZP_HEALTHY_EVENTS = new Set([
+  'subscription.activated', 'subscription.charged', 'subscription.authenticated', 'subscription.resumed',
+]);
+const RZP_PAST_DUE_EVENTS = new Set([
+  'subscription.pending', 'subscription.halted',
+  'subscription.cancelled', 'subscription.completed', 'subscription.expired',
+]);
+
+router.post('/webhook/razorpay', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const secret = (process.env.RAZORPAY_WEBHOOK_SECRET || '').trim();
+    const sig = req.headers['x-razorpay-signature'];
+    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+    if (!secret) { logger.warn('Razorpay webhook received but RAZORPAY_WEBHOOK_SECRET is unset — ignoring'); return; }
+    if (!razorpaySvc.verifyWebhookSignature(rawBody, sig)) {
+      logger.warn('Razorpay webhook: invalid signature — ignoring');
+      return;
+    }
+
+    const evt = req.body || {};
+    const eventType = evt.event || 'unknown';
+    const eventId = req.headers['x-razorpay-event-id']
+      || crypto.createHash('sha256').update(rawBody).digest('hex').slice(0, 48);
+    const sub = evt.payload?.subscription?.entity || null;
+    const subscriptionId = sub?.id || evt.payload?.payment?.entity?.subscription_id || null;
+
+    // Idempotency: a duplicate delivery inserts nothing and is dropped.
+    const ins = await query(
+      `INSERT INTO billing_events (provider, provider_event_id, event_type, subscription_id, payload)
+       VALUES ('razorpay',$1,$2,$3,$4)
+       ON CONFLICT (provider_event_id) DO NOTHING
+       RETURNING id`,
+      [eventId, eventType, subscriptionId, JSON.stringify(evt).slice(0, 100000)]
+    ).catch(e => { logger.warn('billing_events insert failed', { error: e.message }); return { rows: [{ id: null }] }; });
+    if (!ins.rows[0]) { logger.info('Razorpay webhook: duplicate event skipped', { eventType, eventId }); return; }
+
+    if (!subscriptionId) { logger.info('Razorpay webhook: no subscription id, nothing to reconcile', { eventType }); return; }
+
+    const bR = await query(`SELECT * FROM tenant_billing WHERE razorpay_subscription_id=$1`, [subscriptionId]);
+    const billing = bR.rows[0];
+    if (!billing) {
+      // A subscription we do not know about — the trial is card-free and the
+      // subscription is only created via POST /admin/billing/subscribe, which
+      // writes tenant_billing first. Nothing to reconcile.
+      logger.info('Razorpay webhook: no tenant_billing for subscription — ignoring', { subscriptionId, eventType });
+      return;
+    }
+
+    const newSubStatus = sub?.status || null;
+    const periodEnd = sub?.current_end ? new Date(sub.current_end * 1000).toISOString() : null;
+    const chargedAt = (eventType === 'subscription.charged' && sub?.current_start)
+      ? new Date(sub.current_start * 1000).toISOString() : null;
+
+    await query(`
+      UPDATE tenant_billing SET
+        subscription_status = COALESCE($1, subscription_status),
+        current_period_end  = COALESCE($2, current_period_end),
+        last_payment_at     = COALESCE($3, last_payment_at),
+        updated_at = NOW()
+      WHERE tenant_id = $4
+    `, [newSubStatus, periodEnd, chargedAt, billing.tenant_id]);
+
+    await query(
+      `UPDATE billing_events SET tenant_id=$1 WHERE provider_event_id=$2`,
+      [billing.tenant_id, eventId]
+    ).catch(() => {});
+
+    const tR = await query(`SELECT id, status, slug FROM tenants WHERE id=$1`, [billing.tenant_id]);
+    const tenant = tR.rows[0];
+    if (!tenant) return;
+
+    // Only ever move between active ⇄ past_due. Never touch a reviewed/suspended one.
+    if (tenant.status === 'active' && RZP_PAST_DUE_EVENTS.has(eventType)) {
+      await query(
+        `UPDATE tenants SET status='past_due', suspension_reason='payment', suspended_at=NOW() WHERE id=$1`,
+        [tenant.id]
+      );
+      require('../middleware/auth').invalidateTenantCache(tenant.id);
+      logger.warn('Tenant moved to past_due by Razorpay webhook', { tenant: tenant.slug, eventType });
+    } else if (tenant.status === 'past_due' && RZP_HEALTHY_EVENTS.has(eventType)) {
+      await query(
+        `UPDATE tenants SET status='active', suspension_reason=NULL, suspended_at=NULL WHERE id=$1`,
+        [tenant.id]
+      );
+      require('../middleware/auth').invalidateTenantCache(tenant.id);
+      logger.info('Tenant recovered to active by Razorpay webhook', { tenant: tenant.slug, eventType });
+    }
+  } catch (err) {
+    logger.error('Razorpay webhook handler error', { error: err.message });
+  }
+});
+
 // ── DEV/TEST ROUTING BY ENTRY CODE ───────────────────────────
 // One WhatsApp number means Meta delivers EVERY message to one webhook, so the
 // environment cannot be chosen at the transport layer the way a second number

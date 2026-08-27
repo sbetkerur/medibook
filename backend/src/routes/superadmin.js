@@ -210,18 +210,25 @@ router.get('/stats', async (req, res) => {
 // ── LIST ALL TENANTS ──────────────────────────────────────────
 router.get('/tenants', async (req, res) => {
   try {
-    const { page = 1, search, limit } = req.query;
+    const { page = 1, search, limit, status } = req.query;
     const safeLimit = Math.max(1, Math.min(parseInt(limit) || 20, 50));
     const offset = (Math.max(parseInt(page), 1) - 1) * safeLimit;
 
-    let where = '';
+    const conds = [];
     const params = [];
     if (search) {
       if (search.length > 100) return res.status(400).json({ error: 'search too long' });
       const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
       params.push(`%${escapedSearch}%`);
-      where = ` WHERE t.name ILIKE $1 OR t.slug ILIKE $1`;
+      conds.push(`(t.name ILIKE $${params.length} OR t.slug ILIKE $${params.length})`);
     }
+    // ?status=pending_review powers the approval queue in the super-admin UI.
+    const VALID_LIST_STATUSES = ['active', 'pending_review', 'pending_payment', 'past_due', 'suspended', 'inactive'];
+    if (status && VALID_LIST_STATUSES.includes(status)) {
+      params.push(status);
+      conds.push(`t.status = $${params.length}`);
+    }
+    const where = conds.length ? ` WHERE ${conds.join(' AND ')}` : '';
 
     const countParams = [...params];
     params.push(safeLimit, offset);
@@ -248,7 +255,86 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
   try {
     const r = await query(`SELECT * FROM tenants WHERE id=$1`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
-    res.json({ tenant: r.rows[0] });
+    // Self-serve clinics carry a Razorpay subscription; fold its state in so the
+    // super-admin tenant view can show "trial ends", "past due", etc.
+    const bR = await query(`SELECT * FROM tenant_billing WHERE tenant_id=$1`, [req.params.id]).catch(() => ({ rows: [] }));
+    res.json({ tenant: r.rows[0], billing: bR.rows[0] || null });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── APPROVE A SELF-SERVE CLINIC ───────────────────────────────
+// The gate that stays with the super admin: a self-serve signup is provisioned
+// at 'pending_review' and its patients cannot reach it (the bot's entry-code
+// lookup requires status='active') until this runs. activated_at is stamped
+// here, which is when the staged send-cap clock (services/sendCaps.js) starts.
+router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
+  try {
+    const cur = await query(`SELECT id, slug, status FROM tenants WHERE id=$1`, [req.params.id]);
+    const t = cur.rows[0];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    if (t.status === 'active') return res.json({ tenant: t, message: 'Already active' });
+    if (t.status !== 'pending_review') {
+      return res.status(409).json({ error: `Only a clinic in review can be approved (this one is "${t.status}").` });
+    }
+    const r = await query(
+      `UPDATE tenants SET status='active', activated_at=COALESCE(activated_at, NOW()) WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    invalidateTenantCache(req.params.id);
+    await query(`
+      INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
+      VALUES ($1,'super_admin','APPROVE_TENANT','tenant',$2,$3,$4)
+    `, [req.user.id, req.params.id, JSON.stringify({ from: 'pending_review', to: 'active' }), req.ip]).catch(() => {});
+    logger.info('Self-serve clinic approved', { slug: t.slug, by: req.user.email });
+    res.json({ tenant: r.rows[0], message: 'Clinic approved and live' });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── KILL SWITCH: one-click suspend / resume ───────────────────
+// PATCH /tenants/:id does the same via the status field, but an operator putting
+// out a fire wants one obvious button. The 5s tenant cache means it takes hold
+// almost immediately; the bot stops attaching patients on the next message.
+router.post('/tenants/:id/suspend', validateUUID(), async (req, res) => {
+  try {
+    const reason = (req.body?.reason || 'manual suspension').toString().slice(0, 500);
+    const cur = await query(`SELECT id, slug, status FROM tenants WHERE id=$1`, [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
+    const r = await query(
+      `UPDATE tenants SET status='suspended', suspension_reason=$2, suspended_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id, reason]
+    );
+    invalidateTenantCache(req.params.id);
+    await query(`
+      INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
+      VALUES ($1,'super_admin','SUSPEND_TENANT','tenant',$2,$3,$4)
+    `, [req.user.id, req.params.id, JSON.stringify({ from: cur.rows[0].status, reason }), req.ip]).catch(() => {});
+    logger.warn('Tenant suspended', { slug: cur.rows[0].slug, by: req.user.email, reason });
+    res.json({ tenant: r.rows[0], message: 'Clinic suspended' });
+  } catch (err) { handleError(res, err); }
+});
+
+router.post('/tenants/:id/resume', validateUUID(), async (req, res) => {
+  try {
+    const cur = await query(`SELECT id, slug, status, signup_source FROM tenants WHERE id=$1`, [req.params.id]);
+    const t = cur.rows[0];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    if (t.status !== 'suspended') return res.status(409).json({ error: `Clinic is "${t.status}", not suspended.` });
+    // A self-serve clinic that was suspended for non-payment goes back to
+    // past_due (still needs to pay), not straight to active. `?to=active`
+    // overrides that when the suspension was for another reason and is resolved.
+    const to = req.query.to === 'active' ? 'active'
+      : (t.signup_source === 'self_serve' ? 'past_due' : 'active');
+    const r = await query(
+      `UPDATE tenants SET status=$2, suspension_reason=NULL, suspended_at=NULL WHERE id=$1 RETURNING *`,
+      [req.params.id, to]
+    );
+    invalidateTenantCache(req.params.id);
+    await query(`
+      INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
+      VALUES ($1,'super_admin','RESUME_TENANT','tenant',$2,$3,$4)
+    `, [req.user.id, req.params.id, JSON.stringify({ from: 'suspended', to }), req.ip]).catch(() => {});
+    logger.info('Tenant resumed', { slug: t.slug, to, by: req.user.email });
+    res.json({ tenant: r.rows[0], message: `Clinic resumed (${to})` });
   } catch (err) { handleError(res, err); }
 });
 
@@ -257,92 +343,31 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
   try {
     const { name, slug, owner_email, owner_password, owner_name, plan, city, billing_monthly } = req.body;
 
-    const schema = 'tenant_' + slug.replace(/-/g, '_').toLowerCase();
-
-    // Check slug uniqueness
-    const existing = await query(`SELECT id FROM tenants WHERE slug=$1`, [slug]);
-    if (existing.rows[0]) return res.status(409).json({ error: 'Slug already taken' });
-
-    // Phase 1: insert tenant record (WA credentials are now global — no per-tenant fields)
-    //
-    // The entry code is minted HERE rather than left to the backfill in
-    // migrate.js. Migrate runs once per boot, so a tenant created through this
-    // route would otherwise have no code — and therefore no QR, and therefore no
-    // way for its patients to reach it at all — until the next restart.
-    //
-    // Collisions are settled by the unique index rather than a prior SELECT,
-    // which would race a concurrent create. Only an entry-code collision is
-    // retried: any other 23505 (the slug, most likely, since the check above is
-    // racy) is a real conflict and must surface.
-    let tenant = null;
-    for (let attempt = 0; attempt < 5 && !tenant; attempt++) {
-      try {
-        const r = await query(`
-          INSERT INTO tenants (name, slug, schema_name, owner_email, plan, city, entry_code, billing_monthly)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
-        `, [name, slug, schema, owner_email, plan || 'starter', city?.trim() || null,
-            generateEntryCode(), billing_monthly ?? null]);
-        tenant = r.rows[0];
-      } catch (e) {
-        if (e.code === '23505' && e.constraint === 'idx_tenants_entry_code') continue;
-        if (e.code === '23505') return res.status(409).json({ error: 'Slug already taken' });
-        throw e;
-      }
-    }
-    if (!tenant) return res.status(503).json({ error: 'Could not allocate a clinic entry code. Please retry.' });
-
-    // Phase 2 & 3: create schema + admin user — rollback both if either fails
-    const effectivePassword = owner_password || crypto.randomBytes(8).toString('hex');
-    try {
-      await createTenantSchema(schema);
-      await runTenantMigrations(schema);
-
-      const hash = await bcrypt.hash(effectivePassword, 12);
-      await tenantQuery(schema, `
-        INSERT INTO users (email, password_hash, name, role)
-        VALUES ($1,$2,$3,'admin')
-      `, [owner_email, hash, owner_name || name + ' Admin']);
-    } catch (setupErr) {
-      // Rollback: drop schema and delete tenant record to leave no orphans
-      logger.error('Tenant setup failed — rolling back', { slug, error: setupErr.message });
-      // Defense-in-depth: validate the schema name before interpolating it into a
-      // DROP SCHEMA statement, same as every other place that builds tenant SQL.
-      // Joi validation upstream already constrains `slug`, so this should never
-      // throw in practice — but a DROP SCHEMA typo here would be catastrophic.
-      try {
-        validateSchemaName(schema);
-        await query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
-      } catch (validationErr) {
-        logger.error('Refusing to drop schema — failed schema name validation', { schema, error: validationErr.message });
-      }
-      await query(`DELETE FROM tenants WHERE id=$1`, [tenant.id]).catch(() => {});
-      throw setupErr;
-    }
-
-    // Audit log
-    try {
-      await query(`
-        INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
-      `, [req.user.id, 'super_admin', 'CREATE_TENANT', 'tenant', tenant.id,
-          JSON.stringify({ name, slug, plan: plan || 'starter', billing_monthly: billing_monthly ?? null }), req.ip]);
-    } catch (auditErr) { logger.warn('Audit log failed (CREATE_TENANT)', { error: auditErr.message }); }
+    // Provisioning (schema + migrations + first admin + entry code + rollback)
+    // lives in services/signupProvision.js so this route and the self-serve
+    // signup flow build a clinic exactly the same way. A super-admin creation
+    // is its own approval, so the tenant is 'active' immediately.
+    const { provisionTenant } = require('../services/signupProvision');
+    const { tenant, credentials, generatedPassword } = await provisionTenant({
+      name, slug, owner_email, owner_name,
+      owner_password: owner_password || undefined,
+      plan: plan || 'starter',
+      city: city?.trim() || null,
+      billing_monthly: billing_monthly ?? null,
+      signup_source: 'admin',
+      audit: { actor_id: req.user.id, actor_role: 'super_admin', ip: req.ip },
+    });
 
     res.json({
       tenant,
-      credentials: {
-        email: owner_email,
-        password: effectivePassword,
-        tenant_slug: slug,
-        login_url: `${require('../utils/appUrls').frontendBaseUrl()}/login`,
-      },
-      message: 'Tenant created successfully'
+      credentials,
+      generated_password: generatedPassword,
+      message: 'Tenant created successfully',
     });
   } catch (err) {
-    // 23505 = unique_violation — slug or schema_name already exists (TOCTOU race)
-    if (err.code === '23505') {
-      return res.status(409).json({ error: 'Slug already taken' });
-    }
+    if (err.status === 409) return res.status(409).json({ error: err.message });
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === '23505') return res.status(409).json({ error: 'Slug already taken' });
     handleError(res, err, 'POST /superadmin/tenants');
   }
 });
@@ -352,7 +377,10 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
   try {
     const { status, plan, name, suspension_reason, city, billing_monthly } = req.body;
 
-    const VALID_STATUSES = ['active', 'suspended', 'inactive'];
+    // 'pending_review' / 'past_due' / 'pending_payment' are lifecycle states of a
+    // self-serve clinic — normally moved by /approve, the billing webhook or the
+    // dunning cron, but a super admin may set them by hand too.
+    const VALID_STATUSES = ['active', 'suspended', 'inactive', 'pending_review', 'past_due', 'pending_payment'];
     if (status && !VALID_STATUSES.includes(status)) {
       return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_STATUSES.join(', ')}` });
     }
@@ -369,6 +397,9 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
       } else if (status === 'active') {
         // Clear suspension info when reactivating
         updates.push('suspension_reason=NULL', 'suspended_at=NULL');
+        // Stamp go-live once — this is when the staged send-cap clock starts
+        // (services/sendCaps.js). COALESCE keeps a real earlier value.
+        updates.push('activated_at=COALESCE(activated_at, NOW())');
       }
     }
     // Keep in sync with the tiers seeded in db/migrate.js and with

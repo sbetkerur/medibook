@@ -5,6 +5,7 @@ import api, { clearSessionTimers, resetSessionTimers } from '@/lib/api';
 import { todayIST } from '@/lib/dateIST';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import TermsGate from '@/components/TermsGate';
+import BillingBanner from '@/components/BillingBanner';
 import BrandMark from '@/components/BrandMark';
 import toast from 'react-hot-toast';
 import { format, parseISO } from 'date-fns';
@@ -1490,6 +1491,10 @@ export default function Dashboard() {
         </header>
 
         <main className="flex-1 overflow-y-auto p-3 sm:p-6">
+
+          {/* Self-serve billing state: review-pending / trial ending / past-due.
+              Renders nothing for a super-admin-provisioned clinic. */}
+          <BillingBanner />
 
           {/* Tab loading skeleton */}
           {tabLoading && (

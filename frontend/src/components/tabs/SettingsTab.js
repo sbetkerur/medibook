@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import ClinicQRCard from '@/components/ClinicQRCard';
+import { BillingSummary } from '@/components/BillingBanner';
 
 // `settings` is shared (also read by DoctorsTab) and stays owned by the parent,
 // which self-fetches it on tab select and passes it (plus `fetchSettings` to
@@ -63,6 +64,10 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
           nobody. Self-fetching rather than fed from `settings`, which is shared
           with DoctorsTab and has no reason to carry a rendered QR image. */}
       <ClinicQRCard isAdmin={isAdmin} />
+
+      {/* Self-serve subscription. Renders "managed by MediBook" for a clinic the
+          super admin provisioned, so it is safe to always mount. */}
+      {isAdmin && <BillingSummary />}
 
       {/* 'Clinic Settings' used to also cover clinic name and the WhatsApp-
           alerts phone number — removed by request, along with the card's own

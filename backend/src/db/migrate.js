@@ -461,7 +461,8 @@ async function migrate() {
         ('weekly_digest'),
         ('webhook_retry'),
         ('recalls'),
-        ('treatment_nudges')
+        ('treatment_nudges'),
+        ('billing_dunning')
       ON CONFLICT (job_name) DO NOTHING;
     `);
 
@@ -1010,6 +1011,132 @@ async function migrate() {
         ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
       `);
     });
+
+    // ── SELF-SERVE SIGNUP ─────────────────────────────────────
+    // A clinic can now create its own account (routes/signup.js) without a
+    // super admin provisioning it. Two things guard that against abuse and
+    // against the shared WhatsApp number: identity is verified by a one-time
+    // code sent to the owner's OWN WhatsApp (wa_otps — a DIFFERENT mechanism
+    // from the removed email reset flow, and the only channel this product
+    // has), and a card is taken up front through Razorpay before any schema is
+    // created (pending_signups + tenant_billing).
+    //
+    // Version 29: WhatsApp OTP store + the pre-payment signup holding area.
+    //   * wa_otps also backs the WhatsApp-code password reset in routes/auth.js.
+    //   * pending_signups holds the verified-but-not-yet-paid signup. The client
+    //     is handed a raw token; only its SHA-256 is stored, matching how
+    //     refresh_tokens / password_resets treat their tokens. No tenant row and
+    //     no schema exist until payment clears, so an abandoned signup leaves
+    //     nothing behind but an expiring row here.
+    await runMigration(client, 29, 'wa_otps_and_pending_signups', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS wa_otps (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          phone VARCHAR(20) NOT NULL,
+          purpose VARCHAR(20) NOT NULL CHECK (purpose IN ('signup','password_reset')),
+          code_hash TEXT NOT NULL,
+          payload JSONB DEFAULT '{}',
+          attempts INTEGER DEFAULT 0,
+          max_attempts INTEGER DEFAULT 5,
+          consumed_at TIMESTAMPTZ,
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_wa_otps_lookup ON wa_otps(phone, purpose, expires_at);
+
+        CREATE TABLE IF NOT EXISTS pending_signups (
+          token VARCHAR(64) PRIMARY KEY,
+          phone VARCHAR(20) NOT NULL,
+          email VARCHAR(255) NOT NULL,
+          slug VARCHAR(56) NOT NULL,
+          data JSONB NOT NULL,
+          plan VARCHAR(50) NOT NULL DEFAULT 'starter',
+          razorpay_customer_id VARCHAR(64),
+          razorpay_subscription_id VARCHAR(64),
+          tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+          expires_at TIMESTAMPTZ NOT NULL,
+          consumed_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_signups_sub ON pending_signups(razorpay_subscription_id);
+        CREATE INDEX IF NOT EXISTS idx_pending_signups_expires ON pending_signups(expires_at);
+      `);
+    });
+
+    // Version 30: subscription state and a webhook-idempotency ledger.
+    //   * tenant_billing is one row per tenant carrying the Razorpay
+    //     subscription and where its paid-through date sits. It is the source of
+    //     truth the dunning cron reconciles against.
+    //   * billing_events dedups Razorpay webhook deliveries (they retry) on
+    //     provider_event_id, exactly as the WhatsApp webhook dedups on
+    //     wa_message_id.
+    await runMigration(client, 30, 'tenant_billing', async () => {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS tenant_billing (
+          tenant_id UUID PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+          provider VARCHAR(20) NOT NULL DEFAULT 'razorpay',
+          plan_id VARCHAR(50),
+          razorpay_customer_id VARCHAR(64),
+          razorpay_subscription_id VARCHAR(64),
+          -- created | authenticated | active | pending | halted | cancelled | completed | expired
+          subscription_status VARCHAR(30),
+          short_url TEXT,
+          trial_end TIMESTAMPTZ,
+          current_period_end TIMESTAMPTZ,
+          last_payment_at TIMESTAMPTZ,
+          cancel_at_period_end BOOLEAN DEFAULT false,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_tenant_billing_subscription ON tenant_billing(razorpay_subscription_id);
+        CREATE INDEX IF NOT EXISTS idx_tenant_billing_status ON tenant_billing(subscription_status);
+
+        CREATE TABLE IF NOT EXISTS billing_events (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          provider VARCHAR(20) NOT NULL DEFAULT 'razorpay',
+          provider_event_id VARCHAR(120) UNIQUE,
+          event_type VARCHAR(60),
+          subscription_id VARCHAR(64),
+          tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+          payload JSONB,
+          received_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_billing_events_sub ON billing_events(subscription_id);
+      `);
+    });
+
+    // Version 31: plan ↔ Razorpay-plan mapping, and how a tenant was born.
+    //   * plans.razorpay_plan_id — populated from env below so there is one
+    //     place to read it; the operator creates the two plans in the Razorpay
+    //     dashboard once (see docs/self-serve-signup.md).
+    //   * tenants.signup_source — 'admin' (super-admin created) or 'self_serve'.
+    //   * tenants.activated_at — when a self-serve tenant's schema went live.
+    // `status` is a free VARCHAR (no CHECK), so the new 'pending_payment' and
+    // 'past_due' values need no constraint change — see middleware/auth.js and
+    // jobs/billingDunning.js for how they are treated.
+    await runMigration(client, 31, 'self_serve_tenant_columns', async () => {
+      await client.query(`
+        ALTER TABLE plans   ADD COLUMN IF NOT EXISTS razorpay_plan_id VARCHAR(64);
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS signup_source VARCHAR(20) DEFAULT 'admin';
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS activated_at  TIMESTAMPTZ;
+      `);
+    });
+
+    // Keep plans.razorpay_plan_id in step with the env on every boot — the
+    // operator may set or rotate these after the migration first ran. Scoped
+    // updates, no-ops when unset or unchanged.
+    for (const [planId, envKey] of [
+      ['starter', 'RAZORPAY_PLAN_STARTER'],
+      ['professional', 'RAZORPAY_PLAN_PROFESSIONAL'],
+    ]) {
+      const rzp = (process.env[envKey] || '').trim();
+      if (rzp) {
+        await client.query(
+          `UPDATE plans SET razorpay_plan_id=$1 WHERE id=$2 AND razorpay_plan_id IS DISTINCT FROM $1`,
+          [rzp, planId]
+        ).catch(e => console.warn(`⚠️  Could not set ${envKey} on plans.${planId}: ${e.message}`));
+      }
+    }
 
     // Backfill, unconditionally on every boot rather than inside the migration
     // above. Two reasons: prod runs with SEED_DEMO_DATA=false so seed-time

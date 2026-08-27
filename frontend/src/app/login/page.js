@@ -19,8 +19,13 @@ export default function LoginPage() {
   // this page is statically prerendered, and useSearchParams would force it
   // behind a Suspense boundary for one line of copy.
   const [sessionExpired, setSessionExpired] = useState(false);
+  const [signupOpen, setSignupOpen] = useState(false);
   useEffect(() => {
     setSessionExpired(new URLSearchParams(window.location.search).get('reason') === 'expired');
+    // Best-effort: only advertise self-serve signup when the backend has it on.
+    api.get('/signup/config')
+      .then(({ data }) => setSignupOpen(!!data?.enabled))
+      .catch(() => setSignupOpen(false));
   }, []);
 
   async function handleLogin(e) {
@@ -109,8 +114,8 @@ export default function LoginPage() {
             </button>
           </form>
 
-          <p className="text-center mt-4 text-xs text-gray-400">
-            Forgot your password? Contact your clinic administrator.
+          <p className="text-center mt-4 text-xs text-gray-500">
+            <a href="/forgot-password" className="text-blue-600 hover:underline">Forgot your password?</a>
           </p>
 
           {process.env.NODE_ENV === 'development' && (
@@ -121,6 +126,12 @@ export default function LoginPage() {
             </div>
           )}
         </div>
+
+        {signupOpen && (
+          <p className="text-center mt-6 text-sm text-gray-600">
+            New clinic? <a href="/signup" className="font-medium text-blue-600 hover:underline">Create an account</a>
+          </p>
+        )}
       </div>
     </div>
   );
