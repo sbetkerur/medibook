@@ -30,7 +30,6 @@ import SettingsTab from '@/components/tabs/SettingsTab';
 import CalendarTab from '@/components/tabs/CalendarTab';
 import LeavesTab from '@/components/tabs/LeavesTab';
 import AuditTab from '@/components/tabs/AuditTab';
-import TestBotTab from '@/components/tabs/TestBotTab';
 
 
 // Modal, ConfirmModal imported from @/components/ui
@@ -52,7 +51,6 @@ const NAV = [
   { id: 'services', label: 'Services', icon: '💊' },
   { id: 'holidays', label: 'Holidays', icon: '🗓️' },
   { id: 'settings', label: 'Settings', icon: '⚙️' },
-  { id: 'test', label: 'Bot Tester', icon: '🤖' },
   { id: 'audit', label: 'Audit Logs', icon: '📋' },
 ];
 
@@ -80,7 +78,12 @@ export default function Dashboard() {
   const [statsLastUpdated, setStatsLastUpdated] = useState(null);
   const [statsRefreshing, setStatsRefreshing] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [filterDate, setFilterDate] = useState('');
+  // Used to be a single exact-match date — reviewing a week or a month meant
+  // clicking through one day at a time. Either end can be left blank: only
+  // `from` set means "this date onward", only `to` set means "up to this
+  // date", and setting both narrows to the range between them.
+  const [filterDateFrom, setFilterDateFrom] = useState('');
+  const [filterDateTo, setFilterDateTo] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [patientSearch, setPatientSearch] = useState('');
 
@@ -100,6 +103,11 @@ export default function Dashboard() {
   // The appointment a treatment is being recorded against, opened from the
   // appointment row itself. Null when the modal is closed.
   const [recordTreatmentAppt, setRecordTreatmentAppt] = useState(null);
+  // Set by promptNextSitting (below) when the desk agrees to book a
+  // completed visit's next sitting: switches to the Treatments tab and asks
+  // IT to open its own date/slot picker for this plan, rather than this file
+  // keeping a second, independent "book the next visit" implementation.
+  const [pendingBookPlanId, setPendingBookPlanId] = useState(null);
 
   // Schedule state
   // Which dentist's week is being edited — null means the modal is closed.
@@ -239,7 +247,7 @@ export default function Dashboard() {
   const openWalkinModal = useCallback(() => {
     if (!hospitals.length) fetchHospitals();
     if (!doctors.length) fetchDoctors();
-    setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
+    setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '', effective_fee: '' });
     setWalkinSlots([]);
     setShowWalkinModal(true);
   }, [hospitals.length, doctors.length]);
@@ -252,6 +260,9 @@ export default function Dashboard() {
   const [walkinForm, setWalkinForm] = useState({
     patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '',
     appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '',
+    // Blank = use the doctor's own consultation_fee (appointments.effective_fee,
+    // see CLAUDE.md — the fee is quotable, not fixed, and varies per patient).
+    effective_fee: '',
   });
   const [walkinSaving, setWalkinSaving] = useState(false);
 
@@ -290,16 +301,19 @@ export default function Dashboard() {
   const [selectedApptIds, setSelectedApptIds] = useState(new Set());
   const [bulkUpdating, setBulkUpdating] = useState(false);
 
-  // Send WhatsApp message state
-  const [showWaMessageModal, setShowWaMessageModal] = useState(false);
-  const [waMessagePhone, setWaMessagePhone] = useState('');
-  const [waMessageText, setWaMessageText] = useState('');
-  const [waSending, setWaSending] = useState(false);
-
   // Appointment notes inline editing — A5
   const [editingNotesId, setEditingNotesId] = useState(null);
   const [notesText, setNotesText] = useState('');
   const [notesSaving, setNotesSaving] = useState(false);
+
+  // Consultation fee override — appointments.effective_fee. The fee is
+  // quotable, not fixed (see CLAUDE.md), and this is how the desk records
+  // what was actually charged for a booking that already exists (one made via
+  // WhatsApp, or a walk-in whose fee needs correcting) — the walk-in modal's
+  // own field only covers the moment of booking.
+  const [editingFeeId, setEditingFeeId] = useState(null);
+  const [feeAmount, setFeeAmount] = useState('');
+  const [feeSaving, setFeeSaving] = useState(false);
 
   // Role gate: the backend enforces adminOnly on staff CRUD, settings PATCH,
   // walk-ins, bulk updates, imports, WhatsApp sends, audit logs, etc. Staff
@@ -390,7 +404,7 @@ export default function Dashboard() {
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
       if (e.key === 'g') { gPressed = true; clearTimeout(gTimer); gTimer = setTimeout(() => { gPressed = false; }, 1000); return; }
       if (gPressed) {
-        const navMap = { o: 'overview', a: 'appointments', d: 'doctors', p: 'patients', n: 'analytics', s: 'settings', t: 'test', l: 'audit' };
+        const navMap = { o: 'overview', a: 'appointments', d: 'doctors', p: 'patients', n: 'analytics', s: 'settings', l: 'audit' };
         // Audit logs are admin-only on the backend — read the role fresh from
         // localStorage (this closure was created before `user` state resolved).
         if (navMap[e.key] === 'audit') {
@@ -436,7 +450,8 @@ export default function Dashboard() {
   const fetchAppointments = useCallback(async (page = apptPage) => {
     try {
       const params = new URLSearchParams({ limit: '25', page: String(page) });
-      if (filterDate) params.set('date', filterDate);
+      if (filterDateFrom) params.set('from', filterDateFrom);
+      if (filterDateTo) params.set('to', filterDateTo);
       if (filterStatus) params.set('status', filterStatus);
       const { data } = await api.get(`/admin/appointments?${params}`);
       const rows = data.appointments || [];
@@ -444,7 +459,7 @@ export default function Dashboard() {
       setApptHasMore(data.has_more ?? rows.length === 25);
       if (data.total != null) setApptTotal(data.total);
     } catch { toast.error('Failed to load appointments'); }
-  }, [filterDate, filterStatus, apptPage]);
+  }, [filterDateFrom, filterDateTo, filterStatus, apptPage]);
 
   // The 60s auto-refresh interval below must not depend on `fetchAppointments`
   // directly: its identity changes with the filters and the page, so the timer
@@ -831,24 +846,20 @@ export default function Dashboard() {
         title: 'Book the next sitting?',
         message: `${plan.title} — sitting ${plan.nextVisitNumber} of ${plan.total_visits}`
           + (plan.treating_doctor_name ? ` with Dr. ${plan.treating_doctor_name}` : '')
-          + '. Book the next free slot now, while the patient is still here?',
+          + '. Take you to pick a date and time now, while the patient is still here?',
         danger: false,
-        onConfirm: async () => {
-          // Dismiss FIRST. ConfirmModal does not close itself — it is dismissed
-          // only through onCancel — so leaving it up made the Confirm button
-          // look inert, and a second click booked ANOTHER sitting: the backend
-          // re-counts under FOR UPDATE and happily issues the next visit. That
-          // is a real appointment, an atomically locked slot the bot can no
-          // longer offer, a monthly-quota decrement, and a confirmation sent to
-          // a patient for a date they never agreed to. A double-click on the
-          // first press did the same.
+        onConfirm: () => {
+          // Used to book straight off ({ after_days: 7 }) with no picker — the
+          // FIRST free slot a week out, silently, before the desk ever saw a
+          // date or time. TreatmentPlansTab's own "Book visit N" button was
+          // rewritten away from exactly that pattern (a misread tap booked a
+          // date nobody chose); this was the second, untouched call site for
+          // the same backend action reintroducing the same failure. Hand off
+          // to that tab's own picker instead of keeping a second, blind
+          // implementation of "book the next visit" here.
           setConfirmModal(null);
-          try {
-            const { data: booked } = await api.post(`/admin/treatment-plans/${planId}/visits`, { after_days: 7 });
-            toast.success(`Sitting ${booked.visit_number} booked — ${booked.date} at ${String(booked.time).slice(0, 5)}`);
-          } catch (err) {
-            toast.error(err.response?.data?.error || 'Could not book the next sitting');
-          }
+          setTab('treatments');
+          setPendingBookPlanId(planId);
         },
       });
     } catch { /* the prompt is a convenience; never block the status change */ }
@@ -1085,7 +1096,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (tab === 'appointments') { setApptPage(1); fetchAppointments(1); }
-  }, [filterDate, filterStatus]);
+  }, [filterDateFrom, filterDateTo, filterStatus]);
 
   // Drop selected appointments that are no longer on screen. Selection used to
   // survive pagination and filter changes, so ticking 5 rows on page 1 and
@@ -1139,7 +1150,7 @@ export default function Dashboard() {
         slot_id && slot_id !== '__manual__' ? { ...rest, slot_id } : rest);
       toast.success('Walk-in appointment created!');
       setShowWalkinModal(false);
-      setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '' });
+      setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '', effective_fee: '' });
       setWalkinSlots([]);
       fetchAppointments();
       fetchStats();
@@ -1196,21 +1207,6 @@ export default function Dashboard() {
     } finally { setBulkUpdating(false); }
   }
 
-  async function sendWaMessage(e) {
-    e.preventDefault();
-    if (!waMessagePhone || !waMessageText) return toast.error('Phone and message required');
-    setWaSending(true);
-    try {
-      await api.post('/admin/messages/send', { phone: waMessagePhone, message: waMessageText });
-      toast.success(`Message sent to ${waMessagePhone}`);
-      setShowWaMessageModal(false);
-      setWaMessagePhone('');
-      setWaMessageText('');
-    } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to send message');
-    } finally { setWaSending(false); }
-  }
-
   async function saveApptNotes(apptId) {
     setNotesSaving(true);
     try {
@@ -1221,6 +1217,24 @@ export default function Dashboard() {
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to save notes');
     } finally { setNotesSaving(false); }
+  }
+
+  async function saveApptFee(apptId) {
+    setFeeSaving(true);
+    try {
+      // Always a concrete number, never blank: 0 is the documented sentinel for
+      // "no override, use the doctor's rate" (COALESCE(NULLIF(effective_fee,0),
+      // consultation_fee), read by every revenue query) — sending '' would be
+      // read by the backend as "field omitted, leave it as it was" and could
+      // never clear a previously-set override back to the default.
+      const fee = feeAmount === '' ? 0 : Number(feeAmount);
+      await api.patch(`/admin/appointments/${apptId}`, { effective_fee: fee });
+      setAppointments(prev => prev.map(a => a.id === apptId ? { ...a, effective_fee: fee } : a));
+      toast.success(fee > 0 ? `Fee set to ₹${fee}` : 'Fee reset to the doctor’s rate');
+      setEditingFeeId(null);
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to save fee');
+    } finally { setFeeSaving(false); }
   }
 
   async function printReceipt(apptId) {
@@ -1278,7 +1292,8 @@ export default function Dashboard() {
       try {
         for (let page = 1; page <= MAX_PAGES; page++) {
           const params = new URLSearchParams({ limit: '100', page: String(page) });
-          if (filterDate) params.set('date', filterDate);
+          if (filterDateFrom) params.set('from', filterDateFrom);
+          if (filterDateTo) params.set('to', filterDateTo);
           if (filterStatus) params.set('status', filterStatus);
           const { data } = await api.get(`/admin/appointments?${params}`);
           const batch = data.appointments || [];
@@ -1572,7 +1587,8 @@ export default function Dashboard() {
             <AppointmentsTab
               appointments={appointments}
               isAdmin={isAdmin}
-              filterDate={filterDate} setFilterDate={setFilterDate}
+              filterDateFrom={filterDateFrom} setFilterDateFrom={setFilterDateFrom}
+              filterDateTo={filterDateTo} setFilterDateTo={setFilterDateTo}
               filterStatus={filterStatus} setFilterStatus={setFilterStatus}
               apptTotal={apptTotal}
               apptPage={apptPage} setApptPage={setApptPage}
@@ -1583,9 +1599,9 @@ export default function Dashboard() {
               updateApptStatus={updateApptStatus}
               printReceipt={printReceipt}
               waLink={waLink}
-              onMessagePatient={(phone) => { setShowWaMessageModal(true); setWaMessagePhone(phone); setWaMessageText(''); }}
               onAddWalkin={openWalkinModal}
               onEditNotes={(a) => { setEditingNotesId(a.id); setNotesText(a.notes || ''); }}
+              onEditFee={(a) => { setEditingFeeId(a.id); setFeeAmount(a.effective_fee > 0 ? String(a.effective_fee) : ''); }}
               onCancelAppt={(a) => { setCancellingAppt(a); setCancelReason(''); }}
               onRecordTreatment={(a) => setRecordTreatmentAppt(a)}
             />
@@ -1723,7 +1739,8 @@ export default function Dashboard() {
               the tab is open to all roles; declining/cancelling a plan is
               admin-gated server-side, hence isAdmin rather than hiding the tab. */}
           {tab === 'treatments' && !tabLoading && (
-            <TreatmentPlansTab isAdmin={isAdmin} setConfirmModal={setConfirmModal} />
+            <TreatmentPlansTab isAdmin={isAdmin} setConfirmModal={setConfirmModal}
+              pendingBookPlanId={pendingBookPlanId} clearPendingBookPlanId={() => setPendingBookPlanId(null)} />
           )}
 
           {/* ── SLOTS ── */}
@@ -1732,11 +1749,6 @@ export default function Dashboard() {
               rather than hiding the whole tab. */}
           {tab === 'slots' && !tabLoading && (
             <SlotsTab doctors={doctors} isAdmin={isAdmin} />
-          )}
-
-          {/* ── BOT TESTER ── */}
-          {tab === 'test' && !tabLoading && (
-            <TestBotTab isAdmin={isAdmin} />
           )}
 
           </ErrorBoundary>
@@ -1762,7 +1774,7 @@ export default function Dashboard() {
                 Specialization <span className="text-gray-400 font-normal">(optional)</span>
               </label>
               <input value={doctorForm.specialization} onChange={e => setDoctorForm(f => ({ ...f, specialization: e.target.value }))}
-                placeholder="e.g. Cardiologist"
+                placeholder="e.g. Endodontist"
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
             <div>
@@ -1770,7 +1782,7 @@ export default function Dashboard() {
                 Qualification <span className="text-gray-400 font-normal">(optional)</span>
               </label>
               <input value={doctorForm.qualification} onChange={e => setDoctorForm(f => ({ ...f, qualification: e.target.value }))}
-                placeholder="e.g. MBBS, MD"
+                placeholder="e.g. BDS, MDS"
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
             <div className="sm:col-span-2">
@@ -2013,7 +2025,7 @@ export default function Dashboard() {
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Department Name *</label>
             <input value={deptForm.name} onChange={e => setDeptForm(f => ({ ...f, name: e.target.value }))}
-              placeholder="e.g. Cardiology"
+              placeholder="e.g. Orthodontics"
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
           </div>
           <div>
@@ -2355,10 +2367,10 @@ export default function Dashboard() {
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">Patient Name</label>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Patient Name *</label>
               <input value={walkinForm.patient_name} onChange={e => setWalkinForm(f => ({ ...f, patient_name: e.target.value }))}
-                placeholder="Full name (optional)"
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                placeholder="Full name"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
             </div>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -2492,6 +2504,22 @@ export default function Dashboard() {
             </select>
           </div>
           <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">
+              Consultation Fee <span className="text-gray-400 font-normal">(optional)</span>
+            </label>
+            {/* The doctor's rate is a guideline, not a price — clinics waive it
+                or negotiate per patient. Leaving this blank charges the
+                doctor's own consultation_fee; entering a number here overrides
+                it for THIS visit only (appointments.effective_fee). */}
+            <input type="number" min="0" step="1" value={walkinForm.effective_fee}
+              onChange={e => setWalkinForm(f => ({ ...f, effective_fee: e.target.value }))}
+              placeholder={(() => {
+                const doc = doctors.find(d => d.id === walkinForm.doctor_id);
+                return doc?.consultation_fee > 0 ? `₹${doc.consultation_fee} (Dr. ${doc.name}'s rate)` : 'Doctor’s rate';
+              })()}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Notes</label>
             <textarea value={walkinForm.notes} onChange={e => setWalkinForm(f => ({ ...f, notes: e.target.value }))}
               rows={2} placeholder="Optional notes..."
@@ -2606,6 +2634,41 @@ export default function Dashboard() {
       </div>
     )}
 
+    {/* ── CONSULTATION FEE OVERRIDE MODAL ── */}
+    {editingFeeId && (() => {
+      const appt = appointments.find(a => a.id === editingFeeId);
+      const doc = doctors.find(d => d.id === appt?.doctor_id);
+      return (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] supports-[max-height:90dvh]:max-h-[90dvh] overflow-y-auto">
+          <h3 className="text-base font-semibold text-gray-900 mb-1">Consultation Fee</h3>
+          <p className="text-xs text-gray-400 mb-4">
+            The fee is quotable, not fixed — clinics waive or negotiate it per patient.
+            {doc?.consultation_fee > 0 && <> Dr. {doc.name}&apos;s rate is <strong>₹{doc.consultation_fee}</strong>.</>}
+            {' '}Leave blank to bill the doctor&apos;s own rate (clears any override); enter an amount to override it for this visit only.
+          </p>
+          <input type="number" min="0" step="1"
+            value={feeAmount}
+            onChange={e => setFeeAmount(e.target.value)}
+            placeholder={doc?.consultation_fee > 0 ? `₹${doc.consultation_fee}` : '0'}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-blue-500"
+            autoFocus
+          />
+          <div className="flex gap-3 mt-4">
+            <button onClick={() => setEditingFeeId(null)}
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              Cancel
+            </button>
+            <button onClick={() => saveApptFee(editingFeeId)} disabled={feeSaving}
+              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
+              {feeSaving ? 'Saving...' : '💾 Save Fee'}
+            </button>
+          </div>
+        </div>
+      </div>
+      );
+    })()}
+
     {/* ── CONFIRM MODAL ── */}
     {confirmModal && (
       <ConfirmModal
@@ -2615,42 +2678,6 @@ export default function Dashboard() {
         onConfirm={confirmModal.onConfirm}
         onCancel={() => setConfirmModal(null)}
       />
-    )}
-
-    {/* ── SEND WHATSAPP MESSAGE MODAL ── */}
-    {showWaMessageModal && (
-      <Modal title="Send WhatsApp Message" onClose={() => setShowWaMessageModal(false)}>
-        <form onSubmit={sendWaMessage} className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Phone Number <span className="text-red-400">*</span></label>
-            <input value={waMessagePhone} onChange={e => setWaMessagePhone(e.target.value)}
-              placeholder="917795676142"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-            <p className="text-xs text-gray-400 mt-1">Include country code, no + or spaces (e.g. 917795676142)</p>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Message <span className="text-red-400">*</span></label>
-            <textarea value={waMessageText} onChange={e => setWaMessageText(e.target.value)}
-              rows={4} maxLength={1000}
-              placeholder="Type your message here..."
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" required />
-            <p className="text-xs text-gray-400 mt-1">{waMessageText.length}/1000 characters</p>
-          </div>
-          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-xs text-yellow-700">
-            ⚠️ Only send messages to patients who have previously contacted this WhatsApp number. Unsolicited messages may violate WhatsApp policy.
-          </div>
-          <div className="flex gap-3 pt-2">
-            <button type="button" onClick={() => setShowWaMessageModal(false)}
-              className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
-              Cancel
-            </button>
-            <button type="submit" disabled={waSending}
-              className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition">
-              {waSending ? 'Sending...' : '📤 Send Message'}
-            </button>
-          </div>
-        </form>
-      </Modal>
     )}
 
     </>

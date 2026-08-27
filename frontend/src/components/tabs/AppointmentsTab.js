@@ -7,14 +7,23 @@ import Badge from '@/components/ui/Badge';
  * table. Extracted from dashboard/page.js verbatim — behaviour unchanged.
  *
  * The modals themselves stay in the page (they are shared with other tabs), so
- * this component takes intent callbacks — onMessagePatient, onAddWalkin,
- * onEditNotes, onCancelAppt — rather than the dozen individual setState props
- * that opening each one used to require.
+ * this component takes intent callbacks — onAddWalkin, onEditNotes,
+ * onCancelAppt — rather than the dozen individual setState props that opening
+ * each one used to require.
+ *
+ * No in-app WhatsApp send lives here: `waLink` is a `wa.me` deep link that
+ * opens the ADMIN'S OWN WhatsApp to message a patient directly — nothing goes
+ * through MediBook's backend or the shared platform number. The dashboard
+ * used to also offer a free-form send THROUGH the platform number
+ * (POST /admin/messages/send, a "Message Patient" button + 📤 icons); that
+ * capability has been removed, backend route included — deliberately, not an
+ * oversight, so don't re-add a call site for it here.
  */
 export default function AppointmentsTab({
   appointments,
   isAdmin,
-  filterDate, setFilterDate,
+  filterDateFrom, setFilterDateFrom,
+  filterDateTo, setFilterDateTo,
   filterStatus, setFilterStatus,
   apptTotal, apptPage, setApptPage, apptHasMore,
   fetchAppointments,
@@ -23,9 +32,9 @@ export default function AppointmentsTab({
   updateApptStatus,
   printReceipt,
   waLink,
-  onMessagePatient,
   onAddWalkin,
   onEditNotes,
+  onEditFee,
   onCancelAppt,
   onRecordTreatment,
 }) {
@@ -34,8 +43,19 @@ export default function AppointmentsTab({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap gap-3 items-center">
-        <input type="date" value={filterDate} onChange={e => setFilterDate(e.target.value)}
-          className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        <div className="flex items-center gap-1.5">
+          <input type="date" value={filterDateFrom} onChange={e => setFilterDateFrom(e.target.value)}
+            aria-label="From date"
+            // Clamps the end of the range so a "from" picked after the
+            // existing "to" can't silently produce an empty result.
+            max={filterDateTo || undefined}
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          <span className="text-xs text-gray-400">to</span>
+          <input type="date" value={filterDateTo} onChange={e => setFilterDateTo(e.target.value)}
+            aria-label="To date"
+            min={filterDateFrom || undefined}
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
         <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
           className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
           <option value="">All Status</option>
@@ -44,21 +64,17 @@ export default function AppointmentsTab({
           <option value="cancelled">Cancelled</option>
           <option value="no_show">No Show</option>
         </select>
-        {(filterDate || filterStatus) && (
-          <button onClick={() => { setFilterDate(''); setFilterStatus(''); }}
+        {(filterDateFrom || filterDateTo || filterStatus) && (
+          <button onClick={() => { setFilterDateFrom(''); setFilterDateTo(''); setFilterStatus(''); }}
             className="text-sm text-blue-600 hover:underline">Clear filters</button>
         )}
         <span className="text-sm text-gray-400 ml-auto">{apptTotal > 0 ? `${apptTotal} total` : `${appointments.length} records`}</span>
-        {isAdmin && (<>
-        <button onClick={() => onMessagePatient('')}
-          className="px-3 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition flex items-center gap-1.5">
-          📤 Message Patient
-        </button>
+        {isAdmin && (
         <button onClick={onAddWalkin}
           className="px-3 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition flex items-center gap-1.5">
           + Walk-in
         </button>
-        </>)}
+        )}
       </div>
 
       {isAdmin && selectedApptIds.size > 0 && (
@@ -92,15 +108,10 @@ export default function AppointmentsTab({
                 <div className="min-w-0">
                   <div className="font-medium text-gray-900 truncate">{a.patient_name}</div>
                   <div className="flex items-center gap-1.5 mt-0.5">
+                    {/* Opens the admin's OWN WhatsApp (wa.me) — never MediBook's
+                        backend or the shared platform number. */}
                     <a href={waLink(a.patient_phone)} target="_blank" rel="noreferrer"
                       className="inline-block py-2 text-xs text-green-600 hover:underline">{a.patient_phone}</a>
-                    {/* Icon-only next to a phone number, so it needs a real
-                        target on touch; negative margins keep the row's visual
-                        height unchanged. */}
-                    {isAdmin && (
-                    <button onClick={() => onMessagePatient(a.patient_phone || '')} aria-label="Message patient on WhatsApp"
-                      className="shrink-0 w-10 h-10 -my-3 flex items-center justify-center text-xs text-green-500 hover:text-green-700 md:w-auto md:h-auto md:my-0 md:px-1.5 md:py-1">📤</button>
-                    )}
                   </div>
                 </div>
                 <Badge status={a.status} />
@@ -143,6 +154,14 @@ export default function AppointmentsTab({
                   className={`px-3 py-2 text-xs border rounded-lg transition ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
                   📝 {a.notes ? 'Notes' : 'Add Note'}
                 </button>
+                {/* Not admin-gated, matching the backend: PATCH /appointments/:id
+                    only withholds effective_fee (like notes) from nobody —
+                    the fee is negotiated at the desk, same as recording a
+                    treatment payment. */}
+                <button onClick={() => onEditFee(a)}
+                  className={`px-3 py-2 text-xs border rounded-lg transition ${a.effective_fee > 0 ? 'bg-green-50 text-green-700 border-green-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                  💰 {a.effective_fee > 0 ? `₹${a.effective_fee}` : 'Fee'}
+                </button>
                 {/* Recording the treatment has to happen HERE, on the visit the
                     dentist just finished — not on a separate tab that asks the
                     front desk to find this appointment again in a dropdown. If
@@ -157,7 +176,7 @@ export default function AppointmentsTab({
           ))}
           {!appointments.length && (
             <div className="px-4 py-12 text-center text-gray-400">
-              No appointments found{filterDate || filterStatus ? ' for selected filters' : ''}
+              No appointments found{filterDateFrom || filterDateTo || filterStatus ? ' for selected filters' : ''}
             </div>
           )}
         </div>
@@ -202,11 +221,6 @@ export default function AppointmentsTab({
                     <div className="flex items-center gap-1.5">
                       <a href={waLink(a.patient_phone)} target="_blank" rel="noreferrer"
                         className="text-xs text-green-600 hover:underline">{a.patient_phone}</a>
-                      {isAdmin && (
-                      <button onClick={() => onMessagePatient(a.patient_phone || '')}
-                        title="Send WhatsApp message"
-                        className="text-xs text-green-500 hover:text-green-700">📤</button>
-                      )}
                     </div>
                   </td>
                   <td className="px-4 py-3 text-gray-700 text-sm">Dr. {a.doctor_name}</td>
@@ -242,6 +256,10 @@ export default function AppointmentsTab({
                         className={`px-2 py-1 text-xs border rounded hover:bg-gray-100 transition whitespace-nowrap ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
                         📝 {a.notes ? 'Notes' : 'Add Note'}
                       </button>
+                      <button onClick={() => onEditFee(a)} title="Set the consultation fee for this visit"
+                        className={`px-2 py-1 text-xs border rounded hover:bg-gray-100 transition whitespace-nowrap ${a.effective_fee > 0 ? 'bg-green-50 text-green-700 border-green-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                        💰 {a.effective_fee > 0 ? `₹${a.effective_fee}` : 'Fee'}
+                      </button>
                       <button onClick={() => onRecordTreatment(a)} title="Record a treatment the dentist advised"
                         className="px-2 py-1 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded hover:bg-teal-100 transition whitespace-nowrap">
                         🩺 Treatment
@@ -253,7 +271,7 @@ export default function AppointmentsTab({
               {!appointments.length && (
                 <tr>
                   <td colSpan={9} className="px-4 py-12 text-center text-gray-400">
-                    No appointments found{filterDate || filterStatus ? ' for selected filters' : ''}
+                    No appointments found{filterDateFrom || filterDateTo || filterStatus ? ' for selected filters' : ''}
                   </td>
                 </tr>
               )}

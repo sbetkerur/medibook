@@ -129,13 +129,24 @@ export default function NewTenantPage() {
               <li>2. Log in as clinic admin and add doctors &amp; schedules</li>
               <li>3. Generate appointment slots from the Slots tab</li>
               {/* Printing the QR is the step that makes the clinic reachable at
-                  all, and it was missing from this list entirely. The Bot Tester
-                  passes tenant_slug directly and so bypasses entry-code routing —
-                  meaning an operator could work this checklist end to end, watch
-                  the bot answer, and still hand over a clinic no patient can
-                  reach. Called out last because it is the one to leave with the
-                  clinic, not because it is optional. */}
-              <li>4. Test the bot via the Bot Tester tab</li>
+                  all, and it was missing from this list entirely. POST
+                  /api/webhook/test passes tenant_slug directly and so bypasses
+                  entry-code routing — meaning an operator could work this
+                  checklist end to end, watch the bot answer, and still hand
+                  over a clinic no patient can reach. Called out last because
+                  it is the one to leave with the clinic, not because it is
+                  optional.
+                  The dashboard's own Bot Tester tab (which used the same
+                  tenant-scoped POST /admin/bot-test, authenticated instead of
+                  the shared webhook secret) was removed — the equivalent
+                  check here is a curl to /api/webhook/test, only available
+                  outside production or with ENABLE_TEST_ENDPOINT=true.
+                  In production the route ALSO requires an X-Test-Secret header
+                  matching TEST_ENDPOINT_SECRET (webhook.js) — omitting that
+                  originally left this instruction pointing an operator at a
+                  bare 401 with no clue why, for exactly the case (a live
+                  tenant being onboarded in prod) this checklist runs in. */}
+              <li>4. Test the bot — <code className="text-xs bg-blue-100 px-1 py-0.5 rounded">POST /api/webhook/test</code> with <code className="text-xs bg-blue-100 px-1 py-0.5 rounded">tenant_slug: &quot;{creds.tenant_slug}&quot;</code> (outside production, or with <code className="text-xs bg-blue-100 px-1 py-0.5 rounded">ENABLE_TEST_ENDPOINT=true</code>). <strong>In production</strong>, also send <code className="text-xs bg-blue-100 px-1 py-0.5 rounded">X-Test-Secret: &lt;TEST_ENDPOINT_SECRET&gt;</code> or the request 401s.</li>
               <li className="font-semibold">5. Print the clinic&apos;s QR card — Settings → Your WhatsApp QR code. Patients can only reach this clinic by scanning it.</li>
             </ol>
           </div>

@@ -658,8 +658,11 @@ router.post('/doctors/:id/leaves', adminOnly, validateUUID(), async (req, res) =
     let affectedAppointments = [];
     if (validDates.length) {
       try {
+        // a.id included so the dashboard can offer a direct reschedule/cancel
+        // action on each one (PATCH /appointments/:id/reschedule) rather than
+        // just naming them in a warning the admin has to go find manually.
         const apptR = await tenantQuery(s, `
-          SELECT a.booking_id, a.appointment_date::text, a.appointment_time::text,
+          SELECT a.id, a.booking_id, a.appointment_date::text, a.appointment_time::text,
                  p.name as patient_name, p.phone as patient_phone
           FROM appointments a
           JOIN patients p ON p.id = a.patient_id
@@ -747,7 +750,7 @@ router.get('/slots', async (req, res) => {
 });
 
 // adminOnly: blocking/unblocking a slot is a schedule mutation, exactly like
-// POST /slots/block-range below — which does the same thing in one call and has
+// POST /slots/range below — which does the same thing over a date range and has
 // always been admin-gated. Without it a 'staff' login could enumerate ids via
 // GET /slots?doctor_id=…&date=… and loop PATCH {"action":"block"} to take a
 // dentist's entire bookable calendar offline one slot at a time.
@@ -780,7 +783,11 @@ router.patch('/slots/:id', adminOnly, validateUUID(), async (req, res) => {
        WHERE id=$2 AND status != 'booked' RETURNING *`,
       [newStatus, req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Slot not found or is already booked' });
-    await writeAuditLog(s, req.user.id, req.user.role, `slot_${newStatus === 'blocked' ? 'block' : 'unblock'}`, 'time_slot', req.params.id, null, null, req.ip);
+    // UPPER_SNAKE_CASE, matching every other audit action in the codebase
+    // (including SLOTS_RANGE_BLOCK/UNBLOCK below) — this one was the sole
+    // lowercase outlier, which made GET /audit-logs?action= inconsistent
+    // between the single-slot and date-range variants of the same operation.
+    await writeAuditLog(s, req.user.id, req.user.role, `SLOT_${newStatus === 'blocked' ? 'BLOCK' : 'UNBLOCK'}`, 'time_slot', req.params.id, null, null, req.ip);
     res.json({ slot: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });
@@ -818,18 +825,39 @@ router.post('/slots/generate', adminOnly, slotsGenerateLimiter, async (req, res)
   } catch (err) { handleError(res, err); }
 });
 
-router.post('/slots/block-range', adminOnly, validate(schemas.blockRange), async (req, res) => {
+// Manual block/unblock across a date range, in one call — the per-slot PATCH
+// above (and the Slots tab's click-to-toggle) makes an admin open every day
+// individually and tap each slot; this is the same operation the schedule
+// editor's day-off toggle does, but for a temporary window (a conference, a
+// short leave not worth recording as a doctor_leaves row) rather than a
+// permanent change to the recurring week.
+//
+// 'block' only touches 'available' slots and 'unblock' only touches 'blocked'
+// ones — booked and expired slots are never in either WHERE clause, so this
+// can never touch a real appointment. Clearing blocked_by_leave/holiday
+// mirrors the single-slot route: once an admin manually sets a slot's status,
+// it is under manual control, and a stale flag would let a later leave/holiday
+// removal silently re-open (or a later leave silently re-close) a slot the
+// admin deliberately set here.
+router.post('/slots/range', adminOnly, validate(schemas.slotRangeAction), async (req, res) => {
   try {
-    const { doctor_id, start_date, end_date, reason } = req.body;
+    const { doctor_id, start_date, end_date, action, reason } = req.body;
     const s = req.tenant.schema_name;
+    // Matches POST /slots/generate: a wrong/mistyped doctor_id would otherwise
+    // UPDATE zero rows and still answer 200 {blocked:0}, reading as "there was
+    // nothing to block" rather than "that doctor doesn't exist".
+    const docR = await tenantQuery(s, `SELECT id FROM doctors WHERE id=$1`, [doctor_id]);
+    if (!docR.rows[0]) return res.status(404).json({ error: 'Doctor not found' });
+    const fromStatus = action === 'block' ? 'available' : 'blocked';
+    const toStatus = action === 'block' ? 'blocked' : 'available';
     const r = await tenantQuery(s, `
-      UPDATE time_slots SET status='blocked'
-      WHERE doctor_id=$1 AND slot_date BETWEEN $2 AND $3 AND status='available'
+      UPDATE time_slots SET status=$4, blocked_by_leave=false, blocked_by_holiday=false
+      WHERE doctor_id=$1 AND slot_date BETWEEN $2 AND $3 AND status=$5
       RETURNING id
-    `, [doctor_id, start_date, end_date]);
-    await writeAuditLog(s, req.user.id, req.user.role, 'BLOCK_SLOTS_RANGE', 'time_slot', null,
+    `, [doctor_id, start_date, end_date, toStatus, fromStatus]);
+    await writeAuditLog(s, req.user.id, req.user.role, `SLOTS_RANGE_${action.toUpperCase()}`, 'time_slot', null,
       null, { doctor_id, start_date, end_date, reason, count: r.rows.length }, req.ip);
-    res.json({ blocked: r.rows.length });
+    res.json({ [action === 'block' ? 'blocked' : 'unblocked']: r.rows.length });
   } catch (err) { handleError(res, err); }
 });
 

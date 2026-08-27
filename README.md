@@ -67,7 +67,9 @@ and `tenant_slug`. The message runs through the real bot engine and the
 response contains the replies the bot would have sent. Enabled outside
 production, or in production with `ENABLE_TEST_ENDPOINT=true`.
 
-Or use the **Bot Tester** tab inside the dashboard at http://localhost:3000/dashboard.
+The dashboard's own Bot Tester tab has been removed; `POST /api/admin/bot-test`
+(authenticated, same simulated bot engine, scoped to the logged-in admin's
+tenant) still exists as the production-safe equivalent — see `routes/admin.js`.
 
 ---
 

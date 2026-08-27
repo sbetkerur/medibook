@@ -1,7 +1,7 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import api from '@/lib/api';
-import { format, parseISO } from 'date-fns';
+import { format, parseISO, addDays } from 'date-fns';
 import toast from 'react-hot-toast';
 import Modal from '@/components/ui/Modal';
 import RecordTreatmentModal from '@/components/RecordTreatmentModal';
@@ -11,6 +11,10 @@ import RecordTreatmentModal from '@/components/RecordTreatmentModal';
 // each one is an ordinary appointment linked back to the plan.
 //
 // Self-contained: fetches its own plans, dentists and recent appointments.
+
+// Pre-fills the date picker when booking a visit — matches the old auto-book
+// default so the common case (routine follow-up) still needs no typing.
+const DEFAULT_VISIT_GAP_DAYS = 7;
 
 const STATUS_STYLES = {
   proposed:    'bg-amber-100 text-amber-700',
@@ -44,7 +48,7 @@ function VisitDots({ done, booked, total }) {
   );
 }
 
-export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
+export default function TreatmentPlansTab({ isAdmin, setConfirmModal, pendingBookPlanId, clearPendingBookPlanId }) {
   const [plans, setPlans] = useState([]);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState('outstanding');
@@ -52,7 +56,16 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
 
   const [detail, setDetail] = useState(null);        // { treatment_plan, visits }
   const [showCreate, setShowCreate] = useState(false);
-  const [bookingGap, setBookingGap] = useState('7');
+  // "Book visit N" used to fire straight off with no picker — it took whatever
+  // slot was first free at least N days out and told the operator afterwards.
+  // That is what let a misread tap book a date/time nobody chose. Now it opens
+  // a date/slot picker (visitBooking = the plan being scheduled) and defaults
+  // the date field to DEFAULT_VISIT_GAP_DAYS out, matching the old default,
+  // but nothing is booked until the operator picks an actual slot.
+  const [visitBooking, setVisitBooking] = useState(null); // plan, or null when closed
+  const [visitForm, setVisitForm] = useState({ appointment_date: '', slot_id: '' });
+  const [visitSlots, setVisitSlots] = useState([]);
+  const [visitSlotsLoading, setVisitSlotsLoading] = useState(false);
   // Money and lab work for the plan currently open in the detail modal.
   const [payments, setPayments] = useState([]);
   // Consent capture. Held here rather than in a modal: it is one field and a
@@ -69,6 +82,16 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
   const [bookingPlanId, setBookingPlanId] = useState(null);
   const todayISO = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
+  // Set only once a fetch has actually landed — read from the pending-plan
+  // effect below instead of `loading` directly, because on the very first
+  // mount both effects fire in the SAME commit: `loading` is still its
+  // initial `false` when the second effect runs, one render before
+  // fetchPlans's `setLoading(true)` takes visible effect. Gating on that
+  // stale `false` would read as "finished loading, plan not found" before the
+  // request had even gone out, and clear pendingBookPlanId immediately. A ref
+  // is read live regardless of that timing.
+  const hasFetchedOnceRef = useRef(false);
+
   const fetchPlans = useCallback(async () => {
     setLoading(true);
     try {
@@ -79,10 +102,33 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
       setPlans(data.treatment_plans || []);
     } catch (err) {
       toast.error(err.response?.data?.error || 'Failed to load treatment plans');
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+      hasFetchedOnceRef.current = true;
+    }
   }, [filter]);
 
   useEffect(() => { fetchPlans(); }, [fetchPlans]);
+
+  // Landed here from the Appointments tab: a visit was just marked completed
+  // and the desk agreed to book its next sitting now. Open the SAME picker
+  // "Book visit N" uses — rather than a second "book the next visit"
+  // implementation living in dashboard/page.js — as soon as this tab's own
+  // plans list (fetched above, under the default 'outstanding' filter) has
+  // loaded and the plan is in it.
+  useEffect(() => {
+    if (!pendingBookPlanId || loading || !hasFetchedOnceRef.current) return;
+    const plan = plans.find(p => p.id === pendingBookPlanId);
+    if (plan) {
+      openBookVisit(plan);
+    } else {
+      // Loaded and genuinely not there — e.g. it stopped qualifying as
+      // outstanding between the prompt and landing here. Don't leave the
+      // pending id hanging forever waiting for a plan that will never appear.
+      toast.error('That treatment could not be found — it may already be fully booked.');
+    }
+    clearPendingBookPlanId?.();
+  }, [pendingBookPlanId, loading, plans, clearPendingBookPlanId]);
 
   // (No doctors fetch here. This tab rendered nothing from it — the dentist
   // picker lives in RecordTreatmentModal, which fetches its own — so every
@@ -183,6 +229,42 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
     } catch (err) { toast.error(err.response?.data?.error || 'Failed to update'); }
   }
 
+  // Opens the date/slot picker rather than booking immediately. The plan's
+  // dentist and branch are fixed by the treatment; only when and which slot
+  // are the operator's to choose.
+  function openBookVisit(plan) {
+    if (!plan.treating_doctor_id) {
+      toast.error('This treatment has no treating dentist assigned — set one before booking a visit.');
+      return;
+    }
+    setVisitForm({
+      appointment_date: format(addDays(new Date(), DEFAULT_VISIT_GAP_DAYS), 'yyyy-MM-dd'),
+      slot_id: '',
+    });
+    setVisitBooking(plan);
+  }
+
+  // Loads the dentist's open slots once a date is picked, same pattern as the
+  // walk-in modal on the main dashboard — a real slot gets locked; free-typing
+  // a time the bot has no idea is taken would double-book it.
+  useEffect(() => {
+    const doctorId = visitBooking?.treating_doctor_id;
+    const date = visitForm.appointment_date;
+    if (!doctorId || !date) { setVisitSlots([]); return; }
+    let cancelled = false;
+    setVisitSlotsLoading(true);
+    api.get(`/admin/slots?doctor_id=${doctorId}&date=${date}`)
+      .then(({ data }) => {
+        if (cancelled) return;
+        const hospitalId = visitBooking?.hospital_id;
+        setVisitSlots((data.slots || []).filter(s =>
+          s.status === 'available' && (!hospitalId || !s.hospital_id || s.hospital_id === hospitalId)));
+      })
+      .catch(() => { if (!cancelled) setVisitSlots([]); })
+      .finally(() => { if (!cancelled) setVisitSlotsLoading(false); });
+    return () => { cancelled = true; };
+  }, [visitBooking, visitForm.appointment_date]);
+
   // The only mutating action here that had neither a busy flag nor a disabled
   // button. Two clicks sent two POSTs, and because the backend re-counts under
   // the plan lock the second one booked the NEXT visit — an extra appointment,
@@ -193,14 +275,16 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
   // visit on one card disabled and relabelled ("Booking…") the button on EVERY
   // other plan's card at the same time. The modal forms can keep sharing it —
   // only one of them is on screen at a time.
-  async function bookNextVisit(plan) {
-    if (bookingPlanId) return;
+  async function submitVisitBooking() {
+    const plan = visitBooking;
+    if (!plan || !visitForm.slot_id || bookingPlanId) return;
     setBookingPlanId(plan.id);
     try {
       const { data } = await api.post(`/admin/treatment-plans/${plan.id}/visits`, {
-        after_days: Number(bookingGap) || 7,
+        slot_id: visitForm.slot_id,
       });
       toast.success(`Visit ${data.visit_number} booked — ${data.date} at ${String(data.time).slice(0, 5)}`);
+      setVisitBooking(null);
       fetchPlans();
       if (detail?.treatment_plan?.id === plan.id) openDetail(plan.id);
     } catch (err) {
@@ -343,7 +427,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
                     Visits
                   </button>
                   {p.canBookNext && ['proposed', 'in_progress'].includes(p.status) && (
-                    <button onClick={() => bookNextVisit(p)} disabled={bookingPlanId != null}
+                    <button onClick={() => openBookVisit(p)} disabled={bookingPlanId != null}
                       className="px-2.5 py-1.5 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed">
                       {bookingPlanId === p.id ? 'Booking…' : `Book visit ${p.nextVisitNumber}`}
                     </button>
@@ -352,16 +436,6 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
               </div>
             </div>
           ))}
-        </div>
-      )}
-
-      {plans.some(p => p.canBookNext) && (
-        <div className="flex items-center gap-2 text-xs text-gray-500">
-          <label htmlFor="gap">Book the next visit at least</label>
-          <input id="gap" type="number" min="0" max="365" value={bookingGap}
-            onChange={e => setBookingGap(e.target.value)}
-            className="w-16 border border-gray-200 rounded px-2 py-1 text-xs" />
-          <span>days out (first free slot for that dentist is taken).</span>
         </div>
       )}
 
@@ -577,6 +651,64 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal }) {
           onClose={() => setShowCreate(false)}
           onSaved={fetchPlans}
         />
+      )}
+
+      {/* ── BOOK VISIT: date + real slot, not a blind auto-pick ── */}
+      {visitBooking && (
+        <Modal title={`Book visit ${visitBooking.nextVisitNumber} — ${visitBooking.title}`} onClose={() => setVisitBooking(null)}>
+          <div className="space-y-3">
+            <p className="text-xs text-gray-500">
+              {visitBooking.patient_name}
+              {visitBooking.treating_doctor_name && <> with Dr. {visitBooking.treating_doctor_name}</>}
+              {visitBooking.hospital_name && <> · {visitBooking.hospital_name}</>}
+            </p>
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Date *</label>
+              <input type="date" value={visitForm.appointment_date}
+                onChange={e => setVisitForm(f => ({ ...f, appointment_date: e.target.value, slot_id: '' }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">Time *</label>
+              {/* Slot picker, not a free-text time: selecting a real slot sends
+                  slot_id, which is what makes the backend lock it against the bot. */}
+              <select value={visitForm.slot_id}
+                onChange={e => setVisitForm(f => ({ ...f, slot_id: e.target.value }))}
+                disabled={!visitForm.appointment_date || visitSlotsLoading}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+                required>
+                <option value="">
+                  {!visitForm.appointment_date ? '— Pick a date first —'
+                    : visitSlotsLoading ? 'Loading slots…'
+                    : visitSlots.length ? '— Select an open slot —'
+                    : 'No open slots for this date'}
+                </option>
+                {visitSlots.map(s => (
+                  <option key={s.id} value={s.id}>
+                    {String(s.start_time).slice(0, 5)}{s.end_time ? ` – ${String(s.end_time).slice(0, 5)}` : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {visitForm.appointment_date && !visitSlotsLoading && !visitSlots.length && (
+              <p className="text-xs text-amber-600">
+                No open slots for Dr. {visitBooking.treating_doctor_name} on this date — the dentist may
+                be on leave, the clinic closed, or slots not yet generated. Try another date.
+              </p>
+            )}
+            <div className="flex gap-2 pt-2">
+              <button type="button" onClick={() => setVisitBooking(null)}
+                className="flex-1 px-4 py-2.5 border border-gray-200 rounded-lg text-sm text-gray-600">
+                Cancel
+              </button>
+              <button type="button" onClick={submitVisitBooking}
+                disabled={!visitForm.slot_id || bookingPlanId != null}
+                className="flex-1 px-4 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50">
+                {bookingPlanId === visitBooking.id ? 'Booking…' : 'Book this slot'}
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
 
       {/* ── RECORD PAYMENT ── */}

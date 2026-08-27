@@ -68,6 +68,8 @@ const SLOT_DAY_OPEN_SQL = `
  *   to the doctor's primary department (a doctor renders several treatments)
  * @param {string|null} [f.treatmentPlanId=null] - multi-visit course this visit belongs to
  * @param {number|null} [f.visitNumber=null] - 1-based position within that plan
+ * @param {number|null} [f.effectiveFee=null] - per-appointment fee override; 0/null
+ *   means "use the doctor's consultation_fee" (see appointments.effective_fee)
  * @returns {Promise<{bookingId: string, row: object}>}
  */
 async function insertAppointmentWithRetry(client, f) {
@@ -84,14 +86,15 @@ async function insertAppointmentWithRetry(client, f) {
         // identifies the treatment.
         `INSERT INTO appointments
          (booking_id, patient_id, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, status, notes, department_id,
-          treatment_plan_id, visit_number)
+          treatment_plan_id, visit_number, effective_fee)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed',$9,
                  COALESCE($10::uuid, (SELECT department_id FROM doctors WHERE id=$3)),
-                 $11,$12)
+                 $11,$12,$13)
          RETURNING *`,
         [bookingId, f.patientId, f.doctorId, f.hospitalId, f.slotId || null,
          f.appointmentDate, f.appointmentTime, f.visitType || 'in_person', f.notes || null,
-         f.departmentId || null, f.treatmentPlanId || null, f.visitNumber || null]);
+         f.departmentId || null, f.treatmentPlanId || null, f.visitNumber || null,
+         Number.isInteger(f.effectiveFee) ? f.effectiveFee : 0]);
       await client.query('RELEASE SAVEPOINT booking_insert');
       return { bookingId, row: r.rows[0] };
     } catch (insertErr) {

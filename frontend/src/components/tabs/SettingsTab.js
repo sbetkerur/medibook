@@ -6,50 +6,36 @@ import ClinicQRCard from '@/components/ClinicQRCard';
 
 // `settings` is shared (also read by DoctorsTab) and stays owned by the parent,
 // which self-fetches it on tab select and passes it (plus `fetchSettings` to
-// refresh after a save) down here. The editable form is derived from `settings`.
+// refresh after a save) down here.
+//
+// 'Clinic Settings' used to also cover clinic name and the WhatsApp-alerts
+// phone number — removed by request, along with the card's own name. Only the
+// fee-display toggle is kept, since a clinic that waives/negotiates the
+// consultation fee genuinely needs to turn the quoted number off.
 export default function SettingsTab({ settings, fetchSettings, settingsFailed, isAdmin }) {
-  const [settingsForm, setSettingsForm] = useState({
-    notify_phone: '',
-    name: '', notification_prefs: {}
-  });
-  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [showFee, setShowFee] = useState(true);
+  const [feeSaving, setFeeSaving] = useState(false);
   const [changePwdForm, setChangePwdForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
   const [changingPwd, setChangingPwd] = useState(false);
 
-  // Populate the editable form whenever the shared settings payload changes.
-  // PATCH /settings merges these keys into the TOP level of tenants.settings,
-  // so read them back from there (settings.notification_prefs never exists).
+  // PATCH /settings merges notification_prefs into the TOP level of
+  // tenants.settings, so read it back from there.
   useEffect(() => {
     if (!settings) return;
-    setSettingsForm({
-      name: settings.clinic_name || '',
-      notification_prefs: {
-        reminder_24h_enabled: settings.settings?.reminder_24h_enabled,
-        show_consultation_fee: settings.settings?.show_consultation_fee,
-      },
-      notify_phone: settings.notify_phone || '',
-    });
+    setShowFee(settings.settings?.show_consultation_fee !== false);
   }, [settings]);
 
-  async function saveSettings(e) {
-    e.preventDefault();
-    setSettingsSaving(true);
+  async function saveShowFee(next) {
+    setShowFee(next); // optimistic — a slow save must not make the toggle feel stuck
+    setFeeSaving(true);
     try {
-      const payload = {};
-      if (settingsForm.name) payload.name = settingsForm.name;
-      payload.notify_phone = settingsForm.notify_phone || '';
-      // notification_prefs was bound to the toggle but never sent, so switching
-      // it off showed "Settings saved!" and then fetchSettings() flipped it
-      // straight back on from the server. The backend accepts and merges it.
-      if (settingsForm.notification_prefs) {
-        payload.notification_prefs = settingsForm.notification_prefs;
-      }
-      await api.patch('/admin/settings', payload);
-      toast.success('Settings saved!');
+      await api.patch('/admin/settings', { notification_prefs: { show_consultation_fee: next } });
+      toast.success('Saved');
       fetchSettings();
     } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to save settings');
-    } finally { setSettingsSaving(false); }
+      setShowFee(!next); // revert on failure — the toggle must reflect what's actually saved
+      toast.error(err.response?.data?.error || 'Failed to save');
+    } finally { setFeeSaving(false); }
   }
 
   async function changePassword(e) {
@@ -78,8 +64,12 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
           with DoctorsTab and has no reason to carry a rendered QR image. */}
       <ClinicQRCard isAdmin={isAdmin} />
 
+      {/* 'Clinic Settings' used to also cover clinic name and the WhatsApp-
+          alerts phone number — removed by request, along with the card's own
+          heading. notify_phone stays on whichever admin users already had
+          one; nothing here can change it any more (PATCH /admin/settings
+          still accepts it server-side, in case another path needs to). */}
       <div className="bg-white rounded-xl p-4 sm:p-6 shadow-sm">
-        <h2 className="font-semibold text-gray-800 mb-5">Clinic Settings</h2>
         {settings === null && settingsFailed ? (
           <div className="py-8 text-center">
             <p className="text-gray-500 mb-3">Settings could not be loaded.</p>
@@ -91,73 +81,30 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
         ) : settings === null ? (
           <div className="text-gray-400 py-8 text-center">Loading settings...</div>
         ) : (
-          <form onSubmit={saveSettings} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">Clinic Name</label>
-              <input value={settingsForm.name}
-                onChange={e => setSettingsForm(f => ({ ...f, name: e.target.value }))}
-                placeholder="Demo Clinic Hyderabad"
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-            <div className="pt-3 border-t border-gray-100">
-              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">WhatsApp Integration</h3>
-              <p className="text-xs text-gray-500 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
-                📱 WhatsApp is configured globally via a shared phone number. Contact your platform administrator to update credentials.
-              </p>
-            </div>
-            <div className="pt-3 border-t border-gray-100">
-              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Patient booking</h3>
-              {/* Off by choice, not by default: clinics that waive the
-                  consultation when treatment is taken, or negotiate it, do not
-                  want a firm number quoted in WhatsApp and then not charged at
-                  the desk. Defaults to on, which is what every clinic already
-                  shows today. */}
-              <label className="flex items-center gap-3 cursor-pointer select-none py-2.5 -my-2.5">
-                <div className="relative">
-                  <input type="checkbox" className="sr-only"
-                    checked={settingsForm.notification_prefs?.show_consultation_fee !== false}
-                    onChange={e => setSettingsForm(f => ({ ...f, notification_prefs: { ...f.notification_prefs, show_consultation_fee: e.target.checked } }))} />
-                  <div className={`w-10 h-5 rounded-full transition-colors ${settingsForm.notification_prefs?.show_consultation_fee !== false ? 'bg-blue-500' : 'bg-gray-300'}`} />
-                  <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${settingsForm.notification_prefs?.show_consultation_fee !== false ? 'translate-x-5' : ''}`} />
-                </div>
-                <span className="text-sm text-gray-700">Show consultation fee to patients</span>
-              </label>
-              <p className="text-xs text-gray-400 mt-1 mb-3">
-                Turn this off if you waive or negotiate the consultation fee — patients will see no amount until they are at the clinic.
-              </p>
-            </div>
-            <div className="pt-3 border-t border-gray-100">
-              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Notifications</h3>
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-xs font-medium text-gray-700 mb-1">
-                    WhatsApp alerts to
-                    <span className="text-gray-400 font-normal ml-1">(optional)</span>
-                  </label>
-                  <input
-                    type="tel"
-                    value={settingsForm.notify_phone}
-                    onChange={e => setSettingsForm(f => ({ ...f, notify_phone: e.target.value }))}
-                    placeholder="e.g. 917795676142"
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">This number gets a WhatsApp message each time a patient books, cancels or reschedules.</p>
-                </div>
+          <div>
+            {/* Off by choice, not by default: clinics that waive the
+                consultation when treatment is taken, or negotiate it, do not
+                want a firm number quoted in WhatsApp and then not charged at
+                the desk. Defaults to on, which is what every clinic already
+                shows today. */}
+            <label className={`flex items-center gap-3 select-none py-2.5 -my-2.5 ${isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
+              <div className="relative">
+                <input type="checkbox" className="sr-only" disabled={!isAdmin || feeSaving}
+                  checked={showFee}
+                  onChange={e => saveShowFee(e.target.checked)} />
+                <div className={`w-10 h-5 rounded-full transition-colors ${showFee ? 'bg-blue-500' : 'bg-gray-300'}`} />
+                <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${showFee ? 'translate-x-5' : ''}`} />
               </div>
-            </div>
-            <div className="pt-4">
-              {isAdmin ? (
-                <button type="submit" disabled={settingsSaving}
-                  className="w-full sm:w-auto px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-                  {settingsSaving ? 'Saving...' : '💾 Save Settings'}
-                </button>
-              ) : (
-                <p className="text-xs text-gray-400">Only clinic admins can change these settings.</p>
-              )}
-            </div>
-          </form>
+              <span className="text-sm text-gray-700">Show consultation fee to patients</span>
+            </label>
+            <p className="text-xs text-gray-400 mt-1">
+              Turn this off if you waive or negotiate the consultation fee — patients will see no amount until they are at the clinic.
+              {!isAdmin && ' Only clinic admins can change this.'}
+            </p>
+          </div>
         )}
       </div>
+
       {settings && (
         <div className="space-y-3">
           {/* Plan Usage */}

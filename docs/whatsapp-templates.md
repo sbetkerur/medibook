@@ -12,7 +12,7 @@ Create these in **Meta Business Manager → WhatsApp Manager → Message templat
 
 ## Every template that must exist
 
-Nine. Create them all — the product has a message for each and **none of them
+Ten. Create them all — the product has a message for each and **none of them
 reaches anybody without its template**, because every one is sent outside a
 conversation the patient started.
 
@@ -27,9 +27,10 @@ conversation the patient started.
 | 7 | `payment_receipt` | 6 | a payment is recorded | — |
 | 8 | `treatment_sitting_booked` | 7 | the desk books the next sitting | 2 |
 | 9 | `clinic_staff_alert` | 2 | alerts + Monday summary, **to staff** | — |
+| 10 | `appointment_rescheduled_v1` | 7 | the desk moves an appointment (e.g. a doctor's leave) | 2 |
 
-**1 carries a `_v4` suffix, 2 a `_v3` one, and 7, 8 and 9 have never been
-submitted.** Five of the nine, then, are names Meta has not approved yet — until
+**1 carries a `_v4` suffix, 2 a `_v3` one, and 7, 8, 9 and 10 have never been
+submitted.** Six of the ten, then, are names Meta has not approved yet — until
 it does, those messages do not arrive at all.
 
 A template cannot be renamed in WhatsApp Manager. **1 and 2 are therefore
@@ -52,7 +53,7 @@ rollback.
 > all — the 24-hour one is gated on a future date, and there is currently no
 > substitute for same-day.
 
-The other three:
+The other four:
 
 - **9 is the urgent one.** It fails *100% of the time*, not occasionally. A
   clinic owner never messages the shared number — that is the point of the QR —
@@ -62,6 +63,9 @@ The other three:
   patient last wrote, which is most of them.
 - **8** fails whenever the receptionist books a sitting for a patient who is not
   mid-conversation, which is most of them.
+- **10** fails the same way, for the same reason — a doctor's leave is added by
+  the desk, not by the patient asking, so they are very often not mid-conversation
+  when their appointment moves.
 
 3–6 were re-submitted on 2026-08-05 (clinic name added to 3, 4 and 5). If you
 have not done that yet, do it in the same sitting as the `_v3` two.
@@ -95,11 +99,11 @@ scrolls back to check.
 ## Filling in the form
 
 The **Create template** form asks for these, in this order. Everything below is
-per-template; the values for each of the nine are in the sections after.
+per-template; the values for each of the ten are in the sections after.
 
 | Form field | What to do |
 |---|---|
-| **Category** | `Utility` for all nine. Not Marketing — it costs more and is suppressed for anyone who opted out of marketing, which would silently kill the recall. |
+| **Category** | `Utility` for all ten. Not Marketing — it costs more and is suppressed for anyone who opted out of marketing, which would silently kill the recall. |
 | **Name** | Copy the heading exactly, e.g. `appointment_reminder_24h_v3`. Lowercase, digits and underscores only — the code looks it up by this string, `_v3` suffix included. |
 | **Languages** | `English` → the code sends language code `en`. **Not** `English (US)`, which is `en_US` and will not match. |
 | **Header** | Change the dropdown from `None` to **Text**, then paste the header line. Leave "Add variable" alone — every header is static. |
@@ -589,6 +593,63 @@ Smile Dental Clinic
 >
 > This is the only template addressed to STAFF. It is still `Utility` — it
 > follows a real event in the business's own account.
+
+---
+
+## 10. `appointment_rescheduled_v1`
+
+The desk moves a confirmed appointment to a new slot — most commonly because a
+doctor's leave was just added and collided with it, but the endpoint is generic.
+`routes/appointments.js` → `PATCH /appointments/:id/reschedule`
+
+**Why it needs a template:** the desk does this on ITS OWN schedule (reacting to
+a leave, a holiday, a doctor going home sick), not in response to the patient
+writing in. The patient is very often not mid-conversation, same 24-hour problem
+as every other desk-initiated send.
+
+| Variable | Value | Example |
+|---|---|---|
+| `{{1}}` | Old date | `Wed, 12 Aug 2026` |
+| `{{2}}` | Old time | `11:30` |
+| `{{3}}` | New date | `Thu, 13 Aug 2026` |
+| `{{4}}` | New time | `10:00` |
+| `{{5}}` | Dentist | `Kavitha Reddy` |
+| `{{6}}` | Reason | `the dentist is on leave that day` |
+| `{{7}}` | Branch | `Smile Dental - Banjara Hills` |
+
+**Header** — `🔄 Your appointment was moved`
+
+**Body**
+```
+Your visit on {{1}} at {{2}} could not go ahead — {{6}}.
+
+We've moved it to *{{3}} at {{4}}* with Dr. {{5}} at {{7}}.
+```
+
+**Sample values**
+```
+Wed, 12 Aug 2026
+11:30
+Thu, 13 Aug 2026
+10:00
+Kavitha Reddy
+the dentist is on leave that day
+Smile Dental - Banjara Hills
+```
+
+**Footer** — `Reply Menu to see all your appointments`
+
+**Buttons**
+
+| Label | Payload |
+|---|---|
+| 📅 Reschedule | `Reschedule` |
+| Cancel appointment | `Cancel appointment` |
+
+> `{{6}}` and `{{7}}` fall back to the literal strings `the clinic needed to make
+> a change` and `the clinic` respectively when no reason or branch is available —
+> Meta rejects the whole send on an EMPTY parameter, so neither variable here is
+> ever allowed to resolve to `''`.
 
 ## Payload reference
 

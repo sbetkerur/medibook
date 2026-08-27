@@ -53,7 +53,12 @@ const blankSession = (dayOfWeek, isWorking) => ({
   week_of_month: [],
 });
 
-const defaultSchedule = () => DAYS.map((_, i) => blankSession(i, i >= 1 && i <= 6));
+// Every day starts OFF. A modal whose entire purpose is picking which days a
+// dentist works must not pre-select any of them — an admin who meant to set up
+// a single-day visiting consultant (the common case a new doctor gets scheduled
+// for) and only touched THAT day's toggle would otherwise save every
+// pre-checked day as working too, generating slots for days nobody agreed to.
+const defaultSchedule = () => DAYS.map((_, i) => blankSession(i, false));
 
 // "1st Saturday", "3rd Tuesday" — counted as the Nth occurrence of that weekday
 // in the month, which is how clinics say it. Alternate weeks = 1st, 3rd and 5th.

@@ -76,7 +76,13 @@ export default function DoctorsTab({
               </div>
             </div>
             <div className="mt-4 flex items-center justify-between text-sm">
-              <span className="text-green-600 font-medium">{d.consultation_fee > 0 ? `₹${d.consultation_fee}` : 'Free'}</span>
+              {/* consultation_fee > 0 is a real quoted fee; 0/null just means
+                  nobody has entered one yet — showing "Free" there told the
+                  desk a dentist waives their fee when in fact no one had set
+                  it. */}
+              <span className={d.consultation_fee > 0 ? 'text-green-600 font-medium' : 'text-gray-400'}>
+                {d.consultation_fee > 0 ? `₹${d.consultation_fee}` : 'Fee not set'}
+              </span>
               <div className="text-right text-xs text-gray-500">
                 <div>{d.total_appointments} appts</div>
                 <div>{d.available_slots} open slots</div>

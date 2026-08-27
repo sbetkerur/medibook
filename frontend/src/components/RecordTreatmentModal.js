@@ -122,9 +122,13 @@ export default function RecordTreatmentModal({ appointment, onClose, onSaved }) 
           </label>
           {/* Presets, not a spinner: 1–3 covers most dental work and one tap
               beats typing. "Same visit" is the case a number field makes people
-              stop and think about. */}
-          <div className="flex flex-wrap gap-2">
-            {[['1', 'Done in this visit'], ['2', '2'], ['3', '3'], ['4', '4'], ['6', '6']].map(([v, label]) => (
+              stop and think about. The number box mirrors whichever preset is
+              selected (it's the same total_visits value, not a second field) —
+              without the "or" divider that looked like a stray duplicate
+              whenever the mirrored value matched one of the visible chips,
+              e.g. presets "2 3 4 6" plus a box also reading "2". */}
+          <div className="flex flex-wrap items-center gap-2">
+            {[['1', 'Done in this visit'], ['2', '2'], ['3', '3'], ['4', '4'], ['5', '5'], ['6', '6']].map(([v, label]) => (
               <button key={v} type="button"
                 onClick={() => setForm(f => ({ ...f, total_visits: v }))}
                 // min-w: a single-digit chip is only 33px wide at px-3, and
@@ -137,9 +141,10 @@ export default function RecordTreatmentModal({ appointment, onClose, onSaved }) 
                 {label}
               </button>
             ))}
+            <span className="text-xs text-gray-400">or</span>
             <input type="number" min="1" max="60" value={form.total_visits}
               onChange={e => setForm(f => ({ ...f, total_visits: e.target.value }))}
-              aria-label="Number of sittings"
+              aria-label="Custom number of sittings"
               className="w-16 h-10 border border-gray-300 rounded-lg px-2 text-sm" />
           </div>
         </div>

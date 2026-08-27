@@ -174,7 +174,6 @@ export default function OverviewTab({
           )}
           <button onClick={() => setTab('appointments')} className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">View All Appointments</button>
           <button onClick={() => setTab('doctors')} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 transition">Manage Dentists</button>
-          <button onClick={() => setTab('test')} className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700 transition">Test WhatsApp Bot</button>
           <button onClick={async () => {
             // Fetch fresh rows instead of racing the appointments tab's
             // state via setTimeout — the old approach exported whatever

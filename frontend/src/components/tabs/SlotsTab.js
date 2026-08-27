@@ -16,6 +16,14 @@ export default function SlotsTab({ doctors, isAdmin }) {
   // Bumped after a block/unblock to re-run the fetch effect below.
   const [reloadKey, setReloadKey] = useState(0);
 
+  // Range availability — block/unblock several days at once (a conference, a
+  // short leave not worth recording permanently) instead of clicking every
+  // slot on every day by hand. Defaults to the day currently in view.
+  const [rangeStart, setRangeStart] = useState(todayIST());
+  const [rangeEnd, setRangeEnd] = useState(todayIST());
+  const [rangeReason, setRangeReason] = useState('');
+  const [rangeBusy, setRangeBusy] = useState(false);
+
   useEffect(() => {
     if (!selDoctor || !selDate) { setSlots([]); return; }
     // Ignore a response whose doctor/date is no longer selected: picking A then
@@ -40,6 +48,27 @@ export default function SlotsTab({ doctors, isAdmin }) {
     } catch (err) { toast.error(err.response?.data?.error || 'Failed'); }
   }
 
+  async function applyRange(action) {
+    if (!selDoctor) return toast.error('Select a doctor first');
+    if (!rangeStart || !rangeEnd) return toast.error('Pick both dates');
+    if (rangeEnd < rangeStart) return toast.error('End date must be on or after start date');
+    setRangeBusy(true);
+    try {
+      const { data } = await api.post('/admin/slots/range', {
+        doctor_id: selDoctor, start_date: rangeStart, end_date: rangeEnd,
+        action, reason: rangeReason || null,
+      });
+      const count = action === 'block' ? data.blocked : data.unblocked;
+      toast.success(`${count} slot${count === 1 ? '' : 's'} ${action}ed, ${rangeStart} to ${rangeEnd}`);
+      // The visible day's grid is only refetched when it falls inside the
+      // range that just changed — refreshing unconditionally would refetch a
+      // date the operator wasn't even looking at.
+      if (selDate >= rangeStart && selDate <= rangeEnd) setReloadKey(k => k + 1);
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed');
+    } finally { setRangeBusy(false); }
+  }
+
   const slotStatusColor = (s) => ({
     available: 'bg-green-100 text-green-700 border-green-200',
     booked: 'bg-blue-100 text-blue-700 border-blue-200',
@@ -60,6 +89,52 @@ export default function SlotsTab({ doctors, isAdmin }) {
         <input type="date" value={selDate} onChange={e => setSelDate(e.target.value)}
           className="w-full sm:w-auto min-w-0 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
       </div>
+
+      {/* Manual availability over a range of dates. The grid below already
+          lets an admin block/unblock ONE slot at a time by clicking it, and
+          the doctor's Schedule modal changes the recurring week — neither
+          covers "closed Thu–Sat for a conference" without opening three days
+          and tapping every slot on each. adminOnly to match both of those:
+          POST /admin/slots/range is adminOnly server-side. */}
+      {isAdmin && selDoctor && (
+        <div className="bg-white rounded-xl shadow-sm p-4 md:p-5 space-y-3">
+          <h3 className="text-sm font-semibold text-gray-700">Block or unblock a range of dates</h3>
+          <div className="flex flex-wrap items-end gap-3">
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">From</label>
+              <input type="date" value={rangeStart} max={rangeEnd || undefined}
+                onChange={e => setRangeStart(e.target.value)}
+                className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-1">To</label>
+              <input type="date" value={rangeEnd} min={rangeStart || undefined}
+                onChange={e => setRangeEnd(e.target.value)}
+                className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div className="flex-1 min-w-[160px]">
+              <label className="block text-xs font-medium text-gray-700 mb-1">Reason <span className="text-gray-400 font-normal">(optional)</span></label>
+              <input value={rangeReason} onChange={e => setRangeReason(e.target.value)}
+                placeholder="e.g. Conference, personal leave"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => applyRange('block')} disabled={rangeBusy}
+                className="px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 disabled:opacity-50 transition whitespace-nowrap">
+                {rangeBusy ? 'Working…' : 'Block range'}
+              </button>
+              <button type="button" onClick={() => applyRange('unblock')} disabled={rangeBusy}
+                className="px-4 py-2 border border-gray-300 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-50 disabled:opacity-50 transition whitespace-nowrap">
+                {rangeBusy ? 'Working…' : 'Unblock range'}
+              </button>
+            </div>
+          </div>
+          <p className="text-xs text-gray-400">
+            Block only touches currently AVAILABLE slots; unblock only touches ones BLOCKED this way — a booked
+            appointment is never affected either direction, and slots must already be generated for these dates.
+          </p>
+        </div>
+      )}
 
       {!selDoctor ? (
         <div className="bg-white rounded-xl p-8 text-center text-gray-400">Select a doctor to view slots</div>

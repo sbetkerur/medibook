@@ -38,6 +38,7 @@ const SRC = {
   'payment_receipt':              ['src/routes/treatmentPlans.js', null],
   'treatment_sitting_booked':     ['src/routes/treatmentPlans.js', null],
   'clinic_staff_alert':           ['src/services/bot/utils.js', null],
+  'appointment_rescheduled_v1':   ['src/routes/appointments.js', null],
 };
 
 let pass = 0, fail = 0;

@@ -818,75 +818,16 @@ router.post('/bot-test', adminOnly, botTestLimiter, async (req, res) => {
   } catch (err) { handleError(res, err, 'POST /admin/bot-test'); }
 });
 
-// ── SEND WHATSAPP MESSAGE FROM DASHBOARD ──────────────────────
-router.post('/messages/send', adminOnly, async (req, res) => {
-  try {
-    const { phone, message } = req.body;
-    if (!phone || !message) return res.status(400).json({ error: 'phone and message are required' });
-    if (message.length > 1000) return res.status(400).json({ error: 'Message too long (max 1000 chars)' });
-    if (!/^[0-9]{7,20}$/.test(phone.replace(/[+\s]/g, ''))) {
-      return res.status(400).json({ error: 'Invalid phone number' });
-    }
-    if (!process.env.META_PHONE_NUMBER_ID || !process.env.META_ACCESS_TOKEN) {
-      return res.status(400).json({ error: 'WhatsApp not configured (META_PHONE_NUMBER_ID / META_ACCESS_TOKEN missing in env)' });
-    }
-    const normalised = phone.replace(/[+\s]/g, '');
-
-    // The WhatsApp number is SHARED across all tenants, so an unrestricted
-    // "send to any number" endpoint let one clinic's admin message the general
-    // public using platform credentials — and Meta's quality rating (which
-    // governs delivery for EVERY tenant) is a shared resource. Restrict sends to
-    // numbers this tenant already has a relationship with: one of its own
-    // patients, or a staff member's configured notify_phone.
-    const knownR = await tenantQuery(req.tenant.schema_name, `
-      SELECT 1 FROM patients WHERE phone=$1 AND deleted_at IS NULL
-      UNION ALL
-      SELECT 1 FROM users WHERE notify_phone=$1 AND is_active=true
-      LIMIT 1
-    `, [normalised]);
-    if (!knownR.rows[0]) {
-      return res.status(403).json({
-        error: 'That number is not a patient or staff member of this clinic. The WhatsApp number is shared across clinics, so messages can only be sent to your own contacts.',
-      });
-    }
-
-    // Opted-out patients must not be messaged (bot honours this; so must staff).
-    const optedR = await tenantQuery(req.tenant.schema_name,
-      `SELECT 1 FROM patients WHERE phone=$1 AND opted_out=true LIMIT 1`, [normalised]);
-    if (optedR.rows[0]) {
-      return res.status(403).json({ error: 'This patient has opted out of WhatsApp messages.' });
-    }
-
-    // Recorded in wa_messages: a message a staff member sent by hand is part of
-    // the patient's conversation, and it used to be the one outbound message
-    // that left no trace anywhere except the audit log.
-    const { sendPatientText } = require('../services/outbound');
-    try {
-      await sendPatientText(req.tenant.schema_name, normalised, message);
-    } catch (sendErr) {
-      // wa.sendText re-throws Meta's error, so this used to reach handleError as
-      // a bare "Internal server error" — for the single most ORDINARY outcome
-      // of this route. Meta only allows free-form text inside the 24-hour
-      // customer service window, and a receptionist messaging a patient who
-      // last wrote three days ago is not a server fault. Nothing was written to
-      // wa_messages either (sendPatientText logs only on success), so the staff
-      // member could not tell whether it went, and typically sent it again.
-      const meta = sendErr.response?.data?.error;
-      const reEngagement = meta?.code === 131047 || meta?.code === 470;
-      logger.warn('Staff WhatsApp send failed', {
-        tenant: req.tenant.slug, code: meta?.code, error: meta?.message || sendErr.message,
-      });
-      return res.status(reEngagement ? 409 : 502).json({
-        error: reEngagement
-          ? 'WhatsApp only allows a free-text message within 24 hours of the patient\'s last message to you. Nothing was sent — ask them to message the clinic first, or ring them.'
-          : 'WhatsApp did not accept the message. Nothing was sent; try again shortly.',
-      });
-    }
-    await writeAuditLog(req.tenant.schema_name, req.user.id, req.user.role,
-      'SEND_WA_MESSAGE', 'patient', normalised, null, { message: message.slice(0, 100) }, req.ip);
-    res.json({ success: true, phone: normalised });
-  } catch (err) { handleError(res, err); }
-});
+// POST /messages/send (an admin-composed free-form WhatsApp send) has been
+// removed — deliberately, not an oversight. The dashboard must not be able to
+// send an arbitrary WhatsApp message at all; every patient-facing send now
+// goes through a purpose-built flow (the bot, a cron via services/outbound.js,
+// or an admin action like the reschedule notification) that logs to
+// wa_messages and is template-first where Meta requires it. If a genuine
+// need for a free-form staff reply resurfaces, rebuild it as that kind of
+// flow rather than restoring this one — see git history for the old route
+// (tenant-scoped to known patients/staff, opt-out-aware, audited as
+// SEND_WA_MESSAGE) if useful as a reference.
 
 // ── AUDIT LOGS ────────────────────────────────────────────────
 router.get('/audit-logs', adminOnly, async (req, res) => {

@@ -1018,10 +1018,12 @@ async function processIncomingMessage(msg) {
 
 // ── DEV TEST ENDPOINT ─────────────────────────────────────────
 // The mutex and sender monkey-patching live in services/bot/testRunner.js,
-// shared with the authenticated /admin/bot-test route (routes/admin.js) that
-// the dashboard's Bot Tester tab actually calls — this one stays unauthenticated
-// (behind NODE_ENV/secret below) for local dev and the entry-code test flows
-// documented in CLAUDE.md, which take tenant_slug directly.
+// shared with the authenticated /admin/bot-test route (routes/admin.js) — the
+// dashboard's own Bot Tester tab has been removed, but the route stays as a
+// production-safe way to exercise the bot without this endpoint's shared
+// secret. This one stays unauthenticated (behind NODE_ENV/secret below) for
+// local dev and the entry-code test flows documented in CLAUDE.md, which take
+// tenant_slug directly.
 const { runBotTest } = require('../services/bot/testRunner');
 
 if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ENDPOINT === 'true') {

@@ -137,7 +137,11 @@ const schemas = {
       .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +917795676142)' }),
   }),
 
-  blockRange: Joi.object({
+  // Manual availability over a range of dates — the Slots tab used to only let
+  // an admin toggle one slot at a time (or edit the whole recurring schedule,
+  // which regenerates the WHOLE grid). Neither covers "block block Thu-Sat next
+  // week for a conference" without clicking every slot on three days by hand.
+  slotRangeAction: Joi.object({
     doctor_id: Joi.string().uuid().required(),
     start_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
     end_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required()
@@ -147,13 +151,20 @@ const schemas = {
         }
         return value;
       }).messages({ 'any.invalid': 'end_date must be on or after start_date' }),
+    action: Joi.string().valid('block', 'unblock').required(),
     reason: Joi.string().max(255).optional().allow('', null),
   }),
 
   createAppointment: Joi.object({
     patient_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).required()
       .messages({ 'string.pattern.base': 'patient_phone must be 7-20 digits, optionally starting with +' }),
-    patient_name: Joi.string().min(1).max(255).optional().allow('', null),
+    // Required: a walk-in creates a real patient record, and the desk always
+    // has the name in front of them (unlike the bot, which books off phone
+    // number alone and never touches this schema). Optional here is what let
+    // a blank name through to `patients.name`, showing up as '—' on receipts
+    // and as the phone number everywhere else the name is displayed.
+    patient_name: Joi.string().min(1).max(255).required()
+      .messages({ 'string.empty': 'patient_name is required' }),
     // Matches VALID_GENDERS in routes/patients.js — kept in sync manually since
     // there's no shared constant file for cross-route Joi schemas.
     gender: Joi.string().valid('male', 'female', 'other').optional().allow('', null),
@@ -162,6 +173,11 @@ const schemas = {
     // Treatment booked for. Optional — falls back to the doctor's primary
     // department, which is all a walk-in desk normally knows.
     department_id: Joi.string().uuid().optional().allow('', null),
+    // The consultation fee is quotable, not fixed — clinics waive or negotiate
+    // it per patient (see CLAUDE.md). Optional; 0/blank means "use the
+    // doctor's rate" (appointments.effective_fee, matching the COALESCE every
+    // revenue query already reads it through).
+    effective_fee: Joi.number().integer().min(0).max(1000000).optional().allow('', null),
     slot_id: Joi.string().uuid().optional().allow('', null),
     appointment_date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required()
       .messages({ 'string.pattern.base': 'appointment_date must be YYYY-MM-DD' })

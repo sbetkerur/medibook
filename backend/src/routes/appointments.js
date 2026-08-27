@@ -286,9 +286,24 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
 // ── UPDATE APPOINTMENT STATUS ─────────────────────────────────
 router.patch('/appointments/:id', validateUUID(), async (req, res) => {
   try {
-    const { status, notes, note_category, cancellation_reason } = req.body;
+    const { status, notes, note_category, cancellation_reason, effective_fee } = req.body;
     const s = req.tenant.schema_name;
     const VALID_NOTE_CATEGORIES = ['general', 'vip', 'allergy', 'followup', 'special'];
+
+    // The consultation fee is quotable, not fixed (see CLAUDE.md) — clinics
+    // waive it or negotiate it per patient, so doctors.consultation_fee is only
+    // ever a default. effective_fee is the per-appointment override; every
+    // revenue query already reads COALESCE(NULLIF(effective_fee,0), consultation_fee),
+    // but until now nothing ever WROTE it, so summing it always landed on the
+    // doctor's flat rate no matter what was actually charged. 0/blank means
+    // "no override, use the doctor's rate" — the same sentinel those queries
+    // already treat that way, not a free consultation.
+    if (effective_fee !== undefined && effective_fee !== null && effective_fee !== '') {
+      const fee = Number(effective_fee);
+      if (!Number.isInteger(fee) || fee < 0 || fee > 1000000) {
+        return res.status(400).json({ error: 'effective_fee must be a whole number between 0 and 1,000,000' });
+      }
+    }
 
     // Per-capability gate rather than a blanket adminOnly on the route: marking
     // an appointment completed/no_show is normal front-desk work and must keep
@@ -352,6 +367,9 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
         if (notes !== undefined) { params.push(notes); updates.push(`notes=$${params.length}`); }
         if (note_category) { params.push(note_category); updates.push(`note_category=$${params.length}`); }
         if (cancellation_reason) { params.push(cancellation_reason); updates.push(`cancellation_reason=$${params.length}`); }
+        if (effective_fee !== undefined && effective_fee !== null && effective_fee !== '') {
+          params.push(Number(effective_fee)); updates.push(`effective_fee=$${params.length}`);
+        }
         params.push(req.params.id);
         const updated = await client.query(
           `UPDATE appointments SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`, params
@@ -378,6 +396,9 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       if (status) { params.push(status); updates.push(`status=$${params.length}`); }
       if (notes !== undefined) { params.push(notes); updates.push(`notes=$${params.length}`); }
       if (note_category) { params.push(note_category); updates.push(`note_category=$${params.length}`); }
+      if (effective_fee !== undefined && effective_fee !== null && effective_fee !== '') {
+        params.push(Number(effective_fee)); updates.push(`effective_fee=$${params.length}`);
+      }
       params.push(req.params.id);
       const idParam = params.length;
       let guard = '';
@@ -402,7 +423,7 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     }
 
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_APPOINTMENT', 'appointment', req.params.id,
-      { status: oldR.rows[0].status }, { status, cancellation_reason }, req.ip);
+      { status: oldR.rows[0].status }, { status, cancellation_reason, effective_fee }, req.ip);
     res.json({ appointment: r.rows[0] });
     // Fire-and-forget WhatsApp alert to admin on cancel
     if (status === 'cancelled') {
@@ -437,6 +458,195 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// ── RESCHEDULE (desk-initiated) ────────────────────────────────
+// Distinct from the bot's own reschedule flow (services/bot/appointmentFlow.js):
+// that one is the PATIENT moving their own booking and is capped at
+// LIMITS.MAX_RESCHEDULES_PER_APPOINTMENT — a free tap is cheap for them and
+// expensive for the clinic to absorb. This one is the CLINIC moving a booking
+// for its own operational reasons (most commonly: a doctor's leave was just
+// added and landed on a confirmed appointment — POST /doctors/:id/leaves
+// surfaces exactly which ones). That is a deliberate desk decision, not
+// patient behaviour to rate-limit, so it does NOT touch reschedule_count.
+router.patch('/appointments/:id/reschedule', adminOnly, validateUUID(), async (req, res) => {
+  try {
+    const { slot_id, reason } = req.body || {};
+    if (!slot_id || !UUID_RE.test(slot_id)) {
+      return res.status(400).json({ error: 'slot_id is required' });
+    }
+    const s = req.tenant.schema_name;
+    const { SLOT_DAY_OPEN_SQL } = require('../services/bookingCore');
+
+    let result;
+    try {
+      result = await tenantTransaction(s, async (client) => {
+        // Lock the appointment — an admin acting on a leave just added must not
+        // race a patient cancelling the same booking through the bot.
+        // department_id/effective_department_id are read here (not re-derived
+        // after the move) so a doctor reassignment below can tell whether the
+        // ORIGINAL department was explicit or inherited from the old doctor's
+        // primary specialty — see the department-preservation note below.
+        const apptR = await client.query(
+          `SELECT a.id, a.slot_id, a.doctor_id, a.department_id,
+                  a.appointment_date::text, a.appointment_time::text,
+                  COALESCE(a.department_id, d.department_id) AS effective_department_id
+           FROM appointments a
+           LEFT JOIN doctors d ON d.id = a.doctor_id
+           WHERE a.id=$1 AND a.status='confirmed'
+           FOR UPDATE OF a`,
+          [req.params.id]);
+        if (!apptR.rows[0]) { const e = new Error('NOT_RESCHEDULABLE'); e.code = 'NOT_RESCHEDULABLE'; throw e; }
+        const appt = apptR.rows[0];
+
+        // Lock the target slot second (appointment → slot, the order every
+        // writer here uses — see the treatment-plan visit and follow-up routes).
+        // SLOT_DAY_OPEN_SQL excludes a slot that is itself on a leave/holiday,
+        // the IST clauses keep this from moving a patient INTO the past, and the
+        // two EXISTS clauses keep it off a doctor/branch that has since been
+        // deactivated — every other booking-mutation route in this file (the
+        // walk-in create, the follow-up route, the treatment-plan visit route)
+        // checks is_active on the doctor it books; this one didn't, so a
+        // deactivated dentist's already-generated future slots (nothing purges
+        // them on deactivation) could be handed a NEW patient here, defeating
+        // the very guard PATCH/DELETE /doctors/:id enforces against exactly that.
+        const slotR = await client.query(
+          `SELECT id, doctor_id, hospital_id, slot_date::text, start_time::text
+           FROM time_slots
+           WHERE id=$1 AND status='available'
+             AND (slot_date > (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                  OR (slot_date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                      AND start_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time))
+             AND ${SLOT_DAY_OPEN_SQL}
+             AND EXISTS (SELECT 1 FROM doctors d WHERE d.id = time_slots.doctor_id AND d.is_active = true)
+             AND EXISTS (SELECT 1 FROM hospitals h WHERE h.id = time_slots.hospital_id
+                          AND h.is_active = true AND h.deleted_at IS NULL)
+           FOR UPDATE SKIP LOCKED`,
+          [slot_id]);
+        if (!slotR.rows[0]) { const e = new Error('NO_SLOT'); e.code = 'NO_SLOT'; throw e; }
+        const slot = slotR.rows[0];
+
+        const lockUpd = await client.query(
+          `UPDATE time_slots SET status='booked' WHERE id=$1 AND status='available'`, [slot.id]);
+        if (lockUpd.rowCount === 0) { const e = new Error('SLOT_TAKEN'); e.code = 'SLOT_TAKEN'; throw e; }
+
+        if (appt.slot_id) {
+          await client.query(
+            `UPDATE time_slots SET status='available' WHERE id=$1 AND status='booked'`, [appt.slot_id]);
+        }
+
+        // Reassigning to a different doctor whose appointment.department_id was
+        // NULL (i.e. it was only ever inheriting the OLD doctor's primary
+        // specialty via COALESCE(a.department_id, d.department_id)) must not
+        // silently relabel the visit under the NEW doctor's specialty — the
+        // receipt and "by treatment" analytics would then disagree with what
+        // was actually booked for. Pin the department explicitly to what it
+        // effectively was before the move; COALESCE is a no-op ($7 is null)
+        // whenever the doctor didn't change or the department was already explicit.
+        const doctorChanged = slot.doctor_id !== appt.doctor_id;
+        const preserveDeptId = (doctorChanged && !appt.department_id) ? appt.effective_department_id : null;
+
+        // doctor_id/hospital_id follow the SLOT, not the appointment's old
+        // values — a leave long enough to be worth reassigning, not just
+        // re-timing, is a real desk scenario the picker can offer for free.
+        await client.query(
+          `UPDATE appointments SET
+             slot_id=$1, doctor_id=$2, hospital_id=$3,
+             appointment_date=$4, appointment_time=$5,
+             department_id=COALESCE($7::uuid, department_id),
+             reminder_24h_sent=false, updated_at=NOW()
+           WHERE id=$6`,
+          [slot.id, slot.doctor_id, slot.hospital_id, slot.slot_date, slot.start_time, req.params.id, preserveDeptId]);
+
+        return { oldDate: appt.appointment_date, oldTime: appt.appointment_time, slot };
+      });
+    } catch (txErr) {
+      if (txErr.code === 'NOT_RESCHEDULABLE') {
+        return res.status(409).json({ error: 'Appointment is not in a reschedulable state (already cancelled or completed)' });
+      }
+      if (txErr.code === 'NO_SLOT') {
+        return res.status(404).json({ error: 'That slot is no longer available (taken, in the past, or on a leave/holiday)' });
+      }
+      if (txErr.code === 'SLOT_TAKEN') {
+        return res.status(409).json({ error: 'Slot is no longer available — please retry' });
+      }
+      throw txErr;
+    }
+
+    await writeAuditLog(s, req.user.id, req.user.role, 'RESCHEDULE_APPOINTMENT', 'appointment', req.params.id,
+      { date: result.oldDate, time: result.oldTime },
+      { date: result.slot.slot_date, time: result.slot.start_time, doctor_id: result.slot.doctor_id, reason: reason || null },
+      req.ip);
+
+    res.json({
+      success: true,
+      date: result.slot.slot_date,
+      time: result.slot.start_time,
+      doctor_id: result.slot.doctor_id,
+      hospital_id: result.slot.hospital_id,
+    });
+
+    // Tell the patient — best-effort, fire-and-forget: the reschedule itself is
+    // already committed in the transaction above, and a failed WhatsApp send
+    // must not undo it or leave the desk believing the move didn't happen.
+    (async () => {
+      try {
+        const apptR = await tenantQuery(s, `
+          SELECT a.booking_id, p.phone as patient_phone, d.name as doctor_name, h.name as hospital_name
+          FROM appointments a
+          JOIN patients p ON p.id = a.patient_id
+          JOIN doctors d ON d.id = a.doctor_id
+          JOIN hospitals h ON h.id = a.hospital_id
+          WHERE a.id = $1
+        `, [req.params.id]);
+        if (!apptR.rows[0]) return;
+        const info = apptR.rows[0];
+        const { sendPatientMessage } = require('../services/outbound');
+        const { format, parseISO } = require('date-fns');
+        const oldDateLabel = format(parseISO(result.oldDate), 'EEE, d MMM yyyy');
+        const newDateLabel = format(parseISO(result.slot.slot_date), 'EEE, d MMM yyyy');
+        const oldTime = String(result.oldTime || '').slice(0, 5);
+        const newTime = String(result.slot.start_time).slice(0, 5);
+        // Meta rejects an empty parameter, so a reschedule with no reason given
+        // still needs SOMETHING here — matches the {{6}}/{{7}} fallback the doc
+        // for appointment_rescheduled_v1 documents.
+        const reasonText = reason || 'the clinic needed to make a change';
+        const branch = info.hospital_name || 'the clinic';
+
+        const text =
+          `🔄 *Your appointment was moved*\n\n` +
+          `Your visit on ${oldDateLabel} at ${oldTime} could not go ahead — ${reasonText}.\n\n` +
+          `We've moved it to *${newDateLabel} at ${newTime}* with Dr. ${info.doctor_name} at ${branch}.\n\n` +
+          `Booking ID *${info.booking_id}*\n\n` +
+          `Reply *Menu* for your appointments.`;
+
+        // Template-first: this is the desk moving a booking on ITS OWN
+        // schedule (reacting to a leave), so the patient is very often not
+        // mid-conversation — a plain text send is rejected outside Meta's
+        // 24-hour window and they'd hear nothing while the desk believes
+        // they were told.
+        await sendPatientMessage(s, info.patient_phone, {
+          template: 'appointment_rescheduled_v1',
+          components: [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: oldDateLabel },
+              { type: 'text', text: oldTime },
+              { type: 'text', text: newDateLabel },
+              { type: 'text', text: newTime },
+              { type: 'text', text: String(info.doctor_name).slice(0, 60) },
+              { type: 'text', text: reasonText.slice(0, 120) },
+              { type: 'text', text: branch.slice(0, 60) },
+            ],
+          }],
+          buttonPayloads: ['Reschedule', 'Cancel appointment'],
+          text,
+        });
+      } catch (err) {
+        logger.warn('Reschedule notification failed', { appointmentId: req.params.id, error: err.message });
+      }
+    })();
+  } catch (err) { handleError(res, err); }
+});
+
 // ── PRINTABLE RECEIPT (A2) ────────────────────────────────────
 router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
   try {
@@ -446,7 +656,13 @@ router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
              a.visit_type, a.notes, a.note_category, a.created_at,
              p.name AS patient_name, p.phone AS patient_phone, p.email AS patient_email,
              p.date_of_birth, p.gender,
-             d.name AS doctor_name, d.qualification, d.consultation_fee,
+             d.name AS doctor_name, d.qualification,
+             -- What was actually charged, not the doctor's flat rate: the fee is
+             -- quotable and negotiated per patient (see CLAUDE.md), and every
+             -- revenue query already reads it this way. Printing d.consultation_fee
+             -- alone here meant a receipt could show a different amount than what
+             -- the desk actually entered for this visit.
+             COALESCE(NULLIF(a.effective_fee, 0), d.consultation_fee) AS consultation_fee,
              dep.name AS treatment_type,
              h.name AS clinic_name, h.address AS clinic_address, h.phone AS clinic_phone
       FROM appointments a
@@ -525,7 +741,7 @@ router.get('/appointments/:id/receipt', validateUUID(), async (req, res) => {
 // ── CREATE APPOINTMENT (walk-in) ──────────────────────────────
 router.post('/appointments', adminOnly, validate(schemas.createAppointment), async (req, res) => {
   try {
-    const { patient_phone: rawPhone, patient_name, gender, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, department_id } = req.body;
+    const { patient_phone: rawPhone, patient_name, gender, doctor_id, hospital_id, slot_id, appointment_date, appointment_time, visit_type, notes, department_id, effective_fee } = req.body;
     // Strip leading '+' to match DB CHECK constraint: phone ~ '^[0-9]{7,20}$'
     const patient_phone = rawPhone.replace(/^\+/, '');
     const s = req.tenant.schema_name;
@@ -666,6 +882,9 @@ router.post('/appointments', adminOnly, validate(schemas.createAppointment), asy
           visitType: visit_type || 'in_person',
           notes: notes || null,
           departmentId: department_id || null,
+          // Quotable, not fixed — the desk enters what was actually agreed with
+          // THIS patient. Blank/0 falls back to the doctor's rate.
+          effectiveFee: effective_fee !== undefined && effective_fee !== null && effective_fee !== '' ? Number(effective_fee) : null,
         });
       });
     } catch (txErr) {
