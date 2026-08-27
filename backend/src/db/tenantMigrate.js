@@ -26,7 +26,7 @@ async function createTenantSchema(schemaName) {
         email VARCHAR(255) UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         name VARCHAR(255) NOT NULL,
-        role VARCHAR(50) DEFAULT 'staff',
+        role VARCHAR(50) DEFAULT 'doctor',
         is_active BOOLEAN DEFAULT true,
         notify_phone VARCHAR(20),
         created_at TIMESTAMPTZ DEFAULT NOW()
@@ -385,6 +385,13 @@ async function runTenantMigrations(schemaName) {
     await client.query(`
       ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_phone VARCHAR(20);
     `);
+
+    // Two-role model: 'staff' was folded into 'doctor' (permission-identical,
+    // shown as "Dentist" in the dashboard). Naturally idempotent — a no-op on
+    // every boot once no 'staff' rows remain, so no seed_marker is needed. Any
+    // front-desk person who books walk-ins / reschedules / cancels must be an
+    // 'admin'; that was already true, as 'staff' could do none of those either.
+    await client.query(`UPDATE users SET role = 'doctor' WHERE role = 'staff';`);
 
     // Phone format constraint: digits-only (no + prefix) to match the VARCHAR(20)
     // column width. The webhook layer strips any leading + before storage.

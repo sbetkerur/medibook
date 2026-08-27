@@ -96,9 +96,9 @@ const schemas = {
       .messages({ 'string.pattern.name': 'Password must contain at least one {{#name}}' })
       .required(),
     // Must stay in sync with VALID_ROLES in utils/errors.js and the role select
-    // in frontend StaffTab.js — 'doctor' was missing here, so the /doctor page
-    // (which gates on role === 'doctor') could never actually be reached.
-    role: Joi.string().valid(...VALID_ROLES).default('staff'),
+    // in frontend StaffTab.js. Only 'admin' and 'doctor' exist; a new team
+    // member defaults to the clinical 'doctor' role, not admin.
+    role: Joi.string().valid(...VALID_ROLES).default('doctor'),
   }),
 
   updateStaff: Joi.object({
@@ -215,6 +215,12 @@ const schemas = {
     owner_name: Joi.string().max(255).optional().allow('', null),
     city: Joi.string().trim().max(100).optional().allow('', null),
     plan: Joi.string().valid('starter', 'professional').optional().default('starter'),
+    // The negotiated monthly amount, in whole rupees ex-GST, agreed in the deal.
+    // Overrides the tier's list price everywhere revenue is read
+    // (COALESCE(tenants.billing_monthly, plans.price_monthly)). Omit / null to
+    // bill at list price; 0 is allowed (a free pilot). Same column and semantics
+    // as PATCH /superadmin/tenants — this just lets it be set at creation.
+    billing_monthly: Joi.number().integer().min(0).max(10000000).optional().allow(null),
   }),
 };
 

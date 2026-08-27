@@ -239,10 +239,8 @@ router.get('/dashboard', async (req, res) => {
 // view, not a directory: it hands out the email address, role and active flag
 // of every account in the clinic, which is exactly the input for a targeted
 // phish at whoever holds 'admin'. A non-admin who reaches this tab can do
-// nothing with the result — StaffTab renders no actions unless isAdmin.
-// NOTE: the dashboard's NAV does not yet hide the Staff tab from non-admins
-// (it only filters 'audit'), so until it does, a staff/doctor login opening
-// that tab sees a "Failed to load staff" toast instead of a list.
+// nothing with the result — StaffTab renders no actions unless isAdmin, and
+// the dashboard NAV hides the Team tab from non-admin (dentist) logins.
 router.get('/staff', adminOnly, async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
@@ -253,7 +251,7 @@ router.get('/staff', adminOnly, async (req, res) => {
 
 router.post('/staff', adminOnly, validate(schemas.createStaff), async (req, res) => {
   try {
-    const { name, email, password, role = 'staff' } = req.body;
+    const { name, email, password, role = 'doctor' } = req.body;
     if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: `role must be one of: ${VALID_ROLES.join(', ')}` });
     const hash = await bcrypt.hash(password, 12);
     const r = await tenantQuery(req.tenant.schema_name,
@@ -497,8 +495,8 @@ const PLATFORM_ONLY_SETTINGS_KEYS = ['rate_limits', 'alert_webhook_url'];
 // `settings.settings` and nothing else (the toggle is admin-write anyway).
 // show_consultation_fee also has to reach non-admin logins: the dentist
 // picker and confirmation screen must not disagree with what the Settings
-// tab displays to a staff/dentist login, or a staff member sees the toggle
-// as permanently "on" regardless of what an admin actually set.
+// tab displays to a dentist login, or that user sees the toggle as
+// permanently "on" regardless of what an admin actually set.
 const NON_ADMIN_SETTINGS_KEYS = ['reminder_24h_enabled', 'show_consultation_fee'];
 
 function visibleSettings(rawSettings, role) {

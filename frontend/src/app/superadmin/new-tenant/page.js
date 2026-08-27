@@ -24,7 +24,7 @@ export default function NewTenantPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [form, setForm] = useState({
     name: '', slug: '', city: '', owner_email: '', owner_name: '', owner_password: '',
-    plan: 'starter',
+    plan: 'starter', billing_monthly: '',
   });
 
   useEffect(() => {
@@ -57,6 +57,13 @@ export default function NewTenantPage() {
     }
     if (step === 2) {
       if (!form.plan) { toast.error('Select a plan'); return false; }
+      if (form.billing_monthly.trim() !== '') {
+        const n = Number(form.billing_monthly);
+        if (!Number.isInteger(n) || n < 0) {
+          toast.error('Negotiated monthly must be a whole rupee amount (0 or more), or blank');
+          return false;
+        }
+      }
     }
     return true;
   }
@@ -78,6 +85,8 @@ export default function NewTenantPage() {
         owner_name: form.owner_name.trim() || form.name.trim() + ' Admin',
         owner_password: form.owner_password.trim() || undefined,
         plan: form.plan,
+        // Blank = bill at the tier's list price; a number is the negotiated rate.
+        billing_monthly: form.billing_monthly.trim() === '' ? undefined : Number(form.billing_monthly),
       });
       setCreatedTenant(data);
       setStep(5);
@@ -306,6 +315,37 @@ export default function NewTenantPage() {
                   );
                 })}
               </div>
+
+              {/* Negotiated price. Overrides the tier's list price for this clinic
+                  only (COALESCE(billing_monthly, price_monthly) in every revenue
+                  read). Leave blank to bill at list price; set it for a discount
+                  or a per-branch Professional deal. */}
+              <div className="border-t border-gray-100 pt-4">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Negotiated monthly <span className="text-gray-400 font-normal">(₹, ex-GST — optional)</span>
+                </label>
+                <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 max-w-xs">
+                  <span className="px-3 py-2 bg-gray-50 text-gray-400 text-sm border-r border-gray-200">₹</span>
+                  <input type="number" min="0" step="1" value={form.billing_monthly}
+                    onChange={e => set('billing_monthly', e.target.value)}
+                    placeholder={selectedPlan?.price_monthly ? `list: ${selectedPlan.price_monthly}` : 'list price'}
+                    className="flex-1 px-3 py-2 text-sm focus:outline-none" />
+                </div>
+                <p className="text-xs text-gray-500 mt-1.5">
+                  {form.billing_monthly.trim() === '' ? (
+                    <>Blank = bill at the tier&apos;s list price
+                      {selectedPlan?.price_monthly ? ` (₹${selectedPlan.price_monthly.toLocaleString('en-IN')}/mo)` : ''}.
+                      Set it for a discounted or per-branch deal.</>
+                  ) : (() => {
+                    const n = Number(form.billing_monthly);
+                    if (!Number.isInteger(n) || n < 0) return 'Enter a whole rupee amount (0 or more).';
+                    const list = selectedPlan?.price_monthly || 0;
+                    const disc = list > 0 ? Math.round((1 - n / list) * 100) : null;
+                    return <>₹{n.toLocaleString('en-IN')}/mo ex-GST · ₹{Math.round(n * 1.18).toLocaleString('en-IN')} incl. 18% GST
+                      {disc !== null && disc !== 0 ? ` · ${disc > 0 ? disc + '% discount' : Math.abs(disc) + '% above list'}` : ''}</>;
+                  })()}
+                </p>
+              </div>
             </div>
           )}
 
@@ -345,6 +385,7 @@ export default function NewTenantPage() {
                   { label: 'Admin Email', value: form.owner_email },
                   { label: 'Admin Name', value: form.owner_name || `${form.name} Admin` },
                   { label: 'Plan', value: selectedPlan ? `${selectedPlan.name} (${selectedPlan.price_monthly === 0 ? 'Free' : '₹' + selectedPlan.price_monthly + '/mo'})` : form.plan },
+                  { label: 'Negotiated monthly', value: form.billing_monthly.trim() === '' ? '— list price —' : `₹${Number(form.billing_monthly).toLocaleString('en-IN')}/mo ex-GST` },
                   { label: 'WhatsApp', value: 'Shared global number' },
                 ].map(({ label, value, mono }) => (
                   <div key={label} className="flex justify-between items-start gap-3 px-4 py-3 text-sm">

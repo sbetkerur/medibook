@@ -318,6 +318,27 @@ export function clearSessionTimers() {
   clearTimeout(_refreshTimer);
 }
 
+/**
+ * GET a binary file (a PDF report) through the same authenticated `api`
+ * instance — token attach and 401→refresh still apply — and hand it to the
+ * browser as a download. Returns nothing; throws on HTTP error so callers can
+ * toast. An error body comes back as a Blob, so there is no `.data.error` to
+ * read; callers should show a generic message.
+ */
+export async function downloadFile(path, filename) {
+  const res = await api.get(path, { responseType: 'blob' });
+  const url = URL.createObjectURL(res.data);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || 'download';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoke on the next tick — revoking synchronously can race the download in
+  // some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // Start timers immediately if a token already exists (e.g. after page reload)
 if (typeof window !== 'undefined' && localStorage.getItem('token')) {
   resetSessionTimers();

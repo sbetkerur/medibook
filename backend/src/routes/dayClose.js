@@ -27,8 +27,93 @@ const router = require('express').Router();
 const { tenantQuery } = require('../db');
 const { handleError } = require('../utils/errors');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
+const { streamReport, drawTable, kv, rupees, prettyDate } = require('../utils/pdfReport');
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+const METHOD_LABELS = {
+  cash: 'Cash', card: 'Card', upi: 'UPI',
+  bank_transfer: 'Bank transfer', cheque: 'Cheque', other: 'Other',
+};
+
+// Same branch-label rule as routes/reports.js: a name only when the clinic has
+// exactly one active branch, so a multi-branch total isn't mislabelled.
+async function soleBranch(schema) {
+  try {
+    const h = await tenantQuery(schema,
+      `SELECT name, phone FROM hospitals WHERE is_active = true AND deleted_at IS NULL ORDER BY created_at LIMIT 2`);
+    if (h.rows.length === 1) return { branchName: h.rows[0].name, phone: h.rows[0].phone || null };
+  } catch { /* decoration only */ }
+  return { branchName: null, phone: null };
+}
+
+function renderDayClosePdf(res, req, payload) {
+  const a = payload.appointments || {};
+  const byMethod = payload.treatment_payments?.by_method || [];
+  const treatmentTotal = payload.treatment_payments?.total || 0;
+  const dateStr = payload.date || 'today';
+
+  return soleBranch(req.tenant.schema_name).then(({ branchName, phone }) => {
+    streamReport(res, {
+      clinicName: req.tenant.name,
+      branchName,
+      phone,
+      title: 'Day Close',
+      subtitle: payload.date ? prettyDate(payload.date) : 'Today',
+      filename: `day-close-${dateStr}`,
+    }, doc => {
+      doc.font('bold').fontSize(14).fillColor('#000')
+        .text(`Collected: ${rupees(payload.collected_total)}`);
+      doc.moveDown(0.3);
+      doc.font('body').fontSize(9).fillColor('#555').text(
+        `${rupees(a.fees_completed)} in consultation fees for ${a.completed || 0} appointment(s) seen, ` +
+        `plus ${rupees(treatmentTotal)} in treatment payments. The two streams are added once.`
+      );
+      doc.moveDown(1);
+
+      doc.font('bold').fontSize(11).fillColor('#000').text('Appointments');
+      doc.moveDown(0.3);
+      kv(doc, 'Booked', String(a.total ?? 0));
+      kv(doc, 'Completed', String(a.completed ?? 0));
+      kv(doc, 'Still open', String(a.still_open ?? 0));
+      kv(doc, 'No-show', String(a.no_show ?? 0));
+      kv(doc, 'Cancelled', String(a.cancelled ?? 0));
+      doc.moveDown(1);
+
+      doc.font('bold').fontSize(11).fillColor('#000').text('Treatment payments by method');
+      doc.moveDown(0.3);
+      if (byMethod.length) {
+        drawTable(doc, [
+          { key: 'method', label: 'Method', width: 12 },
+          { key: 'count', label: 'Payments', width: 8, align: 'right' },
+          { key: 'amount', label: 'Amount', width: 10, align: 'right' },
+        ], byMethod.map(m => ({
+          method: METHOD_LABELS[m.method] || m.method,
+          count: String(m.count),
+          amount: rupees(m.amount),
+        })).concat([{ method: 'Total', count: '', amount: rupees(treatmentTotal) }]));
+      } else {
+        doc.font('body').fontSize(10).fillColor('#666').text('No treatment payments taken.');
+        doc.moveDown(0.6);
+      }
+
+      if (payload.by_doctor?.length) {
+        doc.moveDown(0.4);
+        doc.font('bold').fontSize(11).fillColor('#000').text('By dentist');
+        doc.moveDown(0.3);
+        drawTable(doc, [
+          { key: 'name', label: 'Dentist', width: 16 },
+          { key: 'seen', label: 'Patients', width: 6, align: 'right' },
+          { key: 'fees', label: 'Consultation fees', width: 10, align: 'right' },
+        ], payload.by_doctor.map(d => ({
+          name: `Dr. ${d.doctor_name}`,
+          seen: String(d.seen),
+          fees: rupees(d.fees),
+        })));
+      }
+    });
+  });
+}
 
 router.get('/day-close', async (req, res) => {
   try {
@@ -92,7 +177,7 @@ router.get('/day-close', async (req, res) => {
     const treatmentTotal = treatment.rows.reduce((sum, r) => sum + r.amount, 0);
     const a = appts.rows[0] || {};
 
-    res.json({
+    const payload = {
       date: day,
       appointments: a,
       treatment_payments: { by_method: treatment.rows, total: treatmentTotal },
@@ -109,8 +194,11 @@ router.get('/day-close', async (req, res) => {
       // honest number beats reporting a distinction the product cannot make; if
       // per-appointment payment marking is ever added, split this again then.
       collected_total: (a.fees_completed || 0) + treatmentTotal,
-    });
-  } catch (err) { handleError(res, err); }
+    };
+
+    if (req.query.format === 'pdf') return renderDayClosePdf(res, req, payload);
+    res.json(payload);
+  } catch (err) { if (!res.headersSent) handleError(res, err); }
 });
 
 module.exports = router;

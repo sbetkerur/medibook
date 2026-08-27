@@ -1,9 +1,33 @@
 'use client';
-import api from '@/lib/api';
+import { format, addDays, parseISO } from 'date-fns';
+import api, { downloadFile } from '@/lib/api';
 import toast from 'react-hot-toast';
 import StatCard from '@/components/ui/StatCard';
 import Badge from '@/components/ui/Badge';
 import RequestsPanel from '@/components/RequestsPanel';
+import { todayIST } from '@/lib/dateIST';
+
+// On-demand PDF reports the front desk prints when closing up. schedule.pdf
+// defaults to today; for a future date it also carries each patient's
+// reminder-reply status and a "confirmed / to call" count, so tomorrow's
+// schedule doubles as the evening call-list.
+function reportButtons() {
+  const today = todayIST();
+  const tomorrow = format(addDays(parseISO(today), 1), 'yyyy-MM-dd');
+  return [
+    { label: "Today's schedule", path: '/admin/reports/schedule.pdf', file: `schedule-${today}.pdf` },
+    { label: "Tomorrow's schedule", path: `/admin/reports/schedule.pdf?date=${tomorrow}`, file: `schedule-${tomorrow}.pdf` },
+    { label: 'Pending requests', path: '/admin/requests?status=open&format=pdf', file: 'requests-open.pdf' },
+  ];
+}
+
+function runReport(path, file) {
+  toast.promise(downloadFile(path, file), {
+    loading: 'Preparing PDF…',
+    success: 'PDF downloaded',
+    error: 'Could not generate the PDF',
+  });
+}
 
 /**
  * Dashboard landing tab.
@@ -165,6 +189,19 @@ export default function OverviewTab({
         </div>
       )}
 
+
+      <div className="bg-white rounded-xl p-5 shadow-sm">
+        <h3 className="font-semibold text-gray-800 mb-1">Reports</h3>
+        <p className="text-xs text-gray-500 mb-3">Printable PDFs for the end-of-day routine.</p>
+        <div className="flex flex-wrap gap-3">
+          {reportButtons().map(r => (
+            <button key={r.label} onClick={() => runReport(r.path, r.file)}
+              className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+              ⬇ {r.label}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <div className="bg-white rounded-xl p-5 shadow-sm">
         <h3 className="font-semibold text-gray-800 mb-3">Quick Actions</h3>

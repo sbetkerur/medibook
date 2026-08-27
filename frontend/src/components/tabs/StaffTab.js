@@ -11,8 +11,11 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
   const [staff, setStaff] = useState([]);
   const [showStaffModal, setShowStaffModal] = useState(false);
   const [editingStaff, setEditingStaff] = useState(null);
-  const [staffForm, setStaffForm] = useState({ name: '', email: '', password: '', role: 'staff' });
+  const [staffForm, setStaffForm] = useState({ name: '', email: '', password: '', role: 'doctor' });
   const [staffSaving, setStaffSaving] = useState(false);
+
+  // Two roles only: 'admin' (full access) and 'doctor', shown as "Dentist".
+  const roleLabel = (r) => (r === 'doctor' ? 'Dentist' : r);
 
   const fetchStaff = useCallback(async () => {
     try {
@@ -41,7 +44,7 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
         toast.success('Staff member added');
       }
       setShowStaffModal(false);
-      setStaffForm({ name: '', email: '', password: '', role: 'staff' });
+      setStaffForm({ name: '', email: '', password: '', role: 'doctor' });
       setEditingStaff(null);
       fetchStaff();
     } catch (err) {
@@ -121,9 +124,9 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
         <div className="flex items-center justify-between">
           <p className="text-sm text-gray-500">{staff.length} team member{staff.length !== 1 ? 's' : ''}</p>
           {isAdmin && (
-          <button onClick={() => { setEditingStaff(null); setStaffForm({ name: '', email: '', password: '', role: 'staff' }); setShowStaffModal(true); }}
+          <button onClick={() => { setEditingStaff(null); setStaffForm({ name: '', email: '', password: '', role: 'doctor' }); setShowStaffModal(true); }}
             className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition">
-            + Add Staff
+            + Add Member
           </button>
           )}
         </div>
@@ -140,7 +143,7 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
                   </div>
                   <div className="flex flex-col items-end gap-1 shrink-0">
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${m.role === 'admin' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
-                      {m.role}
+                      {roleLabel(m.role)}
                     </span>
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${m.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-500'}`}>
                       {m.is_active ? 'Active' : 'Inactive'}
@@ -189,7 +192,7 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
                   <td className="px-4 py-3 text-gray-600 text-sm">{m.email}</td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium capitalize ${m.role === 'admin' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
-                      {m.role}
+                      {roleLabel(m.role)}
                     </span>
                   </td>
                   <td className="px-4 py-3">
@@ -236,7 +239,7 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
 
       {/* ── ADD / EDIT STAFF MODAL ── */}
       {showStaffModal && (
-        <Modal title={editingStaff ? `Edit ${editingStaff.name}` : 'Add Staff Member'} onClose={() => { setShowStaffModal(false); setEditingStaff(null); }}>
+        <Modal title={editingStaff ? `Edit ${editingStaff.name}` : 'Add Team Member'} onClose={() => { setShowStaffModal(false); setEditingStaff(null); }}>
           <form onSubmit={saveStaff} className="space-y-4">
             <div>
               <label className="block text-xs font-medium text-gray-700 mb-1">Full Name *</label>
@@ -265,10 +268,13 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
               <label className="block text-xs font-medium text-gray-700 mb-1">Role</label>
               <select value={staffForm.role} onChange={e => setStaffForm(f => ({ ...f, role: e.target.value }))}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <option value="staff">Staff</option>
                 <option value="doctor">Dentist</option>
                 <option value="admin">Admin</option>
               </select>
+              <p className="mt-1 text-xs text-gray-500">
+                Dentists can read everything and record clinical work (notes, treatment plans,
+                consent). Booking, rescheduling, cancelling and settings need an Admin.
+              </p>
             </div>
             <div className="flex gap-3 pt-2">
               <button type="button" onClick={() => { setShowStaffModal(false); setEditingStaff(null); }}
@@ -277,7 +283,7 @@ export default function StaffTab({ isAdmin, setConfirmModal }) {
               </button>
               <button type="submit" disabled={staffSaving}
                 className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-                {staffSaving ? 'Saving...' : editingStaff ? 'Update Staff' : 'Add Staff'}
+                {staffSaving ? 'Saving...' : editingStaff ? 'Update' : 'Add Member'}
               </button>
             </div>
           </form>

@@ -110,9 +110,14 @@ export default function AnalyticsTab() {
           {analytics.by_department?.length > 0 && (
             <div className="bg-white rounded-xl p-5 shadow-sm">
               <h3 className="font-semibold text-gray-800 mb-4">By Department (30 days)</h3>
-              <ResponsiveContainer width="100%" height={180}>
-                <BarChart data={analytics.by_department.map(d => ({ name: d.name || 'Other', count: parseInt(d.count) }))}>
-                  <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+              <ResponsiveContainer width="100%" height={220}>
+                <BarChart
+                  data={analytics.by_department.map(d => ({ name: d.name || 'Other', count: parseInt(d.count) }))}
+                  margin={{ bottom: 40 }}
+                >
+                  {/* Angled + every label shown: on a phone, 4+ upright department
+                      names overlapped into an unreadable smear. */}
+                  <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-30} textAnchor="end" height={50} />
                   <YAxis tick={{ fontSize: 11 }} allowDecimals={false} width={30} />
                   <Tooltip formatter={(v) => [v, 'Appointments']} />
                   <Bar dataKey="count" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
@@ -135,11 +140,11 @@ export default function AnalyticsTab() {
 
       {/* ── REVENUE SECTION (A6) ── */}
       <div className="bg-white rounded-xl p-5 shadow-sm">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
           <h3 className="font-semibold text-gray-800">💰 Revenue Analytics</h3>
           <select value={revenueMonths}
             onChange={e => setRevenueMonths(Number(e.target.value))}
-            className="border border-gray-300 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            className="border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
             {[3, 6, 12, 24].map(m => <option key={m} value={m}>Last {m} months</option>)}
           </select>
         </div>

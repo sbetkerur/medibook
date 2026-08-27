@@ -28,7 +28,7 @@ export default function DoctorPage() {
     if (!token || !u) { router.push('/login'); return; }
     let parsed;
     try { parsed = JSON.parse(u); } catch { router.push('/login'); return; }
-    if (!['doctor', 'admin', 'staff'].includes(parsed.role)) {
+    if (!['doctor', 'admin'].includes(parsed.role)) {
       router.push('/login');
       return;
     }

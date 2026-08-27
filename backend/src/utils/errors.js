@@ -56,7 +56,13 @@ const ERRORS = {
   TOKEN_VALIDATION_UNAVAILABLE: 'Token validation unavailable',
 };
 
-const VALID_ROLES = ['admin', 'staff', 'doctor'];
+// Two roles only. 'admin' has full access; 'doctor' (shown as "Dentist" in the
+// dashboard) is the clinical role — read everything, plus notes, mark-complete,
+// treatment plans, consent, lab work and payments — but no walk-in booking,
+// reschedule, cancel, patient/settings/staff mutation or PHI export, all of
+// which are `adminOnly`. The old 'staff' role was permission-identical to
+// 'doctor' and was folded into it (see the backfill in tenantMigrate.js).
+const VALID_ROLES = ['admin', 'doctor'];
 
 const VALID_APPOINTMENT_STATUSES = ['confirmed', 'completed', 'cancelled', 'no_show'];
 

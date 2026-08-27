@@ -1,2 +1,8 @@
 * text=auto eol=lf
 *.sh text eol=lf
+
+# Fonts and other binaries — never EOL-normalize
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary

@@ -306,11 +306,12 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     }
 
     // Per-capability gate rather than a blanket adminOnly on the route: marking
-    // an appointment completed/no_show is normal front-desk work and must keep
-    // working for staff. Only cancelling is withheld — it releases the slot back
-    // to the pool and fires a WhatsApp alert to every admin, so a non-admin
-    // could quietly empty a day's book one appointment at a time, which is
-    // exactly what adminOnly on PATCH /appointments/bulk exists to stop.
+    // an appointment completed/no_show is normal clinical work and must keep
+    // working for the non-admin (dentist) role. Only cancelling is withheld — it
+    // releases the slot back to the pool and fires a WhatsApp alert to every
+    // admin, so a non-admin could quietly empty a day's book one appointment at
+    // a time, which is exactly what adminOnly on PATCH /appointments/bulk exists
+    // to stop.
     //
     // `notes` is deliberately NOT gated. An appointment note is reception's
     // scratchpad ("called, running late", "bringing old X-rays") — the people

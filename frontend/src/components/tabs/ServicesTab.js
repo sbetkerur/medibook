@@ -107,7 +107,10 @@ export default function ServicesTab({ hospitals, isAdmin, setConfirmModal }) {
             </div>
           ))}
           {!services.length && (
-            <div className="col-span-3 text-center py-16 bg-white rounded-xl shadow-sm">
+            // col-span-full, not col-span-3: on a phone the grid is 1 column, and
+            // a fixed 3-col span there invents two implicit columns that push the
+            // row past the viewport (same fix as DoctorsTab's empty state).
+            <div className="col-span-full text-center py-16 bg-white rounded-xl shadow-sm">
               <div className="text-4xl mb-3">💊</div>
               <p className="text-gray-500 font-medium">No services yet</p>
               <p className="text-gray-400 text-sm mt-1">Add treatments like Root Canal, Cleaning, Braces consultation, etc.</p>

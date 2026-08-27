@@ -443,7 +443,9 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal, pendingBoo
       {detail && (
         <Modal title={detail.treatment_plan.title} onClose={() => { setDetail(null); setConsentNote(''); }} wide>
           <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-3 text-sm">
+            {/* Stacks on a phone: a patient name or phone in a ~126px half-width
+                cell overflowed the dialog. */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
               <div><span className="text-gray-500 text-xs">Patient</span>
                 <p className="font-medium">{detail.treatment_plan.patient_name}</p>
                 {detail.treatment_plan.patient_phone && (
@@ -790,7 +792,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal, pendingBoo
                 placeholder="Which lab it went to"
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-medium text-gray-700 mb-1">Expected back</label>
                 <input type="date" value={labForm.expected_date}

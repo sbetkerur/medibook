@@ -1,7 +1,7 @@
 'use client';
 import { useState, useEffect, useCallback } from 'react';
 import { format, parseISO, subDays, addDays } from 'date-fns';
-import api from '@/lib/api';
+import api, { downloadFile } from '@/lib/api';
 import toast from 'react-hot-toast';
 import { todayIST } from '@/lib/dateIST';
 
@@ -36,6 +36,16 @@ export default function DayCloseTab() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  const [pdfBusy, setPdfBusy] = useState(false);
+
+  const downloadPdf = async () => {
+    setPdfBusy(true);
+    try {
+      await downloadFile(`/admin/day-close?date=${encodeURIComponent(date)}&format=pdf`, `day-close-${date}.pdf`);
+    } catch {
+      toast.error('Could not generate the PDF');
+    } finally { setPdfBusy(false); }
+  };
 
   const fetchDay = useCallback(async (d) => {
     setLoading(true);
@@ -82,8 +92,12 @@ export default function DayCloseTab() {
           <button onClick={() => setDate(todayStr)}
             className="px-3 py-2 text-sm text-blue-600 hover:underline">Today</button>
         )}
+        <button onClick={downloadPdf} disabled={loading || pdfBusy || failed}
+          className="ml-auto px-3 py-2 border border-gray-300 text-gray-600 rounded-lg text-xs hover:bg-gray-50 disabled:opacity-50 transition">
+          {pdfBusy ? 'Preparing…' : '⬇ PDF'}
+        </button>
         <button onClick={() => fetchDay(date)} disabled={loading}
-          className="ml-auto px-3 py-2 text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50 transition">
+          className="px-3 py-2 text-xs text-blue-500 hover:text-blue-700 disabled:opacity-50 transition">
           ↻ Refresh
         </button>
       </div>

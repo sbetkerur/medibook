@@ -410,6 +410,20 @@ its fees were unpaid. If per-appointment payment marking is ever built, split it
 again then — and give `payment_status` a writer in the same change. IST throughout — `created_at` is a TIMESTAMPTZ and is
 compared in Asia/Kolkata, or a clinic closing at 21:00 sees yesterday.
 
+**On-demand PDF reports.** `utils/pdfReport.js` (pdfkit) is the only PDF path:
+`streamReport` writes the clinic band + page numbers, `drawTable` paginates,
+`rupees()` is the money format. Noto Sans (regular + bold) is embedded from
+`src/assets/fonts/` and subset into every report — pdfkit's built-in Helvetica
+has no ₹ glyph and would drop it silently, so callers use the logical fonts
+`'body'`/`'bold'`, never `'Helvetica'`. The reports: `GET /reports/schedule.pdf`
+(`routes/reports.js` — a day grouped by dentist; for a FUTURE date it also
+carries each patient's 24h-reminder reply and a "confirmed / to call" count, so
+tomorrow's schedule IS the evening call-list — there is no separate
+unconfirmed report), and the `?format=pdf` arms of `GET /day-close` and
+`GET /requests`. All stream, store nothing, and are NOT `adminOnly` — they are
+read views the front desk prints; the bulk PHI extract that is admin-gated
+(`/analytics/export`) does not go through here.
+
 **A working day is a LIST of sessions.** An Indian dentist routinely does 10–1
 at one clinic and 5–9 at another on the SAME day; for a visiting endodontist it
 is the default arrangement. `doctor_schedules` therefore keys on
@@ -609,6 +623,20 @@ without one), and treating it as theft would log people out at random. Auth + te
 in `index.js` for `/api/admin` and `/api/v1/admin` — route files must not
 re-apply them. Mutating admin routes use `adminOnly`; validate route UUIDs with
 `validateUUID()` / shared `UUID_RE` from `utils/errors.js`.
+
+**Two roles, and authorization is binary.** `VALID_ROLES` is `['admin',
+'doctor']` — `doctor` is shown as "Dentist" in the dashboard. There is no
+`staff` role: it was permission-identical to `doctor` and folded into it by an
+idempotent `UPDATE users SET role='doctor' WHERE role='staff'` in
+`tenantMigrate.js`. A clinic may have any number of admins;
+`routes/admin.js` refuses to demote or deactivate the LAST active one.
+`adminOnly` (`role === 'admin'`) is the only gate — every route not carrying it
+is open to a dentist login. That tier is deliberate, not lax: a dentist reads
+everything and records clinical work (appointment notes, mark-complete/no_show,
+treatment plans, consent, lab work, payments), while walk-in booking,
+reschedule, **cancel** (`PATCH /appointments/:id` blocks a non-admin setting
+`status='cancelled'`), bulk edits, patient/settings/staff mutation, QR regen and
+PHI export are all `adminOnly`. Anyone who works the front desk must be an admin.
 
 **Frontend.** All API calls go through the Next.js rewrite proxy
 (`/api/proxy/*` → `BACKEND_URL`) — no API origin is baked into the bundle.

@@ -26,6 +26,13 @@ export default function SuperAdminPage() {
   const [cityValue, setCityValue] = useState('');
   const [savingCity, setSavingCity] = useState(false);
 
+  // Negotiated price. tenants.billing_monthly overrides the tier's list price
+  // for this clinic only; blank / null reverts to list. Same focused-affordance
+  // pattern as the city modal — there is no general tenant-edit form.
+  const [billingModal, setBillingModal] = useState(null); // { tenant }
+  const [billingValue, setBillingValue] = useState('');
+  const [savingBilling, setSavingBilling] = useState(false);
+
   // Tenant health state
   const [tenantHealth, setTenantHealth] = useState({}); // { [tenantId]: healthData }
   const [loadingHealth, setLoadingHealth] = useState(null);
@@ -165,6 +172,49 @@ export default function SuperAdminPage() {
       fetchAll();
     } catch { toast.error('Failed to update city'); }
     finally { setSavingCity(false); }
+  }
+
+  function openBillingModal(tenant) {
+    setBillingModal({ tenant });
+    setBillingValue(tenant.billing_monthly == null ? '' : String(tenant.billing_monthly));
+  }
+
+  async function saveBilling() {
+    if (!billingModal) return;
+    const v = billingValue.trim();
+    let payload;
+    if (v === '') {
+      payload = null; // explicit null tells the API to revert to list price
+    } else {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 0) {
+        toast.error('Enter a whole rupee amount (0 or more), or blank to use list price');
+        return;
+      }
+      payload = n;
+    }
+    setSavingBilling(true);
+    try {
+      await api.patch(`/superadmin/tenants/${billingModal.tenant.id}`, { billing_monthly: payload });
+      toast.success(payload === null ? 'Reverted to list price' : 'Negotiated price saved');
+      setBillingModal(null);
+      setBillingValue('');
+      fetchAll();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to save price');
+    } finally { setSavingBilling(false); }
+  }
+
+  // Short inline label for a tenant's effective monthly price.
+  function priceLabel(t) {
+    const list = Number(t.plan_price_monthly) || 0;
+    if (t.billing_monthly == null) {
+      return list > 0 ? `list ₹${list.toLocaleString('en-IN')}` : null;
+    }
+    const amt = Number(t.billing_monthly);
+    const disc = list > 0 ? Math.round((1 - amt / list) * 100) : null;
+    const tag = disc && disc !== 0 ? ` (${disc > 0 ? '−' : '+'}${Math.abs(disc)}%)` : '';
+    return `₹${amt.toLocaleString('en-IN')}/mo${tag}`;
   }
 
   async function fetchBilling() {
@@ -364,6 +414,9 @@ export default function SuperAdminPage() {
                     )}
                     <div className="flex flex-wrap items-center gap-2 text-xs">
                       <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full capitalize">{t.plan_name || t.plan}</span>
+                      {priceLabel(t) && (
+                        <span className={t.billing_monthly == null ? 'text-gray-400' : 'text-gray-700 font-medium'}>{priceLabel(t)}</span>
+                      )}
                       <span className="text-green-600">✅ Shared</span>
                       <span className="text-gray-400">
                         {t.created_at ? format(parseISO(t.created_at), 'd MMM yy') : '—'}
@@ -411,6 +464,10 @@ export default function SuperAdminPage() {
                         className="inline-flex items-center justify-center min-h-[40px] px-3 py-2 text-xs text-gray-600 border border-gray-200 bg-gray-50 rounded-lg hover:bg-gray-100 transition">
                         📍 Set city
                       </button>
+                      <button onClick={() => openBillingModal(t)}
+                        className="inline-flex items-center justify-center min-h-[40px] px-3 py-2 text-xs text-gray-600 border border-gray-200 bg-gray-50 rounded-lg hover:bg-gray-100 transition">
+                        💰 Price
+                      </button>
                     </div>
                   </div>
                 );
@@ -448,6 +505,11 @@ export default function SuperAdminPage() {
                         <td className="px-4 py-3 text-gray-600 text-xs">{t.owner_email}</td>
                         <td className="px-4 py-3">
                           <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full capitalize">{t.plan_name || t.plan}</span>
+                          {priceLabel(t) && (
+                            <div className={`text-xs mt-0.5 ${t.billing_monthly == null ? 'text-gray-400' : 'text-gray-700 font-medium'}`}>
+                              {priceLabel(t)}
+                            </div>
+                          )}
                         </td>
                         <td className="px-4 py-3 text-xs">
                           <span className="text-green-600">✅ Shared</span>
@@ -509,6 +571,10 @@ export default function SuperAdminPage() {
                             <button onClick={() => openCityModal(t)}
                               className="text-xs px-2 py-1 rounded text-gray-600 hover:bg-gray-100 transition whitespace-nowrap">
                               📍 Set city
+                            </button>
+                            <button onClick={() => openBillingModal(t)}
+                              className="text-xs px-2 py-1 rounded text-gray-600 hover:bg-gray-100 transition whitespace-nowrap">
+                              💰 Price
                             </button>
                           </div>
                         </td>
@@ -1070,6 +1136,61 @@ export default function SuperAdminPage() {
           </div>
         </div>
       )}
+
+      {/* ── NEGOTIATED PRICE MODAL ── */}
+      {billingModal && (() => {
+        const list = Number(billingModal.tenant.plan_price_monthly) || 0;
+        const raw = billingValue.trim();
+        const n = raw === '' ? null : Number(raw);
+        const valid = n === null || (Number.isInteger(n) && n >= 0);
+        const disc = valid && n !== null && list > 0 ? Math.round((1 - n / list) * 100) : null;
+        return (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3 sm:p-4">
+            <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-md shadow-2xl max-h-[85vh] supports-[max-height:85dvh]:max-h-[85dvh] overflow-y-auto">
+              <div className="flex items-center justify-between gap-2 mb-4">
+                <h2 className="text-base font-semibold text-gray-900">Negotiated price</h2>
+                <button onClick={() => setBillingModal(null)} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">✕</button>
+              </div>
+              <p className="text-sm text-gray-600 mb-4 break-words">
+                The agreed monthly amount for <strong>{billingModal.tenant.name}</strong> ({billingModal.tenant.plan_name || billingModal.tenant.plan}).
+                It overrides the tier&apos;s list price everywhere revenue is counted. Leave blank to bill at list price.
+              </p>
+              <div className="rounded-lg bg-gray-50 border border-gray-200 px-3 py-2 mb-4 text-xs text-gray-600">
+                Tier list price: <strong className="text-gray-900">{list > 0 ? `₹${list.toLocaleString('en-IN')}/mo` : '—'}</strong> ex-GST
+                {billingModal.tenant.billing_monthly != null && (
+                  <> · currently set to <strong className="text-gray-900">₹{Number(billingModal.tenant.billing_monthly).toLocaleString('en-IN')}</strong></>
+                )}
+              </div>
+              <div className="mb-2">
+                <label className="block text-xs font-medium text-gray-700 mb-1">Monthly amount (₹, ex-GST) — blank = list price</label>
+                <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500">
+                  <span className="px-3 py-2 bg-gray-50 text-gray-400 text-sm border-r border-gray-200">₹</span>
+                  <input type="number" min="0" step="1" value={billingValue}
+                    onChange={e => setBillingValue(e.target.value)}
+                    placeholder={list > 0 ? String(list) : 'amount'}
+                    className="flex-1 px-3 py-2 text-sm focus:outline-none" />
+                </div>
+              </div>
+              <p className="text-xs text-gray-500 mb-5 min-h-[16px]">
+                {!valid ? <span className="text-red-500">Enter a whole rupee amount (0 or more), or blank.</span>
+                  : n === null ? 'Will bill at the tier list price.'
+                  : <>₹{n.toLocaleString('en-IN')} ex-GST · ₹{Math.round(n * 1.18).toLocaleString('en-IN')} incl. 18% GST
+                      {disc !== null && disc !== 0 ? ` · ${disc > 0 ? disc + '% discount' : Math.abs(disc) + '% above list'}` : ''}</>}
+              </p>
+              <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
+                <button onClick={() => setBillingModal(null)}
+                  className="flex-1 px-4 py-2.5 sm:py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+                  Cancel
+                </button>
+                <button onClick={saveBilling} disabled={savingBilling || !valid}
+                  className="flex-1 px-4 py-2.5 sm:py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
+                  {savingBilling ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
     </div>
   );

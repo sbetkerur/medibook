@@ -249,6 +249,7 @@ app.use('/api/admin', require('./routes/treatmentPlans')); // multi-visit course
 app.use('/api/admin', require('./routes/recalls'));        // recare / check-up loop
 app.use('/api/admin', require('./routes/requests'));       // patients the bot could not finish serving
 app.use('/api/admin', require('./routes/dayClose'));       // end-of-day cash reconciliation
+app.use('/api/admin', require('./routes/reports'));        // on-demand front-desk PDF reports
 app.use('/api/admin', require('./routes/events'));    // SSE real-time dashboard
 app.use('/api/superadmin', require('./routes/superadmin'));
 
@@ -268,6 +269,7 @@ app.use('/api/v1/admin',    require('./routes/treatmentPlans'));
 app.use('/api/v1/admin',    require('./routes/recalls'));
 app.use('/api/v1/admin',    require('./routes/requests'));
 app.use('/api/v1/admin',    require('./routes/dayClose'));
+app.use('/api/v1/admin',    require('./routes/reports'));
 app.use('/api/v1/admin',    require('./routes/events'));
 app.use('/api/v1/superadmin', require('./routes/superadmin'));
 

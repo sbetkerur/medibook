@@ -228,7 +228,7 @@ router.get('/tenants', async (req, res) => {
 
     const [r, countR] = await Promise.all([
       query(
-        `SELECT t.*, p.name as plan_name FROM tenants t LEFT JOIN plans p ON p.id=t.plan${where} ORDER BY t.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        `SELECT t.*, p.name as plan_name, p.price_monthly AS plan_price_monthly FROM tenants t LEFT JOIN plans p ON p.id=t.plan${where} ORDER BY t.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
         params
       ),
       query(`SELECT COUNT(*) FROM tenants t${where}`, countParams),
@@ -255,7 +255,7 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
 // ── CREATE TENANT ─────────────────────────────────────────────
 router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), async (req, res) => {
   try {
-    const { name, slug, owner_email, owner_password, owner_name, plan, city } = req.body;
+    const { name, slug, owner_email, owner_password, owner_name, plan, city, billing_monthly } = req.body;
 
     const schema = 'tenant_' + slug.replace(/-/g, '_').toLowerCase();
 
@@ -278,10 +278,10 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
     for (let attempt = 0; attempt < 5 && !tenant; attempt++) {
       try {
         const r = await query(`
-          INSERT INTO tenants (name, slug, schema_name, owner_email, plan, city, entry_code)
-          VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
+          INSERT INTO tenants (name, slug, schema_name, owner_email, plan, city, entry_code, billing_monthly)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
         `, [name, slug, schema, owner_email, plan || 'starter', city?.trim() || null,
-            generateEntryCode()]);
+            generateEntryCode(), billing_monthly ?? null]);
         tenant = r.rows[0];
       } catch (e) {
         if (e.code === '23505' && e.constraint === 'idx_tenants_entry_code') continue;
@@ -325,7 +325,7 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
         INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
         VALUES ($1,$2,$3,$4,$5,$6,$7)
       `, [req.user.id, 'super_admin', 'CREATE_TENANT', 'tenant', tenant.id,
-          JSON.stringify({ name, slug, plan: plan || 'starter' }), req.ip]);
+          JSON.stringify({ name, slug, plan: plan || 'starter', billing_monthly: billing_monthly ?? null }), req.ip]);
     } catch (auditErr) { logger.warn('Audit log failed (CREATE_TENANT)', { error: auditErr.message }); }
 
     res.json({

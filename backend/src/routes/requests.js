@@ -14,9 +14,12 @@ const router = require('express').Router();
 const { tenantQuery } = require('../db');
 const { validateUUID, handleError } = require('../utils/errors');
 const { writeAuditLog } = require('./adminHelpers');
+const { streamReport, drawTable, istStamp } = require('../utils/pdfReport');
 const logger = require('../utils/logger');
 
 const VALID_STATUS = ['open', 'handled', 'closed'];
+
+const KIND_LABELS = { appointment: 'Full day / no slot', callback: 'Call back' };
 
 // ── LIST ──────────────────────────────────────────────────────
 router.get('/requests', async (req, res) => {
@@ -51,13 +54,47 @@ router.get('/requests', async (req, res) => {
       LIMIT $${params.length}
     `, params);
 
+    if (req.query.format === 'pdf') {
+      streamReport(res, {
+        clinicName: req.tenant.name,
+        title: 'Pending Requests',
+        subtitle: `${r.rows.length} ${status === 'all' ? '' : status + ' '}request${r.rows.length === 1 ? '' : 's'}` +
+          (kind ? ` · ${KIND_LABELS[kind] || kind}` : ''),
+        filename: `requests-${status}`,
+      }, doc => {
+        if (!r.rows.length) {
+          doc.font('body').fontSize(11).fillColor('#666').text('Nothing in the queue.');
+          return;
+        }
+        drawTable(doc, [
+          { key: 'received', label: 'Received', width: 9 },
+          { key: 'patient', label: 'Patient', width: 12 },
+          { key: 'phone', label: 'Phone', width: 9 },
+          { key: 'kind', label: 'Wants', width: 9 },
+          { key: 'pref', label: 'Preferred', width: 8 },
+          { key: 'forwhom', label: 'For', width: 11 },
+          { key: 'note', label: 'Note', width: 13 },
+        ], r.rows.map(x => ({
+          received: istStamp(x.created_at),
+          patient: x.known_patient_name || x.patient_name || '—',
+          phone: x.phone || '—',
+          kind: KIND_LABELS[x.kind] || x.kind,
+          pref: x.preferred_date || '—',
+          forwhom: [x.doctor_name && `Dr. ${x.doctor_name}`, x.department_name, x.hospital_name]
+            .filter(Boolean).join(', ') || '—',
+          note: x.note || '—',
+        })));
+      });
+      return;
+    }
+
     // The open count is what the dashboard badges, and it must not depend on
     // the filter the user happens to be looking at.
     const countR = await tenantQuery(req.tenant.schema_name,
       `SELECT COUNT(*)::int AS open FROM clinic_requests WHERE status='open'`);
 
     res.json({ requests: r.rows, open_count: countR.rows[0]?.open ?? 0 });
-  } catch (err) { handleError(res, err); }
+  } catch (err) { if (!res.headersSent) handleError(res, err); }
 });
 
 // ── CLEAR ONE ─────────────────────────────────────────────────

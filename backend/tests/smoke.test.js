@@ -143,9 +143,11 @@ async function testTenantSetup() {
       owner_email: `admin@${SLUG}.com`,
       owner_password: 'Smoke@123456',
       plan: 'starter',
+      billing_monthly: 1400,   // negotiated rate captured at creation
     }, superToken);
     assert(status === 200 || status === 201, `Got ${status}: ${JSON.stringify(data)}`);
     assert(data.tenant?.id, 'No tenant.id in response');
+    assert(Number(data.tenant.billing_monthly) === 1400, `billing_monthly not persisted: ${data.tenant.billing_monthly}`);
     tenantCreated = true;
   });
 

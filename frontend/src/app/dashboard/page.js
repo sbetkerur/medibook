@@ -46,7 +46,7 @@ const NAV = [
   { id: 'analytics', label: 'Analytics', icon: '📈' },
   { id: 'calendar', label: 'Calendar', icon: '📆' },
   { id: 'slots', label: 'Slots', icon: '🕐' },
-  { id: 'staff', label: 'Staff', icon: '👤' },
+  { id: 'staff', label: 'Team', icon: '👤' },
   { id: 'leaves', label: 'Dentist Leaves', icon: '🏖️' },
   { id: 'services', label: 'Services', icon: '💊' },
   { id: 'holidays', label: 'Holidays', icon: '🗓️' },
