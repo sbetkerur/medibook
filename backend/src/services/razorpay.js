@@ -94,7 +94,11 @@ async function createCustomer({ name, email, contact }) {
 async function createSubscription({ plan, customerId, trialDays, notes }) {
   const rzpPlanId = planIdFor(plan);
   if (!rzpPlanId) throw new Error(`No Razorpay plan configured for "${plan}" (set RAZORPAY_PLAN_${String(plan).toUpperCase()})`);
-  const startAt = Math.floor(Date.now() / 1000) + Math.max(0, Number(trialDays) || 0) * 86400;
+  const days = Math.max(0, Number(trialDays) || 0);
+  // Razorpay rejects a `start_at` that is not in the future. When the trial has
+  // already lapsed (past_due clinic adding a card) omit it entirely so billing
+  // starts immediately, instead of sending `now` and getting a BAD_REQUEST.
+  const startAt = days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : null;
   try {
     const { data } = await client().post('/subscriptions', {
       plan_id: rzpPlanId,
@@ -104,8 +108,7 @@ async function createSubscription({ plan, customerId, trialDays, notes }) {
       total_count: 120,
       quantity: 1,
       customer_notify: 1,
-      start_at: startAt,
-      expire_by: startAt + 7 * 86400, // auth link must be used within a week
+      ...(startAt ? { start_at: startAt, expire_by: startAt + 7 * 86400 } : {}),
       notes: notes || {},
     });
     return data; // { id: 'sub_...', status, short_url, ... }
@@ -160,10 +163,13 @@ function verifyWebhookSignature(rawBody, signatureHeader) {
 
 /**
  * A subscription state we treat as "paid up / in good standing".
- * `authenticated` = card is on file and the trial has not yet ended.
+ * `authenticated` = card is on file (Checkout auth completed) and the trial has
+ * not yet ended. `created` is NOT healthy: it means the subscription exists but
+ * the customer never authorised a card — treating it as good standing let an
+ * abandoned Checkout flip a past_due clinic back to active with no payment.
  */
 function isHealthyStatus(status) {
-  return status === 'active' || status === 'authenticated' || status === 'created';
+  return status === 'active' || status === 'authenticated';
 }
 
 module.exports = {

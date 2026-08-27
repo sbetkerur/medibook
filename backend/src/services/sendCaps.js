@@ -40,13 +40,18 @@ const TIERS = [
 ];
 
 // schema → { ageDays, checkedAt }. Age only matters near a day boundary, so
-// 10-minute staleness is harmless and saves a tenants read per send.
+// 10-minute staleness is harmless and saves a tenants read per send. Bounded so
+// a platform with thousands of schemas can't grow this without limit — when it
+// fills, the whole map is dropped (every entry re-populates in one query on
+// next use).
 const _ageCache = new Map();
 const AGE_TTL_MS = 10 * 60 * 1000;
+const AGE_CACHE_MAX = 5000;
 
 async function _tenantAgeDays(schema) {
   const cached = _ageCache.get(schema);
   if (cached && Date.now() - cached.checkedAt < AGE_TTL_MS) return cached.ageDays;
+  if (_ageCache.size >= AGE_CACHE_MAX) _ageCache.clear();
   try {
     const r = await query(
       `SELECT COALESCE(activated_at, created_at) AS since FROM tenants WHERE schema_name = $1`,

@@ -109,6 +109,9 @@ router.get('/signup/config', async (req, res) => {
 // ── SLUG AVAILABILITY ────────────────────────────────────────
 router.get('/signup/slug-available', async (req, res) => {
   try {
+    // Gate on the feature flag — otherwise this is a public oracle for which
+    // clinic IDs exist on the platform, live even when signup is switched off.
+    if (!selfSignupEnabled()) return res.status(503).json({ available: false, reason: 'Self-serve signup is not available right now.' });
     const slug = String(req.query.slug || '').trim().toLowerCase();
     if (!/^[a-z0-9-]{3,56}$/.test(slug)) {
       return res.json({ available: false, reason: 'Use 3–56 lowercase letters, numbers and hyphens.' });
@@ -142,7 +145,12 @@ router.post('/signup/start', startLimiter, validate(schemas.selfSignupStart), as
       name, slug, owner_email: owner_email.trim().toLowerCase(), owner_name,
       owner_password_hash, plan, phone,
     });
-    if (!result.ok) return res.status(429).json({ error: result.error, retry_after: result.retryAfter });
+    if (!result.ok) {
+      // 429 only for an actual rate limit (a cooldown or the hourly cap); a bad
+      // number is a 400.
+      const rateLimited = result.retryAfter != null || /too many/i.test(result.error || '');
+      return res.status(rateLimited ? 429 : 400).json({ error: result.error, retry_after: result.retryAfter });
+    }
 
     res.json({
       ok: true,
@@ -262,21 +270,19 @@ async function sessionFor(tenant) {
   };
 }
 
+/**
+ * Flag a new clinic for review. There is no super-admin notify channel yet
+ * (`super_admins` has no phone/email-for-alerts column), so the queue lives in
+ * the dashboard — `GET /superadmin/tenants?status=pending_review` — and this
+ * just leaves a breadcrumb in the log and the public audit trail. Wire a real
+ * push here if/when a super-admin alert target exists.
+ */
 async function notifyReviewQueue(tenant) {
-  try {
-    const admins = await query(
-      `SELECT notify_phone FROM super_admins WHERE notify_phone IS NOT NULL`
-    ).catch(() => ({ rows: [] }));
-    // super_admins has no notify_phone column today — this is a no-op unless one
-    // is added later. The review queue is also visible in the super-admin
-    // dashboard (GET /superadmin/tenants?status=pending_review).
-    if (!admins.rows.length) return;
-    const wa = require('../services/whatsapp');
-    for (const a of admins.rows) {
-      await wa.sendText(a.notify_phone,
-        `New MediBook clinic awaiting review: ${tenant.name} (${tenant.slug}).`, null, null).catch(() => {});
-    }
-  } catch (_) { /* non-critical */ }
+  logger.info('Self-serve clinic awaiting review', { slug: tenant.slug, name: tenant.name, tenant_id: tenant.id });
+  await query(`
+    INSERT INTO audit_logs (actor_role, action, resource_type, resource_id, new_values)
+    VALUES ('system','TENANT_AWAITING_REVIEW','tenant',$1,$2)
+  `, [tenant.id, JSON.stringify({ slug: tenant.slug, name: tenant.name })]).catch(() => {});
 }
 
 module.exports = router;

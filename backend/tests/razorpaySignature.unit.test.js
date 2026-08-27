@@ -54,10 +54,11 @@ test('planIdFor maps the two tiers and nothing else', () => {
   assert.strictEqual(rzp.planIdFor('enterprise'), null);
 });
 
-test('isHealthyStatus accepts active/authenticated/created only', () => {
-  ['active', 'authenticated', 'created'].forEach(s =>
+test('isHealthyStatus accepts active/authenticated only', () => {
+  ['active', 'authenticated'].forEach(s =>
     assert.strictEqual(rzp.isHealthyStatus(s), true, s));
-  ['halted', 'cancelled', 'pending', 'expired', 'completed', undefined].forEach(s =>
+  // 'created' = subscription exists but no card authorised — NOT good standing.
+  ['created', 'halted', 'cancelled', 'pending', 'expired', 'completed', undefined].forEach(s =>
     assert.strictEqual(rzp.isHealthyStatus(s), false, String(s)));
 });
 

@@ -100,6 +100,12 @@ router.post('/billing/subscribe', adminOnly, async (req, res) => {
       });
       customerId = cust?.id || null;
     }
+    // Razorpay requires a customer_id on a subscription — without one the
+    // createSubscription call below is a guaranteed 502. Fail with a clear
+    // message instead.
+    if (!customerId) {
+      return res.status(502).json({ error: 'Could not set up your billing profile. Please try again shortly, or contact support.' });
+    }
 
     // Charge from trial_end if we are still inside the trial, else now.
     const trialEndMs = billing?.trial_end ? new Date(billing.trial_end).getTime() : 0;

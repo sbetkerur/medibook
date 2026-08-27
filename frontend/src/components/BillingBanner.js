@@ -125,7 +125,7 @@ export default function BillingBanner() {
     );
   }
 
-  if (data.trialing && data.trial_days_left != null && data.trial_days_left <= 7) {
+  if (data.trialing && data.trial_days_left != null && data.trial_days_left >= 0 && data.trial_days_left <= 7) {
     return (
       <Bar tone="blue">
         <span>
@@ -174,9 +174,10 @@ export function BillingSummary() {
 
   const b = data.billing || {};
   const fmt = (d) => (d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—');
+  const trialLeft = data.trial_days_left == null ? null : Math.max(0, data.trial_days_left);
   const statusLabel =
     data.paywalled ? 'Payment due'
-    : data.trialing ? `Free trial · ${data.trial_days_left ?? '—'} day${data.trial_days_left === 1 ? '' : 's'} left`
+    : data.trialing ? `Free trial · ${trialLeft ?? '—'} day${trialLeft === 1 ? '' : 's'} left`
     : b.subscription_status || '—';
 
   const act = async () => { setBusy(true); await startCardFlow(refresh); setBusy(false); };

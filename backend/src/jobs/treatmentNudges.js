@@ -193,7 +193,7 @@ async function sendTreatmentNudges() {
           `\n\nLeaving a treatment part-done can undo the work already carried out, so let's get it in the diary.\n\n` +
           `Reply *Treatment* to pick a time, or call the clinic.`;
 
-        await sendPatientMessage(tenant.schema_name, plan.phone, {
+        const sendResult = await sendPatientMessage(tenant.schema_name, plan.phone, {
           template: TREATMENT_NUDGE_TEMPLATE,
           components: [{
             type: 'body',
@@ -216,7 +216,12 @@ async function sendTreatmentNudges() {
         // The reply is "treatment" — meaningless on its own, so record which
         // clinic is waiting for it. 7 days: long enough for a patient who reads
         // it on the weekend, short enough not to outlive the next nudge.
-        await recordPendingReply(plan.phone, tenant.id, KINDS.TREATMENT, 24 * 7);
+        // Skip when the new-tenant send cap suppressed the nudge: the patient
+        // never saw it, so a pending "treatment" reply would only misroute
+        // their next unrelated message (resolveAskingTenant).
+        if (sendResult?.via !== 'suppressed_cap') {
+          await recordPendingReply(plan.phone, tenant.id, KINDS.TREATMENT, 24 * 7);
+        }
 
         logger.info('Treatment nudge sent', {
           tenant: tenant.slug, plan: plan.id, phone: maskPhone(plan.phone), visit: nextVisit,

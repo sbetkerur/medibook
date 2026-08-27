@@ -266,7 +266,10 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
 // The gate that stays with the super admin: a self-serve signup is provisioned
 // at 'pending_review' and its patients cannot reach it (the bot's entry-code
 // lookup requires status='active') until this runs. activated_at is stamped
-// here, which is when the staged send-cap clock (services/sendCaps.js) starts.
+// here, which is when the staged send-cap clock (services/sendCaps.js) starts —
+// and the CARD-FREE TRIAL clock is (re)started here too, so a clinic that sat in
+// review for three days still gets its full SIGNUP_TRIAL_DAYS from go-live
+// rather than being paywalled by the next dunning run.
 router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
   try {
     const cur = await query(`SELECT id, slug, status FROM tenants WHERE id=$1`, [req.params.id]);
@@ -280,6 +283,17 @@ router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
       `UPDATE tenants SET status='active', activated_at=COALESCE(activated_at, NOW()) WHERE id=$1 RETURNING *`,
       [req.params.id]
     );
+    // Trial starts now. Only for a self-serve tenant still on a card-free trial
+    // (no subscription attached) — a clinic that added a card during review is
+    // untouched.
+    const trialDays = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '14', 10) || 14);
+    await query(`
+      UPDATE tenant_billing
+         SET trial_end = NOW() + make_interval(days => $2::int), updated_at = NOW()
+       WHERE tenant_id = $1
+         AND subscription_status = 'trialing'
+         AND razorpay_subscription_id IS NULL
+    `, [req.params.id, trialDays]).catch(e => logger.warn('approve: trial_end reset failed', { error: e.message }));
     invalidateTenantCache(req.params.id);
     await query(`
       INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)

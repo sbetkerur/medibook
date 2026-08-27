@@ -545,6 +545,9 @@ router.post('/treatment-plans/:id/visits', validateUUID(), async (req, res) => {
           // nothing. Every other buttoned template already passes these.
           buttonPayloads: ['Reschedule', 'Cancel appointment'],
           text,
+          // Transactional confirmation of a real booking — never withhold it
+          // behind the young-tenant outreach cap (services/sendCaps.js).
+          bypassCap: true,
         });
       } catch (err) {
         logger.warn('Treatment visit booked but patient notification failed', {
@@ -771,6 +774,9 @@ router.post('/treatment-plans/:id/payments', validateUUID(), async (req, res) =>
           ],
         }],
         text,
+        // Transactional payment slip — never withhold it behind the
+        // young-tenant outreach cap (services/sendCaps.js).
+        bypassCap: true,
       });
     })().catch(err => logger.warn('Payment receipt not sent', { plan: req.params.id, error: err.message }));
 

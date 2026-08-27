@@ -127,7 +127,7 @@ async function suspendExpiredGrace() {
     logger.warn('billing_dunning: past_due grace elapsed → suspended', { slug: t.slug });
     await notifyAdminWhatsApp(t.schema_name, t,
       `Your MediBook subscription is overdue and clinic messaging is now paused. ` +
-      `Log in and add a card to restore service.`
+      `Contact MediBook support to settle payment and restore service.`
     ).catch(() => {});
   }
 }
@@ -138,10 +138,25 @@ async function retryStuckProvisioning() {
     JOIN tenants t ON t.id = ps.tenant_id
     WHERE t.status = 'pending_payment'
   `)).rows;
+  const TRIAL_DAYS = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '14', 10) || 14);
   for (const pending of rows) {
     try {
       const { provisionSelfServeTenant } = require('../services/signupProvision');
       const { tenant } = await provisionSelfServeTenant(pending);
+      // The card-free trial row + consumed flag are normally written by the
+      // /signup/confirm route. If the client abandoned after the schema build
+      // failed, this cron is the only thing that ever finishes the job — so it
+      // has to start the trial too, or the clinic goes live billed by nobody.
+      await query(`
+        INSERT INTO tenant_billing
+          (tenant_id, provider, plan_id, razorpay_customer_id, subscription_status, trial_end, updated_at)
+        VALUES ($1,'razorpay',$2,$3,'trialing', NOW() + make_interval(days => $4::int), NOW())
+        ON CONFLICT (tenant_id) DO NOTHING
+      `, [tenant.id, tenant.plan, pending.razorpay_customer_id, TRIAL_DAYS]).catch(() => {});
+      await query(
+        `UPDATE pending_signups SET consumed_at=COALESCE(consumed_at, NOW()), tenant_id=$1 WHERE token=$2`,
+        [tenant.id, pending.token]
+      ).catch(() => {});
       logger.info('billing_dunning: stuck provisioning recovered', { slug: tenant.slug });
     } catch (e) {
       logger.error('billing_dunning: provisioning retry still failing', { slug: pending.slug, error: e.message });

@@ -640,6 +640,9 @@ router.patch('/appointments/:id/reschedule', adminOnly, validateUUID(), async (r
           }],
           buttonPayloads: ['Reschedule', 'Cancel appointment'],
           text,
+          // Transactional: the desk moved a real booking. Never withhold this
+          // behind the young-tenant outreach cap (services/sendCaps.js).
+          bypassCap: true,
         });
       } catch (err) {
         logger.warn('Reschedule notification failed', { appointmentId: req.params.id, error: err.message });

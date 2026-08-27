@@ -229,8 +229,10 @@ const schemas = {
   // `owner_phone` is the WhatsApp number the OTP goes to — digits, optional '+'.
   selfSignupStart: Joi.object({
     name: Joi.string().min(2).max(255).required(),
-    slug: Joi.string().min(3).max(56).pattern(/^[a-z0-9-]+$/).required()
-      .messages({ 'string.pattern.base': 'Clinic ID may use only lowercase letters, numbers and hyphens' }),
+    // Must start and end alphanumeric — no leading/trailing/only hyphens (a
+    // public endpoint; "---" would resolve to schema tenant____).
+    slug: Joi.string().min(3).max(56).pattern(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/).required()
+      .messages({ 'string.pattern.base': 'Clinic ID may use lowercase letters, numbers and hyphens, and must start and end with a letter or number' }),
     owner_email: Joi.string().email().required(),
     owner_name: Joi.string().min(2).max(255).required(),
     owner_phone: Joi.string().pattern(/^[+]?[0-9]{8,20}$/).required()
