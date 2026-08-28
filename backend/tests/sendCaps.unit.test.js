@@ -1,12 +1,13 @@
 'use strict';
 /**
- * Staged outbound caps for young tenants (services/sendCaps.js).
+ * Trial outbound cap for self-serve tenants (services/sendCaps.js).
  *
  * Self-serve signup lets clinics we have never spoken to send on the shared
- * WhatsApp number within minutes. This is the ceiling that keeps a fresh one
- * from blasting it — 100/24h for the first week, 300 for the first month, then
- * uncapped — and it MUST fail open (a cap check that errors must not silence a
- * clinic).
+ * WhatsApp number within minutes. This is the ceiling that keeps a trial one
+ * from blasting it — 50/24h while on the card-free trial, uncapped the moment a
+ * live subscription is attached (and uncapped for super-admin-provisioned
+ * clinics, which went through a human). It MUST fail open (a cap check that
+ * errors must not silence a clinic).
  *
  * Run: node tests/sendCaps.unit.test.js   (no Postgres/Redis required)
  */
@@ -15,11 +16,11 @@ process.env.NODE_ENV = 'test';
 const assert = require('assert');
 
 // Stub ../src/db before sendCaps loads it.
-//   query()       → the tenant's age row (SELECT COALESCE(activated_at,created_at))
+//   query()       → the tenants + tenant_billing join
 //   tenantQuery() → the rolling-24h wa_messages count
-let ageSince = null;        // ISO string or null
+let billingRow = null;      // { signup_source, razorpay_subscription_id, subscription_status } | null
 let sentLast24h = 0;
-let ageQueryThrows = false;
+let billingQueryThrows = false;
 let countQueryThrows = false;
 
 const dbPath = require.resolve('../src/db');
@@ -27,8 +28,8 @@ require.cache[dbPath] = {
   id: dbPath, filename: dbPath, loaded: true,
   exports: {
     query: async () => {
-      if (ageQueryThrows) throw new Error('db down');
-      return { rows: [{ since: ageSince }], rowCount: 1 };
+      if (billingQueryThrows) throw new Error('db down');
+      return { rows: billingRow ? [billingRow] : [], rowCount: billingRow ? 1 : 0 };
     },
     tenantQuery: async () => {
       if (countQueryThrows) throw new Error('db down');
@@ -37,13 +38,14 @@ require.cache[dbPath] = {
   },
 };
 
-const { withinDailyCap, dailyCapFor, TIERS, _clearCache } = require('../src/services/sendCaps');
+const { withinDailyCap, dailyCapFor, TRIAL_DAILY_CAP, _clearCache } = require('../src/services/sendCaps');
 
-const daysAgo = (d) => new Date(Date.now() - d * 86400000).toISOString();
+const selfServe = (o = {}) => ({ signup_source: 'self_serve', razorpay_subscription_id: null, subscription_status: 'trialing', ...o });
 
 let pass = 0, fail = 0;
 async function test(name, fn) {
   _clearCache();
+  billingQueryThrows = false; countQueryThrows = false;
   try { await fn(); console.log(`  ✅ ${name}`); pass++; }
   catch (err) { console.log(`  ❌ ${name}: ${err.message}`); fail++; }
 }
@@ -51,62 +53,68 @@ async function test(name, fn) {
 (async () => {
   console.log('sendCaps unit tests\n');
 
-  await test('TIERS is the agreed shape: 100 (<7d), 300 (<30d)', () => {
-    assert.deepStrictEqual(TIERS, [
-      { maxAgeDays: 7, cap: 100 },
-      { maxAgeDays: 30, cap: 300 },
-    ]);
+  await test('TRIAL_DAILY_CAP is 50', () => {
+    assert.strictEqual(TRIAL_DAILY_CAP, 50);
   });
 
-  await test('a 2-day-old tenant is capped at 100', async () => {
-    ageSince = daysAgo(2);
-    assert.strictEqual(await dailyCapFor('tenant_x'), 100);
+  await test('a self-serve tenant on the card-free trial is capped at 50', async () => {
+    billingRow = selfServe({ subscription_status: 'trialing' });
+    assert.strictEqual(await dailyCapFor('tenant_x'), 50);
   });
 
-  await test('a 20-day-old tenant is capped at 300', async () => {
-    ageSince = daysAgo(20);
-    assert.strictEqual(await dailyCapFor('tenant_x'), 300);
-  });
-
-  await test('a 45-day-old tenant is uncapped (null)', async () => {
-    ageSince = daysAgo(45);
+  await test('a self-serve tenant with a live subscription is uncapped (null)', async () => {
+    billingRow = selfServe({ razorpay_subscription_id: 'sub_123', subscription_status: 'active' });
     assert.strictEqual(await dailyCapFor('tenant_x'), null);
   });
 
-  await test('exactly 7 days old has crossed into the 300 tier', async () => {
-    ageSince = daysAgo(7.01);
-    assert.strictEqual(await dailyCapFor('tenant_x'), 300);
+  await test('"authenticated" also counts as paying → uncapped', async () => {
+    billingRow = selfServe({ razorpay_subscription_id: 'sub_123', subscription_status: 'authenticated' });
+    assert.strictEqual(await dailyCapFor('tenant_x'), null);
   });
 
-  await test('withinDailyCap allows a young tenant below its ceiling', async () => {
-    ageSince = daysAgo(1); sentLast24h = 99;
+  await test('a lapsed trial with no card stays capped at 50', async () => {
+    billingRow = selfServe({ razorpay_subscription_id: null, subscription_status: 'trial_ended' });
+    assert.strictEqual(await dailyCapFor('tenant_x'), 50);
+  });
+
+  await test('a subscription id with an UNhealthy status is still capped', async () => {
+    billingRow = selfServe({ razorpay_subscription_id: 'sub_123', subscription_status: 'halted' });
+    assert.strictEqual(await dailyCapFor('tenant_x'), 50);
+  });
+
+  await test('a super-admin-provisioned tenant is never capped', async () => {
+    billingRow = { signup_source: 'admin', razorpay_subscription_id: null, subscription_status: null };
+    assert.strictEqual(await dailyCapFor('tenant_x'), null);
+  });
+
+  await test('withinDailyCap allows a trial tenant below its ceiling', async () => {
+    billingRow = selfServe(); sentLast24h = 49;
     assert.strictEqual(await withinDailyCap('tenant_x'), true);
   });
 
-  await test('withinDailyCap blocks a young tenant AT its ceiling', async () => {
-    ageSince = daysAgo(1); sentLast24h = 100;
+  await test('withinDailyCap blocks a trial tenant AT its ceiling', async () => {
+    billingRow = selfServe(); sentLast24h = 50;
     assert.strictEqual(await withinDailyCap('tenant_x'), false);
   });
 
-  await test('withinDailyCap never blocks a matured tenant, whatever the volume', async () => {
-    ageSince = daysAgo(400); sentLast24h = 99999;
+  await test('withinDailyCap never blocks a paying tenant, whatever the volume', async () => {
+    billingRow = selfServe({ razorpay_subscription_id: 'sub_123', subscription_status: 'active' });
+    sentLast24h = 99999;
     assert.strictEqual(await withinDailyCap('tenant_x'), true);
   });
 
-  await test('FAILS OPEN when the age lookup errors', async () => {
-    ageQueryThrows = true;
+  await test('FAILS OPEN when the billing lookup errors', async () => {
+    billingQueryThrows = true;
     assert.strictEqual(await withinDailyCap('tenant_x'), true);
-    ageQueryThrows = false;
   });
 
   await test('FAILS OPEN when the count query errors', async () => {
-    ageSince = daysAgo(1); countQueryThrows = true;
+    billingRow = selfServe(); countQueryThrows = true;
     assert.strictEqual(await withinDailyCap('tenant_x'), true);
-    countQueryThrows = false;
   });
 
-  await test('a tenant with no created_at at all is treated as uncapped', async () => {
-    ageSince = null;
+  await test('an unknown schema (no row) is treated as uncapped', async () => {
+    billingRow = null;
     assert.strictEqual(await dailyCapFor('tenant_x'), null);
   });
 

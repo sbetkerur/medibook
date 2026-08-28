@@ -89,12 +89,13 @@ function quickReplyComponents(payloads) {
  * @param {string} opts.text         - the human-readable message, also the history entry
  */
 async function sendPatientMessage(schema, phone, { template, components, buttonPayloads, text, bypassCap }) {
-  // Staged per-tenant daily cap on clinic-initiated outreach. A young self-serve
-  // tenant blasting the shared number degrades delivery for every clinic on it
+  // Trial daily cap on clinic-initiated outreach: a self-serve tenant on the
+  // card-free trial gets 50/24h, lifted the moment it starts paying. Blasting
+  // the shared number degrades delivery for every clinic on it
   // (services/sendCaps.js). Fails open. `bypassCap` is for a genuinely
   // transactional send that must never be withheld.
   if (!bypassCap && !(await withinDailyCap(schema))) {
-    logger.warn('sendPatientMessage suppressed by new-tenant daily cap', { schema });
+    logger.warn('sendPatientMessage suppressed by trial daily cap', { schema });
     return { via: 'suppressed_cap' };
   }
   if (template) {

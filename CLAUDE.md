@@ -37,7 +37,7 @@ cd backend && node tests/circuitBreaker.unit.test.js     # HALF_OPEN lets ONE pr
 cd backend && node tests/messageBudget.unit.test.js      # budget 0 means none, not "default"
 cd backend && node tests/rateLimitFallback.unit.test.js  # per-tenant cap with no Redis
 cd backend && node tests/razorpaySignature.unit.test.js  # self-serve billing: checkout + webhook HMACs
-cd backend && node tests/sendCaps.unit.test.js           # staged outbound caps for young tenants
+cd backend && node tests/sendCaps.unit.test.js           # trial outbound cap: 50/24h until paying
 cd backend && node tests/otp.unit.test.js                # WhatsApp OTP: attempts, cooldown, single-use
 cd backend && node tests/readOnlyTenant.unit.test.js     # whole-tenant read-only guard (demo clinic)
 ```
@@ -735,13 +735,16 @@ enforcer: it ENDS lapsed card-free trials (`active` + `trialing` +
 `trial_end` passed → `past_due`), reconciles subscriptions, and after
 `SIGNUP_DUNNING_GRACE_DAYS` (default 7) moves `past_due` → `suspended`.
 
-**Staged send caps for young tenants** (`services/sendCaps.js`). A fresh
-self-serve tenant on the shared number is throttled to **100** clinic-initiated
-patient messages / rolling 24h for its first 7 days, **300** for its first 30,
-then uncapped — clock starts at `activated_at` (approval). Enforced in
-`services/outbound.js` `sendPatientMessage` only (the outreach path); appointment
-reminders and confirmations call the lower senders directly and stay ungated,
-exactly as `services/messageBudget.js` treats them. Fails OPEN.
+**Trial send cap** (`services/sendCaps.js`). A self-serve tenant on the shared
+number is throttled to **50** (`SIGNUP_TRIAL_SEND_CAP`) clinic-initiated patient
+messages / rolling 24h **while on the card-free trial** — the cap is lifted the
+moment a live Razorpay subscription is attached (`razorpay_subscription_id` set +
+`subscription_status` active/authenticated). A lapsed trial with no card stays
+capped; a super-admin-provisioned clinic (`signup_source <> 'self_serve'`) is
+never capped. Enforced in `services/outbound.js` `sendPatientMessage` only (the
+outreach path); appointment reminders and confirmations call the lower senders
+directly and stay ungated, exactly as `services/messageBudget.js` treats them.
+Fails OPEN.
 
 **Kill switch.** `POST /superadmin/tenants/:id/suspend {reason}` / `.../resume`
 — one call, audited, effective within the 5s tenant-cache TTL. `resume` on a
@@ -770,7 +773,9 @@ Frontend: `BACKEND_URL` (server-side, Railway).
 Self-serve signup (`docs/self-serve-signup.md`): `SELF_SIGNUP_ENABLED` (master
 switch, default false — the ONLY one required outside production, where the flag
 alone opens signup), `SIGNUP_TRIAL_DAYS` (default 14),
-`SIGNUP_DUNNING_GRACE_DAYS` (default 7), `SIGNUP_OTP_TEMPLATE` (+
+`SIGNUP_DUNNING_GRACE_DAYS` (default 7), `SIGNUP_TRIAL_SEND_CAP` (default 50 —
+clinic-initiated patient messages / 24h while a self-serve tenant is on the
+card-free trial; uncapped once paying), `SIGNUP_OTP_TEMPLATE` (+
 `SIGNUP_OTP_TEMPLATE_HAS_BUTTON`, default true) — the WhatsApp template that
 delivers verification/reset codes, `SIGNUP_APPROVED_TEMPLATE` — the template for
 the go-live link sent on approval (two body vars: clinic name, login URL; text

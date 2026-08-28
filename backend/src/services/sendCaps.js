@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Staged outbound caps for young tenants.
+ * Trial outbound cap for self-serve tenants.
  *
  * Self-serve signup means clinics we have never spoken to can start sending on
  * the shared WhatsApp number within minutes. One bad actor blasting messages
@@ -8,15 +8,16 @@
  * (see docs/whatsapp-outage-plan.md). Manual onboarding used to be the implicit
  * filter; this is its replacement.
  *
- * A new tenant gets a low ceiling on CLINIC-INITIATED patient outreach that
- * rises automatically as it ages:
+ * THE RULE. A self-serve tenant on the card-free trial gets a low ceiling on
+ * CLINIC-INITIATED patient outreach:
  *
- *     age < 7 days   → 100 / rolling 24h
- *     age < 30 days  → 300 / rolling 24h
- *     otherwise      → no cap
+ *     self-serve + not yet paying  → 50 / rolling 24h   (SIGNUP_TRIAL_SEND_CAP)
+ *     paying (live subscription)   → no cap
+ *     super-admin provisioned      → no cap  (went through a human already)
  *
- * Thresholds are generous enough that a genuine small practice never notices,
- * low enough that a spam run trips within the hour.
+ * "Paying" = a Razorpay subscription id is attached AND its status is healthy
+ * (active / authenticated). A lapsed trial with no card still counts as "not
+ * paying" and stays capped — the safe direction.
  *
  * WHAT COUNTS. Every `wa_messages` row with direction='out' in the last 24h
  * except `admin_alert` (those go to staff). Broader than
@@ -34,44 +35,62 @@
 const { tenantQuery, query } = require('../db');
 const logger = require('../utils/logger');
 
-const TIERS = [
-  { maxAgeDays: 7,  cap: 100 },
-  { maxAgeDays: 30, cap: 300 },
-];
+const TRIAL_DAILY_CAP = Math.max(
+  0,
+  parseInt(process.env.SIGNUP_TRIAL_SEND_CAP || '50', 10) || 50
+);
 
-// schema → { ageDays, checkedAt }. Age only matters near a day boundary, so
-// 10-minute staleness is harmless and saves a tenants read per send. Bounded so
-// a platform with thousands of schemas can't grow this without limit — when it
-// fills, the whole map is dropped (every entry re-populates in one query on
-// next use).
-const _ageCache = new Map();
-const AGE_TTL_MS = 10 * 60 * 1000;
-const AGE_CACHE_MAX = 5000;
+// A subscription in one of these states is a live paying customer.
+const PAYING_SUB_STATUSES = new Set(['active', 'authenticated']);
 
-async function _tenantAgeDays(schema) {
-  const cached = _ageCache.get(schema);
-  if (cached && Date.now() - cached.checkedAt < AGE_TTL_MS) return cached.ageDays;
-  if (_ageCache.size >= AGE_CACHE_MAX) _ageCache.clear();
+// schema → { cap, checkedAt }. cap is a number or null ("no cap"). The billing
+// state changes rarely, so 10-minute staleness is harmless and saves a
+// tenants/tenant_billing read per send. Bounded so a platform with thousands of
+// schemas can't grow this without limit — when it fills, the whole map is
+// dropped (every entry re-populates in one query on next use).
+const _capCache = new Map();
+const CAP_TTL_MS = 10 * 60 * 1000;
+const CAP_CACHE_MAX = 5000;
+
+/**
+ * The current 24h ceiling for this tenant, or null for "no cap".
+ *
+ * Capped only while a SELF-SERVE tenant is on its card-free trial (or has let it
+ * lapse without paying). Anything else — a paying self-serve subscription, or a
+ * super-admin-provisioned clinic — is uncapped.
+ */
+async function dailyCapFor(schema) {
+  const cached = _capCache.get(schema);
+  if (cached && Date.now() - cached.checkedAt < CAP_TTL_MS) return cached.cap;
+  if (_capCache.size >= CAP_CACHE_MAX) _capCache.clear();
+
+  let cap;
   try {
     const r = await query(
-      `SELECT COALESCE(activated_at, created_at) AS since FROM tenants WHERE schema_name = $1`,
+      `SELECT t.signup_source,
+              b.razorpay_subscription_id,
+              b.subscription_status
+         FROM tenants t
+         LEFT JOIN tenant_billing b ON b.tenant_id = t.id
+        WHERE t.schema_name = $1`,
       [schema]
     );
-    const since = r.rows[0]?.since;
-    const ageDays = since ? Math.max(0, (Date.now() - new Date(since).getTime()) / 86400000) : Infinity;
-    _ageCache.set(schema, { ageDays, checkedAt: Date.now() });
-    return ageDays;
+    const row = r.rows[0];
+    if (!row || row.signup_source !== 'self_serve') {
+      cap = null; // unknown tenant, or admin-provisioned — no cap
+    } else {
+      const paying =
+        !!row.razorpay_subscription_id &&
+        PAYING_SUB_STATUSES.has(row.subscription_status);
+      cap = paying ? null : TRIAL_DAILY_CAP;
+    }
   } catch (err) {
-    logger.warn('sendCaps: tenant age lookup failed — treating as uncapped', { error: err.message });
-    return Infinity;
+    logger.warn('sendCaps: billing lookup failed — treating as uncapped', { error: err.message });
+    cap = null;
   }
-}
 
-/** The current 24h ceiling for this tenant, or null for "no cap". */
-async function dailyCapFor(schema) {
-  const age = await _tenantAgeDays(schema);
-  for (const t of TIERS) if (age < t.maxAgeDays) return t.cap;
-  return null;
+  _capCache.set(schema, { cap, checkedAt: Date.now() });
+  return cap;
 }
 
 /**
@@ -81,7 +100,7 @@ async function dailyCapFor(schema) {
  */
 async function withinDailyCap(schema) {
   const cap = await dailyCapFor(schema);
-  if (cap == null) return true; // matured — uncapped
+  if (cap == null) return true; // paying / vetted — uncapped
   try {
     const r = await tenantQuery(schema, `
       SELECT COUNT(*)::int AS n
@@ -92,7 +111,7 @@ async function withinDailyCap(schema) {
     `);
     const sent = r.rows[0]?.n ?? 0;
     if (sent >= cap) {
-      logger.warn('Outbound suppressed — new-tenant daily cap reached', { schema, sent, cap });
+      logger.warn('Outbound suppressed — trial daily cap reached', { schema, sent, cap });
       return false;
     }
     return true;
@@ -102,6 +121,6 @@ async function withinDailyCap(schema) {
   }
 }
 
-function _clearCache() { _ageCache.clear(); }
+function _clearCache() { _capCache.clear(); }
 
-module.exports = { withinDailyCap, dailyCapFor, TIERS, _clearCache };
+module.exports = { withinDailyCap, dailyCapFor, TRIAL_DAILY_CAP, _clearCache };

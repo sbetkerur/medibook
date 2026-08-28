@@ -269,9 +269,10 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
 //   1. builds the PG schema + the owner's first admin user (from the linked
 //      `pending_signups` row, which carries the password hash),
 //   2. starts the card-free trial (trial_end = now + SIGNUP_TRIAL_DAYS),
-//   3. flips the tenant to 'active' and stamps activated_at (the staged
-//      send-cap clock in services/sendCaps.js starts here),
+//   3. flips the tenant to 'active' and stamps activated_at (go-live record),
 //   4. WhatsApps the owner a login link — their only way back in.
+// While the tenant stays on the card-free trial its outreach is capped at
+// SIGNUP_TRIAL_SEND_CAP/24h (services/sendCaps.js); that lifts when it pays.
 // Idempotent: buildSelfServeTenantSchema is CREATE SCHEMA IF NOT EXISTS +
 // INSERT ... ON CONFLICT DO NOTHING, and the billing INSERT is ON CONFLICT
 // DO NOTHING, so a retried approve is safe.
@@ -472,8 +473,7 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
       } else if (status === 'active') {
         // Clear suspension info when reactivating
         updates.push('suspension_reason=NULL', 'suspended_at=NULL');
-        // Stamp go-live once — this is when the staged send-cap clock starts
-        // (services/sendCaps.js). COALESCE keeps a real earlier value.
+        // Stamp go-live once (audit record). COALESCE keeps a real earlier value.
         updates.push('activated_at=COALESCE(activated_at, NOW())');
       }
     }

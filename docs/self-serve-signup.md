@@ -142,11 +142,13 @@ clinic sends nothing unsolicited.
   cooldown, 4 codes/hour, 5 wrong guesses kills a code (`services/otp.js`).
 - **Super-admin approval** — the human gate. A clinic is invisible to patients
   until approved (`POST /superadmin/tenants/:id/approve`).
-- **Staged send caps** (`services/sendCaps.js`) — a fresh tenant may send at most
-  **100** clinic-initiated patient messages / 24h for its first 7 days, **300**
-  for its first 30, then uncapped. The clock starts at `activated_at` (approval).
-  Enforced in `services/outbound.js` `sendPatientMessage`; reminders /
-  confirmations are never capped. Fails open.
+- **Trial send cap** (`services/sendCaps.js`) — while a self-serve clinic is on
+  the card-free trial it may send at most **50** (`SIGNUP_TRIAL_SEND_CAP`)
+  clinic-initiated patient messages / rolling 24h. The cap is lifted the moment a
+  live subscription is attached; a lapsed trial with no card stays capped, and a
+  super-admin-provisioned clinic is never capped. Enforced in
+  `services/outbound.js` `sendPatientMessage`; reminders / confirmations are
+  never capped. Fails open.
 - **Kill switch** — `POST /superadmin/tenants/:id/suspend {reason}` /
   `.../resume`. Takes hold within ~5s (tenant cache TTL); the bot stops
   attaching patients on the next message.
