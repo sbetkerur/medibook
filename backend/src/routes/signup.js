@@ -12,30 +12,38 @@
  *   2. POST /signup/verify-otp  — check the code, create a Razorpay customer
  *                                 (best-effort, for the later subscription), and
  *                                 park the verified signup in `pending_signups`.
- *   3. POST /signup/confirm     — provision the tenant (schema + first admin
- *                                 user) at status `pending_review`, start a
- *                                 14-day trial in `tenant_billing`, and return a
- *                                 live session so the owner lands in the
- *                                 onboarding wizard. A super admin still has to
- *                                 approve before patients can reach the clinic.
+ *   3. POST /signup/confirm     — REGISTER the clinic for review: INSERT a
+ *                                 `tenants` row at status `pending_review` (with
+ *                                 an entry code) and link it to the
+ *                                 `pending_signups` row. NOTHING else is built —
+ *                                 no schema, no admin user, no session, no
+ *                                 trial. The owner sees a "we'll message you on
+ *                                 WhatsApp" screen and cannot log in yet.
  *
- * Nothing here creates a tenant row or a schema until step 3, so an abandoned
- * signup leaves only an expiring `pending_signups` / `wa_otps` row.
+ * The super admin then approves (POST /superadmin/tenants/:id/approve), and THAT
+ * builds the PG schema + first admin user, starts the card-free trial, flips the
+ * tenant to `active`, and WhatsApps the owner a login link.
  *
- * Gated on SELF_SIGNUP_ENABLED=true AND a real Razorpay config (so a trial can
- * actually convert) AND, for production delivery, an OTP template.
+ * Nothing here creates a schema at all, so an abandoned signup leaves only an
+ * expiring `pending_signups` / `wa_otps` row, or (past step 3) a `pending_review`
+ * tenant row the super admin can reject.
+ *
+ * Gated on SELF_SIGNUP_ENABLED=true. In PRODUCTION it also requires a real
+ * Razorpay config (so a trial can actually convert) and an OTP template (an
+ * owner is always outside Meta's 24h window). Outside production the flag alone
+ * opens signup — the card-free trial runs end to end with no billing config.
  */
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
-const { query, tenantQuery, validateSchemaName } = require('../db');
+const { query, validateSchemaName } = require('../db');
 const { validate, schemas } = require('../middleware/validate');
 const { handleError } = require('../utils/errors');
 const logger = require('../utils/logger');
 const razorpay = require('../services/razorpay');
 const { issueOtp, verifyOtp, normalizePhone } = require('../services/otp');
-const { provisionSelfServeTenant, schemaNameForSlug } = require('../services/signupProvision');
+const { registerSelfServeTenant, schemaNameForSlug } = require('../services/signupProvision');
 
 const TRIAL_DAYS = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '14', 10) || 14);
 const PENDING_TTL_MINUTES = 45;
@@ -70,7 +78,14 @@ const confirmLimiter = rateLimit({
 });
 
 function selfSignupEnabled() {
-  return String(process.env.SELF_SIGNUP_ENABLED || 'false') === 'true' && razorpay.isConfigured();
+  if (String(process.env.SELF_SIGNUP_ENABLED || 'false') !== 'true') return false;
+  // In production a real Razorpay config is required — a card-free trial still
+  // has to be able to CONVERT, or the clinic just gets suspended at day 14.
+  // Outside production the flag alone is enough: the Razorpay customer create in
+  // /signup/verify-otp is already best-effort, so the whole card-free trial runs
+  // without any billing config (dev / test).
+  if (process.env.NODE_ENV === 'production') return razorpay.isConfigured();
+  return true;
 }
 
 function sha256(v) { return crypto.createHash('sha256').update(String(v)).digest('hex'); }
@@ -200,7 +215,10 @@ router.post('/signup/verify-otp', verifyLimiter, validate(schemas.selfSignupVeri
   } catch (err) { handleError(res, err); }
 });
 
-// ── STEP 3: CONFIRM — provision + start the trial, return a session ──
+// ── STEP 3: CONFIRM — register the clinic for review (nothing is built yet) ──
+// No schema, no admin user, no session. The super admin approves
+// (POST /superadmin/tenants/:id/approve), and THAT builds the schema, creates
+// the owner's login, starts the card-free trial and WhatsApps the owner a link.
 router.post('/signup/confirm', confirmLimiter, validate(schemas.selfSignupConfirm), async (req, res) => {
   try {
     if (!selfSignupEnabled()) return res.status(503).json({ error: 'Self-serve signup is not available right now.' });
@@ -213,62 +231,45 @@ router.post('/signup/confirm', confirmLimiter, validate(schemas.selfSignupConfir
       return res.status(400).json({ error: 'This signup session has expired. Please start again.' });
     }
 
-    // Idempotent replay: already provisioned → hand back a fresh session.
-    if (pending.tenant_id && pending.consumed_at) {
-      const t = await query(`SELECT * FROM tenants WHERE id=$1`, [pending.tenant_id]);
-      if (t.rows[0]) return res.json(await sessionFor(t.rows[0]));
+    const phoneHint = '…' + String(pending.phone || '').slice(-4);
+
+    // Idempotent replay: already registered → re-report "in review".
+    if (pending.tenant_id) {
+      const t = await query(`SELECT slug, status FROM tenants WHERE id=$1`, [pending.tenant_id]);
+      if (t.rows[0]) {
+        return res.json({
+          ok: true,
+          review_pending: t.rows[0].status === 'pending_review',
+          tenant_slug: t.rows[0].slug,
+          phone_hint: phoneHint,
+        });
+      }
     }
 
-    let provisioned;
+    let registered;
     try {
-      provisioned = await provisionSelfServeTenant(pending);
-    } catch (provErr) {
-      if (provErr.status === 409) return res.status(409).json({ error: provErr.message });
-      logger.error('Signup confirm: provisioning failed', { slug: pending.slug, error: provErr.message });
+      registered = await registerSelfServeTenant(pending);
+    } catch (regErr) {
+      if (regErr.status === 409) return res.status(409).json({ error: regErr.message });
+      if (regErr.status === 400) return res.status(400).json({ error: regErr.message });
+      logger.error('Signup confirm: registration failed', { slug: pending.slug, error: regErr.message });
       return res.status(500).json({
-        error: 'We hit a snag creating your clinic. Please try again in a minute — if it keeps happening, contact support.',
+        error: 'We hit a snag at our end submitting your clinic for review. Please try again in a minute — if it keeps happening, contact support.',
       });
     }
-    const tenant = provisioned.tenant;
+    const tenant = registered.tenant;
 
-    // Start a card-free trial. subscription_status 'trialing' is OUR marker (not
-    // a Razorpay state) — jobs/billingDunning.js moves the tenant to past_due
-    // when trial_end passes with no razorpay_subscription_id attached.
-    await query(`
-      INSERT INTO tenant_billing
-        (tenant_id, provider, plan_id, razorpay_customer_id, subscription_status, trial_end, updated_at)
-      VALUES ($1,'razorpay',$2,$3,'trialing', NOW() + make_interval(days => $4::int), NOW())
-      ON CONFLICT (tenant_id) DO UPDATE SET
-        plan_id=EXCLUDED.plan_id,
-        razorpay_customer_id=COALESCE(tenant_billing.razorpay_customer_id, EXCLUDED.razorpay_customer_id),
-        updated_at=NOW()
-    `, [tenant.id, tenant.plan, pending.razorpay_customer_id, TRIAL_DAYS]);
-
-    await query(`UPDATE pending_signups SET consumed_at=NOW(), tenant_id=$1 WHERE token=$2`,
-      [tenant.id, pending.token]);
-
-    logger.info('Self-serve clinic provisioned (card-free trial) — awaiting review', { slug: tenant.slug, tenant_id: tenant.id });
+    logger.info('Self-serve clinic registered — awaiting review', { slug: tenant.slug, tenant_id: tenant.id });
     notifyReviewQueue(tenant).catch(() => {});
 
-    res.json(await sessionFor(tenant));
+    res.json({
+      ok: true,
+      review_pending: true,
+      tenant_slug: tenant.slug,
+      phone_hint: phoneHint,
+    });
   } catch (err) { handleError(res, err); }
 });
-
-/** Build the { tenant_slug, status, session } payload the frontend expects. */
-async function sessionFor(tenant) {
-  const { issueSession } = require('./auth');
-  const ur = await tenantQuery(tenant.schema_name,
-    `SELECT * FROM users WHERE role='admin' AND is_active=true ORDER BY created_at ASC LIMIT 1`);
-  const user = ur.rows[0];
-  const session = user ? await issueSession(user, tenant) : null;
-  return {
-    ok: true,
-    tenant_slug: tenant.slug,
-    status: tenant.status,
-    review_pending: tenant.status === 'pending_review',
-    session,
-  };
-}
 
 /**
  * Flag a new clinic for review. There is no super-admin notify channel yet

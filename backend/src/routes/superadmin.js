@@ -263,43 +263,104 @@ router.get('/tenants/:id', validateUUID(), async (req, res) => {
 });
 
 // ── APPROVE A SELF-SERVE CLINIC ───────────────────────────────
-// The gate that stays with the super admin: a self-serve signup is provisioned
-// at 'pending_review' and its patients cannot reach it (the bot's entry-code
-// lookup requires status='active') until this runs. activated_at is stamped
-// here, which is when the staged send-cap clock (services/sendCaps.js) starts —
-// and the CARD-FREE TRIAL clock is (re)started here too, so a clinic that sat in
-// review for three days still gets its full SIGNUP_TRIAL_DAYS from go-live
-// rather than being paywalled by the next dunning run.
+// The gate that stays with the super admin AND the moment the clinic is
+// actually built. A self-serve signup only REGISTERS a `tenants` row at
+// 'pending_review' — no schema, no login, no trial. This route:
+//   1. builds the PG schema + the owner's first admin user (from the linked
+//      `pending_signups` row, which carries the password hash),
+//   2. starts the card-free trial (trial_end = now + SIGNUP_TRIAL_DAYS),
+//   3. flips the tenant to 'active' and stamps activated_at (the staged
+//      send-cap clock in services/sendCaps.js starts here),
+//   4. WhatsApps the owner a login link — their only way back in.
+// Idempotent: buildSelfServeTenantSchema is CREATE SCHEMA IF NOT EXISTS +
+// INSERT ... ON CONFLICT DO NOTHING, and the billing INSERT is ON CONFLICT
+// DO NOTHING, so a retried approve is safe.
 router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
   try {
-    const cur = await query(`SELECT id, slug, status FROM tenants WHERE id=$1`, [req.params.id]);
+    const cur = await query(`SELECT * FROM tenants WHERE id=$1`, [req.params.id]);
     const t = cur.rows[0];
     if (!t) return res.status(404).json({ error: 'Tenant not found' });
     if (t.status === 'active') return res.json({ tenant: t, message: 'Already active' });
     if (t.status !== 'pending_review') {
       return res.status(409).json({ error: `Only a clinic in review can be approved (this one is "${t.status}").` });
     }
+
+    // The linked signup carries the owner's name + password hash — a self-serve
+    // clinic in review has no schema and no user until now. Build them here.
+    // buildSelfServeTenantSchema is fully idempotent, so we run it every time a
+    // signup row exists: that also finishes a build a previous approve left
+    // half-done (schema created, migrations or the admin user not).
+    const psR = await query(
+      `SELECT * FROM pending_signups WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 1`,
+      [req.params.id]
+    );
+    const pending = psR.rows[0];
+
+    if (pending) {
+      const { buildSelfServeTenantSchema } = require('../services/signupProvision');
+      try {
+        await buildSelfServeTenantSchema(t, pending);
+      } catch (buildErr) {
+        logger.error('approve: schema build failed — tenant left pending_review', { slug: t.slug, error: buildErr.message });
+        return res.status(500).json({
+          error: 'Building the clinic schema failed at our end. Nothing was changed — retry, and check the logs if it persists.',
+        });
+      }
+    } else {
+      // No signup behind this tenant (put into 'pending_review' by hand). We
+      // can't build a schema without the owner's password hash — approve it only
+      // if the schema is already there.
+      const schemaExists = (await query(
+        `SELECT 1 FROM information_schema.schemata WHERE schema_name=$1`, [t.schema_name]
+      )).rowCount > 0;
+      if (!schemaExists) {
+        return res.status(409).json({
+          error: 'This clinic has no signup record and no schema — it cannot be provisioned from here. Create it via New Tenant instead.',
+        });
+      }
+    }
+
     const r = await query(
       `UPDATE tenants SET status='active', activated_at=COALESCE(activated_at, NOW()) WHERE id=$1 RETURNING *`,
       [req.params.id]
     );
-    // Trial starts now. Only for a self-serve tenant still on a card-free trial
-    // (no subscription attached) — a clinic that added a card during review is
-    // untouched.
+
+    // Start the card-free trial now. subscription_status 'trialing' is OUR
+    // marker (not a Razorpay state) — jobs/billingDunning.js moves the tenant to
+    // past_due when trial_end passes with no razorpay_subscription_id attached.
     const trialDays = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '14', 10) || 14);
     await query(`
-      UPDATE tenant_billing
-         SET trial_end = NOW() + make_interval(days => $2::int), updated_at = NOW()
-       WHERE tenant_id = $1
-         AND subscription_status = 'trialing'
-         AND razorpay_subscription_id IS NULL
-    `, [req.params.id, trialDays]).catch(e => logger.warn('approve: trial_end reset failed', { error: e.message }));
+      INSERT INTO tenant_billing
+        (tenant_id, provider, plan_id, razorpay_customer_id, subscription_status, trial_end, updated_at)
+      VALUES ($1,'razorpay',$2,$3,'trialing', NOW() + make_interval(days => $4::int), NOW())
+      ON CONFLICT (tenant_id) DO UPDATE SET
+        trial_end = CASE
+          WHEN tenant_billing.subscription_status = 'trialing'
+           AND tenant_billing.razorpay_subscription_id IS NULL
+          THEN EXCLUDED.trial_end ELSE tenant_billing.trial_end END,
+        updated_at = NOW()
+    `, [req.params.id, t.plan, pending?.razorpay_customer_id || null, trialDays])
+      .catch(e => logger.warn('approve: trial start failed', { error: e.message }));
+
+    if (pending && !pending.consumed_at) {
+      await query(`UPDATE pending_signups SET consumed_at=NOW() WHERE token=$1`, [pending.token]).catch(() => {});
+    }
+
     invalidateTenantCache(req.params.id);
     await query(`
       INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
       VALUES ($1,'super_admin','APPROVE_TENANT','tenant',$2,$3,$4)
-    `, [req.user.id, req.params.id, JSON.stringify({ from: 'pending_review', to: 'active' }), req.ip]).catch(() => {});
+    `, [req.user.id, req.params.id, JSON.stringify({ from: 'pending_review', to: 'active', built_from_signup: !!pending }), req.ip]).catch(() => {});
     logger.info('Self-serve clinic approved', { slug: t.slug, by: req.user.email });
+
+    // The owner has been waiting on a "we'll message you" screen — this is the
+    // only thing that tells them they can log in. Best-effort.
+    if (pending?.phone) {
+      require('../services/signupNotify')
+        .notifyOwnerApproved(pending.phone, { clinicName: r.rows[0].name, slug: r.rows[0].slug })
+        .catch(e => logger.warn('approve: owner notify failed', { slug: t.slug, error: e.message }));
+    }
+
     res.json({ tenant: r.rows[0], message: 'Clinic approved and live' });
   } catch (err) { handleError(res, err); }
 });

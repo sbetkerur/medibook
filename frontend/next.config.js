@@ -22,20 +22,17 @@ const nextConfig = {
   // old backend. The Dockerfile passes it as a build ARG for exactly this
   // reason. Set BACKEND_URL in the Railway service variables (Railway forwards
   // service variables as Docker build args) and redeploy to change it.
-  // The bare domain sends people to the login page.
+  // The bare domain now serves the public marketing page (src/app/page.js) —
+  // a real statically prerendered page with "Log in" / "See live demo" / "Start
+  // free trial" links. Railway's healthcheck points at /login (railway.toml), so
+  // the root is free to be the product's front door.
   //
-  // This used to be `redirect('/login')` inside a statically prerendered
-  // src/app/page.js. Next 14.2 serves that as a **307 with no Location header** —
-  // a response no client can follow. Real visitors to the root domain got
-  // nothing, and Railway's healthcheck (pointed at `/`) read it as
-  // 'service unavailable' and killed every deploy after the 14.0.4 → 14.2.35
-  // bump in 7b8c1c5, which had never been deployed until then.
-  //
-  // Declared here instead, so it is compiled into routes-manifest.json and
-  // served with a proper Location.
-  async redirects() {
-    return [{ source: '/', destination: '/login', permanent: false }];
-  },
+  // History worth keeping: src/app/page.js once did `redirect('/login')`, and
+  // Next 14.2 served that as a 307 with NO Location header — unfollowable. When
+  // the healthcheck was still on `/` it read that as 'service unavailable' and
+  // killed every deploy after the 14.0.4 → 14.2.35 bump. A `redirects()` entry
+  // here was the fix; a real page here is the better one. Do NOT reintroduce a
+  // redirect from '/' without moving the healthcheck first.
 
   async rewrites() {
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3001';

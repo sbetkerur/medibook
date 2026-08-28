@@ -81,17 +81,27 @@ if (!process.env.METRICS_SECRET && process.env.NODE_ENV === 'production') {
 }
 
 // ── SELF-SERVE SIGNUP ────────────────────────────────────────
-// Off unless SELF_SIGNUP_ENABLED=true. When on, it needs a real Razorpay config
-// (a card-free trial still has to be able to CONVERT) and, for production
-// delivery, an OTP template — a clinic owner is always outside Meta's 24h
-// free-form window. Warn loudly rather than 500 at signup time.
+// Off unless SELF_SIGNUP_ENABLED=true. In PRODUCTION it also needs a real
+// Razorpay config (a card-free trial still has to be able to CONVERT) and two
+// WhatsApp templates — a clinic owner is always outside Meta's 24h free-form
+// window: SIGNUP_OTP_TEMPLATE (verification code) and SIGNUP_APPROVED_TEMPLATE
+// (the go-live link sent on super-admin approval — the owner's only way in,
+// since nothing is provisioned until then). Outside production the flag alone
+// opens signup and both templates fall back to plain text. Warn, don't 500.
 if (String(process.env.SELF_SIGNUP_ENABLED || 'false') === 'true') {
   const { isConfigured: razorpayConfigured } = require('./services/razorpay');
   if (!razorpayConfigured()) {
-    logger.warn('SELF_SIGNUP_ENABLED=true but Razorpay is not configured (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET / RAZORPAY_PLAN_*) — self-serve signup will report itself unavailable.');
+    if (process.env.NODE_ENV === 'production') {
+      logger.warn('SELF_SIGNUP_ENABLED=true but Razorpay is not configured (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET / RAZORPAY_PLAN_*) — self-serve signup will report itself unavailable.');
+    } else {
+      logger.warn('SELF_SIGNUP_ENABLED=true without Razorpay config — signup is OPEN (non-prod); the card-free trial runs but cannot convert until Razorpay keys are set.');
+    }
   }
   if (!process.env.SIGNUP_OTP_TEMPLATE && process.env.NODE_ENV === 'production') {
     logger.warn('SELF_SIGNUP_ENABLED=true but SIGNUP_OTP_TEMPLATE is not set — signup verification codes will not deliver to owners outside the 24h window.');
+  }
+  if (!process.env.SIGNUP_APPROVED_TEMPLATE && process.env.NODE_ENV === 'production') {
+    logger.warn('SELF_SIGNUP_ENABLED=true but SIGNUP_APPROVED_TEMPLATE is not set — an owner whose clinic is approved will not be told it is live (they cannot log in until approval).');
   }
   if (!process.env.RAZORPAY_WEBHOOK_SECRET && process.env.NODE_ENV === 'production') {
     logger.warn('SELF_SIGNUP_ENABLED=true but RAZORPAY_WEBHOOK_SECRET is not set — subscription lifecycle events will be ignored; the daily dunning cron is the only reconciliation.');
@@ -249,9 +259,9 @@ app.use('/api', globalLimiter);
 // token-blacklist query, the tenant lookup and the IP-allowlist check twice
 // on every single admin request.
 const tenantRateLimit = require('./middleware/tenantRateLimit');
-const { authMiddleware: _auth, tenantMiddleware: _tenant } = require('./middleware/auth');
-app.use('/api/admin', _auth, _tenant, tenantRateLimit);
-app.use('/api/v1/admin', _auth, _tenant, tenantRateLimit);
+const { authMiddleware: _auth, tenantMiddleware: _tenant, enforceReadOnlyTenant: _readOnly } = require('./middleware/auth');
+app.use('/api/admin', _auth, _tenant, tenantRateLimit, _readOnly);
+app.use('/api/v1/admin', _auth, _tenant, tenantRateLimit, _readOnly);
 
 // ── ROUTES ────────────────────────────────────────────────────
 app.use('/api', require('./routes/auth'));

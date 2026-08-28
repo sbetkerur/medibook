@@ -1,19 +1,23 @@
 'use strict';
 /**
- * Turning an approved signup into a live clinic.
+ * Turning a signup into a live clinic. ONE place for slug reservation, entry-code
+ * minting, the tenant row, the PG schema + migrations, and the first admin user —
+ * two copies of that is the last place drift should be allowed.
  *
- * ONE implementation, two entry points:
- *   - provisionTenant()          — the super-admin console (POST /superadmin/tenants)
- *   - provisionSelfServeTenant() — routes/signup.js, after a card has cleared
+ * Entry points:
+ *   - provisionTenant()             — super-admin console (POST /superadmin/tenants).
+ *                                     One shot: everything, straight to 'active'.
+ *   - registerSelfServeTenant()     — routes/signup.js /signup/confirm. Phase 1:
+ *                                     INSERT the tenant row at 'pending_review'
+ *                                     with an entry code and NOTHING else.
+ *   - buildSelfServeTenantSchema()  — POST /superadmin/tenants/:id/approve. Phase
+ *                                     2: build the schema + first admin user for
+ *                                     a clinic that was just approved.
+ *   - provisionSelfServeTenant()    — LEGACY. Only the billing-dunning retry for
+ *                                     old-flow 'pending_payment' rows still calls
+ *                                     it; new signups never reach that state.
  *
- * Both do the same irreducible sequence: reserve the slug, mint the entry code,
- * INSERT the tenant row, CREATE the PG schema + run its migrations, INSERT the
- * first admin user, write an audit row. If the schema or user step fails the
- * tenant row and schema are rolled back so no half-built clinic is left behind.
- *
- * This used to live inline in routes/superadmin.js; self-serve signup needed the
- * exact same thing, and two copies of provisioning is the last place drift
- * should be allowed.
+ * This used to live inline in routes/superadmin.js.
  */
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
@@ -146,17 +150,95 @@ async function provisionTenant({
 }
 
 /**
- * Resumable provisioning for a paid self-serve signup.
+ * Phase 1 of self-serve provisioning: register the clinic for review WITHOUT
+ * building anything.
  *
- * Self-serve provisioning STOPS at 'pending_review' — the super admin still
- * approves each clinic before patients can reach it (the bot's entry-code
- * lookup requires status='active'). The owner can log in and finish the
- * onboarding wizard in the meantime.
+ * A self-serve signup no longer provisions a schema at /signup/confirm. All it
+ * does is INSERT a `tenants` row at status 'pending_review' (with an entry code
+ * so the super-admin queue can show one) and link it to the `pending_signups`
+ * row that carries the owner's password hash. The PG schema, the first admin
+ * user and the trial are all created later, by
+ * POST /superadmin/tenants/:id/approve → buildSelfServeTenantSchema().
  *
- * Safe to call more than once for the same `pending_signups` row: if the tenant
- * is already built (pending_review / active / anything past pending_payment) it
- * is returned untouched; if it is still `pending_payment` (a previous schema
- * build died half-way) the build is retried against the same schema.
+ * Until approval there is nothing to log into: 'pending_review' is out of
+ * LOGIN_ALLOWED_STATUSES / DASHBOARD_ALLOWED_STATUSES.
+ *
+ * Idempotent: a replayed /signup/confirm with the same token returns the
+ * existing tenant row untouched.
+ *
+ * @param {object} pending  a `pending_signups` row (token already matched by caller)
+ * @returns {{ tenant, alreadyRegistered: boolean }}
+ */
+async function registerSelfServeTenant(pending) {
+  const data = typeof pending.data === 'string' ? JSON.parse(pending.data) : (pending.data || {});
+  const { name } = data;
+  const slug = pending.slug;
+  const owner_email = pending.email;
+  const plan = pending.plan || 'starter';
+  const schema = schemaNameForSlug(slug);
+
+  if (pending.tenant_id) {
+    const t = await query(`SELECT * FROM tenants WHERE id=$1`, [pending.tenant_id]);
+    if (t.rows[0]) return { tenant: t.rows[0], alreadyRegistered: true };
+  }
+
+  try { validateSchemaName(schema); }
+  catch (e) { const err = new Error('That clinic ID cannot be used.'); err.status = 400; throw err; }
+
+  const dup = await query(`SELECT id FROM tenants WHERE slug=$1`, [slug]);
+  if (dup.rows[0]) { const err = new Error('That clinic ID was taken while you were signing up — please start again with another.'); err.status = 409; throw err; }
+
+  let tenant;
+  try {
+    tenant = await _insertTenantRow({
+      name, slug, schema, owner_email, plan, city: null, billing_monthly: null,
+      status: 'pending_review', signup_source: 'self_serve',
+    });
+  } catch (e) {
+    if (e.code === '23505') { const err = new Error('That clinic ID was taken while you were signing up — please start again.'); err.status = 409; throw err; }
+    throw e;
+  }
+  await query(`UPDATE pending_signups SET tenant_id=$1 WHERE token=$2`, [tenant.id, pending.token]);
+
+  await _audit({
+    actor_role: 'system', action: 'CREATE_TENANT_SELF_SERVE', tenant_id: tenant.id,
+    new_values: { name, slug, plan, signup_source: 'self_serve', status: 'pending_review', schema_built: false },
+  });
+  return { tenant, alreadyRegistered: false };
+}
+
+/**
+ * Phase 2 of self-serve provisioning: build the PG schema + first admin user for
+ * a clinic that has been APPROVED. Called from the super-admin approve route.
+ *
+ * Idempotent — `_buildSchemaAndAdmin` is `CREATE SCHEMA IF NOT EXISTS` +
+ * `INSERT ... ON CONFLICT DO NOTHING` — so a re-run (or an approve that races
+ * the dunning recovery) is harmless.
+ *
+ * @param {object} tenant   the `tenants` row (already at pending_review)
+ * @param {object} pending  the linked `pending_signups` row (carries the hash)
+ */
+async function buildSelfServeTenantSchema(tenant, pending) {
+  const data = typeof pending.data === 'string' ? JSON.parse(pending.data) : (pending.data || {});
+  const { owner_name, owner_password_hash } = data;
+  const schema = tenant.schema_name || schemaNameForSlug(tenant.slug);
+  validateSchemaName(schema);
+  await _buildSchemaAndAdmin(schema, {
+    owner_email: tenant.owner_email || pending.email,
+    owner_name,
+    passwordHash: owner_password_hash,
+  });
+  await _audit({
+    actor_role: 'system', action: 'PROVISION_TENANT_SCHEMA', tenant_id: tenant.id,
+    new_values: { slug: tenant.slug, schema },
+  });
+}
+
+/**
+ * LEGACY recovery path — only reachable for `pending_payment` tenants left over
+ * from the old flow (where /signup/confirm built the schema inline and could die
+ * half-way). New signups never reach `pending_payment`. `jobs/billingDunning.js`
+ * `retryStuckProvisioning` is the sole caller.
  *
  * @param {object} pending  a `pending_signups` row (token already matched by caller)
  * @returns {{ tenant, alreadyProvisioned: boolean }}
@@ -227,4 +309,10 @@ async function provisionSelfServeTenant(pending) {
   return { tenant: upd.rows[0], alreadyProvisioned: false };
 }
 
-module.exports = { provisionTenant, provisionSelfServeTenant, schemaNameForSlug };
+module.exports = {
+  provisionTenant,
+  registerSelfServeTenant,
+  buildSelfServeTenantSchema,
+  provisionSelfServeTenant,
+  schemaNameForSlug,
+};

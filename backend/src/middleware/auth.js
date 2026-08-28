@@ -13,20 +13,18 @@ const tenantCache = new Map(); // key: tenantId → { tenant, expiresAt }
 
 // Which tenant statuses may reach the dashboard at all.
 //   active         — normal, live to patients.
-//   pending_review — a self-serve tenant that has paid and provisioned but is
-//                    NOT yet approved by a super admin. Let IN so the owner can
-//                    complete the onboarding wizard; the bot's entry-code lookup
-//                    still requires status='active', so patients cannot reach it
-//                    until POST /superadmin/tenants/:id/approve flips it.
 //   past_due       — a self-serve tenant whose card later failed. Let IN so the
 //                    owner can update payment (routes/billing.js);
 //                    jobs/billingDunning.js escalates it to 'suspended' after
 //                    the grace window.
 // Blocked: 'suspended' (kill switch / abuse), 'inactive' (deactivated),
-// 'pending_payment' (signup started, schema not built — no user row exists).
-// Outreach crons filter status='active' on their own, so pending_review /
-// past_due tenants are already excluded from every unsolicited send.
-const DASHBOARD_ALLOWED_STATUSES = new Set(['active', 'pending_review', 'past_due']);
+// 'pending_payment' (legacy: signup started, schema build died — no user row),
+// and 'pending_review' — a self-serve signup only registers a tenants row; its
+// PG schema and first user are not built until a super admin approves it
+// (POST /superadmin/tenants/:id/approve), so there is no session to have yet.
+// Outreach crons filter status='active' on their own, so a past_due tenant is
+// already excluded from every unsolicited send.
+const DASHBOARD_ALLOWED_STATUSES = new Set(['active', 'past_due']);
 
 async function authMiddleware(req, res, next) {
   // Support token in Authorization header (normal) or ?token= query param.
@@ -206,4 +204,23 @@ async function checkIPAllowlist(tenantId, clientIp) {
   }
 }
 
-module.exports = { authMiddleware, tenantMiddleware, invalidateTenantCache, checkIPAllowlist };
+// ── READ-ONLY TENANT GUARD ───────────────────────────────────
+// A whole-tenant switch (tenants.read_only), independent of the admin/doctor
+// role split — for the shareable demo clinic, where the login is public and no
+// visitor may change what the next visitor sees. Mounted once in index.js right
+// after tenantMiddleware for /api/admin + /api/v1/admin, so req.tenant is
+// already resolved. Everything safe (GET/HEAD/OPTIONS) passes; every mutation
+// gets a plain 403 that names the cause. Auth routes are not under this prefix,
+// so the demo user can still log in and out; /auth/change-password blocks the
+// read-only tenant on its own (routes/auth.js).
+const READ_ONLY_SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+function enforceReadOnlyTenant(req, res, next) {
+  if (!req.tenant?.read_only) return next();
+  if (READ_ONLY_SAFE_METHODS.has((req.method || '').toUpperCase())) return next();
+  return res.status(403).json({
+    error: 'This is a read-only demo clinic — you can look around, but changes are disabled. Sign up for your own MediBook account to book, edit and configure.',
+    read_only: true,
+  });
+}
+
+module.exports = { authMiddleware, tenantMiddleware, enforceReadOnlyTenant, invalidateTenantCache, checkIPAllowlist };

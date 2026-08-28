@@ -39,6 +39,7 @@ cd backend && node tests/rateLimitFallback.unit.test.js  # per-tenant cap with n
 cd backend && node tests/razorpaySignature.unit.test.js  # self-serve billing: checkout + webhook HMACs
 cd backend && node tests/sendCaps.unit.test.js           # staged outbound caps for young tenants
 cd backend && node tests/otp.unit.test.js                # WhatsApp OTP: attempts, cooldown, single-use
+cd backend && node tests/readOnlyTenant.unit.test.js     # whole-tenant read-only guard (demo clinic)
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -641,6 +642,27 @@ reschedule, **cancel** (`PATCH /appointments/:id` blocks a non-admin setting
 `status='cancelled'`), bulk edits, patient/settings/staff mutation, QR regen and
 PHI export are all `adminOnly`. Anyone who works the front desk must be an admin.
 
+**A whole tenant can be READ-ONLY, orthogonal to the role split.**
+`tenants.read_only` (default false) — `middleware/auth.js` `enforceReadOnlyTenant`
+runs once in `index.js` after `tenantMiddleware` for `/api/admin` +
+`/api/v1/admin` and 403s every non-`GET/HEAD/OPTIONS` request with
+`{ read_only: true }`, whatever the user's role. `/auth/*` is not under that
+prefix, so the login still works; `/auth/change-password` refuses a read-only
+tenant on its own (a public demo login must not be able to lock everyone out).
+Built for the shareable **demo clinic** (`pragati-demo` / "Pragati Dental
+Studio", entry code `TRYMED`): `ensureDemoTenant` in `migrate.js` sets the flag
+(and pre-accepts the ToS so the blocking `TermsGate` can't trap a visitor),
+re-asserting it every boot from `DEMO_READ_ONLY` (default on; set `=false`,
+restart, hand-edit the fixture, restart). `/auth/login` and `issueSession` both
+return `read_only` in the `user` object; the dashboard shows
+`components/ReadOnlyBanner.js`. `POST /auth/demo-session` (public, rate-limited)
+mints a passwordless session for `DEMO_TENANT_SLUG` (default `pragati-demo`) —
+but ONLY while that tenant is `read_only` + `active`, so it can never reach a
+real clinic. The public site uses it: `frontend/src/app/page.js` is the
+marketing landing page (root `/`; the old `/`→`/login` redirect is gone,
+healthcheck is on `/login`) and `frontend/src/app/demo/page.js` is the "See a
+live demo" button. Tests: `tests/readOnlyTenant.unit.test.js`.
+
 **Frontend.** All API calls go through the Next.js rewrite proxy
 (`/api/proxy/*` → `BACKEND_URL`) — no API origin is baked into the bundle.
 `lib/api.js` handles token attach, 401 → refresh rotation (queued), and
@@ -652,10 +674,12 @@ substantially, prefer extracting tabs into `components/tabs/` (see
 `checkout.razorpay.com` (billing) — added narrowly in `next.config.js`.
 
 **Self-serve signup, and the super admin still approves.** A clinic can create
-its own account (`routes/signup.js`, `/signup`) — the super admin is no longer
-in the provisioning path, but is still the gate before patients can reach it.
-Off unless `SELF_SIGNUP_ENABLED=true` with a real Razorpay config. Full
-walkthrough and operator setup: `docs/self-serve-signup.md`.
+its own account (`routes/signup.js`, `/signup`). The super admin approves every
+clinic AND that approval is what provisions it — see below. In production it is
+off unless `SELF_SIGNUP_ENABLED=true` with a real Razorpay config; OUTSIDE
+production `SELF_SIGNUP_ENABLED=true` alone opens it (`selfSignupEnabled()` only
+checks `razorpay.isConfigured()` when `NODE_ENV=production`). Full walkthrough
+and operator setup: `docs/self-serve-signup.md`.
 
 Identity is proven by a **WhatsApp one-time code** to the owner's own number
 (`services/otp.js`, `wa_otps`) — the ONLY verification channel this product has.
@@ -666,25 +690,39 @@ patient-facing changes and the code goes through the same WhatsApp sender.
 *email*-based. Delivery is template-first (`SIGNUP_OTP_TEMPLATE`), because an
 owner is permanently outside Meta's 24-hour window.
 
-The trial is **card-free** (`SIGNUP_TRIAL_DAYS`, default 14). `/signup/confirm`
-provisions the tenant at status `pending_review` and starts the trial; the card
-is only taken later, via `POST /admin/billing/subscribe` → Razorpay Checkout →
-`/billing/subscribe/confirm`. Provisioning (`services/signupProvision.js`,
-`provisionTenant` / `provisionSelfServeTenant`) is the ONE implementation the
-super-admin `POST /superadmin/tenants` route also uses — two copies of
-schema+migrations+first-admin+entry-code is exactly the drift not to allow.
+**Nothing is provisioned until the super admin approves.** `/signup/confirm`
+only REGISTERS the clinic: it INSERTs a `tenants` row at status `pending_review`
+(with an entry code) and links it to the `pending_signups` row that carries the
+owner's password hash. No PG schema, no admin user, no session, no trial — the
+owner finishes on a "we'll WhatsApp you" screen and CANNOT log in.
+`POST /superadmin/tenants/:id/approve` then does the rest: it builds the schema +
+first admin user (`buildSelfServeTenantSchema`), starts the **card-free** trial
+(`SIGNUP_TRIAL_DAYS`, default 14; `trial_end = now + N`), flips the tenant to
+`active`, stamps `activated_at`, and WhatsApps the owner a login link
+(`services/signupNotify.js`, `SIGNUP_APPROVED_TEMPLATE`, text fallback in dev).
+It is idempotent (`CREATE SCHEMA IF NOT EXISTS` + `INSERT … ON CONFLICT DO
+NOTHING`). The card is only taken later, via `POST /admin/billing/subscribe` →
+Razorpay Checkout → `/billing/subscribe/confirm`. `services/signupProvision.js`
+holds all of it: `registerSelfServeTenant` (phase 1) +
+`buildSelfServeTenantSchema` (phase 2) for self-serve, `provisionTenant` (one
+shot) for the super-admin `POST /superadmin/tenants` route, and
+`provisionSelfServeTenant` as a LEGACY recovery path for old-flow
+`pending_payment` rows only (`jobs/billingDunning.js` `retryStuckProvisioning`).
+Two copies of schema+migrations+first-admin+entry-code is exactly the drift not
+to allow.
 
 **Tenant `status` is now a lifecycle, not a boolean.** `pending_payment`
-(signup mid-provision, no login), `pending_review` (paid/trialing, awaiting
-`POST /superadmin/tenants/:id/approve` — can log in and onboard, patients
-can't reach it), `active`, `past_due` (trial lapsed / payment failed — can log
-in and add a card), `suspended` (kill switch or grace elapsed), `inactive`.
-`middleware/auth.js` `DASHBOARD_ALLOWED_STATUSES` and `routes/auth.js`
-`LOGIN_ALLOWED_STATUSES` (`active` + `pending_review` + `past_due`) are the
-source of truth for who may log in; the bot's entry-code lookup still requires
-`status='active'`, and every outreach cron filters `status='active'` via
-`forEachActiveTenantParallel`, so `pending_review` / `past_due` clinics send
-nothing unsolicited without any cron change.
+(LEGACY: old-flow signup whose inline schema build died, no login),
+`pending_review` (signup submitted, awaiting
+`POST /superadmin/tenants/:id/approve` — **no schema/user exists yet, cannot log
+in**, patients can't reach it), `active`, `past_due` (trial lapsed / payment
+failed — can log in and add a card), `suspended` (kill switch or grace elapsed),
+`inactive`. `middleware/auth.js` `DASHBOARD_ALLOWED_STATUSES` and
+`routes/auth.js` `LOGIN_ALLOWED_STATUSES` (both `active` + `past_due` only) are
+the source of truth for who may log in; the bot's entry-code lookup still
+requires `status='active'`, and every outreach cron filters `status='active'`
+via `forEachActiveTenantParallel`, so a `past_due` clinic sends nothing
+unsolicited without any cron change.
 
 **Billing lifecycle.** `tenant_billing` (one row per self-serve tenant) is the
 source of truth; `billing_events` dedups Razorpay webhooks on the
@@ -729,15 +767,20 @@ bound for more than one, and logs the condition ONCE rather than per request), `
 tenant's traffic from a shared IP pool, so this is effectively platform-wide).
 Frontend: `BACKEND_URL` (server-side, Railway).
 
-Self-serve signup (all optional; the feature is inert without them —
-`docs/self-serve-signup.md`): `SELF_SIGNUP_ENABLED` (master switch, default
-false), `SIGNUP_TRIAL_DAYS` (default 14), `SIGNUP_DUNNING_GRACE_DAYS` (default
-7), `SIGNUP_OTP_TEMPLATE` (+ `SIGNUP_OTP_TEMPLATE_HAS_BUTTON`, default true) —
-the WhatsApp template that delivers verification/reset codes, `RAZORPAY_KEY_ID` /
-`RAZORPAY_KEY_SECRET` / `RAZORPAY_WEBHOOK_SECRET`, `RAZORPAY_PLAN_STARTER` /
-`RAZORPAY_PLAN_PROFESSIONAL` (the two recurring plan ids created in the Razorpay
-dashboard, mirrored to `plans.razorpay_plan_id` on boot). `index.js` warns at
-startup when `SELF_SIGNUP_ENABLED=true` but any of these are missing.
+Self-serve signup (`docs/self-serve-signup.md`): `SELF_SIGNUP_ENABLED` (master
+switch, default false — the ONLY one required outside production, where the flag
+alone opens signup), `SIGNUP_TRIAL_DAYS` (default 14),
+`SIGNUP_DUNNING_GRACE_DAYS` (default 7), `SIGNUP_OTP_TEMPLATE` (+
+`SIGNUP_OTP_TEMPLATE_HAS_BUTTON`, default true) — the WhatsApp template that
+delivers verification/reset codes, `SIGNUP_APPROVED_TEMPLATE` — the template for
+the go-live link sent on approval (two body vars: clinic name, login URL; text
+fallback in dev), `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` /
+`RAZORPAY_WEBHOOK_SECRET`, `RAZORPAY_PLAN_STARTER` / `RAZORPAY_PLAN_PROFESSIONAL`
+(the two recurring plan ids created in the Razorpay dashboard, mirrored to
+`plans.razorpay_plan_id` on boot). In production `index.js` warns at startup
+when `SELF_SIGNUP_ENABLED=true` but any of these are missing, and
+`selfSignupEnabled()` reports the feature unavailable without a real Razorpay
+config.
 
 ## Testing without WhatsApp credentials
 

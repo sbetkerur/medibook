@@ -1,7 +1,6 @@
 'use client';
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
-import api, { getApiError, resetSessionTimers } from '@/lib/api';
+import api, { getApiError } from '@/lib/api';
 import BrandMark from '@/components/BrandMark';
 import toast from 'react-hot-toast';
 
@@ -18,7 +17,6 @@ const slugify = (s) =>
   String(s || '').toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').replace(/-+/g, '-').replace(/^-|-$/g, '');
 
 export default function SignupPage() {
-  const router = useRouter();
   const [config, setConfig] = useState(null); // null = loading, {} once fetched
   const [step, setStep] = useState(1);
   const [submitting, setSubmitting] = useState(false);
@@ -35,6 +33,8 @@ export default function SignupPage() {
   const [resendIn, setResendIn] = useState(0);
   const [signupToken, setSignupToken] = useState('');
   const [trialDays, setTrialDays] = useState(14);
+  const [submitted, setSubmitted] = useState(false);
+  const [reviewPhone, setReviewPhone] = useState('');
 
   // ── config ────────────────────────────────────────────────
   useEffect(() => {
@@ -132,21 +132,13 @@ export default function SignupPage() {
     setSubmitting(true);
     try {
       const { data } = await api.post('/signup/confirm', { signup_token: signupToken });
-      const s = data.session;
-      if (s?.token) {
-        localStorage.setItem('token', s.token);
-        if (s.refresh_token) localStorage.setItem('refresh_token', s.refresh_token);
-        if (s.user) localStorage.setItem('user', JSON.stringify(s.user));
-        resetSessionTimers();
-      }
-      if (data.review_pending) {
-        toast.success('Your clinic is being reviewed — you can set everything up now.');
-      } else {
-        toast.success('Clinic created!');
-      }
-      router.push('/onboarding');
+      // Nothing is provisioned yet — a super admin approves first, then the
+      // owner gets a WhatsApp message with a login link. No session here.
+      setReviewPhone(data.phone_hint || phoneHint);
+      setSubmitted(true);
+      toast.success('Submitted for review');
     } catch (err) {
-      toast.error(getApiError(err, 'Could not finish setup'));
+      toast.error(getApiError(err, 'Could not submit your clinic'));
     } finally { setSubmitting(false); }
   }
 
@@ -306,18 +298,36 @@ export default function SignupPage() {
           </form>
         )}
 
-        {step === 3 && (
+        {step === 3 && !submitted && (
           <div className="space-y-4 text-center">
-            <div className="w-14 h-14 rounded-full bg-green-100 text-green-600 text-2xl flex items-center justify-center mx-auto">✓</div>
-            <h2 className="text-lg font-bold text-gray-900">You’re all set</h2>
+            <div className="w-14 h-14 rounded-full bg-blue-100 text-blue-600 text-2xl flex items-center justify-center mx-auto">→</div>
+            <h2 className="text-lg font-bold text-gray-900">Submit your clinic for review</h2>
             <p className="text-sm text-gray-600">
-              Starting your <span className="font-medium">{trialDays}-day free trial</span>. No card needed now —
-              add one later from Settings to keep going after the trial.
+              A MediBook admin checks every new clinic before it goes live. Once approved, we’ll message you
+              on WhatsApp with a link to sign in — usually within a day. Your <span className="font-medium">{trialDays}-day
+              free trial</span> starts then, and no card is needed to begin.
             </p>
             <button onClick={submitConfirm} disabled={submitting}
               className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-medium py-2.5 rounded-xl transition-colors">
-              {submitting ? 'Creating your clinic…' : 'Create my clinic'}
+              {submitting ? 'Submitting…' : 'Submit for review'}
             </button>
+          </div>
+        )}
+
+        {step === 3 && submitted && (
+          <div className="space-y-4 text-center">
+            <div className="w-14 h-14 rounded-full bg-green-100 text-green-600 text-2xl flex items-center justify-center mx-auto">✓</div>
+            <h2 className="text-lg font-bold text-gray-900">Thanks — your clinic is in review</h2>
+            <p className="text-sm text-gray-600">
+              We’ll send a WhatsApp message to <span className="font-medium">{reviewPhone || 'your number'}</span> the
+              moment it’s approved, with a link to sign in and finish setup. This is usually done within a day.
+            </p>
+            <p className="text-xs text-gray-400">
+              You can close this page. Nothing more is needed from you right now.
+            </p>
+            <a href="/login" className="inline-block text-sm font-medium text-blue-600 hover:underline">
+              Back to sign in
+            </a>
           </div>
         )}
       </div>

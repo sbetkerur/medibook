@@ -107,6 +107,14 @@ async function ensureDemoTenant() {
 
   const { query, tenantQuery } = require('./index');
   const { createTenantSchema, runTenantMigrations } = require('./tenantMigrate');
+  const { CURRENT_TERMS_VERSION } = require('../config/terms');
+
+  // The demo login is meant to be shared with anyone evaluating the product, so
+  // it runs READ-ONLY: every /api/admin write 403s (middleware/auth.js
+  // `enforceReadOnlyTenant`). Set DEMO_READ_ONLY=false to hand-edit the fixture,
+  // restart, edit, then restart with it back on. The flag is re-asserted on
+  // every boot so a stray edit while it was off does not leave it writable.
+  const demoReadOnly = process.env.DEMO_READ_ONLY !== 'false';
 
   let tenant = (await query(
     `SELECT id FROM tenants WHERE slug=$1`, [DEMO_SLUG])).rows[0];
@@ -123,16 +131,16 @@ async function ensureDemoTenant() {
     // exactly the fixture that teaches the wrong rule.
     tenant = (await query(`
       INSERT INTO tenants
-        (name, slug, schema_name, owner_email, plan, status, city, entry_code, billing_monthly)
+        (name, slug, schema_name, owner_email, plan, status, city, entry_code, billing_monthly, read_only)
       VALUES ($1, $2, $3, 'contactus@pragatisolutions.com', 'professional', 'active',
-              'Bengaluru', $4, 0)
+              'Bengaluru', $4, 0, $5)
       RETURNING id
-    `, [DEMO_CLINIC_NAME, DEMO_SLUG, DEMO_SCHEMA, DEMO_ENTRY_CODE])).rows[0];
+    `, [DEMO_CLINIC_NAME, DEMO_SLUG, DEMO_SCHEMA, DEMO_ENTRY_CODE, demoReadOnly])).rows[0];
     await createTenantSchema(DEMO_SCHEMA);
     await runTenantMigrations(DEMO_SCHEMA);
     console.log(`✅ Demo clinic created: ${DEMO_CLINIC_NAME} (code ${DEMO_ENTRY_CODE})`);
   } else {
-    // Repaired only when actually wrong, and only these two. A deactivated
+    // Repaired only when actually wrong, and only these three. A deactivated
     // tenant detaches every patient session that reaches it, and a drifted
     // entry code means the code already printed in outreach answers "that code
     // didn't match a clinic" — which reads to the reader as a broken product.
@@ -145,7 +153,25 @@ async function ensureDemoTenant() {
       `UPDATE tenants SET entry_code=$2 WHERE id=$1 AND entry_code IS DISTINCT FROM $2`,
       [tenant.id, DEMO_ENTRY_CODE]
     ).catch(err => console.warn(`⚠️  Demo entry code not applied: ${err.message}`));
+    // Re-assert the read-only flag every boot so DEMO_READ_ONLY is the single
+    // source of truth: flip the env, restart, and the demo locks or unlocks.
+    await query(
+      `UPDATE tenants SET read_only=$2 WHERE id=$1 AND read_only IS DISTINCT FROM $2`,
+      [tenant.id, demoReadOnly]);
   }
+
+  // Pre-accept the ToS/DPA for this fixture. It is our own demo clinic, not a
+  // customer — and while read-only, the blocking TermsGate could not be cleared
+  // (POST /admin/terms/accept 403s), which would trap every visitor on the
+  // legal modal. Idempotent, and re-runs on a terms-version bump.
+  await query(`
+    UPDATE tenants
+       SET terms_accepted_at = COALESCE(terms_accepted_at, NOW()),
+           terms_version     = $2,
+           terms_accepted_by = COALESCE(terms_accepted_by, 'Demo clinic (auto-accepted)')
+     WHERE id = $1
+       AND (terms_version IS DISTINCT FROM $2 OR terms_accepted_at IS NULL)
+  `, [tenant.id, CURRENT_TERMS_VERSION]);
 
   // ── BRANCH ──────────────────────────────────────────────────────────────
   // One branch on purpose: the bot skips the "which branch?" step entirely when
@@ -359,6 +385,16 @@ async function migrate() {
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspension_reason TEXT;
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT false;
+    `);
+
+    // ── TENANTS: read-only flag ──────────────────────────────────
+    // A whole-tenant switch that makes every /api/admin write 403 regardless of
+    // role (middleware/auth.js `enforceReadOnlyTenant`). Built for the shareable
+    // demo clinic: hand the login to anyone, and no visitor can change the data
+    // the next visitor sees. NOT a per-user permission — the two roles stay
+    // binary (see CLAUDE.md). `ensureDemoTenant` sets it for `pragati-demo`.
+    await client.query(`
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS read_only BOOLEAN NOT NULL DEFAULT false;
     `);
 
     // ── PER-BRANCH PRICING SUPPORT ────────────────────────────

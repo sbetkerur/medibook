@@ -1,14 +1,19 @@
 # Self-serve clinic signup
 
-A dental clinic can create its own MediBook account without a super admin
-provisioning it: verify the owner's WhatsApp number with a one-time code, then
-run for **14 days on a card-free trial**. A card is only needed to continue past
-the trial. **A super admin still approves every clinic** before its patients can
-reach it.
+A dental clinic can apply for its own MediBook account: verify the owner's
+WhatsApp number with a one-time code, choose a plan, and submit. **A super admin
+approves every clinic**, and approval is also what actually builds it — the PG
+schema, the owner's login, and the **14-day card-free trial** are all created at
+approval, not at signup. A card is only needed to continue past the trial.
 
-Everything here is **off** until `SELF_SIGNUP_ENABLED=true` *and* the setup
-below is done. Until then `/signup` reports itself unavailable and the "Create an
-account" link is hidden on the login page.
+Until approval there is nothing to log into: the owner finishes signup on a
+"we'll message you on WhatsApp" screen and gets a login link once approved.
+
+**In production** everything here is **off** until `SELF_SIGNUP_ENABLED=true`
+*and* the setup below is done — until then `/signup` reports itself unavailable
+and the "Create an account" link is hidden on the login page. **Outside
+production** `SELF_SIGNUP_ENABLED=true` alone opens signup; Razorpay and the
+WhatsApp templates are optional and fall back (see notes inline below).
 
 ---
 
@@ -16,9 +21,11 @@ account" link is hidden on the login page.
 
 ### 1. Razorpay
 
-Even though the trial takes no card, self-serve signup needs Razorpay configured
-so a trial can *convert* — a clinic that can never pay would just get suspended
-at day 14.
+Even though the trial takes no card, **production** self-serve signup needs
+Razorpay configured so a trial can *convert* — a clinic that can never pay would
+just get suspended at day 14. (Outside production this is skipped:
+`selfSignupEnabled()` only checks `razorpay.isConfigured()` when
+`NODE_ENV=production`.)
 
 1. **API keys** — Razorpay Dashboard → Settings → API Keys. Set
    `RAZORPAY_KEY_ID` (`rzp_live_…` / `rzp_test_…`) and `RAZORPAY_KEY_SECRET`.
@@ -56,9 +63,21 @@ for where):
 
 Set `SIGNUP_OTP_TEMPLATE` to the template name.
 
-In **dev** no template is needed — delivery falls back to `sendText`, which works
-for any number that has messaged the number, and the code is also in the server
-log.
+You also need a **second template** for the go-live message sent when a super
+admin approves the clinic — since nothing is provisioned until approval, this is
+the owner's only way to learn they can now log in:
+
+- **Category** UTILITY.
+- **Body**: two variables, e.g.
+  `{{1}} is approved on MediBook. Sign in here: {{2}}` — `{{1}}` = clinic name,
+  `{{2}}` = login URL.
+- No button.
+
+Set `SIGNUP_APPROVED_TEMPLATE` to that template name.
+
+In **dev** neither template is needed — delivery falls back to `sendText`, which
+works for any number that has messaged the number, and the OTP is also in the
+server log.
 
 ### 3. Flip the switch
 
@@ -76,11 +95,20 @@ SIGNUP_DUNNING_GRACE_DAYS=7   # optional, default 7
 /signup  (public)
   1. POST /signup/start       details + password → WhatsApp OTP to the owner
   2. POST /signup/verify-otp  code checked → Razorpay customer created (best effort)
-  3. POST /signup/confirm     tenant provisioned at status 'pending_review',
-                              14-day trial started, owner auto-logged-in → /onboarding
+  3. POST /signup/confirm     REGISTER ONLY: a `tenants` row at status
+                              'pending_review' + an entry code, linked to the
+                              pending_signups row. NO schema, NO login, NO trial.
+                              Owner sees "we'll WhatsApp you" and stops here.
 
 super admin
-     POST /superadmin/tenants/:id/approve   pending_review → active (patients can now reach it)
+     POST /superadmin/tenants/:id/approve
+         builds the PG schema + first admin user (from pending_signups),
+         starts the 14-day card-free trial (trial_end = now + SIGNUP_TRIAL_DAYS),
+         pending_review → active, stamps activated_at,
+         WhatsApps the owner a login link (SIGNUP_APPROVED_TEMPLATE)
+
+owner  (after the go-live message)
+     /login with Clinic ID + chosen password → /onboarding
 
 owner, before day 14
      Settings › Billing → "Add card" → Razorpay Checkout → subscription active
@@ -94,17 +122,17 @@ payment recovers (webhook or refresh)  →  past_due → active
 
 | status | can log in | patients can reach | meaning |
 |---|---|---|---|
-| `pending_payment` | no | no | signup mid-provision (schema build failed) — cron retries |
-| `pending_review` | **yes** | no | paid/trialing, awaiting super-admin approval |
+| `pending_payment` | no | no | legacy: old-flow signup whose inline schema build died — cron retries |
+| `pending_review` | **no** | no | signup submitted, awaiting super-admin approval — no schema/user exists yet |
 | `active` | yes | yes | normal |
 | `past_due` | **yes** | no | trial lapsed / payment failed — add a card |
 | `suspended` | no | no | kill switch, or grace elapsed |
 | `inactive` | no | no | deactivated |
 
 `middleware/auth.js` `DASHBOARD_ALLOWED_STATUSES` and `routes/auth.js`
-`LOGIN_ALLOWED_STATUSES` are the source of truth for column 2. Outreach crons
-filter `status='active'`, so `pending_review` / `past_due` clinics send nothing
-unsolicited.
+`LOGIN_ALLOWED_STATUSES` (both now just `active` + `past_due`) are the source of
+truth for column 2. Outreach crons filter `status='active'`, so a `past_due`
+clinic sends nothing unsolicited.
 
 ---
 
@@ -128,10 +156,19 @@ unsolicited.
 ## Operating notes
 
 - **Approval queue**: `GET /superadmin/tenants?status=pending_review`, or the
-  "Pending review" section in the super-admin dashboard.
-- **"Paid but no clinic"**: if `/signup/confirm` provisions the tenant row but
-  the schema build fails, the tenant sits at `pending_payment` and the
-  `billing_dunning` cron (06:15 IST) retries it every day. Check the logs for
+  "Pending review" section in the super-admin dashboard. Approving is what
+  builds the clinic — expect the approve call to take a beat while the schema
+  migrations run.
+- **Approve failed the schema build**: the approve route reports a 500 and
+  leaves the tenant at `pending_review` (nothing half-built — `CREATE SCHEMA IF
+  NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`). Retry the approve; check
+  the logs for `approve: schema build failed`.
+- **Owner didn't get the go-live message**: the clinic is still `active` and
+  fine — the WhatsApp send is best-effort. Look for `approve: owner notify
+  failed`, and hand the owner the login URL + Clinic ID directly. In prod this
+  usually means `SIGNUP_APPROVED_TEMPLATE` is missing or unapproved.
+- **Legacy `pending_payment`**: only old-flow signups reach this. The
+  `billing_dunning` cron (06:15 IST) retries the build daily; look for
   `provisioning retry still failing`.
 - **`billing_events`** dedups Razorpay webhook deliveries on the
   `x-razorpay-event-id` header — safe to let Razorpay retry.

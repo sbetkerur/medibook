@@ -18,7 +18,11 @@ const skipInDev = () => process.env.NODE_ENV === 'test' || process.env.NODE_ENV 
 // (self-serve signup, awaiting super-admin approval) or is past_due on payment —
 // both need dashboard access to move forward. Same set middleware/auth.js
 // enforces on every /api/admin request. 'suspended' / 'inactive' cannot log in.
-const LOGIN_ALLOWED_STATUSES = ['active', 'pending_review', 'past_due'];
+// 'pending_review' is deliberately NOT here: a self-serve clinic in review has
+// no PG schema and no user yet (routes/signup.js registers only a tenants row;
+// POST /superadmin/tenants/:id/approve builds the rest). There is nothing to log
+// into until it is approved and the owner gets the WhatsApp go-live message.
+const LOGIN_ALLOWED_STATUSES = ['active', 'past_due'];
 
 // ── Login rate limiter — 10 attempts per 15 minutes per IP ────
 // Prevents brute-force and credential-stuffing attacks against both
@@ -37,6 +41,17 @@ const changePasswordLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 10,
   message: { error: 'Too many password change attempts. Try again in an hour.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipInDev,
+});
+
+// Public "See a live demo" button — issues a session with no credentials, so it
+// needs its own ceiling (each call writes a refresh_tokens row).
+const demoLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30,
+  message: { error: 'Too many demo sessions from this address. Please wait a few minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
   skip: skipInDev,
@@ -127,13 +142,44 @@ router.post('/auth/login', loginLimiter, validate(schemas.login), async (req, re
       // anyway, so this only duplicated the rule in a second place where it
       // could drift. One source of truth; see routes/admin.js.
       // tenant_status lets the dashboard show the right banner without an extra
-      // round trip: 'pending_review' (awaiting super-admin approval — patients
-      // can't reach the clinic yet) or 'past_due' (update payment).
-      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug: normalizedSlug, tenant_status: tenant.status }
+      // round trip — in practice 'past_due' (update payment), since only
+      // 'active'/'past_due' can log in at all (see LOGIN_ALLOWED_STATUSES).
+      user: { email: userR.rows[0].email, name: userR.rows[0].name, role: userR.rows[0].role, tenant: tenant.name, tenant_slug: normalizedSlug, tenant_status: tenant.status, read_only: !!tenant.read_only }
     });
   } catch (err) {
     handleError(res, err);
   }
+});
+
+// ── PUBLIC DEMO LOGIN ─────────────────────────────────────────
+// Hands anyone a session for the demo clinic with NO credentials, so it can sit
+// behind a "See a live demo" button on the public site. The whole safety story
+// is one check: the tenant MUST be `read_only`. A passwordless session is only
+// ever minted for a tenant where every write already 403s (middleware/auth.js
+// `enforceReadOnlyTenant`), so even a mis-set DEMO_TENANT_SLUG cannot turn this
+// into a way into a real clinic. Turn the demo login off by clearing the
+// read-only flag (DEMO_READ_ONLY=false) — a writable demo must not be handed out.
+router.post('/auth/demo-session', demoLoginLimiter, async (req, res) => {
+  try {
+    const slug = (process.env.DEMO_TENANT_SLUG || 'pragati-demo').trim();
+    const tR = await query(`SELECT * FROM tenants WHERE slug=$1`, [slug]);
+    const tenant = tR.rows[0];
+    if (!tenant || tenant.read_only !== true || tenant.status !== 'active') {
+      return res.status(404).json({ error: 'The live demo is not available right now.' });
+    }
+    const uR = await tenantQuery(tenant.schema_name,
+      `SELECT * FROM users WHERE role='admin' AND is_active=true ORDER BY created_at ASC LIMIT 1`);
+    const user = uR.rows[0];
+    if (!user) return res.status(404).json({ error: 'The live demo is not available right now.' });
+
+    const session = await issueSession(user, tenant);
+    await query(
+      `INSERT INTO admin_access_logs (user_id, email, tenant_id, event, ip_address, user_agent)
+       VALUES ($1,$2,$3,'demo_login',$4,$5)`,
+      [user.id, user.email, tenant.id, req.ip, req.headers['user-agent']]
+    ).catch(e => logger.warn('demo-session audit log failed', { error: e.message }));
+    res.json(session);
+  } catch (err) { handleError(res, err); }
 });
 
 // Hash a refresh token for storage — a DB leak must not yield usable
@@ -217,7 +263,7 @@ async function issueSession(user, tenant) {
   return {
     token,
     refresh_token,
-    user: { email: user.email, name: user.name, role: user.role, tenant: tenant.name, tenant_slug: tenant.slug, tenant_status: tenant.status },
+    user: { email: user.email, name: user.name, role: user.role, tenant: tenant.name, tenant_slug: tenant.slug, tenant_status: tenant.status, read_only: !!tenant.read_only },
   };
 }
 
@@ -395,8 +441,14 @@ router.post('/auth/change-password', changePasswordLimiter, authMiddleware, vali
       currentHash = r.rows[0].password_hash;
     } else {
       // Fetch schema once, reuse for both SELECT and UPDATE
-      const tenantR = await query(`SELECT schema_name FROM tenants WHERE id=$1`, [tenant_id]);
+      const tenantR = await query(`SELECT schema_name, read_only FROM tenants WHERE id=$1`, [tenant_id]);
       if (!tenantR.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
+      if (tenantR.rows[0].read_only) {
+        // The demo login is public — a visitor changing its password locks
+        // everyone else out. /api/admin writes are already blocked upstream;
+        // this route sits under /api/auth, so it needs its own guard.
+        return res.status(403).json({ error: 'This is a read-only demo clinic — the password cannot be changed here.', read_only: true });
+      }
       tenantSchemaName = tenantR.rows[0].schema_name;
       const userR = await tenantQuery(tenantSchemaName,
         `SELECT password_hash FROM users WHERE id=$1`, [id]);
