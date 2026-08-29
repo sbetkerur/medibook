@@ -13,10 +13,15 @@ FROM postgres:18-alpine AS pgclient
 
 FROM node:20-alpine
 
-COPY --from=pgclient /usr/local/bin/pg_dump /usr/local/bin/pg_dump
-# `pg_dump --version` here fails the build if a .so is missing, so a broken
+# pg_dump for the backup cron; pg_isready for entrypoint.sh's DB-wait loop.
+# (The old `apk add postgresql-client` bundled both — dropping it dropped
+# pg_isready too, which stalled the boot.)
+COPY --from=pgclient /usr/local/bin/pg_dump    /usr/local/bin/pg_dump
+COPY --from=pgclient /usr/local/bin/pg_isready /usr/local/bin/pg_isready
+# `--version` on each here fails the build if a .so is missing, so a broken
 # image never reaches prod.
-RUN apk add --no-cache libpq zstd-libs lz4-libs && pg_dump --version
+RUN apk add --no-cache libpq zstd-libs lz4-libs \
+    && pg_dump --version && pg_isready --version
 
 WORKDIR /app
 
