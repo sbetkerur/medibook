@@ -9,8 +9,15 @@
  *
  *   node scripts/backup-prod.js
  *
- * Writes  <BACKUP_HOME>/medibook-prod-YYYY-MM-DDTHH-MM-SS.dump  (custom format,
- * so pg_restore -j can be used) and keeps the most recent KEEP files.
+ * Writes  <BACKUP_HOME>/medibook-prod-YYYY-MM-DDTHH-MM-SS.dump.enc  and keeps
+ * the most recent KEEP files. ENCRYPTED — this is a full copy of every
+ * clinic's data (including patients' health records) sitting on a personal
+ * machine rather than a server, which is a softer target than Railway's own
+ * infrastructure, not a safer one. Same AES-256-GCM/ENCRYPTION_KEY scheme as
+ * jobs/backupManager.js's in-container backup — fetched via the Railway CLI
+ * (scripts/decryptBackup.js's getEncryptionKey), the same way this script
+ * already fetches DATABASE_PUBLIC_URL, so nothing new to configure by hand.
+ * Decrypt with `node scripts/decryptBackup.js <file>` before pg_restore.
  *
  * WHICH pg_dump: production runs Postgres 18 and a client older than the server
  * refuses to dump at all. A native pg_dump 18+ is used when one can be found —
@@ -23,6 +30,8 @@ const { execSync, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+const { getEncryptionKey } = require('./decryptBackup');
 
 const REPO = path.resolve(__dirname, '..', '..');
 const BACKUP_HOME = process.env.MEDIBOOK_BACKUP_DIR
@@ -111,12 +120,42 @@ function dumpDocker(url, target) {
   }
 }
 
+/**
+ * Encrypt `plainPath` to `encPath` (AES-256-GCM, same [iv][ciphertext][tag]
+ * format as jobs/backupManager.js and scripts/decryptBackup.js), then delete
+ * the plaintext. Whole-file rather than streamed, unlike the in-container
+ * backup: pg_dump here already writes a complete file to disk before this
+ * runs (native and Docker both do), so there is no stdout stream to intercept
+ * without restructuring how pg_dump is invoked — and that restructuring is
+ * exactly the kind of change that's risky to make without a live Railway
+ * connection to test it against. The cost is a brief window where the
+ * plaintext dump sits on disk before this deletes it; acceptable for a
+ * routine, human-run backup, not for the unattended nightly one.
+ */
+function encryptFileInPlace(plainPath, encPath, keyBuffer) {
+  const data = fs.readFileSync(plainPath);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', keyBuffer, iv);
+  const ciphertext = Buffer.concat([cipher.update(data), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  fs.writeFileSync(encPath, Buffer.concat([iv, ciphertext, tag]));
+  fs.unlinkSync(plainPath);
+}
+
 function main() {
   fs.mkdirSync(BACKUP_HOME, { recursive: true });
 
+  // Fetched FIRST and fails fast — no point running a multi-minute pg_dump
+  // only to discover at the end there's nothing to encrypt it with.
+  process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || getEncryptionKey();
+  const { getKeyBuffer } = require('../src/utils/encryption');
+  const keyBuffer = getKeyBuffer();
+
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const name = `medibook-prod-${stamp}.dump`;
-  const target = path.join(BACKUP_HOME, name);
+  const plainName = `medibook-prod-${stamp}.dump`;
+  const encName = `${plainName}.enc`;
+  const plainTarget = path.join(BACKUP_HOME, plainName);
+  const encTarget = path.join(BACKUP_HOME, encName);
 
   const native = nativeDump();
   const useDocker = !native;
@@ -126,23 +165,27 @@ function main() {
       + `${MIN_SERVER_MAJOR}+ is on PATH. Start Docker Desktop, or install the `
       + 'PostgreSQL 18 client tools to make this work without Docker.');
   }
-  log(`starting backup -> ${name}  (via ${native ? `pg_dump ${native.major}` : 'docker ' + IMAGE})`);
+  log(`starting backup -> ${encName}  (via ${native ? `pg_dump ${native.major}` : 'docker ' + IMAGE})`);
 
   const url = prodUrl();
-  if (native) dumpNative(native.exe, url, target); else dumpDocker(url, target);
+  if (native) dumpNative(native.exe, url, plainTarget); else dumpDocker(url, plainTarget);
 
-  const size = fs.statSync(target).size;
   // A custom-format dump of an empty-but-migrated database is still tens of KB.
   // Anything tiny means the dump aborted and wrote a stub — fail loudly rather
-  // than quietly keeping a useless file and pruning a good one.
-  if (size < 5000) {
-    try { fs.unlinkSync(target); } catch { /* leave it */ }
-    throw new Error(`backup suspiciously small (${size} bytes) — discarded and treated as failed`);
+  // than quietly keeping a useless file and pruning a good one. Checked on the
+  // PLAINTEXT file, before encryption ever touches it.
+  const plainSize = fs.statSync(plainTarget).size;
+  if (plainSize < 5000) {
+    try { fs.unlinkSync(plainTarget); } catch { /* leave it */ }
+    throw new Error(`backup suspiciously small (${plainSize} bytes) — discarded and treated as failed`);
   }
-  log(`wrote ${name} (${size.toLocaleString()} bytes)`);
+
+  encryptFileInPlace(plainTarget, encTarget, keyBuffer);
+  const size = fs.statSync(encTarget).size;
+  log(`wrote ${encName} (${size.toLocaleString()} bytes)`);
 
   const files = fs.readdirSync(BACKUP_HOME)
-    .filter(f => /^medibook-prod-.*\.dump$/.test(f))
+    .filter(f => /^medibook-prod-.*\.dump\.enc$/.test(f))
     .map(f => ({ f, t: fs.statSync(path.join(BACKUP_HOME, f)).mtimeMs }))
     .sort((a, b) => b.t - a.t);
 
@@ -152,6 +195,19 @@ function main() {
     pruned++;
   }
   log(`retention: ${Math.min(files.length, KEEP)} kept, ${pruned} pruned`);
+
+  // Retention only matches `.dump.enc` now. Any plaintext `.dump` left over from
+  // before encryption existed is the exact PHI exposure this change removes — it
+  // will never be pruned and is not auto-deleted here (the operator may want to
+  // encrypt it first). Say so loudly so it doesn't sit forgotten.
+  const legacyPlain = fs.readdirSync(BACKUP_HOME)
+    .filter(f => /^medibook-prod-.*\.dump$/.test(f));
+  if (legacyPlain.length) {
+    log(`WARNING: ${legacyPlain.length} UNENCRYPTED legacy dump(s) still in ${BACKUP_HOME} ` +
+        `(${legacyPlain.join(', ')}) — each is a full plaintext copy of every clinic's data. ` +
+        `Encrypt or delete them.`);
+  }
+
   log('backup OK');
 }
 

@@ -17,7 +17,7 @@
  */
 const { tenantQuery } = require('../../db');
 const logger = require('../../utils/logger');
-const { STATES, updateSession, getPatient, notifyAdminWhatsApp, maskPhone, clinicPhoneLine } = require('./utils');
+const { STATES, updateSession, getPatient, notifyAdminWhatsApp, maskPhone, clinicPhoneLine, isReadOnlyDemo, READ_ONLY_DEMO_MESSAGE } = require('./utils');
 
 // Button ids are matched on the message TEXT as well, because wa.sendButtons
 // mints opaque ids and the numbered text fallback (used when an interactive
@@ -83,6 +83,14 @@ async function offerRequest(send, lead) {
 }
 
 async function handleCallbackRequest(phone, schema, tenant, send, ctx = {}) {
+  // Whole-tenant read-only guard — recordRequest below also fires a REAL
+  // WhatsApp alert to the clinic's own admin phone, which must never happen
+  // for a public demo visitor. See isReadOnlyDemo in bot/utils.js.
+  if (isReadOnlyDemo(tenant)) {
+    await send.text(READ_ONLY_DEMO_MESSAGE);
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
   await recordRequest(schema, tenant, phone, 'callback', {
     note: ctx.request_note || null,
     hospitalId: ctx.hospital_id || null,
@@ -104,6 +112,13 @@ async function handleCallbackRequest(phone, schema, tenant, send, ctx = {}) {
  * dentist and treatment they were after rather than starting from nothing.
  */
 async function handleAppointmentRequest(phone, schema, tenant, send, ctx = {}) {
+  // Whole-tenant read-only guard — same reasoning as handleCallbackRequest
+  // above: recordRequest also fires a real WhatsApp alert to clinic staff.
+  if (isReadOnlyDemo(tenant)) {
+    await send.text(READ_ONLY_DEMO_MESSAGE);
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
   await recordRequest(schema, tenant, phone, 'appointment', {
     hospitalId: ctx.hospital_id || null,
     departmentId: ctx.department_id && ctx.department_id !== 'general_consult' ? ctx.department_id : null,

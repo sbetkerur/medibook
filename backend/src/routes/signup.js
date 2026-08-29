@@ -284,6 +284,9 @@ async function notifyReviewQueue(tenant) {
     INSERT INTO audit_logs (actor_role, action, resource_type, resource_id, new_values)
     VALUES ('system','TENANT_AWAITING_REVIEW','tenant',$1,$2)
   `, [tenant.id, JSON.stringify({ slug: tenant.slug, name: tenant.name })]).catch(() => {});
+  // WhatsApp the operator(s) if SIGNUP_REVIEW_NOTIFY_PHONE is set — otherwise
+  // the queue is dashboard-only, as before.
+  require('../services/signupNotify').notifyReviewQueue(tenant).catch(() => {});
 }
 
 module.exports = router;

@@ -2,12 +2,13 @@
 const router = require('express').Router();
 const { tenantQuery, tenantTransaction } = require('../db');
 const { validate, schemas } = require('../middleware/validate');
-const { VALID_APPOINTMENT_STATUSES, APPOINTMENT_TRANSITIONS, UUID_RE, validateUUID, handleError } = require('../utils/errors');
+const { VALID_APPOINTMENT_STATUSES, APPOINTMENT_TRANSITIONS, UUID_RE, validateUUID, handleError, VALID_PAYMENT_STATUSES, PAYMENT_METHODS } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
 
 const { derivePlanStatus } = require('../utils/treatmentPlan');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
+const { decryptJSON } = require('../utils/encryption');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -187,16 +188,27 @@ router.get('/appointments/:id', validateUUID(), async (req, res) => {
       WHERE a2.patient_id=$1 AND a2.id != $2
       ORDER BY a2.appointment_date DESC LIMIT 5
     `, [r.rows[0].patient_id, req.params.id]);
+    // dental_history is encrypted at rest (utils/encryption.js encryptJSON) —
+    // see routes/patients.js for the same handling. null means decryption
+    // failed (wrong/rotated key, corrupted row); it must reach the dentist as
+    // an explicit error, never as a silently empty-looking history.
+    const appointment = r.rows[0];
+    const dentalHistory = decryptJSON(appointment.dental_history);
+    appointment.dental_history = dentalHistory === null ? null : dentalHistory;
+    if (dentalHistory === null) {
+      logger.warn('dental_history decryption failed', { patient: appointment.patient_id });
+      appointment.dental_history_error = true;
+    }
     // Audit dental history access for privacy compliance.
     // Store a truncated patient_id (first 8 chars) rather than the full UUID to
     // avoid unnecessarily surfacing sensitive identifiers in audit log queries.
-    if (r.rows[0].dental_history && Object.keys(r.rows[0].dental_history).length > 0) {
-      const maskedPatientId = String(r.rows[0].patient_id || '').slice(0, 8) + '…';
+    if (dentalHistory && Object.keys(dentalHistory).length > 0) {
+      const maskedPatientId = String(appointment.patient_id || '').slice(0, 8) + '…';
       writeAuditLog(s, req.user.id, req.user.role, 'ACCESS_DENTAL_HISTORY', 'patient',
         maskedPatientId, null, null, req.ip)
         .catch(e => logger.warn('Medical history audit log failed', { error: e.message }));
     }
-    res.json({ appointment: r.rows[0], patient_history: history.rows });
+    res.json({ appointment, patient_history: history.rows });
   } catch (err) { handleError(res, err); }
 });
 
@@ -286,7 +298,7 @@ router.patch('/appointments/bulk', adminOnly, async (req, res) => {
 // ── UPDATE APPOINTMENT STATUS ─────────────────────────────────
 router.patch('/appointments/:id', validateUUID(), async (req, res) => {
   try {
-    const { status, notes, note_category, cancellation_reason, effective_fee } = req.body;
+    const { status, notes, note_category, cancellation_reason, effective_fee, payment_status, payment_method } = req.body;
     const s = req.tenant.schema_name;
     const VALID_NOTE_CATEGORIES = ['general', 'vip', 'allergy', 'followup', 'special'];
 
@@ -302,6 +314,35 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       const fee = Number(effective_fee);
       if (!Number.isInteger(fee) || fee < 0 || fee > 1000000) {
         return res.status(400).json({ error: 'effective_fee must be a whole number between 0 and 1,000,000' });
+      }
+    }
+
+    // Per-appointment paid/unpaid/waived marking — see routes/dayClose.js for
+    // why this matters: payment_status previously had no writer at all, so
+    // day-close could only ever report a theoretical total, never what was
+    // actually collected.
+    if (payment_status !== undefined && !VALID_PAYMENT_STATUSES.includes(payment_status)) {
+      return res.status(400).json({ error: `Invalid payment_status. Must be one of: ${VALID_PAYMENT_STATUSES.join(', ')}` });
+    }
+    if (payment_method !== undefined && payment_method !== null && payment_method !== '' && !PAYMENT_METHODS.includes(payment_method)) {
+      return res.status(400).json({ error: `Invalid payment_method. Must be one of: ${PAYMENT_METHODS.join(', ')}` });
+    }
+
+    // Applies the three payment columns together so they can never drift apart:
+    // marking 'paid' always stamps HOW and WHEN; stepping back to 'pending' or
+    // 'waived' always clears both, so a corrected mis-click doesn't leave a
+    // stale method/timestamp behind that a report could still pick up. Defaults
+    // the method to 'cash' when marking paid without specifying one, same as
+    // treatment_payments (routes/treatmentPlans.js) already does.
+    function pushPaymentUpdate(updates, params) {
+      if (payment_status === undefined) return;
+      params.push(payment_status); updates.push(`payment_status=$${params.length}`);
+      if (payment_status === 'paid') {
+        params.push(payment_method || 'cash'); updates.push(`payment_method=$${params.length}`);
+        updates.push('payment_collected_at=NOW()');
+      } else {
+        updates.push('payment_method=NULL');
+        updates.push('payment_collected_at=NULL');
       }
     }
 
@@ -371,6 +412,7 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
         if (effective_fee !== undefined && effective_fee !== null && effective_fee !== '') {
           params.push(Number(effective_fee)); updates.push(`effective_fee=$${params.length}`);
         }
+        pushPaymentUpdate(updates, params);
         params.push(req.params.id);
         const updated = await client.query(
           `UPDATE appointments SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`, params
@@ -400,6 +442,7 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
       if (effective_fee !== undefined && effective_fee !== null && effective_fee !== '') {
         params.push(Number(effective_fee)); updates.push(`effective_fee=$${params.length}`);
       }
+      pushPaymentUpdate(updates, params);
       params.push(req.params.id);
       const idParam = params.length;
       let guard = '';
@@ -424,7 +467,7 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     }
 
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_APPOINTMENT', 'appointment', req.params.id,
-      { status: oldR.rows[0].status }, { status, cancellation_reason, effective_fee }, req.ip);
+      { status: oldR.rows[0].status }, { status, cancellation_reason, effective_fee, payment_status, payment_method }, req.ip);
     res.json({ appointment: r.rows[0] });
     // Fire-and-forget WhatsApp alert to admin on cancel
     if (status === 'cancelled') {

@@ -316,6 +316,13 @@ export default function Dashboard() {
   const [editingFeeId, setEditingFeeId] = useState(null);
   const [feeAmount, setFeeAmount] = useState('');
   const [feeSaving, setFeeSaving] = useState(false);
+  // Paid/pending/waived — appointments.payment_status, edited alongside the
+  // fee override since the desk sets both at the same moment (the visit's
+  // done, here's what was charged, here's whether it was collected). Method
+  // only matters once 'paid' is chosen; day-close's "by method" reconciliation
+  // reads it.
+  const [paymentStatus, setPaymentStatus] = useState('pending');
+  const [paymentMethod, setPaymentMethod] = useState('cash');
 
   // Role gate: the backend enforces adminOnly on staff CRUD, settings PATCH,
   // walk-ins, bulk updates, imports, WhatsApp sends, audit logs, etc. Staff
@@ -804,7 +811,13 @@ export default function Dashboard() {
       ]);
       if (isStale()) return;
       if (histData.status === 'fulfilled') setPatientHistory(histData.value.data.appointments || []);
-      if (medData.status === 'fulfilled') {
+      // medical_history_error is a SUCCESSFUL response whose payload could not
+      // be decrypted (utils/encryption.js decryptJSON — wrong/rotated key, a
+      // corrupted row). It must be treated exactly like the network-failure
+      // branch below, not like `medData.status === 'fulfilled'` normally would:
+      // the fields still need to read as "could not load," never as "none
+      // recorded," or a real allergy silently disappears from the chart.
+      if (medData.status === 'fulfilled' && !medData.value.data.patient?.medical_history_error) {
         const mh = medData.value.data.patient?.medical_history || {};
         setMedHistory({ blood_type: mh.blood_type || '', allergies: mh.allergies || '', conditions: mh.conditions || '', medications: mh.medications || '', notes: mh.notes || '' });
         setMedHistoryFailed(false);
@@ -1230,8 +1243,24 @@ export default function Dashboard() {
       // read by the backend as "field omitted, leave it as it was" and could
       // never clear a previously-set override back to the default.
       const fee = feeAmount === '' ? 0 : Number(feeAmount);
-      await api.patch(`/admin/appointments/${apptId}`, { effective_fee: fee });
-      setAppointments(prev => prev.map(a => a.id === apptId ? { ...a, effective_fee: fee } : a));
+      const body = { effective_fee: fee };
+      // Only send the payment fields when they actually changed. The backend
+      // re-stamps payment_collected_at=NOW() every time it sees
+      // payment_status:'paid', so sending it unconditionally would silently
+      // move an already-paid visit's collection time to "now" just because the
+      // desk reopened this modal to tweak the fee amount.
+      const cur = appointments.find(a => a.id === apptId) || {};
+      const curStatus = cur.payment_status || 'pending';
+      const curMethod = cur.payment_method || 'cash';
+      if (paymentStatus !== curStatus || (paymentStatus === 'paid' && paymentMethod !== curMethod)) {
+        body.payment_status = paymentStatus;
+        if (paymentStatus === 'paid') body.payment_method = paymentMethod;
+      }
+      await api.patch(`/admin/appointments/${apptId}`, body);
+      setAppointments(prev => prev.map(a => a.id === apptId ? {
+        ...a, effective_fee: fee, payment_status: paymentStatus,
+        payment_method: paymentStatus === 'paid' ? paymentMethod : null,
+      } : a));
       toast.success(fee > 0 ? `Fee set to ₹${fee}` : 'Fee reset to the doctor’s rate');
       setEditingFeeId(null);
     } catch (err) {
@@ -1610,7 +1639,12 @@ export default function Dashboard() {
               waLink={waLink}
               onAddWalkin={openWalkinModal}
               onEditNotes={(a) => { setEditingNotesId(a.id); setNotesText(a.notes || ''); }}
-              onEditFee={(a) => { setEditingFeeId(a.id); setFeeAmount(a.effective_fee > 0 ? String(a.effective_fee) : ''); }}
+              onEditFee={(a) => {
+                setEditingFeeId(a.id);
+                setFeeAmount(a.effective_fee > 0 ? String(a.effective_fee) : '');
+                setPaymentStatus(a.payment_status || 'pending');
+                setPaymentMethod(a.payment_method || 'cash');
+              }}
               onCancelAppt={(a) => { setCancellingAppt(a); setCancelReason(''); }}
               onRecordTreatment={(a) => setRecordTreatmentAppt(a)}
             />
@@ -2650,7 +2684,7 @@ export default function Dashboard() {
       return (
       <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50">
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 sm:p-6 max-h-[90vh] supports-[max-height:90dvh]:max-h-[90dvh] overflow-y-auto">
-          <h3 className="text-base font-semibold text-gray-900 mb-1">Consultation Fee</h3>
+          <h3 className="text-base font-semibold text-gray-900 mb-1">Consultation Fee &amp; Payment</h3>
           <p className="text-xs text-gray-400 mb-4">
             The fee is quotable, not fixed — clinics waive or negotiate it per patient.
             {doc?.consultation_fee > 0 && <> Dr. {doc.name}&apos;s rate is <strong>₹{doc.consultation_fee}</strong>.</>}
@@ -2663,14 +2697,60 @@ export default function Dashboard() {
             className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-blue-500"
             autoFocus
           />
-          <div className="flex gap-3 mt-4">
+
+          {/* payment_status only feeds day-close for COMPLETED visits — that's
+              the only status it counts as revenue, and feeButtonInfo() styles
+              the button the same way. Hiding the controls until the visit is
+              seen keeps the modal from offering to "mark a future booking
+              paid", which no report would ever pick up. */}
+          {appt?.status === 'completed' && (
+          <div className="mt-5 border-t border-gray-100 pt-4">
+            <p className="text-sm font-medium text-gray-700 mb-2">Payment</p>
+            <div className="flex gap-2">
+              {[
+                ['pending', 'Unpaid'],
+                ['paid', 'Paid'],
+                ['waived', 'Waived'],
+              ].map(([val, label]) => (
+                <button key={val} type="button" onClick={() => setPaymentStatus(val)}
+                  className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition ${
+                    paymentStatus === val
+                      ? val === 'paid' ? 'bg-green-600 text-white border-green-600'
+                        : val === 'waived' ? 'bg-gray-500 text-white border-gray-500'
+                        : 'bg-amber-500 text-white border-amber-500'
+                      : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'
+                  }`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {paymentStatus === 'paid' && (
+              <select value={paymentMethod} onChange={e => setPaymentMethod(e.target.value)}
+                className="mt-3 w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="cash">Cash</option>
+                <option value="card">Card</option>
+                <option value="upi">UPI</option>
+                <option value="bank_transfer">Bank transfer</option>
+                <option value="cheque">Cheque</option>
+                <option value="other">Other</option>
+              </select>
+            )}
+            <p className="mt-2 text-xs text-gray-400">
+              {paymentStatus === 'waived'
+                ? 'Waived fees are not counted as outstanding on day-close.'
+                : 'Feeds the day-close "collected" total and its by-method breakdown.'}
+            </p>
+          </div>
+          )}
+
+          <div className="flex gap-3 mt-5">
             <button onClick={() => setEditingFeeId(null)}
               className="flex-1 px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
               Cancel
             </button>
             <button onClick={() => saveApptFee(editingFeeId)} disabled={feeSaving}
               className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
-              {feeSaving ? 'Saving...' : '💾 Save Fee'}
+              {feeSaving ? 'Saving...' : '💾 Save'}
             </button>
           </div>
         </div>

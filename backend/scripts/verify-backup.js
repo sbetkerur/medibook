@@ -10,6 +10,11 @@
  * is not "did pg_restore exit 0" but "are the platform tables, the plans, the
  * super admin and every tenant schema present afterwards".
  *
+ * scripts/backup-prod.js now writes `.dump.enc` (AES-256-GCM) instead of a
+ * plain `.dump` — this decrypts to a local temp file first (deleted when done,
+ * success or failure) and restores THAT, same as always otherwise. A `.dump`
+ * from before that change is still accepted as-is, unencrypted.
+ *
  * Touches nothing real — it starts its own postgres:18-alpine container, restores
  * into that, and removes it again.
  */
@@ -17,6 +22,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { decryptFile } = require('./decryptBackup');
 
 const BACKUP_HOME = process.env.MEDIBOOK_BACKUP_DIR
   || path.join(os.homedir(), 'MediBookBackups');
@@ -29,7 +35,7 @@ const d = (args, opts = {}) =>
 
 function newest() {
   const files = fs.readdirSync(BACKUP_HOME)
-    .filter(f => /^medibook-prod-.*\.dump$/.test(f))
+    .filter(f => /^medibook-prod-.*\.dump(\.enc)?$/.test(f))
     .map(f => ({ p: path.join(BACKUP_HOME, f), t: fs.statSync(path.join(BACKUP_HOME, f)).mtimeMs }))
     .sort((a, b) => b.t - a.t);
   if (!files.length) throw new Error(`no backups found in ${BACKUP_HOME}`);
@@ -37,9 +43,16 @@ function newest() {
 }
 
 (function main() {
-  const file = process.argv[2] || newest();
+  let file = process.argv[2] || newest();
+  let decryptedTemp = null;
+  if (file.endsWith('.enc')) {
+    decryptedTemp = path.join(os.tmpdir(), `medibook-verify-${Date.now()}.dump`);
+    console.log(`decrypting ${path.basename(file)}...`);
+    decryptFile(file, decryptedTemp);
+    file = decryptedTemp;
+  }
   const size = fs.statSync(file).size;
-  console.log(`verifying ${path.basename(file)} (${size.toLocaleString()} bytes)`);
+  console.log(`verifying ${path.basename(process.argv[2] || file)} (${size.toLocaleString()} bytes)`);
 
   try { d(['rm', '-f', NAME], { stdio: 'ignore' }); } catch { /* not running */ }
 
@@ -103,5 +116,8 @@ function newest() {
     process.exitCode = failed ? 1 : 0;
   } finally {
     try { d(['rm', '-f', NAME], { stdio: 'ignore' }); } catch { /* gone */ }
+    // The decrypted copy is plaintext PHI for every clinic — clean it up
+    // whether verification passed or failed, not just on the happy path.
+    if (decryptedTemp) { try { fs.unlinkSync(decryptedTemp); } catch { /* already gone */ } }
   }
 })();

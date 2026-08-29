@@ -40,6 +40,10 @@ cd backend && node tests/razorpaySignature.unit.test.js  # self-serve billing: c
 cd backend && node tests/sendCaps.unit.test.js           # trial outbound cap: 50/24h until paying
 cd backend && node tests/otp.unit.test.js                # WhatsApp OTP: attempts, cooldown, single-use
 cd backend && node tests/readOnlyTenant.unit.test.js     # whole-tenant read-only guard (demo clinic)
+cd backend && node tests/demoReadOnlyBot.unit.test.js    # same guard, extended into the bot engine itself
+cd backend && node tests/askingTenant.unit.test.js       # answers redirect to the clinic that asked (confirmation/feedback/treatment/recall)
+cd backend && node tests/dentalHistoryEncryption.unit.test.js  # dental_history encryption: round-trip, legacy fallback, tamper detection
+cd backend && node tests/backupEncryption.unit.test.js   # backup file format shared by backupManager.js/backup-prod.js/decryptBackup.js
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -401,18 +405,28 @@ if it is ever needed. Not `adminOnly`: the dentist who took it is usually not
 the account owner.
 
 **`GET /day-close` is the end-of-day count.** Consultation fees and treatment
-payments stay SEPARATE (conflating them double-counts revenue) and are added
-once into `collected_total`, broken down by method so the drawer can be counted
-against the cash line. The consultation half uses
-`COALESCE(NULLIF(a.effective_fee,0), d.consultation_fee)` — the same expression
-the analytics queries and the weekly digest use. `effective_fee` is an OVERRIDE
-column that nothing currently writes, so summing it raw reported ₹0 of
-consultation income every day. For the same reason there is deliberately no
-paid/unpaid split: `payment_status` has no writer either, so the old
-`fees_collected` was structurally always 0 and told every clinic that 100% of
-its fees were unpaid. If per-appointment payment marking is ever built, split it
-again then — and give `payment_status` a writer in the same change. IST throughout — `created_at` is a TIMESTAMPTZ and is
-compared in Asia/Kolkata, or a clinic closing at 21:00 sees yesterday.
+payments stay SEPARATE (conflating them double-counts revenue). The
+consultation half uses `COALESCE(NULLIF(a.effective_fee,0), d.consultation_fee)`
+— the same expression the analytics queries and the weekly digest use.
+`effective_fee` (an OVERRIDE; 0/unset means "use the doctor's rate") and
+`payment_status`/`payment_method` all now have writers — `PATCH
+/appointments/:id`, open to the same non-admin roles as marking an appointment
+completed (front-desk work, not `adminOnly`). `payment_status` is `pending`
+(the column default — a completed visit nobody has touched yet reads as this,
+never as silently paid) → `paid` (stamps `payment_method`, defaulting to
+`cash`, and `payment_collected_at=NOW()`) or `waived` (clears both — a waived
+fee is not outstanding money). `collected_total` counts only fees actually
+MARKED paid, plus treatment payments — not "every completed visit," which is
+what an earlier version assumed before either column had a writer, and which
+reported ₹0 every day once it tried to sum `effective_fee` raw. A completed
+visit nobody has marked shows up in `appointments.fees_pending`/
+`pending_count` instead, which the dashboard surfaces as an amber "still
+marked unpaid" banner — the desk works that down before trusting the number,
+same discipline as recording a treatment payment. Consultation fees also get
+their own "by method" breakdown now (`consultation_payments.by_method`),
+mirroring `treatment_payments.by_method`'s existing reconciliation. IST
+throughout — `created_at` is a TIMESTAMPTZ and is compared in Asia/Kolkata, or
+a clinic closing at 21:00 sees yesterday.
 
 **On-demand PDF reports.** `utils/pdfReport.js` (pdfkit) is the only PDF path:
 `streamReport` writes the clinic band + page numbers, `drawTable` paginates,
@@ -663,6 +677,31 @@ marketing landing page (root `/`; the old `/`→`/login` redirect is gone,
 healthcheck is on `/login`) and `frontend/src/app/demo/page.js` is the "See a
 live demo" button. Tests: `tests/readOnlyTenant.unit.test.js`.
 
+`enforceReadOnlyTenant` only ever covered the DASHBOARD (`/api/admin` +
+`/api/v1/admin`) — nothing stopped the bot/webhook path from booking,
+cancelling, rescheduling, or queuing a `clinic_requests` row (which also fires
+a real WhatsApp alert to the clinic's own admin) against a read-only tenant.
+Harmless while `pragati-demo`'s WhatsApp number was reachable only by its own
+operators; not harmless once `frontend/src/components/WhatsAppDemoChat.js` (the
+live, interactive "try the bot" widget in the marketing page's hero, backed by
+`POST /api/demo/chat`) invokes the SAME bot engine as a public, unauthenticated
+surface. `services/bot/utils.js` `isReadOnlyDemo(tenant)` extends the guarantee
+down into the bot itself, checked immediately before each mutation rather than
+earlier in the flow — browsing menus and picking a slot still works, only the
+commit is blocked, replying with a "this is a live demo" message instead. Five
+call sites: `bookingFlow.completeBooking`, `appointmentFlow.handleCancelConfirm`
++ `handleRescheduleConfirm`, and `requestFlow.handleCallbackRequest` +
+`handleAppointmentRequest`. `routes/demoChat.js` is the second, narrower layer
+that makes this reachable by the public in the first place: unlike
+`POST /webhook/test` (whose free-form `tenant_slug` would, in the wrong hands,
+return any patient's appointment details for ANY real tenant), it hardcodes
+`DEMO_TENANT_SLUG` and re-verifies `read_only` + `active` on every call — the
+same one-check safety story as `POST /auth/demo-session`. It runs the bot via
+`services/bot/testRunner.js` (shared with `/webhook/test` and the authenticated
+`/admin/bot-test`), keyed by a synthetic phone derived server-side from a
+client-supplied per-tab session id — never a client-supplied phone. Neither
+layer substitutes for the other. Tests: `tests/demoReadOnlyBot.unit.test.js`.
+
 **Frontend.** All API calls go through the Next.js rewrite proxy
 (`/api/proxy/*` → `BACKEND_URL`) — no API origin is baked into the bundle.
 `lib/api.js` handles token attach, 401 → refresh rotation (queued), and
@@ -701,7 +740,18 @@ first admin user (`buildSelfServeTenantSchema`), starts the **card-free** trial
 `active`, stamps `activated_at`, and WhatsApps the owner a login link
 (`services/signupNotify.js`, `SIGNUP_APPROVED_TEMPLATE`, text fallback in dev).
 It is idempotent (`CREATE SCHEMA IF NOT EXISTS` + `INSERT … ON CONFLICT DO
-NOTHING`). The card is only taken later, via `POST /admin/billing/subscribe` →
+NOTHING`). A fresh schema has no hospital, doctor or schedule, so the owner's
+FIRST admin login (`app/login/page.js`) checks `GET /admin/onboarding/status`
+and routes to the guided wizard (`app/onboarding/page.js` — clinic details,
+treatments, first dentist + weekly hours, then the QR code) instead of a bare
+dashboard, rather than leaving the dashboard's own passive checklist banner
+(`onboarding.steps`) as the only hint anything is left to do. Gated to
+`role === 'admin'` and non-`read_only` — every wizard step is `adminOnly`
+(hospital/doctor/schedule mutation), and the shareable demo tenant already has
+all of it seeded so `all_done` is already true there regardless. Fails open to
+`/dashboard` on any error; `POST /admin/onboarding/complete` marks it done
+(and is what makes `all_done` stick — the dashboard banner keeps showing,
+offering that button, until it's called explicitly). The card is only taken later, via `POST /admin/billing/subscribe` →
 Razorpay Checkout → `/billing/subscribe/confirm`. `services/signupProvision.js`
 holds all of it: `registerSelfServeTenant` (phase 1) +
 `buildSelfServeTenantSchema` (phase 2) for self-serve, `provisionTenant` (one
@@ -750,6 +800,44 @@ Fails OPEN.
 — one call, audited, effective within the 5s tenant-cache TTL. `resume` on a
 self-serve clinic returns it to `past_due` (still owes payment) unless
 `?to=active`.
+
+**`patients.dental_history` is encrypted at rest, and so is every backup.**
+Blood type, allergies, chronic conditions and medications used to sit in
+plain JSONB — readable straight out of a `SELECT *`, and swept into the
+nightly backup as plaintext too, across every clinic on the platform in one
+file. `routes/patients.js` and `routes/appointments.js` now read/write it
+through `utils/encryption.js`'s `encryptJSON`/`decryptJSON` — the same
+`{_enc: "v2:..."}` convention `services/botEngine.js` already used for
+`bot_sessions.context`, reused rather than inventing a second format.
+`decryptJSON` returns `null` on a decryption failure (wrong/rotated key,
+corrupted row) — **never** `{}`: a dentist checking for an allergy must be
+told the read failed, not handed a falsely-reassuring empty record. Every
+route surfaces this as `medical_history_error: true`, and
+`dashboard/page.js`'s patient modal already had the right instinct for a
+*network* failure here (`medHistoryFailed`) — extended to treat a decryption
+failure identically rather than silently rendering it as "none recorded." A
+one-shot migration (`tenantMigrate.js`, `seed_markers` key
+`encrypt_dental_history_v1`) encrypts every pre-existing plaintext row on the
+next boot, per tenant; anything created or edited after that point is
+encrypted automatically by the routes above.
+
+Both backup paths are encrypted the same way (AES-256-GCM,
+`[12-byte IV][ciphertext][16-byte auth tag]`, same `ENCRYPTION_KEY`):
+`jobs/backupManager.js`'s nightly in-container `pg_dump` (streamed through a
+cipher before it ever touches disk — `medibook_backup_*.sql.enc`) and
+`scripts/backup-prod.js`'s off-Railway laptop copy (encrypted-then-deleted
+after pg_dump writes it — `medibook-prod-*.dump.enc`), which is the more
+exposed of the two: a full copy of every clinic's data sitting on a personal
+machine rather than a server. `scripts/decryptBackup.js` reads either format
+and fetches `ENCRYPTION_KEY` via the Railway CLI the same way
+`backup-prod.js` already fetches `DATABASE_PUBLIC_URL`, so restoring needs no
+separately-managed secret — but also means **losing or rotating
+`ENCRYPTION_KEY` without keeping the old value makes every backup taken under
+it permanently unreadable**, with no recovery path that doesn't start with
+the original key. `scripts/verify-backup.js` decrypts to a temp file before
+`pg_restore`ing it, and deletes that temp file whether verification passed or
+failed. Tests: `tests/dentalHistoryEncryption.unit.test.js`,
+`tests/backupEncryption.unit.test.js`.
 
 ## Environment variables
 

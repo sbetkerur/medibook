@@ -66,6 +66,21 @@ const VALID_ROLES = ['admin', 'doctor'];
 
 const VALID_APPOINTMENT_STATUSES = ['confirmed', 'completed', 'cancelled', 'no_show'];
 
+// Shared with treatment_payments.method (routes/treatmentPlans.js) and
+// appointments.payment_method (routes/appointments.js, routes/dayClose.js) —
+// one list so a day-close "by method" breakdown and a payment form can never
+// recognise a different set of methods than the other writes.
+const PAYMENT_METHODS = ['cash', 'card', 'upi', 'bank_transfer', 'cheque', 'other'];
+
+// appointments.payment_status. 'pending' is the column default (and the read
+// state of every appointment before this was ever built) — a completed visit
+// stays 'pending' until the desk explicitly marks it paid or waived, it does
+// not infer either from anything else. 'waived' is the consultation-fee waiver
+// CLAUDE.md describes (a clinic showing the fee but not charging it once
+// treatment is taken) — kept apart from 'paid' so day-close doesn't count a
+// waived visit as still-outstanding money.
+const VALID_PAYMENT_STATUSES = ['pending', 'paid', 'waived'];
+
 // Allowed appointment status transitions — single source of truth used by both
 // the single-appointment PATCH and the bulk update route.
 const APPOINTMENT_TRANSITIONS = {
@@ -123,6 +138,8 @@ module.exports = {
   VALID_ROLES,
   VALID_APPOINTMENT_STATUSES,
   APPOINTMENT_TRANSITIONS,
+  PAYMENT_METHODS,
+  VALID_PAYMENT_STATUSES,
   UUID_RE,
   isRealAppSecret,
   SLOT_LOOKAHEAD_DAYS,

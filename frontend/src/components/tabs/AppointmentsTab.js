@@ -19,6 +19,25 @@ import Badge from '@/components/ui/Badge';
  * capability has been removed, backend route included — deliberately, not an
  * oversight, so don't re-add a call site for it here.
  */
+// The 💰 button's colour/label — payment_status only really means anything
+// once a visit is COMPLETED (that's the only status day-close counts as
+// revenue), so a confirmed/no_show/cancelled appointment keeps the plain
+// fee-only look regardless of payment_status.
+function feeButtonInfo(a) {
+  if (a.status === 'completed') {
+    if (a.payment_status === 'paid') {
+      return { cls: 'bg-green-50 text-green-700 border-green-200', label: `Paid${a.effective_fee > 0 ? ` ₹${a.effective_fee}` : ''}` };
+    }
+    if (a.payment_status === 'waived') {
+      return { cls: 'bg-gray-100 text-gray-500 border-gray-300', label: 'Waived' };
+    }
+    return { cls: 'bg-amber-50 text-amber-700 border-amber-200', label: a.effective_fee > 0 ? `₹${a.effective_fee} unpaid` : 'Unpaid' };
+  }
+  return a.effective_fee > 0
+    ? { cls: 'bg-green-50 text-green-700 border-green-200', label: `₹${a.effective_fee}` }
+    : { cls: 'bg-gray-50 text-gray-500 border-gray-200', label: 'Fee' };
+}
+
 export default function AppointmentsTab({
   appointments,
   isAdmin,
@@ -159,8 +178,8 @@ export default function AppointmentsTab({
                     the fee is negotiated at the desk, same as recording a
                     treatment payment. */}
                 <button onClick={() => onEditFee(a)}
-                  className={`px-3 py-2 text-xs border rounded-lg transition ${a.effective_fee > 0 ? 'bg-green-50 text-green-700 border-green-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
-                  💰 {a.effective_fee > 0 ? `₹${a.effective_fee}` : 'Fee'}
+                  className={`px-3 py-2 text-xs border rounded-lg transition ${feeButtonInfo(a).cls}`}>
+                  💰 {feeButtonInfo(a).label}
                 </button>
                 {/* Recording the treatment has to happen HERE, on the visit the
                     dentist just finished — not on a separate tab that asks the
@@ -256,9 +275,9 @@ export default function AppointmentsTab({
                         className={`px-2 py-1 text-xs border rounded hover:bg-gray-100 transition whitespace-nowrap ${a.notes ? 'bg-yellow-50 text-yellow-700 border-yellow-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
                         📝 {a.notes ? 'Notes' : 'Add Note'}
                       </button>
-                      <button onClick={() => onEditFee(a)} title="Set the consultation fee for this visit"
-                        className={`px-2 py-1 text-xs border rounded hover:bg-gray-100 transition whitespace-nowrap ${a.effective_fee > 0 ? 'bg-green-50 text-green-700 border-green-200' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
-                        💰 {a.effective_fee > 0 ? `₹${a.effective_fee}` : 'Fee'}
+                      <button onClick={() => onEditFee(a)} title="Set the consultation fee and mark it paid"
+                        className={`px-2 py-1 text-xs border rounded hover:bg-gray-100 transition whitespace-nowrap ${feeButtonInfo(a).cls}`}>
+                        💰 {feeButtonInfo(a).label}
                       </button>
                       <button onClick={() => onRecordTreatment(a)} title="Record a treatment the dentist advised"
                         className="px-2 py-1 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded hover:bg-teal-100 transition whitespace-nowrap">

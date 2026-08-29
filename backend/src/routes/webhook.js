@@ -195,15 +195,47 @@ router.post('/webhook/razorpay', async (req, res) => {
     const periodEnd = sub?.current_end ? new Date(sub.current_end * 1000).toISOString() : null;
     const chargedAt = (eventType === 'subscription.charged' && sub?.current_start)
       ? new Date(sub.current_start * 1000).toISOString() : null;
+    // A scheduled downgrade (billing.js) takes effect when Razorpay starts a new
+    // cycle at the changed plan — surface that as `plan_id` catching up to
+    // `pending_plan_id` and clear the schedule. Razorpay reports the live plan
+    // id on the subscription entity.
+    const livePlanId = sub?.plan_id || null;
 
     await query(`
       UPDATE tenant_billing SET
         subscription_status = COALESCE($1, subscription_status),
         current_period_end  = COALESCE($2, current_period_end),
         last_payment_at     = COALESCE($3, last_payment_at),
+        quantity            = COALESCE($4, quantity),
         updated_at = NOW()
-      WHERE tenant_id = $4
-    `, [newSubStatus, periodEnd, chargedAt, billing.tenant_id]);
+      WHERE tenant_id = $5
+    `, [newSubStatus, periodEnd, chargedAt, (sub?.quantity != null ? Number(sub.quantity) : null), billing.tenant_id]);
+
+    // Reconcile a pending plan change: if Razorpay is now billing the plan the
+    // clinic asked to move to, promote it on our side and clear the schedule.
+    if (billing.pending_plan_id && livePlanId) {
+      const pendR = await query(`SELECT razorpay_plan_id FROM plans WHERE id=$1`, [billing.pending_plan_id]);
+      if (pendR.rows[0]?.razorpay_plan_id === livePlanId) {
+        await query(`UPDATE tenant_billing SET plan_id=$1, pending_plan_id=NULL, plan_change_at=NULL, updated_at=NOW() WHERE tenant_id=$2`,
+          [billing.pending_plan_id, billing.tenant_id]);
+        await query(`UPDATE tenants SET plan=$1 WHERE id=$2`, [billing.pending_plan_id, billing.tenant_id]);
+        require('../middleware/auth').invalidateTenantCache(billing.tenant_id);
+        logger.info('Razorpay webhook: scheduled plan change applied', { tenant: billing.tenant_id, plan: billing.pending_plan_id });
+      }
+    }
+
+    // Issue the GST tax invoice for a successful charge. Idempotent on the
+    // payment id, so a webhook retry never double-issues.
+    if (eventType === 'subscription.charged') {
+      try {
+        const payment = evt.payload?.payment?.entity || null;
+        await require('../services/invoice').recordInvoiceFromCharge({
+          subscriptionId, payment, subscription: sub,
+        });
+      } catch (invErr) {
+        logger.error('Razorpay webhook: invoice write failed', { subscriptionId, error: invErr.message });
+      }
+    }
 
     await query(
       `UPDATE billing_events SET tenant_id=$1 WHERE provider_event_id=$2`,

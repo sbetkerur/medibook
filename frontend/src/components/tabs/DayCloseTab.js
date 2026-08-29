@@ -70,6 +70,8 @@ export default function DayCloseTab() {
   };
 
   const a = data?.appointments || {};
+  const consultByMethod = data?.consultation_payments?.by_method || [];
+  const consultPaidTotal = data?.consultation_payments?.total || 0;
   const byMethod = data?.treatment_payments?.by_method || [];
   const treatmentTotal = data?.treatment_payments?.total || 0;
 
@@ -117,19 +119,54 @@ export default function DayCloseTab() {
             <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Collected today</p>
             <p className="mt-1 text-3xl font-bold text-gray-900">{money(data.collected_total)}</p>
             <p className="mt-2 text-xs text-gray-500">
-              {money(a.fees_completed)} in consultation fees for the {a.completed || 0} appointment{a.completed === 1 ? '' : 's'} seen today, plus {money(treatmentTotal)} in treatment payments.
+              {money(consultPaidTotal)} in consultation fees marked paid, plus {money(treatmentTotal)} in treatment payments.
             </p>
-            {/* There used to be a "still marked unpaid" amber line here, driven by
-                appointments.payment_status. Nothing in the product ever writes
-                that column, so the line fired on every clinic, every day, always
-                claiming 100% of consultation fees were unpaid — and the headline
-                above it read ₹0. A number that is wrong every single time is
-                worse than no number: it is what teaches a receptionist to stop
-                reading the screen. If per-appointment payment marking is ever
-                built, bring the split back then. */}
+            {/* Brought back now that appointments.payment_status has a real writer
+                (PATCH /appointments/:id) — it used to fire on every clinic, every
+                day, always claiming 100% of fees were unpaid, because nothing
+                wrote the column it read. Now it reflects what the desk hasn't
+                gotten to yet, not an assumption. */}
+            {a.pending_count > 0 && (
+              <p className="mt-3 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                {a.pending_count} completed appointment{a.pending_count === 1 ? ' is' : 's are'} still marked unpaid
+                ({money(a.fees_pending)}). Mark {a.pending_count === 1 ? 'it' : 'them'} paid or waived from the
+                appointment so this total can be trusted.
+              </p>
+            )}
+            {a.waived_count > 0 && (
+              <p className="mt-2 text-xs text-gray-400">
+                {a.waived_count} consultation fee{a.waived_count === 1 ? '' : 's'} waived ({money(a.fees_waived)}), not counted as outstanding.
+              </p>
+            )}
           </div>
 
           {/* ── By method: cash vs the drawer ────────────────── */}
+          <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+            <div className="px-5 py-4 border-b border-gray-100">
+              <h2 className="font-semibold text-gray-800">Consultation fees by method</h2>
+              <p className="text-xs text-gray-500 mt-0.5">Fees marked paid on the appointment.</p>
+            </div>
+            {consultByMethod.length ? (
+              <div className="divide-y divide-gray-50">
+                {consultByMethod.map(m => (
+                  <div key={m.method} className="px-5 py-3 flex items-center justify-between">
+                    <div className="text-sm text-gray-700">
+                      {METHOD_LABELS[m.method] || m.method}
+                      <span className="ml-2 text-xs text-gray-400">{m.count} appointment{m.count === 1 ? '' : 's'}</span>
+                    </div>
+                    <div className="text-sm font-semibold text-gray-900">{money(m.amount)}</div>
+                  </div>
+                ))}
+                <div className="px-5 py-3 flex items-center justify-between bg-gray-50">
+                  <div className="text-sm font-medium text-gray-700">Total</div>
+                  <div className="text-sm font-bold text-gray-900">{money(consultPaidTotal)}</div>
+                </div>
+              </div>
+            ) : (
+              <div className="px-5 py-8 text-center text-gray-400 text-sm">No consultation fees marked paid yet.</div>
+            )}
+          </div>
+
           <div className="bg-white rounded-xl shadow-sm overflow-hidden">
             <div className="px-5 py-4 border-b border-gray-100">
               <h2 className="font-semibold text-gray-800">Treatment payments by method</h2>

@@ -91,7 +91,7 @@ async function createCustomer({ name, email, contact }) {
  * sits in `authenticated` once the customer has completed the Checkout auth
  * transaction. `customer_notify: 1` lets Razorpay send its own payment emails.
  */
-async function createSubscription({ plan, customerId, trialDays, notes }) {
+async function createSubscription({ plan, customerId, trialDays, notes, quantity }) {
   const rzpPlanId = planIdFor(plan);
   if (!rzpPlanId) throw new Error(`No Razorpay plan configured for "${plan}" (set RAZORPAY_PLAN_${String(plan).toUpperCase()})`);
   const days = Math.max(0, Number(trialDays) || 0);
@@ -103,16 +103,39 @@ async function createSubscription({ plan, customerId, trialDays, notes }) {
     const { data } = await client().post('/subscriptions', {
       plan_id: rzpPlanId,
       customer_id: customerId,
-      // ~10 years of monthly cycles. Razorpay requires a finite count; this is
-      // effectively "until cancelled" without an awkward low ceiling.
-      total_count: 120,
-      quantity: 1,
+      // 100 years of monthly cycles. Razorpay requires a finite count; this is
+      // effectively "until cancelled". Was 120 (10y) — bumped so a long-lived
+      // clinic never hits `subscription.completed` and silently stops billing.
+      total_count: 1200,
+      quantity: Math.max(1, Number(quantity) || 1),
       customer_notify: 1,
       ...(startAt ? { start_at: startAt, expire_by: startAt + 7 * 86400 } : {}),
       notes: notes || {},
     });
     return data; // { id: 'sub_...', status, short_url, ... }
   } catch (err) { throw _wrap(err, 'createSubscription'); }
+}
+
+/**
+ * Update a live subscription — plan swap and/or quantity change.
+ *   scheduleChangeAt: 'now' (immediate, proration on) | 'cycle_end' (default).
+ * Razorpay's PATCH /subscriptions/:id takes `plan_id`, `quantity`,
+ * `schedule_change_at` and `remaining_count`. We pass `remaining_count` on a
+ * plan change because Razorpay resets the billing cycle and requires it.
+ */
+async function updateSubscription(subscriptionId, { planId, quantity, scheduleChangeAt = 'cycle_end' } = {}) {
+  const body = { schedule_change_at: scheduleChangeAt === 'now' ? 'now' : 'cycle_end' };
+  if (planId) {
+    const rzpPlanId = planIdFor(planId);
+    if (!rzpPlanId) throw new Error(`No Razorpay plan configured for "${planId}"`);
+    body.plan_id = rzpPlanId;
+    body.remaining_count = 1200;
+  }
+  if (quantity != null) body.quantity = Math.max(1, Number(quantity) || 1);
+  try {
+    const { data } = await client().patch(`/subscriptions/${encodeURIComponent(subscriptionId)}`, body);
+    return data;
+  } catch (err) { throw _wrap(err, 'updateSubscription'); }
 }
 
 async function fetchSubscription(subscriptionId) {
@@ -178,6 +201,7 @@ module.exports = {
   planIdFor,
   createCustomer,
   createSubscription,
+  updateSubscription,
   fetchSubscription,
   cancelSubscription,
   verifyCheckoutSignature,

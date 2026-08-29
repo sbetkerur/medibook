@@ -498,7 +498,8 @@ async function migrate() {
         ('webhook_retry'),
         ('recalls'),
         ('treatment_nudges'),
-        ('billing_dunning')
+        ('billing_dunning'),
+        ('account_deletion')
       ON CONFLICT (job_name) DO NOTHING;
     `);
 
@@ -1173,6 +1174,92 @@ async function migrate() {
         ).catch(e => console.warn(`⚠️  Could not set ${envKey} on plans.${planId}: ${e.message}`));
       }
     }
+
+    // Version 32: everything the self-serve module needed to be self-serve —
+    // cancellation, plan changes, per-branch subscription quantity, GST tax
+    // invoices, and the tenant-initiated account-deletion flow.
+    //   * tenant_billing gains the columns that make "cancel at cycle end" and
+    //     "downgrade at cycle end" first-class rather than a support ticket:
+    //     `quantity` (Professional bills plan_price × active branches),
+    //     `pending_plan_id`/`plan_change_at` (a scheduled downgrade),
+    //     `canceled_at`/`cancel_reason`.
+    //   * tenant_billing_profiles holds the buyer's GST identity — legal name,
+    //     address, GSTIN, place-of-supply state code — captured in Settings ›
+    //     Billing, needed to raise a compliant tax invoice. Nullable: a clinic
+    //     with no GSTIN is billed B2C and the invoice omits the buyer GSTIN.
+    //   * billing_invoices is one row per successful Razorpay charge
+    //     (webhook `subscription.charged`), carrying the GST split (CGST+SGST
+    //     for an in-state buyer, IGST otherwise; amounts are GST-INCLUSIVE of
+    //     the plan price, so `taxable_paise` is back-computed). invoice_number
+    //     is `<PREFIX>/<FY>/<seq>` from billing_invoice_seq. tenant_id is
+    //     ON DELETE SET NULL — a financial record outlives the clinic.
+    //   * tenants gains the deletion-request columns. A tenant admin asks to
+    //     delete; ACCOUNT_DELETION_GRACE_DAYS later, jobs/accountDeletion.js
+    //     DROPs the schema and deletes the row. Cancellable until then.
+    await runMigration(client, 32, 'billing_self_service', async () => {
+      await client.query(`
+        ALTER TABLE tenant_billing ADD COLUMN IF NOT EXISTS quantity        INTEGER DEFAULT 1;
+        ALTER TABLE tenant_billing ADD COLUMN IF NOT EXISTS pending_plan_id VARCHAR(50);
+        ALTER TABLE tenant_billing ADD COLUMN IF NOT EXISTS plan_change_at  TIMESTAMPTZ;
+        ALTER TABLE tenant_billing ADD COLUMN IF NOT EXISTS canceled_at     TIMESTAMPTZ;
+        ALTER TABLE tenant_billing ADD COLUMN IF NOT EXISTS cancel_reason   TEXT;
+
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS deletion_requested_at   TIMESTAMPTZ;
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS deletion_scheduled_for  TIMESTAMPTZ;
+        ALTER TABLE tenants ADD COLUMN IF NOT EXISTS deletion_requested_by   UUID;
+
+        ALTER TABLE plan_changes ADD COLUMN IF NOT EXISTS source     VARCHAR(20) DEFAULT 'admin';
+        ALTER TABLE plan_changes ADD COLUMN IF NOT EXISTS effective  VARCHAR(20) DEFAULT 'immediate';
+
+        CREATE TABLE IF NOT EXISTS tenant_billing_profiles (
+          tenant_id UUID PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+          legal_name       VARCHAR(255),
+          billing_address  TEXT,
+          gstin            VARCHAR(20),
+          -- GST state code, 2 chars ("29" = Karnataka). Decides CGST+SGST vs IGST
+          -- against SELLER_STATE_CODE. NULL → assume same state as the seller.
+          place_of_supply  VARCHAR(2),
+          billing_email    VARCHAR(255),
+          updated_at       TIMESTAMPTZ DEFAULT NOW(),
+          updated_by       UUID
+        );
+
+        CREATE SEQUENCE IF NOT EXISTS billing_invoice_seq;
+
+        CREATE TABLE IF NOT EXISTS billing_invoices (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+          invoice_number VARCHAR(40) UNIQUE NOT NULL,
+          financial_year VARCHAR(7) NOT NULL,
+          provider VARCHAR(20) NOT NULL DEFAULT 'razorpay',
+          razorpay_payment_id     VARCHAR(64) UNIQUE,
+          razorpay_subscription_id VARCHAR(64),
+          razorpay_invoice_id     VARCHAR(64),
+          period_start TIMESTAMPTZ,
+          period_end   TIMESTAMPTZ,
+          currency VARCHAR(3) NOT NULL DEFAULT 'INR',
+          -- All amounts in paise. total = taxable + cgst + sgst + igst, and
+          -- total equals the amount Razorpay actually charged (GST-inclusive).
+          total_paise   INTEGER NOT NULL,
+          taxable_paise INTEGER NOT NULL,
+          cgst_paise INTEGER NOT NULL DEFAULT 0,
+          sgst_paise INTEGER NOT NULL DEFAULT 0,
+          igst_paise INTEGER NOT NULL DEFAULT 0,
+          gst_rate NUMERIC(5,4) NOT NULL DEFAULT 0.18,
+          place_of_supply VARCHAR(2),
+          buyer_legal_name VARCHAR(255),
+          buyer_gstin VARCHAR(20),
+          plan_id VARCHAR(50),
+          quantity INTEGER NOT NULL DEFAULT 1,
+          status VARCHAR(20) NOT NULL DEFAULT 'paid',
+          issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          payload JSONB,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_billing_invoices_tenant ON billing_invoices(tenant_id, issued_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_billing_invoices_sub ON billing_invoices(razorpay_subscription_id);
+      `);
+    });
 
     // Backfill, unconditionally on every boot rather than inside the migration
     // above. Two reasons: prod runs with SEED_DEMO_DATA=false so seed-time

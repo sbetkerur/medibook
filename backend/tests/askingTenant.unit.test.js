@@ -35,6 +35,7 @@ const world = {
   askingState: 'idle',           // bot_sessions.state in the ASKING clinic
   askingHasReminder: true,       // an unanswered reminder_confirmations row?
   askingHasOpenPlan: true,       // a treatment course with a sitting left to book?
+  askingHasOpenRecall: true,     // a patient_recalls row still 'due' and sent?
 };
 
 function rows(r) { return { rows: r, rowCount: r.length }; }
@@ -65,6 +66,9 @@ async function routeTenantQuery(schema, sql, params = []) {
   if (q.includes('FROM treatment_plans tp')) {
     return rows(world.askingHasOpenPlan ? [{ '?column?': 1 }] : []);
   }
+  if (q.includes('FROM patient_recalls r')) {
+    return rows(world.askingHasOpenRecall ? [{ '?column?': 1 }] : []);
+  }
   return rows([]);
 }
 
@@ -83,7 +87,7 @@ const PHONE = '919333333333';
 function scenario(overrides) {
   Object.assign(world, {
     pendingTenantId: 'tenant-a', currentState: 'idle', askingState: 'idle', askingHasReminder: true,
-    askingHasOpenPlan: true,
+    askingHasOpenPlan: true, askingHasOpenRecall: true,
   }, overrides);
 }
 
@@ -196,10 +200,66 @@ async function run() {
   });
 
   await test('ordinary bot input is never classified as an answer', async () => {
+    // 'book' is deliberately NOT in this list any more — RECALL_REPLY_RE
+    // matches it on purpose (see the RECALL block below), so it is no longer
+    // "ordinary" input once a recall is genuinely waiting for an answer.
     scenario({});
-    for (const text of ['book', 'Smile Dental', '6', 'MB12AB3', '']) {
+    for (const text of ['Smile Dental', '6', 'MB12AB3', '']) {
       assert.strictEqual(await resolveAskingTenant(PHONE, text, TENANT_B), null, `"${text}" was redirected`);
     }
+  });
+
+  // ── The fourth clinic-initiated question: the six-month recall ──
+  // jobs/recalls.js records KINDS.RECALL; this mirrors the TREATMENT block
+  // above almost exactly, plus the one extra risk RECALL carries that
+  // TREATMENT doesn't: its vocabulary includes "menu" and "book", which are
+  // ALSO ordinary things to type while actively talking to the CURRENT
+  // clinic. The state + authoritative-recall checks are what's supposed to
+  // keep the two apart — these tests pin that down rather than just asserting
+  // the happy path.
+  await test('*Menu*/"book"/"checkup" go back to the clinic that asked, not the one selected', async () => {
+    for (const text of ['Menu', 'book', 'checkup', 'check-up']) {
+      scenario({});
+      const r = await resolveAskingTenant(PHONE, text, TENANT_B);
+      assert.strictEqual(r?.id, 'tenant-a', `"${text}" was not redirected to the asking clinic`);
+    }
+  });
+
+  await test('a recall reply at the selected clinic\'s main menu still redirects', async () => {
+    scenario({ currentState: 'main_menu' });
+    assert.strictEqual((await resolveAskingTenant(PHONE, 'Menu', TENANT_B))?.id, 'tenant-a');
+  });
+
+  await test('HIGH: a recall reply is NOT redirected into an asking clinic that is mid-flow', async () => {
+    // Same reasoning as TREATMENT: botEngine only opens the menu from a
+    // resting state, so a clinic sitting at select_date would eat the word.
+    scenario({ askingState: 'select_date' });
+    assert.strictEqual(await resolveAskingTenant(PHONE, 'Menu', TENANT_B), null);
+  });
+
+  await test('HIGH: a recall reply is not redirected once the recall is no longer open', async () => {
+    // closeActedOnRecalls flips a booked recall to 'status=booked'; the pending
+    // row has a 72h TTL and may still exist after that happens. The word then
+    // belongs to the clinic the patient is actually looking at.
+    scenario({ askingHasOpenRecall: false });
+    assert.strictEqual(await resolveAskingTenant(PHONE, 'Menu', TENANT_B), null);
+  });
+
+  await test('mid-conversation with the selected clinic, a recall reply is not redirected', async () => {
+    scenario({ currentState: 'select_slot' });
+    assert.strictEqual(await resolveAskingTenant(PHONE, 'Menu', TENANT_B), null);
+  });
+
+  await test('ACCEPTED TRADE-OFF: "Menu" typed at the patient\'s OWN idle clinic still redirects ' +
+    'if a different clinic genuinely has an open recall', async () => {
+    // This is the one documented sharp edge: unlike "Treatment", "Menu" is also
+    // completely ordinary navigation at the clinic the patient is actually
+    // talking to. The code accepts this trade-off deliberately (see the
+    // comment above RECALL_REPLY_RE in routes/webhook.js) rather than never
+    // redirecting a recall reply at all — pinned here so a future change to
+    // either direction is a decision, not an accident.
+    scenario({});
+    assert.strictEqual((await resolveAskingTenant(PHONE, 'Menu', TENANT_B))?.id, 'tenant-a');
   });
 
   console.log(`\nResults: ${pass} passed, ${fail} failed\n`);

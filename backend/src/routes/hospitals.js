@@ -57,6 +57,10 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
 
     await writeAuditLog(s, req.user.id, req.user.role, 'CREATE_HOSPITAL', 'hospital', r.rows[0].id,
       null, { name, city }, req.ip);
+    // Professional bills per branch — push the new count to Razorpay. Never
+    // blocks the response; jobs/billingDunning.js reconciles quantity daily.
+    require('../services/billing').syncSubscriptionQuantity(req.tenant.id)
+      .catch(e => require('../utils/logger').warn('branch add: billing sync failed', { error: e.message }));
     res.json({ hospital: r.rows[0] });
   } catch (err) {
     if (err.isQuota) {
@@ -64,6 +68,9 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
       return res.status(403).json({
         error: `Branch limit reached for your plan (${cur}/${max}). Upgrade to Professional to add more branches.`,
         quota_exceeded: true,
+        code: 'PLAN_LIMIT',
+        resource: 'branches',
+        upgrade_to: 'professional',
       });
     }
     handleError(res, err);
@@ -112,6 +119,9 @@ router.delete('/hospitals/:id', adminOnly, validateUUID(), async (req, res) => {
     }
     await writeAuditLog(s, req.user.id, req.user.role, 'DELETE_HOSPITAL', 'hospital', req.params.id,
       null, null, req.ip);
+    // One fewer branch to bill for (Professional). Takes effect next cycle.
+    require('../services/billing').syncSubscriptionQuantity(req.tenant.id)
+      .catch(e => require('../utils/logger').warn('branch remove: billing sync failed', { error: e.message }));
     res.json({ success: true });
   } catch (err) { handleError(res, err); }
 });

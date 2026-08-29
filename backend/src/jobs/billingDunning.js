@@ -132,6 +132,56 @@ async function suspendExpiredGrace() {
   }
 }
 
+/**
+ * Issue the actual Razorpay cancel for a subscription the clinic asked to end
+ * (routes/billing.js sets `cancel_at_period_end` but does NOT call Razorpay, so
+ * /cancel/undo can be a real undo). Once `current_period_end` has passed and
+ * the flag is still set, the clinic has had every day it paid for — cancel it
+ * with the provider now. `at_cycle_end=false` because the cycle is already over.
+ */
+async function applyScheduledCancellations() {
+  if (!razorpay.isConfigured()) return;
+  const rows = (await query(`
+    SELECT b.tenant_id, b.razorpay_subscription_id, t.slug
+      FROM tenant_billing b
+      JOIN tenants t ON t.id = b.tenant_id
+     WHERE b.cancel_at_period_end = true
+       AND b.canceled_at IS NULL
+       AND b.razorpay_subscription_id IS NOT NULL
+       AND (b.current_period_end IS NULL OR b.current_period_end < NOW())
+  `)).rows;
+
+  for (const row of rows) {
+    try {
+      await razorpay.cancelSubscription(row.razorpay_subscription_id, false);
+      await query(`UPDATE tenant_billing SET canceled_at=NOW(), subscription_status='cancelled', updated_at=NOW() WHERE tenant_id=$1`, [row.tenant_id]);
+      logger.warn('billing_dunning: scheduled cancellation applied', { slug: row.slug });
+    } catch (e) {
+      logger.warn('billing_dunning: cancel call failed — will retry', { slug: row.slug, error: e.message });
+    }
+  }
+}
+
+/**
+ * Backstop for services/billing.js's syncSubscriptionQuantity — if a branch
+ * add/remove couldn't reach Razorpay at the time, bring the subscription
+ * quantity (and tenants.billing_monthly) back in line here.
+ */
+async function reconcileBranchQuantities() {
+  const billingSvc = require('../services/billing');
+  const rows = (await query(`
+    SELECT t.id FROM tenants t
+      JOIN tenant_billing b ON b.tenant_id = t.id
+     WHERE t.signup_source = 'self_serve'
+       AND t.plan = 'professional'
+       AND t.status IN ('active','past_due')
+  `)).rows;
+  for (const r of rows) {
+    await billingSvc.syncSubscriptionQuantity(r.id).catch(e =>
+      logger.warn('billing_dunning: quantity reconcile failed', { tenant: r.id, error: e.message }));
+  }
+}
+
 async function retryStuckProvisioning() {
   const rows = (await query(`
     SELECT ps.* FROM pending_signups ps
@@ -168,6 +218,8 @@ async function runOnce() {
   await purgeStaleSignups();
   await endLapsedTrials();
   await reconcileSubscriptions();
+  await applyScheduledCancellations();
+  await reconcileBranchQuantities();
   await suspendExpiredGrace();
   await retryStuckProvisioning();
 }

@@ -414,6 +414,52 @@ router.post('/tenants/:id/resume', validateUUID(), async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// ── REJECT A PENDING SIGNUP ──────────────────────────────────
+// A clinic in `pending_review` has NO schema and NO user yet (routes/signup.js),
+// so rejecting it is a clean delete: drop the tenants row (CASCADE clears
+// tenant_billing; pending_signups.tenant_id is ON DELETE SET NULL), free the
+// slug and entry code, and WhatsApp the owner that we couldn't proceed. Only
+// valid for pending_review — an active clinic is suspended/deleted, not rejected.
+router.post('/tenants/:id/reject', validateUUID(), async (req, res) => {
+  try {
+    const reason = String(req.body?.reason || '').slice(0, 500);
+    const cur = await query(`SELECT * FROM tenants WHERE id=$1`, [req.params.id]);
+    const t = cur.rows[0];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    if (t.status !== 'pending_review') {
+      return res.status(409).json({ error: `Only a clinic awaiting review can be rejected (this one is "${t.status}").` });
+    }
+    const schemaExists = (await query(
+      `SELECT 1 FROM information_schema.schemata WHERE schema_name=$1`, [t.schema_name]
+    )).rowCount > 0;
+    if (schemaExists) {
+      return res.status(409).json({ error: 'This clinic already has a schema — it has been provisioned. Suspend or delete it instead of rejecting.' });
+    }
+
+    const psR = await query(
+      `SELECT * FROM pending_signups WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 1`, [req.params.id]);
+    const pending = psR.rows[0];
+
+    await query(`UPDATE pending_signups SET consumed_at=COALESCE(consumed_at, NOW()) WHERE tenant_id=$1`, [req.params.id]).catch(() => {});
+    await query(`DELETE FROM tenants WHERE id=$1`, [req.params.id]);
+    invalidateTenantCache(req.params.id);
+    await query(`
+      INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
+      VALUES ($1,'super_admin','REJECT_TENANT','tenant',$2,$3,$4)
+    `, [req.user.id, req.params.id, JSON.stringify({ slug: t.slug, name: t.name, reason }), req.ip]).catch(() => {});
+    logger.warn('Self-serve clinic rejected', { slug: t.slug, by: req.user.email, reason });
+
+    if (pending?.phone) {
+      const { frontendBaseUrl } = require('../utils/appUrls');
+      const wa = require('../services/whatsapp');
+      const msg = `We're sorry — we couldn't set up "${t.name}" on MediBook right now`
+        + (reason ? ` (${reason})` : '') + `. Reply here or write to ${frontendBaseUrl().replace(/^https?:\/\//, '')} if you'd like to try again.`;
+      wa.sendText(pending.phone, msg, null, null).catch(() => {});
+    }
+    res.json({ message: 'Signup rejected', slug: t.slug });
+  } catch (err) { handleError(res, err); }
+});
+
 // ── CREATE TENANT ─────────────────────────────────────────────
 router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), async (req, res) => {
   try {

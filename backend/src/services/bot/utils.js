@@ -460,6 +460,32 @@ async function reminder24hApplies(schemaName, appointmentDateStr) {
   return appointmentDateStr > todayStr;
 }
 
+/**
+ * Whole-tenant read-only guard, extended from the dashboard's `tenants.read_only`
+ * flag (`middleware/auth.js` `enforceReadOnlyTenant`) down into the bot engine.
+ * That HTTP-layer guard only ever covered `/api/admin` + `/api/v1/admin` — the
+ * bot/webhook path was never touched, so a read-only tenant's data was only
+ * "read-only" from the dashboard. The bot could still book, cancel, reschedule,
+ * or queue a `clinic_requests` row (which also fires a real WhatsApp alert to
+ * the clinic's own admin). That gap was harmless while the read-only demo
+ * tenant's WhatsApp number was unreachable by anyone but its own operators;
+ * it stops being harmless the moment a public "try the bot" widget invokes
+ * this SAME bot engine against the SAME shared tenant every dashboard demo
+ * visitor also sees.
+ *
+ * Callers check this immediately before the write they're about to make — the
+ * booking insert, the cancel/reschedule UPDATE, the clinic-request INSERT —
+ * not earlier in the flow, so browsing menus and picking a slot still works
+ * and only the commit is blocked.
+ */
+function isReadOnlyDemo(tenant) {
+  return tenant?.read_only === true;
+}
+
+const READ_ONLY_DEMO_MESSAGE =
+  'This is a live demo — booking is disabled here so the calendar stays the same for everyone trying it.\n\n' +
+  'Reply *Menu* to keep exploring.';
+
 module.exports = {
   STATES,
   genBookingId,
@@ -480,4 +506,6 @@ module.exports = {
   clinicPhone,
   clinicPhoneLine,
   reminder24hApplies,
+  isReadOnlyDemo,
+  READ_ONLY_DEMO_MESSAGE,
 };

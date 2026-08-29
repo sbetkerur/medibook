@@ -14,7 +14,7 @@
  */
 const router = require('express').Router();
 const { tenantQuery, tenantTransaction } = require('../db');
-const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
+const { validateUUID, handleError, UUID_RE, PAYMENT_METHODS } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { planProgress, derivePlanStatus, canTransitionPlan, PLAN_STATUSES } = require('../utils/treatmentPlan');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
@@ -648,7 +648,9 @@ router.patch('/treatment-plans/:id', validateUUID(), async (req, res) => {
 });
 
 // ── PAYMENTS ──────────────────────────────────────────────────
-const PAYMENT_METHODS = ['cash', 'card', 'upi', 'bank_transfer', 'cheque', 'other'];
+// PAYMENT_METHODS now lives in utils/errors.js — shared with
+// appointments.payment_method (routes/appointments.js, routes/dayClose.js) so
+// the two payment paths can never recognise a different set of methods.
 
 router.get('/treatment-plans/:id/payments', validateUUID(), async (req, res) => {
   try {
