@@ -67,4 +67,31 @@ async function notifyOwnerApproved(phone, { clinicName, slug }) {
   }
 }
 
-module.exports = { notifyOwnerApproved };
+/**
+ * Ping the operator(s) that a clinic is sitting in the review queue, so a
+ * signup at 2 a.m. doesn't wait until someone happens to open the superadmin
+ * dashboard. SIGNUP_REVIEW_NOTIFY_PHONE is a comma-separated list of WhatsApp
+ * numbers — these are OPERATOR numbers, not patients, so a plain sendText is
+ * fine (no template, no 24h window concern for an internal recipient who is
+ * expected to keep the thread open). Best-effort: the clinic is already
+ * registered and visible in the queue regardless.
+ */
+async function notifyReviewQueue(tenant) {
+  const raw = (process.env.SIGNUP_REVIEW_NOTIFY_PHONE || '').trim();
+  if (!raw) return;
+  const numbers = raw.split(',').map(s => s.replace(/[^\d+]/g, '')).filter(Boolean);
+  if (!numbers.length) return;
+  const url = `${frontendBaseUrl()}/superadmin`;
+  const msg =
+    `New MediBook clinic awaiting approval: "${tenant.name}" (${tenant.slug}). ` +
+    `Review and approve at ${url}`;
+  for (const to of numbers) {
+    try {
+      await wa.sendText(to, msg, null, null);
+    } catch (err) {
+      logger.warn('review-queue notify failed', { to: to.slice(-4), error: err.response?.data?.error?.message || err.message });
+    }
+  }
+}
+
+module.exports = { notifyOwnerApproved, notifyReviewQueue };

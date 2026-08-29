@@ -17,7 +17,7 @@
  */
 const { tenantQuery } = require('../../db');
 const logger = require('../../utils/logger');
-const { STATES, updateSession, getPatient, notifyAdminWhatsApp, maskPhone, clinicPhoneLine } = require('./utils');
+const { STATES, updateSession, getPatient, notifyAdminWhatsApp, maskPhone, clinicPhoneLine, isReadOnlyDemo, READ_ONLY_DEMO_MESSAGE } = require('./utils');
 
 // Button ids are matched on the message TEXT as well, because wa.sendButtons
 // mints opaque ids and the numbered text fallback (used when an interactive
@@ -32,7 +32,7 @@ const REQUEST_RE = /(fit me in|ask the clinic|request an appointment|call me bac
  * appointment, not three items on the receptionist's list. The newest details
  * win, so the note reflects what they last asked for.
  */
-async function recordRequest(schema, tenant, phone, kind, details = {}) {
+async function recordRequest(schema, tenant, phone, kind, details = {}, send = null) {
   const patient = await getPatient(schema, phone).catch(() => null);
   try {
     await tenantQuery(schema, `
@@ -67,7 +67,8 @@ async function recordRequest(schema, tenant, phone, kind, details = {}) {
        details.preferredDate ? `Wanted: ${details.preferredDate}` : null,
        `Their preferred day had nothing free.`];
   await notifyAdminWhatsApp(schema, tenant,
-    [...lines.filter(Boolean), '', 'Open the dashboard to clear it.'].join('\n'));
+    [...lines.filter(Boolean), '', 'Open the dashboard to clear it.'].join('\n'),
+    { senders: send?._senders });
 }
 
 /**
@@ -83,6 +84,14 @@ async function offerRequest(send, lead) {
 }
 
 async function handleCallbackRequest(phone, schema, tenant, send, ctx = {}) {
+  // Whole-tenant read-only guard — recordRequest below also fires a REAL
+  // WhatsApp alert to the clinic's own admin phone, which must never happen
+  // for a public demo visitor. See isReadOnlyDemo in bot/utils.js.
+  if (isReadOnlyDemo(tenant)) {
+    await send.text(READ_ONLY_DEMO_MESSAGE);
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
   await recordRequest(schema, tenant, phone, 'callback', {
     note: ctx.request_note || null,
     hospitalId: ctx.hospital_id || null,
@@ -90,7 +99,7 @@ async function handleCallbackRequest(phone, schema, tenant, send, ctx = {}) {
     doctorId: ctx.doctor_id || null,
     departmentName: ctx.department_name || null,
     doctorName: ctx.doctor_name || null,
-  });
+  }, send);
   await send.text(
     `Done — we have your number and someone from the clinic will ring you.\n\n` +
     `If it is urgent, please call us instead.` + await clinicPhoneLine(schema, ctx.hospital_id)
@@ -104,6 +113,13 @@ async function handleCallbackRequest(phone, schema, tenant, send, ctx = {}) {
  * dentist and treatment they were after rather than starting from nothing.
  */
 async function handleAppointmentRequest(phone, schema, tenant, send, ctx = {}) {
+  // Whole-tenant read-only guard — same reasoning as handleCallbackRequest
+  // above: recordRequest also fires a real WhatsApp alert to clinic staff.
+  if (isReadOnlyDemo(tenant)) {
+    await send.text(READ_ONLY_DEMO_MESSAGE);
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
   await recordRequest(schema, tenant, phone, 'appointment', {
     hospitalId: ctx.hospital_id || null,
     departmentId: ctx.department_id && ctx.department_id !== 'general_consult' ? ctx.department_id : null,
@@ -112,7 +128,7 @@ async function handleAppointmentRequest(phone, schema, tenant, send, ctx = {}) {
     doctorName: ctx.doctor_name || null,
     preferredDate: ctx.request_preferred_date || null,
     note: ctx.request_note || null,
-  });
+  }, send);
   await send.text(
     `Thank you — the clinic has your request and will call you to find a time.\n\n` +
     `We often fit people in sooner than the online diary shows.` +

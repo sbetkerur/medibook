@@ -44,6 +44,25 @@ export default function LoginPage() {
       localStorage.setItem('user', JSON.stringify(data.user));
       resetSessionTimers();
       toast.success(`Welcome, ${data.user.name || data.user.email}!`);
+
+      // A newly-approved self-serve clinic (or any tenant nobody has finished
+      // setting up) lands on the guided wizard instead of a bare dashboard —
+      // /onboarding has always existed but nothing ever routed to it, so an
+      // owner's first login was the empty dashboard with a small checklist
+      // banner as the only hint anything was left to do. adminOnly-gated:
+      // every step it takes (add hospital/doctor/schedule) 403s for the
+      // dentist role, so only an admin login is ever considered. Fails open
+      // straight to the dashboard on any error — never blocks login over this.
+      if (!isSuperAdmin && data.user.role === 'admin' && !data.user.read_only) {
+        try {
+          // Short timeout: this is on the critical path of every admin login and
+          // the toast has already fired — a hung endpoint must not leave the
+          // user staring at the login screen. A slow/failed check just means
+          // the dashboard (with its own checklist banner) instead of the wizard.
+          const { data: ob } = await api.get('/admin/onboarding/status', { timeout: 5000 });
+          if (!ob.all_done) { router.push('/onboarding'); return; }
+        } catch { /* fall through to the dashboard */ }
+      }
       router.push(isSuperAdmin ? '/superadmin' : '/dashboard');
     } catch (err) {
       toast.error(getApiError(err, 'Login failed. Check your credentials.'));

@@ -367,6 +367,67 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE patients ADD COLUMN IF NOT EXISTS dental_history JSONB DEFAULT '{}';
     `);
 
+    // ── ENCRYPT EXISTING dental_history ROWS ─────────────────────
+    // Blood type, allergies, chronic conditions and medications were stored
+    // in PLAIN JSONB — readable straight out of a `SELECT *`, and swept into
+    // the nightly pg_dump backup (jobs/backupManager.js) as plaintext too,
+    // across every clinic on the platform in one file. routes/patients.js and
+    // routes/appointments.js now read/write this column through
+    // utils/encryption.js's encryptJSON/decryptJSON (the same `{_enc: "v2:.."}`
+    // convention services/botEngine.js already uses for bot_sessions.context),
+    // which means anything CREATED OR EDITED from here on is encrypted
+    // automatically. This block is the other half: without it, every record
+    // that predates this change would sit in plaintext indefinitely, since
+    // nothing forces an existing patient's history to be re-saved. ONE-SHOT
+    // per tenant via seed_markers — an ungated version would re-encrypt an
+    // already-encrypted `{_enc: ...}` value as ANOTHER layer on every boot.
+    //
+    // Row-by-row rather than a single UPDATE: encryption is a Node call
+    // (AES-256-GCM, utils/encryption.js), not an expression Postgres can
+    // evaluate. A failure on one malformed row is logged and skipped rather
+    // than aborting the tenant's whole backfill — the marker is only written
+    // after the loop, so a genuinely failed run retries in full next boot,
+    // but one bad row must not hold every other patient's record in plaintext
+    // forever.
+    const dentalHistoryBackfilled = await client.query(
+      `SELECT 1 FROM seed_markers WHERE key='encrypt_dental_history_v1'`
+    ).catch(() => ({ rows: [] }));
+    if (!dentalHistoryBackfilled.rows.length) {
+      try {
+        const { encrypt } = require('../utils/encryption');
+        const toEncrypt = await client.query(
+          `SELECT id, dental_history FROM patients
+            WHERE dental_history IS NOT NULL
+              AND jsonb_typeof(dental_history) = 'object'
+              AND dental_history <> '{}'::jsonb
+              AND NOT (dental_history ? '_enc')`
+        );
+        let failed = 0;
+        for (const row of toEncrypt.rows) {
+          try {
+            const enc = JSON.stringify({ _enc: encrypt(JSON.stringify(row.dental_history)) });
+            await client.query(`UPDATE patients SET dental_history=$1::jsonb WHERE id=$2`, [enc, row.id]);
+          } catch (rowErr) {
+            failed++;
+            logger.warn('dental_history encryption backfill failed for one patient', {
+              schema: schemaName, patient: row.id, error: rowErr.message,
+            });
+          }
+        }
+        if (failed === 0) {
+          await client.query(
+            `INSERT INTO seed_markers (key) VALUES ('encrypt_dental_history_v1') ON CONFLICT DO NOTHING`
+          );
+        } else {
+          logger.warn('dental_history backfill incomplete — will retry remaining rows next boot', {
+            schema: schemaName, failed, total: toEncrypt.rows.length,
+          });
+        }
+      } catch (err) {
+        logger.warn('dental_history encryption backfill skipped', { schema: schemaName, error: err.message });
+      }
+    }
+
     // Create doctor_leaves table
     await client.query(`
       CREATE TABLE IF NOT EXISTS doctor_leaves (
@@ -745,6 +806,10 @@ async function runTenantMigrations(schemaName) {
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS effective_fee INTEGER DEFAULT 0;
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS payment_status VARCHAR(20) DEFAULT 'pending';
       ALTER TABLE appointments ADD COLUMN IF NOT EXISTS payment_collected_at TIMESTAMPTZ;
+      -- How the consultation fee was collected, mirroring treatment_payments.method
+      -- (PAYMENT_METHODS, utils/errors.js). Only meaningful once payment_status='paid' —
+      -- PATCH /appointments/:id clears it back to NULL for 'pending'/'waived'.
+      ALTER TABLE appointments ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20);
     `);
 
     // Patient cohort tracking

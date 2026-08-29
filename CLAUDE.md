@@ -37,9 +37,14 @@ cd backend && node tests/circuitBreaker.unit.test.js     # HALF_OPEN lets ONE pr
 cd backend && node tests/messageBudget.unit.test.js      # budget 0 means none, not "default"
 cd backend && node tests/rateLimitFallback.unit.test.js  # per-tenant cap with no Redis
 cd backend && node tests/razorpaySignature.unit.test.js  # self-serve billing: checkout + webhook HMACs
+cd backend && node tests/billing.unit.test.js            # GST split (inclusive, CGST/SGST vs IGST), FY, invoice numbering
 cd backend && node tests/sendCaps.unit.test.js           # trial outbound cap: 50/24h until paying
 cd backend && node tests/otp.unit.test.js                # WhatsApp OTP: attempts, cooldown, single-use
 cd backend && node tests/readOnlyTenant.unit.test.js     # whole-tenant read-only guard (demo clinic)
+cd backend && node tests/demoReadOnlyBot.unit.test.js    # same guard, extended into the bot engine itself
+cd backend && node tests/askingTenant.unit.test.js       # answers redirect to the clinic that asked (confirmation/feedback/treatment/recall)
+cd backend && node tests/dentalHistoryEncryption.unit.test.js  # dental_history encryption: round-trip, legacy fallback, tamper detection
+cd backend && node tests/backupEncryption.unit.test.js   # backup file format shared by backupManager.js/backup-prod.js/decryptBackup.js
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -401,18 +406,28 @@ if it is ever needed. Not `adminOnly`: the dentist who took it is usually not
 the account owner.
 
 **`GET /day-close` is the end-of-day count.** Consultation fees and treatment
-payments stay SEPARATE (conflating them double-counts revenue) and are added
-once into `collected_total`, broken down by method so the drawer can be counted
-against the cash line. The consultation half uses
-`COALESCE(NULLIF(a.effective_fee,0), d.consultation_fee)` — the same expression
-the analytics queries and the weekly digest use. `effective_fee` is an OVERRIDE
-column that nothing currently writes, so summing it raw reported ₹0 of
-consultation income every day. For the same reason there is deliberately no
-paid/unpaid split: `payment_status` has no writer either, so the old
-`fees_collected` was structurally always 0 and told every clinic that 100% of
-its fees were unpaid. If per-appointment payment marking is ever built, split it
-again then — and give `payment_status` a writer in the same change. IST throughout — `created_at` is a TIMESTAMPTZ and is
-compared in Asia/Kolkata, or a clinic closing at 21:00 sees yesterday.
+payments stay SEPARATE (conflating them double-counts revenue). The
+consultation half uses `COALESCE(NULLIF(a.effective_fee,0), d.consultation_fee)`
+— the same expression the analytics queries and the weekly digest use.
+`effective_fee` (an OVERRIDE; 0/unset means "use the doctor's rate") and
+`payment_status`/`payment_method` all now have writers — `PATCH
+/appointments/:id`, open to the same non-admin roles as marking an appointment
+completed (front-desk work, not `adminOnly`). `payment_status` is `pending`
+(the column default — a completed visit nobody has touched yet reads as this,
+never as silently paid) → `paid` (stamps `payment_method`, defaulting to
+`cash`, and `payment_collected_at=NOW()`) or `waived` (clears both — a waived
+fee is not outstanding money). `collected_total` counts only fees actually
+MARKED paid, plus treatment payments — not "every completed visit," which is
+what an earlier version assumed before either column had a writer, and which
+reported ₹0 every day once it tried to sum `effective_fee` raw. A completed
+visit nobody has marked shows up in `appointments.fees_pending`/
+`pending_count` instead, which the dashboard surfaces as an amber "still
+marked unpaid" banner — the desk works that down before trusting the number,
+same discipline as recording a treatment payment. Consultation fees also get
+their own "by method" breakdown now (`consultation_payments.by_method`),
+mirroring `treatment_payments.by_method`'s existing reconciliation. IST
+throughout — `created_at` is a TIMESTAMPTZ and is compared in Asia/Kolkata, or
+a clinic closing at 21:00 sees yesterday.
 
 **On-demand PDF reports.** `utils/pdfReport.js` (pdfkit) is the only PDF path:
 `streamReport` writes the clinic band + page numbers, `drawTable` paginates,
@@ -663,6 +678,31 @@ marketing landing page (root `/`; the old `/`→`/login` redirect is gone,
 healthcheck is on `/login`) and `frontend/src/app/demo/page.js` is the "See a
 live demo" button. Tests: `tests/readOnlyTenant.unit.test.js`.
 
+`enforceReadOnlyTenant` only ever covered the DASHBOARD (`/api/admin` +
+`/api/v1/admin`) — nothing stopped the bot/webhook path from booking,
+cancelling, rescheduling, or queuing a `clinic_requests` row (which also fires
+a real WhatsApp alert to the clinic's own admin) against a read-only tenant.
+Harmless while `pragati-demo`'s WhatsApp number was reachable only by its own
+operators; not harmless once `frontend/src/components/WhatsAppDemoChat.js` (the
+live, interactive "try the bot" widget in the marketing page's hero, backed by
+`POST /api/demo/chat`) invokes the SAME bot engine as a public, unauthenticated
+surface. `services/bot/utils.js` `isReadOnlyDemo(tenant)` extends the guarantee
+down into the bot itself, checked immediately before each mutation rather than
+earlier in the flow — browsing menus and picking a slot still works, only the
+commit is blocked, replying with a "this is a live demo" message instead. Five
+call sites: `bookingFlow.completeBooking`, `appointmentFlow.handleCancelConfirm`
++ `handleRescheduleConfirm`, and `requestFlow.handleCallbackRequest` +
+`handleAppointmentRequest`. `routes/demoChat.js` is the second, narrower layer
+that makes this reachable by the public in the first place: unlike
+`POST /webhook/test` (whose free-form `tenant_slug` would, in the wrong hands,
+return any patient's appointment details for ANY real tenant), it hardcodes
+`DEMO_TENANT_SLUG` and re-verifies `read_only` + `active` on every call — the
+same one-check safety story as `POST /auth/demo-session`. It runs the bot via
+`services/bot/testRunner.js` (shared with `/webhook/test` and the authenticated
+`/admin/bot-test`), keyed by a synthetic phone derived server-side from a
+client-supplied per-tab session id — never a client-supplied phone. Neither
+layer substitutes for the other. Tests: `tests/demoReadOnlyBot.unit.test.js`.
+
 **Frontend.** All API calls go through the Next.js rewrite proxy
 (`/api/proxy/*` → `BACKEND_URL`) — no API origin is baked into the bundle.
 `lib/api.js` handles token attach, 401 → refresh rotation (queued), and
@@ -701,7 +741,18 @@ first admin user (`buildSelfServeTenantSchema`), starts the **card-free** trial
 `active`, stamps `activated_at`, and WhatsApps the owner a login link
 (`services/signupNotify.js`, `SIGNUP_APPROVED_TEMPLATE`, text fallback in dev).
 It is idempotent (`CREATE SCHEMA IF NOT EXISTS` + `INSERT … ON CONFLICT DO
-NOTHING`). The card is only taken later, via `POST /admin/billing/subscribe` →
+NOTHING`). A fresh schema has no hospital, doctor or schedule, so the owner's
+FIRST admin login (`app/login/page.js`) checks `GET /admin/onboarding/status`
+and routes to the guided wizard (`app/onboarding/page.js` — clinic details,
+treatments, first dentist + weekly hours, then the QR code) instead of a bare
+dashboard, rather than leaving the dashboard's own passive checklist banner
+(`onboarding.steps`) as the only hint anything is left to do. Gated to
+`role === 'admin'` and non-`read_only` — every wizard step is `adminOnly`
+(hospital/doctor/schedule mutation), and the shareable demo tenant already has
+all of it seeded so `all_done` is already true there regardless. Fails open to
+`/dashboard` on any error; `POST /admin/onboarding/complete` marks it done
+(and is what makes `all_done` stick — the dashboard banner keeps showing,
+offering that button, until it's called explicitly). The card is only taken later, via `POST /admin/billing/subscribe` →
 Razorpay Checkout → `/billing/subscribe/confirm`. `services/signupProvision.js`
 holds all of it: `registerSelfServeTenant` (phase 1) +
 `buildSelfServeTenantSchema` (phase 2) for self-serve, `provisionTenant` (one
@@ -735,6 +786,61 @@ enforcer: it ENDS lapsed card-free trials (`active` + `trialing` +
 `trial_end` passed → `past_due`), reconciles subscriptions, and after
 `SIGNUP_DUNNING_GRACE_DAYS` (default 7) moves `past_due` → `suspended`.
 
+**Self-serve billing management** (`routes/billing.js`, tenant-facing under
+`/api/admin`). A clinic runs its own subscription — no support ticket needed:
+- **Cancel** (`POST /billing/cancel {reason}`) does NOT call Razorpay; it sets
+  `tenant_billing.cancel_at_period_end`, and `billingDunning.js`
+  `applyScheduledCancellations` issues the real Razorpay cancel once
+  `current_period_end` passes. That makes `POST /billing/cancel/undo` a true
+  undo (Razorpay has no un-cancel) and guarantees the clinic keeps every paid
+  day. A trial (no subscription) just records the intent.
+- **Plan change** (`POST /billing/change-plan {plan}`) — upgrade takes effect
+  now (`razorpay.updateSubscription` with `schedule_change_at:'now'`), downgrade
+  is scheduled for cycle end (`pending_plan_id` + `plan_change_at`, promoted by
+  the `subscription.charged` webhook when Razorpay's live `plan_id` matches). A
+  downgrade whose target plan can't fit current usage (3 dentists → 2-dentist
+  plan) is refused with what to shed first.
+- **Per-branch quantity.** Professional bills `plan_amount × active branches`.
+  `services/billing.js` `syncSubscriptionQuantity` recomputes on every branch
+  add/remove (`routes/hospitals.js`, fire-and-forget), pushes `quantity` to
+  Razorpay (`schedule_change_at:'cycle_end'`), mirrors the rupee figure to
+  `tenants.billing_monthly`, and `billingDunning.js` reconciles it daily.
+- **GST tax invoices.** The Razorpay plan amount is GST-INCLUSIVE. The
+  `subscription.charged` webhook writes one `billing_invoices` row per charge
+  (`services/invoice.js`, idempotent on `razorpay_payment_id`) with the split
+  back-computed by `services/billing.js` `splitGst` — CGST+SGST for a buyer in
+  `SELLER_STATE_CODE`, IGST otherwise. `invoice_number` is
+  `<INVOICE_NUMBER_PREFIX>/<FY>/<seq>` from `billing_invoice_seq`.
+  `GET /billing/invoices[/:id]` (PDF via `utils/pdfReport.js`).
+  `GET/PUT /billing/profile` captures the buyer's GSTIN / place of supply
+  (`tenant_billing_profiles`); with none, the clinic is billed B2C and the
+  invoice omits the buyer GSTIN. `billing_invoices.tenant_id` is
+  `ON DELETE SET NULL` — a financial record outlives the clinic.
+- `GET /billing` also returns `usage` (dentists/branches used vs plan limit),
+  and the doctor/branch quota 403/409 now carries `code:'PLAN_LIMIT'` +
+  `upgrade_to`.
+
+**Signup review queue + rejection.** `SIGNUP_REVIEW_NOTIFY_PHONE` (comma list)
+gets a WhatsApp ping when a clinic lands in `pending_review`
+(`signupNotify.notifyReviewQueue`) — otherwise the queue stays dashboard-only.
+`POST /superadmin/tenants/:id/reject {reason}` is the counterpart to `approve`:
+valid ONLY for `pending_review` (no schema built yet), it deletes the `tenants`
+row, frees the slug, and WhatsApps the owner.
+
+**Tenant-initiated account deletion** (`routes/account.js`, `/api/admin`, so the
+read-only demo can never reach it). `POST /account/deletion {password, confirm}`
+(admin's own password + literal `"DELETE"`) sets `deletion_requested_at` +
+`deletion_scheduled_for = now + ACCOUNT_DELETION_GRACE_DAYS` (default 14) and
+flags the subscription to cancel. Nothing is scrubbed during the window — the
+clinic works normally and `POST /account/deletion/cancel` fully reverses it.
+`jobs/accountDeletion.js` (03:30 IST, after the backup) then `DROP SCHEMA …
+CASCADE` + `DELETE FROM tenants` — the one irreversible cron, guarded by a
+re-read, the `validateSchemaName` pattern, and a final backup existing first.
+
+**Public status page.** `GET /api/status` (unauthenticated, no per-tenant data)
+reports database reachability, cron freshness, webhook backlog and the shared
+WhatsApp circuit-breaker state; `frontend/src/app/status/page.js` renders it.
+
 **Trial send cap** (`services/sendCaps.js`). A self-serve tenant on the shared
 number is throttled to **50** (`SIGNUP_TRIAL_SEND_CAP`) clinic-initiated patient
 messages / rolling 24h **while on the card-free trial** — the cap is lifted the
@@ -750,6 +856,44 @@ Fails OPEN.
 — one call, audited, effective within the 5s tenant-cache TTL. `resume` on a
 self-serve clinic returns it to `past_due` (still owes payment) unless
 `?to=active`.
+
+**`patients.dental_history` is encrypted at rest, and so is every backup.**
+Blood type, allergies, chronic conditions and medications used to sit in
+plain JSONB — readable straight out of a `SELECT *`, and swept into the
+nightly backup as plaintext too, across every clinic on the platform in one
+file. `routes/patients.js` and `routes/appointments.js` now read/write it
+through `utils/encryption.js`'s `encryptJSON`/`decryptJSON` — the same
+`{_enc: "v2:..."}` convention `services/botEngine.js` already used for
+`bot_sessions.context`, reused rather than inventing a second format.
+`decryptJSON` returns `null` on a decryption failure (wrong/rotated key,
+corrupted row) — **never** `{}`: a dentist checking for an allergy must be
+told the read failed, not handed a falsely-reassuring empty record. Every
+route surfaces this as `medical_history_error: true`, and
+`dashboard/page.js`'s patient modal already had the right instinct for a
+*network* failure here (`medHistoryFailed`) — extended to treat a decryption
+failure identically rather than silently rendering it as "none recorded." A
+one-shot migration (`tenantMigrate.js`, `seed_markers` key
+`encrypt_dental_history_v1`) encrypts every pre-existing plaintext row on the
+next boot, per tenant; anything created or edited after that point is
+encrypted automatically by the routes above.
+
+Both backup paths are encrypted the same way (AES-256-GCM,
+`[12-byte IV][ciphertext][16-byte auth tag]`, same `ENCRYPTION_KEY`):
+`jobs/backupManager.js`'s nightly in-container `pg_dump` (streamed through a
+cipher before it ever touches disk — `medibook_backup_*.sql.enc`) and
+`scripts/backup-prod.js`'s off-Railway laptop copy (encrypted-then-deleted
+after pg_dump writes it — `medibook-prod-*.dump.enc`), which is the more
+exposed of the two: a full copy of every clinic's data sitting on a personal
+machine rather than a server. `scripts/decryptBackup.js` reads either format
+and fetches `ENCRYPTION_KEY` via the Railway CLI the same way
+`backup-prod.js` already fetches `DATABASE_PUBLIC_URL`, so restoring needs no
+separately-managed secret — but also means **losing or rotating
+`ENCRYPTION_KEY` without keeping the old value makes every backup taken under
+it permanently unreadable**, with no recovery path that doesn't start with
+the original key. `scripts/verify-backup.js` decrypts to a temp file before
+`pg_restore`ing it, and deletes that temp file whether verification passed or
+failed. Tests: `tests/dentalHistoryEncryption.unit.test.js`,
+`tests/backupEncryption.unit.test.js`.
 
 ## Environment variables
 
@@ -782,10 +926,17 @@ the go-live link sent on approval (two body vars: clinic name, login URL; text
 fallback in dev), `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` /
 `RAZORPAY_WEBHOOK_SECRET`, `RAZORPAY_PLAN_STARTER` / `RAZORPAY_PLAN_PROFESSIONAL`
 (the two recurring plan ids created in the Razorpay dashboard, mirrored to
-`plans.razorpay_plan_id` on boot). In production `index.js` warns at startup
-when `SELF_SIGNUP_ENABLED=true` but any of these are missing, and
-`selfSignupEnabled()` reports the feature unavailable without a real Razorpay
-config.
+`plans.razorpay_plan_id` on boot; the plan amount is GST-INCLUSIVE). In
+production `index.js` warns at startup when `SELF_SIGNUP_ENABLED=true` but any
+of these are missing, and `selfSignupEnabled()` reports the feature unavailable
+without a real Razorpay config.
+
+GST invoicing + lifecycle: `SELLER_LEGAL_NAME`, `SELLER_GSTIN`,
+`SELLER_STATE_CODE` (default `29`, Karnataka — decides CGST+SGST vs IGST),
+`SELLER_ADDRESS`, `INVOICE_NUMBER_PREFIX` (default `MB`);
+`SIGNUP_REVIEW_NOTIFY_PHONE` (comma list, WhatsApp ping on a new
+`pending_review` clinic; blank = dashboard-only queue);
+`ACCOUNT_DELETION_GRACE_DAYS` (default 14).
 
 ## Testing without WhatsApp credentials
 

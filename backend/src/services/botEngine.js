@@ -185,8 +185,17 @@ function detectIntent(input) {
 // `welcome` is set by routes/webhook.js only for the synthesised greeting that
 // follows a QR scan, so the main menu can greet the patient by the clinic's name
 // instead of sending a second "connecting you…" message ahead of it.
-async function handle({ phone, text, buttonId, tenant, waMessageId, welcome }) {
+async function handle({ phone, text, buttonId, tenant, waMessageId, welcome, senders }) {
   if (!text && !buttonId) return;
+
+  // `senders` is an optional { sendText, sendButtons, sendList } capture object
+  // passed by services/bot/testRunner.js so the dev/admin/demo test harnesses
+  // collect output instead of calling Meta. It used to monkey-patch the shared
+  // whatsapp module for the duration of this call, which meant a real cron or
+  // webhook send that interleaved with a test run (routine now the demo widget
+  // is public) was silently swallowed into the test's throwaway buffer.
+  // Injecting per-call removes the shared mutable state entirely.
+  const waSend = senders || wa;
 
   const { LIMITS } = require('../utils/errors');
   // Input length guard
@@ -201,7 +210,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId, welcome }) {
   const waPhoneId = null;
 
   try {
-    return await _handleInner({ phone, text, buttonId, tenant, waMessageId, schema, waToken, waPhoneId, welcome });
+    return await _handleInner({ phone, text, buttonId, tenant, waMessageId, schema, waToken, waPhoneId, welcome, waSend });
   } catch (err) {
     // Top-level safety net — if anything throws (DB error, circuit breaker open, etc.),
     // reset the session to idle and tell the user to try again. This prevents the bot
@@ -218,7 +227,7 @@ async function handle({ phone, text, buttonId, tenant, waMessageId, welcome }) {
     // step the patient was on. If failures persist, "Hi" always resets, and
     // the 4-hour session expiry catches abandoned flows.
     try {
-      await wa.sendText(phone,
+      await waSend.sendText(phone,
         'Something went wrong at our end — I am trying again. If nothing happens, reply *Menu* to start over.',
         waToken, waPhoneId);
     } catch (_) { /* ignore — circuit might be open */ }
@@ -228,7 +237,8 @@ async function handle({ phone, text, buttonId, tenant, waMessageId, welcome }) {
   }
 }
 
-async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema, waToken, waPhoneId, welcome }) {
+async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema, waToken, waPhoneId, welcome, waSend }) {
+  const w = waSend || wa;
 
   // Inbound message is already logged by the webhook handler for idempotency dedup.
   // Only log outgoing messages here to avoid a double-insert in wa_messages.
@@ -242,8 +252,12 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   // handle()'s top-level catch exactly as before, which is what feeds the
   // BullMQ/failed_webhooks retry path.
   const send = {
+    // The raw injected senders (or null in a real run) — carried so a flow can
+    // hand them to notifyAdminWhatsApp, which sends to a STAFF number (not
+    // `phone`) and so cannot go through send.text. Null → the real wa module.
+    _senders: waSend || null,
     text: async (t) => {
-      const id = await wa.sendText(phone, t, waToken, waPhoneId);
+      const id = await w.sendText(phone, t, waToken, waPhoneId);
       await logMessage(schema, phone, 'out', 'text', t, id);
       return id;
     },
@@ -251,12 +265,12 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     // faked inside the body. History logs the body only, which is what the
     // clinic reads back; the header/footer are chrome.
     buttons: async (t, btns, opts) => {
-      const id = await wa.sendButtons(phone, t, btns, waToken, waPhoneId, opts);
+      const id = await w.sendButtons(phone, t, btns, waToken, waPhoneId, opts);
       await logMessage(schema, phone, 'out', 'buttons', t, id);
       return id;
     },
     list: async (t, label, sections, opts) => {
-      const id = await wa.sendList(phone, t, label, sections, waToken, waPhoneId, opts);
+      const id = await w.sendList(phone, t, label, sections, waToken, waPhoneId, opts);
       await logMessage(schema, phone, 'out', 'list', t, id);
       return id;
     },

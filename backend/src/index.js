@@ -269,6 +269,15 @@ app.use('/api', require('./routes/webhook'));
 // Public, unauthenticated: self-serve clinic signup (WhatsApp OTP + card-free
 // trial). Its own strict rate limiters live in the router.
 app.use('/api', require('./routes/signup'));
+// Public, unauthenticated: the "try the WhatsApp bot" widget on the marketing
+// site. Hardcoded to the read-only demo tenant only — see routes/demoChat.js
+// for why it must never take a tenant slug from the request. Not mirrored
+// under /api/v1: nothing but the frontend proxy (which always calls /api)
+// consumes it.
+app.use('/api', require('./routes/demoChat'));
+// Public, unauthenticated: coarse platform status for a clinic to check during
+// an incident without logging in. No per-tenant data.
+app.use('/api', require('./routes/status'));
 // Split route files registered first so they take priority over legacy admin.js for their domains
 app.use('/api/admin', require('./routes/appointments'));
 app.use('/api/admin', require('./routes/doctors'));
@@ -284,6 +293,7 @@ app.use('/api/admin', require('./routes/requests'));       // patients the bot c
 app.use('/api/admin', require('./routes/dayClose'));       // end-of-day cash reconciliation
 app.use('/api/admin', require('./routes/reports'));        // on-demand front-desk PDF reports
 app.use('/api/admin', require('./routes/billing'));        // self-serve subscription + paywall
+app.use('/api/admin', require('./routes/account'));        // tenant-initiated account closure
 app.use('/api/admin', require('./routes/events'));    // SSE real-time dashboard
 app.use('/api/superadmin', require('./routes/superadmin'));
 
@@ -305,8 +315,10 @@ app.use('/api/v1/admin',    require('./routes/requests'));
 app.use('/api/v1/admin',    require('./routes/dayClose'));
 app.use('/api/v1/admin',    require('./routes/reports'));
 app.use('/api/v1/admin',    require('./routes/billing'));
+app.use('/api/v1/admin',    require('./routes/account'));
 app.use('/api/v1/admin',    require('./routes/events'));
 app.use('/api/v1',          require('./routes/signup'));
+app.use('/api/v1',          require('./routes/status'));
 app.use('/api/v1/superadmin', require('./routes/superadmin'));
 
 // ── HEALTH CHECK ──────────────────────────────────────────────
@@ -450,6 +462,7 @@ const server = app.listen(PORT, () => {
     const { startTreatmentNudgeCron } = require('./jobs/treatmentNudges');
     const { startRecallCron } = require('./jobs/recalls');
     const { startBillingDunningCron } = require('./jobs/billingDunning');
+    const { startAccountDeletionCron } = require('./jobs/accountDeletion');
     // Track cron tasks so we can stop them gracefully before DB closes.
     // Only ONE backup cron is registered (backupManager's spawn()-based daily
     // job) — slotGenerator.js's exec()-based weekly startBackupReminderCron was
@@ -483,6 +496,9 @@ const server = app.listen(PORT, () => {
       // Ends card-free trials, reconciles Razorpay subscriptions, enforces the
       // past_due grace window. Safe no-op when no self-serve tenants exist.
       startBillingDunningCron(),
+      // Carries out tenant-requested account deletions after the grace window.
+      // Safe no-op unless a tenant has actually requested deletion.
+      startAccountDeletionCron(),
       ...patientCrons,
     ];
     startBotWorker();

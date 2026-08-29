@@ -189,8 +189,11 @@ router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, r
     if (err.isQuota) {
       const [cur, max] = err.message.replace('QUOTA:', '').split('/');
       return res.status(403).json({
-        error: `Doctor limit reached for your plan (${cur}/${max}). Upgrade to add more doctors.`,
+        error: `Doctor limit reached for your plan (${cur}/${max}). Upgrade to Professional to add more dentists.`,
         quota_exceeded: true,
+        code: 'PLAN_LIMIT',
+        resource: 'doctors',
+        upgrade_to: 'professional',
       });
     }
     handleError(res, err, 'POST /doctors');

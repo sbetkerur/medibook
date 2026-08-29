@@ -92,6 +92,14 @@ the Service (except where unenforceable); resell or sublicense it; or use it in
 a way that risks harm to patients. We may suspend immediately on reasonable
 belief of security, legal or safety risk.
 
+**This also applies to our public website and demonstration environment, and
+to anyone accessing them — whether or not they hold an account.** You must not
+use bots, scrapers, crawlers or automated agents to systematically access,
+copy or reproduce our website, the Service's interface, or the conduct of its
+WhatsApp assistant, including for the purpose of training a machine-learning
+model or building a competing product. We may rate-limit, block or take legal
+action against access that violates this paragraph.
+
 ## 8. IP and confidentiality
 
 We own the Service and its intellectual property. You own your Patient Data and

@@ -23,6 +23,8 @@ const {
   logMessage,
   notifyAdminWhatsApp,
   reminder24hApplies,
+  isReadOnlyDemo,
+  READ_ONLY_DEMO_MESSAGE,
 } = require('./utils');
 
 /**
@@ -1072,6 +1074,15 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
   const { LIMITS } = require('../../utils/errors');
   const { insertAppointmentWithRetry, checkMonthlyQuota, SLOT_DAY_OPEN_SQL } = require('../bookingCore');
 
+  // Whole-tenant read-only guard (the shareable demo clinic) — checked before
+  // any query, including the patient upsert further down. See isReadOnlyDemo
+  // in bot/utils.js for why this can't live at the HTTP layer alone.
+  if (isReadOnlyDemo(tenant)) {
+    await send.text(READ_ONLY_DEMO_MESSAGE);
+    await updateSession(schema, phone, STATES.IDLE, {});
+    return;
+  }
+
   // Guard: validate schema name before using it in a raw SET LOCAL command.
   // tenantQuery/tenantTransaction enforce this internally; since completeBooking
   // uses pool.connect() directly for a custom transaction, we must check here too.
@@ -1437,7 +1448,8 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
             `Dr. ${ctx.doctor_name}\n` +
             `📅 ${dateLabel3} at ${(ctx.appointment_time || '').slice(0, 5)}\n` +
             `🦷 ${ctx.hospital_name}\n` +
-            `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`
+            `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`,
+            { senders: send._senders }
           );
         } catch (waErr) {
           logger.warn('Admin WhatsApp booking alert failed', { error: waErr.message });

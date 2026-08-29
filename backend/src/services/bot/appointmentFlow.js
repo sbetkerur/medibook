@@ -19,6 +19,8 @@ const {
   updateSession,
   notifyAdminWhatsApp,
   reminder24hApplies,
+  isReadOnlyDemo,
+  READ_ONLY_DEMO_MESSAGE,
 } = require('./utils');
 
 async function showMyAppointments(phone, schema, tenant, send) {
@@ -446,6 +448,14 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
   // btn_1/btn_0 are matched by index now, not as substrings of the raw id.
   const isNegative = btnIdx === 1 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^2$/i.test(choice);
   if (!isNegative && (btnIdx === 0 || /^(yes|reschedule|confirm)$|^1$/.test(choice))) {
+    // Whole-tenant read-only guard — checked right before the commit, not
+    // earlier, so browsing dates/slots up to this point still works. See
+    // isReadOnlyDemo in bot/utils.js.
+    if (isReadOnlyDemo(tenant)) {
+      await send.text(READ_ONLY_DEMO_MESSAGE);
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
     // Atomic: lock appointment row + lock new slot + release old slot + update appointment
     const rescheduled = await tenantTransaction(schema, async (client) => {
       // Lock the appointment and re-check it is still confirmed — an admin may have
@@ -529,7 +539,8 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
         `Patient: ${phone}\n` +
         `Dr. ${ctx.reschedule_doctor_name}\n` +
         `Old: ${oldDateLabel} at ${(ctx.reschedule_old_time || '').slice(0, 5)}\n` +
-        `New: ${newDate} at ${(ctx.reschedule_new_time || '').slice(0, 5)}`
+        `New: ${newDate} at ${(ctx.reschedule_new_time || '').slice(0, 5)}`,
+        { senders: send._senders }
       );
     })().catch(() => {});
   } else {
@@ -663,6 +674,14 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
   // changed" and their appointment stayed on the book. The negative test above
   // still runs FIRST, so "no, keep it" and "yes but keep it" are unaffected.
   if (!isNegative && (btnIdx === 1 || /^(yes|cancel)\b|^2$/i.test(choice))) {
+    // Whole-tenant read-only guard — checked right before the commit, not
+    // earlier, so picking which booking to cancel still works. See
+    // isReadOnlyDemo in bot/utils.js.
+    if (isReadOnlyDemo(tenant)) {
+      await send.text(READ_ONLY_DEMO_MESSAGE);
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
     const cancelled = await tenantTransaction(schema, async (client) => {
       const r = await client.query(
         `UPDATE appointments SET status='cancelled', cancellation_reason=$1, cancelled_by='bot', cancelled_at=NOW(), updated_at=NOW() WHERE id=$2 AND status='confirmed' RETURNING id`,
@@ -697,7 +716,8 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
         `Patient: ${phone}\n` +
         `Dr. ${ctx.cancel_doctor_name}\n` +
         `📅 ${dateLabel} at ${(ctx.cancel_time || '').slice(0, 5)}\n` +
-        `📝 Reason: ${ctx.cancel_reason || 'Not specified'}`
+        `📝 Reason: ${ctx.cancel_reason || 'Not specified'}`,
+        { senders: send._senders }
       );
     })().catch(() => {});
   } else {

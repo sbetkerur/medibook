@@ -651,6 +651,114 @@ Smile Dental - Banjara Hills
 > Meta rejects the whole send on an EMPTY parameter, so neither variable here is
 > ever allowed to resolve to `''`.
 
+---
+
+## Self-serve signup templates (owner-facing, not patient-facing)
+
+Two more templates, separate from the ten above: these go to a **clinic
+owner**, not a patient, as part of `docs/self-serve-signup.md`. They're not
+counted in the "ten" — nobody scanning a QR ever sees them — but they follow
+the exact same form and the exact same trap (an approved template invoked with
+the wrong parameter count silently fails, same as any of the ten). Their
+template names are **not hardcoded** — the code looks them up by whatever you
+put in the env var — so treat the names below as the recommended default, not
+a requirement.
+
+### 11. `medibook_signup_otp`
+
+Sent to a clinic owner's own WhatsApp during self-serve signup and the
+WhatsApp-code password reset. `services/otp.js` → `deliverCode`
+(`SIGNUP_OTP_TEMPLATE`)
+
+**Why it needs a template:** the owner never messages the shared number — the
+QR is for patients — so they are permanently outside the 24-hour window from
+message one.
+
+**Category — AUTHENTICATION.** This behaves differently from the ten Utility
+templates above: picking Authentication switches Meta's form to a fixed
+layout. You don't get a header, a footer or button fields — you type only the
+language and the body's one variable, then tick add-on checkboxes. Meta
+supplies the footer text and the copy-code button itself; none of that
+wording is yours to choose.
+
+| Variable | Value | Example |
+|---|---|---|
+| `{{1}}` | The 6-digit code | `482913` |
+
+**Body** (the only line you write)
+```
+{{1}} is your MediBook verification code.
+```
+
+**Add-ons** — tick "Add security recommendation" (Meta's fixed "don't share
+this code" line) and "Add expiry time", set to **10 minutes** — this must
+match `CODE_TTL_MINUTES` in `services/otp.js`. If that constant ever changes,
+update the template too, or the message promises an expiry the server doesn't
+enforce.
+
+**Sample value** — `482913`
+
+**Button** — Meta adds the "Copy code" button automatically. Leave
+`SIGNUP_OTP_TEMPLATE_HAS_BUTTON=true` (the default) to match it — the code
+sends a matching button parameter (`services/otp.js`, `deliverCode`). If you
+create this as a plain **Utility** template instead (just the body variable,
+no button), set `SIGNUP_OTP_TEMPLATE_HAS_BUTTON=false` or the send fails on an
+extra, unexpected button component.
+
+**Config:** `SIGNUP_OTP_TEMPLATE=medibook_signup_otp`
+
+---
+
+### 12. `medibook_signup_approved`
+
+Sent once, when a super admin approves a pending signup — the owner's ONLY way
+to learn their clinic is live, since nothing is provisioned and no login
+exists before this. `services/signupNotify.js` → `notifyOwnerApproved`
+(`SIGNUP_APPROVED_TEMPLATE`)
+
+**Why it needs a template:** approval happens on the super admin's schedule,
+not in response to the owner writing in, so the owner is essentially always
+outside the 24-hour window.
+
+**Category — UTILITY** (the normal form, same as the ten above).
+
+| Variable | Value | Example |
+|---|---|---|
+| `{{1}}` | Clinic name | `Pragati Dental Studio` |
+| `{{2}}` | Login URL | `https://app.medibook.example/login` |
+
+**Header** — `✅ You're approved`
+
+**Body**
+```
+*{{1}}* is approved and live on MediBook.
+
+Sign in at {{2}} with your Clinic ID and the password you chose at signup, then finish setting up your dentists and hours. Your free trial has started now.
+```
+
+**Sample values**
+```
+Pragati Dental Studio
+https://app.medibook.example/login
+```
+
+**Footer** — `Automated notification`
+
+**Buttons** — none. `notifyOwnerApproved` sends only a body component; adding
+a button in Manager with no matching component in code fails the send on a
+parameter-count mismatch, same as templates 7 and 9 above.
+
+> The Clinic ID (tenant slug) is deliberately not a template variable — it
+> isn't passed to `notifyOwnerApproved`. The text-fallback version in
+> `services/signupNotify.js` does quote it (`Clinic ID "{slug}"`); if you want
+> parity, add it as `{{3}}` in both the template and the `components` array in
+> the same change, or the two versions of this message will read differently
+> depending on whether the template is approved yet.
+
+**Config:** `SIGNUP_APPROVED_TEMPLATE=medibook_signup_approved`
+
+---
+
 ## Payload reference
 
 Every payload below is a keyword MediBook already understands from a typed
@@ -671,27 +779,37 @@ carry an emoji or any leading/trailing space.
 | `Start` | Re-subscribes an opted-out patient | `botEngine.js:201` |
 | `Stop` | Opts the patient out of all messages | `botEngine.js:201` |
 
-## Known limitation: `Menu` and the shared number
+## `Menu` and the shared number — fixed, with one accepted trade-off
 
 All clinics share one WhatsApp number, and inbound messages route to whichever
-clinic the patient last selected (`global_bot_sessions`). `Menu` is a navigation
-command, not an answer to a question, so it is NOT redirected back to the clinic
-that sent the template.
+clinic the patient last selected (`global_bot_sessions`). That used to mean a
+patient who used clinic A and later searched for clinic B would tap **Book a
+check-up** on a recall from A and land on **B's** menu instead — they could
+still book, just at the wrong clinic.
 
-For the patients who only ever deal with one clinic this is invisible. For a
-patient who used clinic A and later searched for clinic B, tapping **Book a
-check-up** on a recall from A opens **B's** menu. They can still book — at the
-wrong clinic.
+This is fixed: `jobs/recalls.js` records a pending reply (`KINDS.RECALL`,
+72h TTL) when it sends the recall, and `routes/webhook.js`'s
+`RECALL_REPLY_RE` (`menu` / `book` / `book appointment` / `checkup` /
+`check up` / `check-up`) sends the answer back to the clinic that asked —
+after re-checking that clinic's session is resting (not mid-flow, or the word
+would be eaten by whatever step it's sitting at) AND that clinic genuinely
+still has a `patient_recalls` row `status='due'` with `last_sent_at` set (a
+recall already closed by `closeActedOnRecalls`, or whose pending row simply
+expired, is not waiting for anything, and the word belongs to the clinic the
+patient is looking at). Same three-piece pattern
+`treatment_sitting_reminder` already used for `KINDS.TREATMENT`. Tests:
+`tests/askingTenant.unit.test.js`.
 
-`treatment_sitting_reminder` does not have this problem: the treatment nudge
-records a pending reply (`KINDS.TREATMENT`) and `resolveAskingTenant` sends the
-`Treatment` payload back to the clinic that asked, after re-checking that clinic
-still has an unbooked sitting.
-
-Fixing it for the recall means the same three pieces: a `KINDS.RECALL` pending
-reply written by `jobs/recalls.js`, a matching regex in `routes/webhook.js`, and
-a keyword the engine acts on from a resting state. Worth doing before a clinic
-has patients who use two practices on the number; not worth blocking launch on.
+**One accepted trade-off remains, and it's deliberate, not an oversight:**
+unlike `Treatment`, `Menu` is ALSO a perfectly ordinary thing to type while
+actively talking to the clinic the patient is currently with. The state and
+open-recall checks narrow the window a lot, but they can't close it
+completely — a patient idle at clinic B who types "Menu" purely to see B's
+menu again will still be redirected to clinic A if clinic A genuinely has an
+unresolved recall outstanding for that phone. This was judged better than the
+alternative (never redirecting a recall reply at all, which is the bug
+described above) rather than a gap nobody noticed — see the comment above
+`RECALL_REPLY_RE` in `routes/webhook.js` for the same reasoning in place.
 
 ## Verifying a template once approved
 

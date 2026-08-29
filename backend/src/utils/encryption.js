@@ -100,4 +100,49 @@ function decrypt(ciphertext) {
   }
 }
 
-module.exports = { encrypt, decrypt };
+/**
+ * Encrypt a JS value for storage in a JSONB column as `{_enc: "v2:..."}` —
+ * the exact convention services/botEngine.js established for
+ * bot_sessions.context, reused here (routes/patients.js, routes/appointments.js)
+ * for `patients.dental_history` so column encryption doesn't grow a second,
+ * slightly-different format to keep straight.
+ */
+function encryptJSON(value) {
+  return { _enc: encrypt(JSON.stringify(value == null ? {} : value)) };
+}
+
+/**
+ * Decrypt a JSONB value written by encryptJSON. Returns:
+ *   - the decrypted object, on success
+ *   - `raw` itself, for a LEGACY plaintext row (no `_enc` key) — written
+ *     before this existed; accepted for backward compat, exactly like
+ *     botEngine.js does for bot_sessions.context, and re-encrypted the next
+ *     time something writes it
+ *   - `null`, if `_enc` is present but decryption FAILS (wrong/rotated key,
+ *     corrupted data)
+ *
+ * The null case is deliberately NOT the same as "no history recorded" ({}):
+ * a dentist who cannot see a patient's allergies because of a key problem
+ * must be told that plainly, never shown an empty-looking, falsely reassuring
+ * record. Callers must check for `null` and surface it as an error, not
+ * default it to `{}`.
+ */
+function decryptJSON(raw) {
+  if (!raw || typeof raw !== 'object') return {};
+  if (!raw._enc) return raw;
+  const decrypted = decrypt(raw._enc);
+  if (decrypted == null) return null;
+  try {
+    return JSON.parse(decrypted);
+  } catch {
+    return null;
+  }
+}
+
+// Exposed for jobs/backupManager.js, which encrypts a multi-hundred-MB
+// pg_dump as a STREAM rather than one in-memory string — it needs the same
+// key derivation `encrypt`/`decrypt` use internally, but must build its own
+// cipher/IV/tag handling around a stream (see the comment there for the
+// on-disk format). Nothing else should need this; encrypt()/decrypt() cover
+// every in-memory case.
+module.exports = { encrypt, decrypt, encryptJSON, decryptJSON, getKeyBuffer };

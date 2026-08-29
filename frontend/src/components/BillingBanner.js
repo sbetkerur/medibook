@@ -73,7 +73,7 @@ async function startCardFlow(onDone) {
   rzp.open();
 }
 
-function useBilling() {
+export function useBilling() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(false);
   const refresh = useCallback(async () => {
@@ -87,6 +87,8 @@ function useBilling() {
   useEffect(() => { refresh(); }, [refresh]);
   return { data, err, refresh };
 }
+
+export { startCardFlow };
 
 // ── Dashboard banner ────────────────────────────────────────
 export default function BillingBanner() {
@@ -125,6 +127,34 @@ export default function BillingBanner() {
     );
   }
 
+  if (data.deletion) {
+    const when = data.deletion.scheduled_for
+      ? new Date(data.deletion.scheduled_for).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+      : null;
+    return (
+      <Bar tone="red">
+        <span>
+          <strong>This clinic is scheduled for permanent deletion{when ? ` on ${when}` : ''}.</strong>{' '}
+          Cancel the request in <strong>Settings → Billing</strong> to keep your account.
+        </span>
+      </Bar>
+    );
+  }
+
+  if (data.billing?.cancel_at_period_end && !data.billing?.canceled_at) {
+    const when = data.billing.current_period_end
+      ? new Date(data.billing.current_period_end).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+      : null;
+    return (
+      <Bar tone="amber">
+        <span>
+          Your subscription is set to end{when ? ` on ${when}` : ' at the end of this cycle'}. You can keep it in{' '}
+          <strong>Settings → Billing</strong>.
+        </span>
+      </Bar>
+    );
+  }
+
   if (data.trialing && data.trial_days_left != null && data.trial_days_left >= 0 && data.trial_days_left <= 7) {
     return (
       <Bar tone="blue">
@@ -156,71 +186,6 @@ function Bar({ tone, children }) {
   );
 }
 
-// ── Settings tab summary card ───────────────────────────────
-export function BillingSummary() {
-  const { data, refresh } = useBilling();
-  const [busy, setBusy] = useState(false);
-
-  if (!data) return null;
-  if (data.managed_by_medibook) {
-    return (
-      <Card>
-        <p className="text-sm text-gray-600">
-          Billing for this clinic is managed by MediBook. Contact us for any changes.
-        </p>
-      </Card>
-    );
-  }
-
-  const b = data.billing || {};
-  const fmt = (d) => (d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '—');
-  const trialLeft = data.trial_days_left == null ? null : Math.max(0, data.trial_days_left);
-  const statusLabel =
-    data.paywalled ? 'Payment due'
-    : data.trialing ? `Free trial · ${trialLeft ?? '—'} day${trialLeft === 1 ? '' : 's'} left`
-    : b.subscription_status || '—';
-
-  const act = async () => { setBusy(true); await startCardFlow(refresh); setBusy(false); };
-
-  return (
-    <Card>
-      <dl className="grid grid-cols-2 gap-y-2 text-sm">
-        <dt className="text-gray-500">Plan</dt>
-        <dd className="text-gray-900 font-medium">
-          {data.plan?.name || data.plan?.id}
-          {data.plan?.price_monthly ? ` · ₹${Number(data.plan.price_monthly).toLocaleString('en-IN')}/mo` : ''}
-        </dd>
-        <dt className="text-gray-500">Status</dt>
-        <dd className="text-gray-900">{statusLabel}</dd>
-        {data.trialing && (
-          <>
-            <dt className="text-gray-500">Trial ends</dt>
-            <dd className="text-gray-900">{fmt(b.trial_end)}</dd>
-          </>
-        )}
-        {!data.trialing && b.current_period_end && (
-          <>
-            <dt className="text-gray-500">Next charge</dt>
-            <dd className="text-gray-900">{fmt(b.current_period_end)}</dd>
-          </>
-        )}
-      </dl>
-      <div className="mt-4">
-        <button onClick={act} disabled={busy}
-          className="rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-sm font-medium px-4 py-2">
-          {busy ? 'Opening…' : b.has_subscription ? 'Update card' : 'Add card'}
-        </button>
-      </div>
-    </Card>
-  );
-}
-
-function Card({ children }) {
-  return (
-    <div className="bg-white rounded-xl p-4 sm:p-6 shadow-sm">
-      <h2 className="font-semibold text-gray-800 mb-1">Billing</h2>
-      <p className="text-xs text-gray-500 mb-4">Your subscription and payment method.</p>
-      {children}
-    </div>
-  );
-}
+// The Settings-tab billing card lives in components/BillingPanel.js now (full
+// plan/cancel/invoice/GST/deletion surface). This file keeps only the
+// top-of-dashboard Bar + the useBilling/startCardFlow hooks it shares.

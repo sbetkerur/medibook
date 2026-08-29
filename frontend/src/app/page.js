@@ -1,4 +1,5 @@
 import BrandMark from '@/components/BrandMark';
+import WhatsAppDemoChat from '@/components/WhatsAppDemoChat';
 
 export const metadata = {
   title: 'MediBook — WhatsApp appointment booking for dental clinics',
@@ -115,31 +116,10 @@ export default function LandingPage() {
           </p>
         </div>
 
-        {/* Stylised WhatsApp chat → dashboard, all inline */}
+        {/* Real WhatsApp bot, live — not a scripted mock. Runs against the
+            same read-only demo clinic as "See a live demo" below. */}
         <div className="relative">
-          <div className="mx-auto max-w-sm rounded-3xl border border-gray-200 bg-gradient-to-b from-emerald-50 to-white p-4 shadow-xl">
-            <div className="mb-3 flex items-center gap-2 border-b border-gray-100 pb-3">
-              <BrandMark className="h-7 w-7" />
-              <div className="text-sm font-semibold">Pragati Dental Studio</div>
-              <span className="ml-auto rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
-                WhatsApp
-              </span>
-            </div>
-            <div className="space-y-2 text-sm">
-              <div className="ml-auto w-fit max-w-[80%] rounded-2xl rounded-br-sm bg-emerald-500 px-3 py-2 text-white">
-                Hi, I’d like a check-up
-              </div>
-              <div className="w-fit max-w-[85%] rounded-2xl rounded-bl-sm bg-white px-3 py-2 shadow-sm ring-1 ring-gray-100">
-                Sure! Which dentist — or reply <b>1</b> for the next available?
-              </div>
-              <div className="ml-auto w-fit max-w-[80%] rounded-2xl rounded-br-sm bg-emerald-500 px-3 py-2 text-white">
-                1, tomorrow evening
-              </div>
-              <div className="w-fit max-w-[85%] rounded-2xl rounded-bl-sm bg-white px-3 py-2 shadow-sm ring-1 ring-gray-100">
-                Booked ✅ Tomorrow 6:30 pm with Dr. Ananya Rao. We’ll remind you 24h before.
-              </div>
-            </div>
-          </div>
+          <WhatsAppDemoChat />
           <div className="mx-auto -mt-4 max-w-xs rounded-2xl border border-gray-200 bg-white p-3 shadow-lg">
             <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
               Front desk · Today

@@ -3,6 +3,7 @@ const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const { tenantQuery } = require('../db');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
+const { encryptJSON, decryptJSON } = require('../utils/encryption');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 
 const { IST_TODAY_SQL } = require('../utils/dateTz');
@@ -52,10 +53,21 @@ router.get('/patients', patientLimiter, async (req, res) => {
 router.get('/patients/:id', validateUUID(), async (req, res) => {
   try {
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, referral_source, dental_history as medical_history, created_at, updated_at FROM patients WHERE id=$1 AND deleted_at IS NULL`,
+      `SELECT id, name, phone, email, gender, date_of_birth, visit_count, referral_source, dental_history, created_at, updated_at FROM patients WHERE id=$1 AND deleted_at IS NULL`,
       [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
-    res.json({ patient: r.rows[0] });
+    const patient = r.rows[0];
+    // dental_history is encrypted at rest (utils/encryption.js encryptJSON) —
+    // decrypt() returning null means the ciphertext exists but could not be
+    // read back (wrong/rotated key, corrupted row), which must never be
+    // silently shown as "no history."
+    const medical_history = decryptJSON(patient.dental_history);
+    delete patient.dental_history;
+    if (medical_history === null) {
+      logger.warn('dental_history decryption failed', { patient: req.params.id });
+      return res.json({ patient: { ...patient, medical_history: null, medical_history_error: true } });
+    }
+    res.json({ patient: { ...patient, medical_history } });
   } catch (err) { handleError(res, err); }
 });
 
@@ -127,6 +139,9 @@ router.delete('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     // "anonymised" records trivially re-identifiable. Replacement must satisfy
     // the phone CHECK (^[0-9]{7,20}$); the '000' prefix can't collide with a
     // real number (stored numbers never start with 0).
+    // dental_history reset to a plain empty object rather than an encrypted
+    // one — decryptJSON() already treats a row with no `_enc` key as legacy
+    // plaintext, and there's nothing to protect in `{}` either way.
     const r = await tenantQuery(s, `
       UPDATE patients SET
         name='[Deleted]', email=NULL, date_of_birth=NULL, gender=NULL,
@@ -173,17 +188,27 @@ router.get('/patients/:id/medical-history', validateUUID(), async (req, res) => 
   try {
     const s = req.tenant.schema_name;
     const r = await tenantQuery(s,
-      `SELECT id, name, phone, dental_history as medical_history FROM patients WHERE id=$1 AND deleted_at IS NULL`, [req.params.id]);
+      `SELECT id, name, phone, dental_history FROM patients WHERE id=$1 AND deleted_at IS NULL`, [req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
+    const patient = r.rows[0];
+    const medical_history = decryptJSON(patient.dental_history);
+    delete patient.dental_history;
+    if (medical_history === null) {
+      // Never shown as "no history" — see decryptJSON's doc comment. A
+      // dentist relying on this to check for an allergy must be told the read
+      // failed, not handed an empty-looking, falsely reassuring record.
+      logger.warn('dental_history decryption failed', { patient: req.params.id });
+      return res.json({ patient: { ...patient, medical_history: null, medical_history_error: true } });
+    }
     // Fire-and-forget, and only when there is actually something to read.
     // Masked patient id (first 8 chars) matches appointments.js so the audit
     // log itself doesn't become a second copy of the identifiers.
-    if (r.rows[0].medical_history && Object.keys(r.rows[0].medical_history).length > 0) {
+    if (Object.keys(medical_history).length > 0) {
       writeAuditLog(s, req.user.id, req.user.role, 'ACCESS_DENTAL_HISTORY', 'patient',
         String(req.params.id).slice(0, 8) + '…', null, null, req.ip)
         .catch(e => logger.warn('Medical history audit log failed', { error: e.message }));
     }
-    res.json({ patient: r.rows[0] });
+    res.json({ patient: { ...patient, medical_history } });
   } catch (err) { handleError(res, err); }
 });
 
@@ -194,19 +219,23 @@ router.patch('/patients/:id/medical-history', adminOnly, validateUUID(), async (
       return res.status(400).json({ error: 'medical_history object required' });
     }
     const s = req.tenant.schema_name;
+    // Encrypted at rest (utils/encryption.js encryptJSON) — this column holds
+    // blood type, allergies, chronic conditions and medications, and a raw
+    // pg_dump backup of it must not be a plaintext copy of every patient's
+    // sensitive health data across the whole clinic. See CLAUDE.md.
     const r = await tenantQuery(s,
       // deleted_at IS NULL for the same reason PATCH /patients/:id carries it:
       // DELETE /patients/:id anonymises the row and clears dental_history, and
       // without this guard a later PATCH writes live clinical data back onto a
       // record that every read path has stopped showing.
-      `UPDATE patients SET dental_history=$1, updated_at=NOW()
+      `UPDATE patients SET dental_history=$1::jsonb, updated_at=NOW()
         WHERE id=$2 AND deleted_at IS NULL
-        RETURNING id, name, dental_history as medical_history`,
-      [JSON.stringify(medical_history), req.params.id]);
+        RETURNING id, name`,
+      [JSON.stringify(encryptJSON(medical_history)), req.params.id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_MEDICAL_HISTORY', 'patient', req.params.id,
       null, { fields: Object.keys(medical_history) }, req.ip);
-    res.json({ patient: r.rows[0] });
+    res.json({ patient: { ...r.rows[0], medical_history } });
   } catch (err) { handleError(res, err); }
 });
 

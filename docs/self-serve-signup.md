@@ -174,9 +174,62 @@ clinic sends nothing unsolicited.
   `provisioning retry still failing`.
 - **`billing_events`** dedups Razorpay webhook deliveries on the
   `x-razorpay-event-id` header — safe to let Razorpay retry.
-- **Refund / cancel**: cancel the subscription in the Razorpay dashboard; the
-  webhook (or the cron) moves the clinic to `past_due`, then `suspended` after
-  the grace window. There is no self-serve "delete my clinic".
 - **Turning it off**: `SELF_SIGNUP_ENABLED=false` disables new signups
   immediately. Existing self-serve clinics keep working; their billing lifecycle
   still runs.
+
+---
+
+## Self-serve billing management
+
+Everything below is tenant-facing (Settings → Billing) and needs no operator
+action.
+
+- **Cancel / undo**: `POST /api/admin/billing/cancel {reason}` flags
+  `cancel_at_period_end` — it does **not** call Razorpay. `billing_dunning`
+  issues the real Razorpay cancel once `current_period_end` passes, so
+  `POST /api/admin/billing/cancel/undo` before then is a genuine undo. The
+  dashboard shows an amber "subscription ends on …" bar in the interim.
+- **Plan change**: `POST /api/admin/billing/change-plan {plan}`. Upgrade is
+  immediate (proration on); downgrade is scheduled for the next cycle
+  (`tenant_billing.pending_plan_id` + `plan_change_at`, applied by the
+  `subscription.charged` webhook). A downgrade the current dentist/branch count
+  won't fit is refused (`code: DOWNGRADE_BLOCKED`).
+- **Per-branch billing**: Professional = plan amount × active branches.
+  `services/billing.js` `syncSubscriptionQuantity` runs on branch add/remove and
+  pushes `quantity` to Razorpay at cycle end; `billing_dunning` reconciles it
+  daily and keeps `tenants.billing_monthly` in step for MRR.
+- **GST tax invoices**: one `billing_invoices` row per `subscription.charged`
+  (idempotent on `razorpay_payment_id`). The Razorpay plan amount is
+  **GST-inclusive**; `splitGst` back-computes the taxable value and the
+  CGST+SGST (buyer in `SELLER_STATE_CODE`) or IGST (interstate) split.
+  Invoice number: `<INVOICE_NUMBER_PREFIX>/<FY>/<seq>` from
+  `billing_invoice_seq`. `GET /api/admin/billing/invoices[/:id]` (PDF).
+  `GET/PUT /api/admin/billing/profile` captures the buyer GSTIN / place of
+  supply; with none, the invoice is raised B2C (no buyer GSTIN line).
+  Set `SELLER_LEGAL_NAME` / `SELLER_GSTIN` / `SELLER_STATE_CODE` /
+  `SELLER_ADDRESS` for the seller block.
+
+## Rejecting and deleting
+
+- **Reject a signup**: `POST /api/superadmin/tenants/:id/reject {reason}` — only
+  for `pending_review` (no schema exists yet). Deletes the `tenants` row, frees
+  the slug, WhatsApps the owner. Use it for spam / duplicates instead of leaving
+  the row in the queue.
+- **Notify on new signups**: set `SIGNUP_REVIEW_NOTIFY_PHONE` (comma-separated
+  WhatsApp numbers) so the queue pings an operator rather than waiting to be
+  noticed.
+- **Tenant "delete my clinic"**: `POST /api/admin/billing`… → Settings → Billing
+  → *Close this clinic*. Requires the admin's password + typing `DELETE`. Sets
+  `deletion_scheduled_for = now + ACCOUNT_DELETION_GRACE_DAYS` (default 14);
+  nothing is scrubbed during the window and `POST
+  /api/admin/account/deletion/cancel` reverses it. `jobs/accountDeletion.js`
+  (03:30 IST) then `DROP SCHEMA … CASCADE` + deletes the row — recoverable only
+  from the ≤30-day encrypted backups. `billing_invoices` rows survive
+  (`tenant_id` → NULL).
+
+## Status page
+
+`GET /api/status` (public, no auth, no per-tenant data) — DB reachability, cron
+freshness, webhook backlog, shared-number circuit-breaker state. Rendered at
+`/status` on the frontend.
