@@ -539,7 +539,8 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
         `Patient: ${phone}\n` +
         `Dr. ${ctx.reschedule_doctor_name}\n` +
         `Old: ${oldDateLabel} at ${(ctx.reschedule_old_time || '').slice(0, 5)}\n` +
-        `New: ${newDate} at ${(ctx.reschedule_new_time || '').slice(0, 5)}`
+        `New: ${newDate} at ${(ctx.reschedule_new_time || '').slice(0, 5)}`,
+        { senders: send._senders }
       );
     })().catch(() => {});
   } else {
@@ -715,7 +716,8 @@ async function handleCancelConfirm(phone, schema, tenant, send, ctx, choice) {
         `Patient: ${phone}\n` +
         `Dr. ${ctx.cancel_doctor_name}\n` +
         `📅 ${dateLabel} at ${(ctx.cancel_time || '').slice(0, 5)}\n` +
-        `📝 Reason: ${ctx.cancel_reason || 'Not specified'}`
+        `📝 Reason: ${ctx.cancel_reason || 'Not specified'}`,
+        { senders: send._senders }
       );
     })().catch(() => {});
   } else {

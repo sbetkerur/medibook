@@ -337,8 +337,13 @@ const STAFF_ALERT_TEMPLATE = 'clinic_staff_alert';
  *
  * Never throws — logs warnings on failure.
  */
-async function notifyAdminWhatsApp(schema, tenant, message) {
+async function notifyAdminWhatsApp(schema, tenant, message, opts = {}) {
   try {
+    // opts.senders is the test-harness capture object (services/bot/testRunner.js)
+    // when this runs under /webhook/test or /admin/bot-test — routes the alert
+    // into the captured output instead of a real WhatsApp send. Real runs pass
+    // nothing and fall through to the wa module below.
+    const injected = opts.senders || null;
     const adminUsers = await tenantQuery(schema,
       // ORDER BY, and a ceiling that is a safety valve rather than a policy.
       // This function is documented — and named — as fanning out to ALL admins
@@ -352,8 +357,8 @@ async function notifyAdminWhatsApp(schema, tenant, message) {
         ORDER BY created_at ASC
         LIMIT 10`);
     if (!adminUsers.rows.length) return;
-    // Shared phone — use global META_* env vars
-    const wa = require('../whatsapp');
+    // Shared phone — use global META_* env vars. `injected` (test harness) wins.
+    const wa = injected || require('../whatsapp');
     const clinicName = String(tenant?.name || 'your clinic').slice(0, 60);
 
     for (const admin of adminUsers.rows) {

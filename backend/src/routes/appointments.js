@@ -375,6 +375,16 @@ router.patch('/appointments/:id', validateUUID(), async (req, res) => {
     const oldR = await tenantQuery(s, `SELECT status FROM appointments WHERE id=$1`, [req.params.id]);
     if (!oldR.rows[0]) return res.status(404).json({ error: 'Appointment not found' });
 
+    // A fee can only be marked paid/waived on a visit that actually HAPPENED.
+    // day-close counts consultation money only for status='completed', so
+    // 'paid' on a confirmed/cancelled row is money that no report can ever
+    // show — and a later cancel would silently erase it from the books.
+    // Clearing back to 'pending' is always allowed (it's the neutral value).
+    if ((payment_status === 'paid' || payment_status === 'waived')
+        && (status || oldR.rows[0].status) !== 'completed') {
+      return res.status(409).json({ error: 'A consultation fee can only be marked paid or waived once the appointment is completed.' });
+    }
+
     // Enforce valid state transitions to prevent data inconsistency
     // (e.g. reverting a completed appointment back to confirmed).
     // APPOINTMENT_TRANSITIONS is shared with the bulk route so the two can't drift.

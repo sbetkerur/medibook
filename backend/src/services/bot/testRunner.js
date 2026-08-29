@@ -42,6 +42,10 @@ async function runBotTest({ tenant, phone, message, buttonId, welcome }) {
     sendList: async (to, text, label, sections, _t, _p, opts = {}) => {
       responses.push({ type: 'list', text, label, sections, ...opts });
     },
+    // Captured too, so a flow that runs to completion and reaches
+    // notifyAdminWhatsApp (bot/utils.js) does NOT fire a real staff alert from
+    // a test invocation. Recorded distinctly so a caller can see it happened.
+    sendTemplate: async (to, name) => { responses.push({ type: 'template', to, name }); return null; },
   };
 
   await botEngine.handle({ phone, text: message, buttonId, tenant, welcome, senders });

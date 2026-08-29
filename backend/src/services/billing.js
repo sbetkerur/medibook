@@ -16,6 +16,7 @@
 const { query, tenantQuery } = require('../db');
 const logger = require('../utils/logger');
 const razorpay = require('./razorpay');
+const { toZonedTime } = require('../utils/dateTz');
 
 const GST_RATE = 0.18;
 
@@ -51,11 +52,15 @@ function splitGst(totalPaise, buyerStateCode, rate = GST_RATE) {
   return { taxable_paise: taxable, cgst_paise: cgst, sgst_paise: taxTotal - cgst, igst_paise: 0, gst_rate: rate, inter_state: false };
 }
 
-/** Indian financial year for a date — "2025-26" for anything Apr 2025–Mar 2026. */
+/**
+ * Indian financial year for a date — "2025-26" for anything Apr 2025–Mar 2026.
+ * Computed in IST, not UTC: a charge at 2026-03-31 20:00 UTC is 2026-04-01
+ * 01:30 IST, which is FY 2026-27, and the invoice number must say so.
+ */
 function financialYear(d = new Date()) {
-  const dt = d instanceof Date ? d : new Date(d);
-  const y = dt.getUTCFullYear();
-  const startYear = dt.getUTCMonth() >= 3 ? y : y - 1; // month 3 = April (0-indexed)
+  const dt = toZonedTime(d instanceof Date ? d : new Date(d), 'Asia/Kolkata');
+  const y = dt.getFullYear();
+  const startYear = dt.getMonth() >= 3 ? y : y - 1; // month 3 = April (0-indexed)
   return `${startYear}-${String((startYear + 1) % 100).padStart(2, '0')}`;
 }
 

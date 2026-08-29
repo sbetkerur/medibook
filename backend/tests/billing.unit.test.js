@@ -79,8 +79,15 @@ test('taxable value is never more than the total', () => {
 test('financialYear: April 2025 → 2025-26', () => {
   assert.strictEqual(billing.financialYear(new Date('2025-04-01T00:00:00Z')), '2025-26');
 });
-test('financialYear: March 2025 → 2024-25 (still the prior FY)', () => {
-  assert.strictEqual(billing.financialYear(new Date('2025-03-31T23:00:00Z')), '2024-25');
+test('financialYear: mid-March 2025 IST → 2024-25 (still the prior FY)', () => {
+  assert.strictEqual(billing.financialYear(new Date('2025-03-15T06:00:00Z')), '2024-25');
+});
+test('financialYear: computed in IST, not UTC — 31 Mar 20:00 UTC is 1 Apr IST → new FY', () => {
+  // 2026-03-31 20:00 UTC = 2026-04-01 01:30 IST → FY 2026-27
+  assert.strictEqual(billing.financialYear(new Date('2026-03-31T20:00:00Z')), '2026-27');
+});
+test('financialYear: 31 Mar 17:00 UTC is still 31 Mar IST (22:30) → old FY', () => {
+  assert.strictEqual(billing.financialYear(new Date('2026-03-31T17:00:00Z')), '2025-26');
 });
 test('financialYear: Jan 2026 → 2025-26', () => {
   assert.strictEqual(billing.financialYear(new Date('2026-01-15T00:00:00Z')), '2025-26');

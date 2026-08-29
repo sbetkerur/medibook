@@ -59,10 +59,13 @@ async function recordInvoiceFromCharge({ subscriptionId, payment, subscription }
   const periodEnd = subscription?.current_end ? new Date(subscription.current_end * 1000) : null;
   const issuedAt = payment.created_at ? new Date(payment.created_at * 1000) : new Date();
 
-  // nextval + INSERT in one transaction: if the INSERT trips the
-  // razorpay_payment_id unique index (a racing duplicate webhook), the whole
-  // tx rolls back and the sequence value is simply skipped — a gap in the
-  // invoice series is allowed; a reused number is not.
+  // A consumed nextval() is never returned to the sequence (Postgres does not
+  // roll sequence advances back, even inside a transaction), so a duplicate
+  // webhook or a caught error that skips the INSERT leaves a GAP in the invoice
+  // series. That is acceptable under GST rules (the series must be unique and
+  // sequential; documented gaps from voided/duplicate issuance are fine) — what
+  // must never happen is a REUSED number, and the razorpay_payment_id unique
+  // index + ON CONFLICT DO NOTHING guarantee that.
   const invoiceNumber = await billing.nextInvoiceNumber(null, issuedAt);
   try {
     const ins = await query(`

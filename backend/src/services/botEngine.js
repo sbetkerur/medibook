@@ -252,6 +252,10 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   // handle()'s top-level catch exactly as before, which is what feeds the
   // BullMQ/failed_webhooks retry path.
   const send = {
+    // The raw injected senders (or null in a real run) — carried so a flow can
+    // hand them to notifyAdminWhatsApp, which sends to a STAFF number (not
+    // `phone`) and so cannot go through send.text. Null → the real wa module.
+    _senders: waSend || null,
     text: async (t) => {
       const id = await w.sendText(phone, t, waToken, waPhoneId);
       await logMessage(schema, phone, 'out', 'text', t, id);

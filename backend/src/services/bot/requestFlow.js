@@ -32,7 +32,7 @@ const REQUEST_RE = /(fit me in|ask the clinic|request an appointment|call me bac
  * appointment, not three items on the receptionist's list. The newest details
  * win, so the note reflects what they last asked for.
  */
-async function recordRequest(schema, tenant, phone, kind, details = {}) {
+async function recordRequest(schema, tenant, phone, kind, details = {}, send = null) {
   const patient = await getPatient(schema, phone).catch(() => null);
   try {
     await tenantQuery(schema, `
@@ -67,7 +67,8 @@ async function recordRequest(schema, tenant, phone, kind, details = {}) {
        details.preferredDate ? `Wanted: ${details.preferredDate}` : null,
        `Their preferred day had nothing free.`];
   await notifyAdminWhatsApp(schema, tenant,
-    [...lines.filter(Boolean), '', 'Open the dashboard to clear it.'].join('\n'));
+    [...lines.filter(Boolean), '', 'Open the dashboard to clear it.'].join('\n'),
+    { senders: send?._senders });
 }
 
 /**
@@ -98,7 +99,7 @@ async function handleCallbackRequest(phone, schema, tenant, send, ctx = {}) {
     doctorId: ctx.doctor_id || null,
     departmentName: ctx.department_name || null,
     doctorName: ctx.doctor_name || null,
-  });
+  }, send);
   await send.text(
     `Done — we have your number and someone from the clinic will ring you.\n\n` +
     `If it is urgent, please call us instead.` + await clinicPhoneLine(schema, ctx.hospital_id)
@@ -127,7 +128,7 @@ async function handleAppointmentRequest(phone, schema, tenant, send, ctx = {}) {
     doctorName: ctx.doctor_name || null,
     preferredDate: ctx.request_preferred_date || null,
     note: ctx.request_note || null,
-  });
+  }, send);
   await send.text(
     `Thank you — the clinic has your request and will call you to find a time.\n\n` +
     `We often fit people in sooner than the online diary shows.` +

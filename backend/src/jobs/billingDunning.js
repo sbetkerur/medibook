@@ -148,7 +148,13 @@ async function applyScheduledCancellations() {
      WHERE b.cancel_at_period_end = true
        AND b.canceled_at IS NULL
        AND b.razorpay_subscription_id IS NOT NULL
-       AND (b.current_period_end IS NULL OR b.current_period_end < NOW())
+       -- ONLY once we KNOW the paid-through date has passed. A NULL
+       -- current_period_end (subscription just created, no subscription.charged
+       -- webhook yet) must NOT trigger an immediate hard-cancel — that would
+       -- burn paid time and make /billing/cancel/undo impossible. A stuck-NULL
+       -- period end is reconcileSubscriptions()'s problem, not this step's.
+       AND b.current_period_end IS NOT NULL
+       AND b.current_period_end < NOW()
   `)).rows;
 
   for (const row of rows) {
@@ -180,6 +186,46 @@ async function reconcileBranchQuantities() {
     await billingSvc.syncSubscriptionQuantity(r.id).catch(e =>
       logger.warn('billing_dunning: quantity reconcile failed', { tenant: r.id, error: e.message }));
   }
+}
+
+/**
+ * Re-issue any GST invoice the subscription.charged webhook failed to write.
+ * The webhook commits the billing_events idempotency row BEFORE it calls
+ * recordInvoiceFromCharge, so a transient DB blip there is otherwise permanent:
+ * Razorpay's retry is deduped and no invoice is ever raised for a real charge.
+ * billing_events.payload holds the whole event, so this replays it. Idempotent
+ * (recordInvoiceFromCharge no-ops when the invoice already exists).
+ */
+async function backfillMissingInvoices() {
+  const rows = (await query(`
+    SELECT be.payload
+      FROM billing_events be
+     WHERE be.event_type = 'subscription.charged'
+       AND be.received_at > NOW() - INTERVAL '35 days'
+       AND NOT EXISTS (
+         SELECT 1 FROM billing_invoices bi
+          WHERE bi.razorpay_payment_id =
+                be.payload #>> '{payload,payment,entity,id}'
+       )
+       AND be.payload #>> '{payload,payment,entity,id}' IS NOT NULL
+  `)).rows;
+  if (!rows.length) return;
+  const { recordInvoiceFromCharge } = require('../services/invoice');
+  let issued = 0;
+  for (const r of rows) {
+    const evt = r.payload || {};
+    const payment = evt.payload?.payment?.entity;
+    const sub = evt.payload?.subscription?.entity;
+    const subscriptionId = sub?.id || payment?.subscription_id;
+    if (!payment || !subscriptionId) continue;
+    try {
+      const inv = await recordInvoiceFromCharge({ subscriptionId, payment, subscription: sub });
+      if (inv) issued++;
+    } catch (e) {
+      logger.warn('billing_dunning: invoice backfill failed for one charge', { payment: payment.id, error: e.message });
+    }
+  }
+  if (issued) logger.info('billing_dunning: backfilled missing invoices', { count: issued });
 }
 
 async function retryStuckProvisioning() {
@@ -220,6 +266,7 @@ async function runOnce() {
   await reconcileSubscriptions();
   await applyScheduledCancellations();
   await reconcileBranchQuantities();
+  await backfillMissingInvoices();
   await suspendExpiredGrace();
   await retryStuckProvisioning();
 }

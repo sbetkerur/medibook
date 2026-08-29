@@ -164,7 +164,7 @@ export default function BillingPanel() {
           </dd>
           <dt className="text-gray-500">Status</dt>
           <dd className="text-gray-900">{statusLabel}</dd>
-          {data.trialing && (<><dt className="text-gray-500">Trial ends</dt><dd className="text-gray-900">{fmtDate(b.trial_end)}</dd></>)}
+          {data.trialing && (<><dt className="text-gray-500">Trial ends</dt><dd className="text-gray-900">{fmtDate(data.trial_end || b.trial_end)}</dd></>)}
           {!data.trialing && b.current_period_end && (
             <><dt className="text-gray-500">{b.cancel_at_period_end ? 'Ends on' : 'Next charge'}</dt>
               <dd className="text-gray-900">{fmtDate(b.current_period_end)}</dd></>

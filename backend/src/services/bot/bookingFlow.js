@@ -1448,7 +1448,8 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
             `Dr. ${ctx.doctor_name}\n` +
             `📅 ${dateLabel3} at ${(ctx.appointment_time || '').slice(0, 5)}\n` +
             `🦷 ${ctx.hospital_name}\n` +
-            `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`
+            `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`,
+            { senders: send._senders }
           );
         } catch (waErr) {
           logger.warn('Admin WhatsApp booking alert failed', { error: waErr.message });
