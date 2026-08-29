@@ -3,22 +3,20 @@
 # Postgres 18, but Alpine's `postgresql-client` metapackage lagged at 16/17, so
 # every nightly backup was exiting 1 with "server version mismatch" (backup_log
 # / cron_jobs.last_error). Alpine has no pg18 client in a stable repo yet, so
-# take the real thing from the official postgres:18-alpine image — same
-# musl/Alpine ABI — and the shared libs it links. Bump this tag when Railway's
-# Postgres major moves.
+# take just the pg_dump 18 BINARY from the official postgres:18-alpine image
+# (same musl/Alpine ABI) and let it link Alpine's own libpq — pg_dump only uses
+# libpq's stable public API and gates on the SERVER version, not libpq's, so a
+# pg18 pg_dump with Alpine's slightly-older libpq is fine. Copying pg18's own
+# libpq instead drags in a GSSAPI/LDAP-enabled build whose krb5/openldap
+# sonames aren't in this base. Bump the tag when Railway's Postgres major moves.
 FROM postgres:18-alpine AS pgclient
 
 FROM node:20-alpine
 
 COPY --from=pgclient /usr/local/bin/pg_dump /usr/local/bin/pg_dump
-# libpq + the compression/crypto libs pg_dump 18 links. `apk add libpq` pulls
-# the openssl/ldap/gssapi transitive deps; the COPY then overrides just the
-# libpq.so.5 itself with the pg18 build (musl searches /usr/local/lib before
-# /usr/lib). `pg_dump --version` at build time fails the build if any .so is
-# missing — so a broken image never reaches prod.
-RUN apk add --no-cache libpq zstd-libs lz4-libs
-COPY --from=pgclient /usr/local/lib/libpq.so.5 /usr/local/lib/libpq.so.5
-RUN pg_dump --version
+# `pg_dump --version` here fails the build if a .so is missing, so a broken
+# image never reaches prod.
+RUN apk add --no-cache libpq zstd-libs lz4-libs && pg_dump --version
 
 WORKDIR /app
 
