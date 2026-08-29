@@ -428,7 +428,9 @@ async function recordPlanChange(tenantId, oldPlan, newPlan, userId, effective) {
 }
 
 // ── GET /admin/billing/invoices ────────────────────────────
-router.get('/billing/invoices', async (req, res) => {
+// adminOnly: a GST tax invoice is a financial document, gated like
+// /billing/profile and the PHI export, not open to the dentist role.
+router.get('/billing/invoices', adminOnly, async (req, res) => {
   try {
     const r = await query(`
       SELECT id, invoice_number, issued_at, period_start, period_end,
@@ -444,7 +446,7 @@ router.get('/billing/invoices', async (req, res) => {
 });
 
 // ── GET /admin/billing/invoices/:id.pdf ────────────────────
-router.get('/billing/invoices/:id', validateUUID(), async (req, res) => {
+router.get('/billing/invoices/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
     const r = await query(`SELECT * FROM billing_invoices WHERE id=$1 AND tenant_id=$2`, [req.params.id, req.tenant.id]);
     const invoice = r.rows[0];

@@ -37,6 +37,7 @@ cd backend && node tests/circuitBreaker.unit.test.js     # HALF_OPEN lets ONE pr
 cd backend && node tests/messageBudget.unit.test.js      # budget 0 means none, not "default"
 cd backend && node tests/rateLimitFallback.unit.test.js  # per-tenant cap with no Redis
 cd backend && node tests/razorpaySignature.unit.test.js  # self-serve billing: checkout + webhook HMACs
+cd backend && node tests/billing.unit.test.js            # GST split (inclusive, CGST/SGST vs IGST), FY, invoice numbering
 cd backend && node tests/sendCaps.unit.test.js           # trial outbound cap: 50/24h until paying
 cd backend && node tests/otp.unit.test.js                # WhatsApp OTP: attempts, cooldown, single-use
 cd backend && node tests/readOnlyTenant.unit.test.js     # whole-tenant read-only guard (demo clinic)
@@ -785,6 +786,61 @@ enforcer: it ENDS lapsed card-free trials (`active` + `trialing` +
 `trial_end` passed → `past_due`), reconciles subscriptions, and after
 `SIGNUP_DUNNING_GRACE_DAYS` (default 7) moves `past_due` → `suspended`.
 
+**Self-serve billing management** (`routes/billing.js`, tenant-facing under
+`/api/admin`). A clinic runs its own subscription — no support ticket needed:
+- **Cancel** (`POST /billing/cancel {reason}`) does NOT call Razorpay; it sets
+  `tenant_billing.cancel_at_period_end`, and `billingDunning.js`
+  `applyScheduledCancellations` issues the real Razorpay cancel once
+  `current_period_end` passes. That makes `POST /billing/cancel/undo` a true
+  undo (Razorpay has no un-cancel) and guarantees the clinic keeps every paid
+  day. A trial (no subscription) just records the intent.
+- **Plan change** (`POST /billing/change-plan {plan}`) — upgrade takes effect
+  now (`razorpay.updateSubscription` with `schedule_change_at:'now'`), downgrade
+  is scheduled for cycle end (`pending_plan_id` + `plan_change_at`, promoted by
+  the `subscription.charged` webhook when Razorpay's live `plan_id` matches). A
+  downgrade whose target plan can't fit current usage (3 dentists → 2-dentist
+  plan) is refused with what to shed first.
+- **Per-branch quantity.** Professional bills `plan_amount × active branches`.
+  `services/billing.js` `syncSubscriptionQuantity` recomputes on every branch
+  add/remove (`routes/hospitals.js`, fire-and-forget), pushes `quantity` to
+  Razorpay (`schedule_change_at:'cycle_end'`), mirrors the rupee figure to
+  `tenants.billing_monthly`, and `billingDunning.js` reconciles it daily.
+- **GST tax invoices.** The Razorpay plan amount is GST-INCLUSIVE. The
+  `subscription.charged` webhook writes one `billing_invoices` row per charge
+  (`services/invoice.js`, idempotent on `razorpay_payment_id`) with the split
+  back-computed by `services/billing.js` `splitGst` — CGST+SGST for a buyer in
+  `SELLER_STATE_CODE`, IGST otherwise. `invoice_number` is
+  `<INVOICE_NUMBER_PREFIX>/<FY>/<seq>` from `billing_invoice_seq`.
+  `GET /billing/invoices[/:id]` (PDF via `utils/pdfReport.js`).
+  `GET/PUT /billing/profile` captures the buyer's GSTIN / place of supply
+  (`tenant_billing_profiles`); with none, the clinic is billed B2C and the
+  invoice omits the buyer GSTIN. `billing_invoices.tenant_id` is
+  `ON DELETE SET NULL` — a financial record outlives the clinic.
+- `GET /billing` also returns `usage` (dentists/branches used vs plan limit),
+  and the doctor/branch quota 403/409 now carries `code:'PLAN_LIMIT'` +
+  `upgrade_to`.
+
+**Signup review queue + rejection.** `SIGNUP_REVIEW_NOTIFY_PHONE` (comma list)
+gets a WhatsApp ping when a clinic lands in `pending_review`
+(`signupNotify.notifyReviewQueue`) — otherwise the queue stays dashboard-only.
+`POST /superadmin/tenants/:id/reject {reason}` is the counterpart to `approve`:
+valid ONLY for `pending_review` (no schema built yet), it deletes the `tenants`
+row, frees the slug, and WhatsApps the owner.
+
+**Tenant-initiated account deletion** (`routes/account.js`, `/api/admin`, so the
+read-only demo can never reach it). `POST /account/deletion {password, confirm}`
+(admin's own password + literal `"DELETE"`) sets `deletion_requested_at` +
+`deletion_scheduled_for = now + ACCOUNT_DELETION_GRACE_DAYS` (default 14) and
+flags the subscription to cancel. Nothing is scrubbed during the window — the
+clinic works normally and `POST /account/deletion/cancel` fully reverses it.
+`jobs/accountDeletion.js` (03:30 IST, after the backup) then `DROP SCHEMA …
+CASCADE` + `DELETE FROM tenants` — the one irreversible cron, guarded by a
+re-read, the `validateSchemaName` pattern, and a final backup existing first.
+
+**Public status page.** `GET /api/status` (unauthenticated, no per-tenant data)
+reports database reachability, cron freshness, webhook backlog and the shared
+WhatsApp circuit-breaker state; `frontend/src/app/status/page.js` renders it.
+
 **Trial send cap** (`services/sendCaps.js`). A self-serve tenant on the shared
 number is throttled to **50** (`SIGNUP_TRIAL_SEND_CAP`) clinic-initiated patient
 messages / rolling 24h **while on the card-free trial** — the cap is lifted the
@@ -870,10 +926,17 @@ the go-live link sent on approval (two body vars: clinic name, login URL; text
 fallback in dev), `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` /
 `RAZORPAY_WEBHOOK_SECRET`, `RAZORPAY_PLAN_STARTER` / `RAZORPAY_PLAN_PROFESSIONAL`
 (the two recurring plan ids created in the Razorpay dashboard, mirrored to
-`plans.razorpay_plan_id` on boot). In production `index.js` warns at startup
-when `SELF_SIGNUP_ENABLED=true` but any of these are missing, and
-`selfSignupEnabled()` reports the feature unavailable without a real Razorpay
-config.
+`plans.razorpay_plan_id` on boot; the plan amount is GST-INCLUSIVE). In
+production `index.js` warns at startup when `SELF_SIGNUP_ENABLED=true` but any
+of these are missing, and `selfSignupEnabled()` reports the feature unavailable
+without a real Razorpay config.
+
+GST invoicing + lifecycle: `SELLER_LEGAL_NAME`, `SELLER_GSTIN`,
+`SELLER_STATE_CODE` (default `29`, Karnataka — decides CGST+SGST vs IGST),
+`SELLER_ADDRESS`, `INVOICE_NUMBER_PREFIX` (default `MB`);
+`SIGNUP_REVIEW_NOTIFY_PHONE` (comma list, WhatsApp ping on a new
+`pending_review` clinic; blank = dashboard-only queue);
+`ACCOUNT_DELETION_GRACE_DAYS` (default 14).
 
 ## Testing without WhatsApp credentials
 

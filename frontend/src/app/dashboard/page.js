@@ -666,7 +666,12 @@ export default function Dashboard() {
       setHospitals(data.hospitals || []);
       fetchAllHospitalDepts(data.hospitals || []);
     } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to save hospital');
+      const d = err.response?.data;
+      if (d?.code === 'PLAN_LIMIT') {
+        toast.error(`${d.error} Open Settings → Billing to upgrade.`, { duration: 6000 });
+      } else {
+        toast.error(d?.error || 'Failed to save hospital');
+      }
     } finally { setHospitalSaving(false); }
   }
 
@@ -960,7 +965,12 @@ export default function Dashboard() {
       setShowDoctorModal(false);
       fetchDoctors();
     } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to save doctor');
+      const d = err.response?.data;
+      if (d?.code === 'PLAN_LIMIT') {
+        toast.error(`${d.error} Open Settings → Billing to upgrade.`, { duration: 6000 });
+      } else {
+        toast.error(d?.error || 'Failed to save doctor');
+      }
     } finally { setDoctorSaving(false); }
   }
 

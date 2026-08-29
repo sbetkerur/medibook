@@ -73,7 +73,7 @@ async function startCardFlow(onDone) {
   rzp.open();
 }
 
-function useBilling() {
+export function useBilling() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(false);
   const refresh = useCallback(async () => {
@@ -87,6 +87,8 @@ function useBilling() {
   useEffect(() => { refresh(); }, [refresh]);
   return { data, err, refresh };
 }
+
+export { startCardFlow };
 
 // ── Dashboard banner ────────────────────────────────────────
 export default function BillingBanner() {
@@ -121,6 +123,34 @@ export default function BillingBanner() {
           className="shrink-0 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-medium px-4 py-1.5">
           {busy ? 'Opening…' : 'Add card'}
         </button>
+      </Bar>
+    );
+  }
+
+  if (data.deletion) {
+    const when = data.deletion.scheduled_for
+      ? new Date(data.deletion.scheduled_for).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+      : null;
+    return (
+      <Bar tone="red">
+        <span>
+          <strong>This clinic is scheduled for permanent deletion{when ? ` on ${when}` : ''}.</strong>{' '}
+          Cancel the request in <strong>Settings → Billing</strong> to keep your account.
+        </span>
+      </Bar>
+    );
+  }
+
+  if (data.billing?.cancel_at_period_end && !data.billing?.canceled_at) {
+    const when = data.billing.current_period_end
+      ? new Date(data.billing.current_period_end).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+      : null;
+    return (
+      <Bar tone="amber">
+        <span>
+          Your subscription is set to end{when ? ` on ${when}` : ' at the end of this cycle'}. You can keep it in{' '}
+          <strong>Settings → Billing</strong>.
+        </span>
       </Bar>
     );
   }
