@@ -19,7 +19,18 @@ const CRON_MAX_AGE_HOURS = {
   backup: 30,
   webhook_retry: 3,
   account_deletion: 30,
+  feedback: 30,
+  recalls: 30,
+  treatment_nudges: 30,
+  weekly_digest: 24 * 8,
+  weekly_backup: 24 * 8,
 };
+
+// Patient-facing crons are deliberately switched off on the dev environment
+// (DISABLE_PATIENT_CRONS) — a stale row there is expected, not an incident, so
+// don't let it colour the status.
+const PATIENT_CRONS = new Set(['reminders', 'feedback', 'recalls', 'treatment_nudges', 'weekly_digest']);
+const skipPatientCrons = String(process.env.DISABLE_PATIENT_CRONS || '') === 'true';
 
 router.get('/status', async (req, res) => {
   const out = { ok: true, checked_at: new Date().toISOString(), components: {} };
@@ -38,6 +49,7 @@ router.get('/status', async (req, res) => {
     const r = await query(`SELECT job_name, last_run_at, last_status FROM cron_jobs`);
     const jobs = {};
     for (const row of r.rows) {
+      if (skipPatientCrons && PATIENT_CRONS.has(row.job_name)) continue;
       const maxAgeH = CRON_MAX_AGE_HOURS[row.job_name] || 48;
       const ageMs = row.last_run_at ? Date.now() - new Date(row.last_run_at).getTime() : Infinity;
       const fresh = ageMs <= maxAgeH * 3600 * 1000;
