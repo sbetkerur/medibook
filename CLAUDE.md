@@ -38,6 +38,7 @@ cd backend && node tests/messageBudget.unit.test.js      # budget 0 means none, 
 cd backend && node tests/rateLimitFallback.unit.test.js  # per-tenant cap with no Redis
 cd backend && node tests/razorpaySignature.unit.test.js  # self-serve billing: checkout + webhook HMACs
 cd backend && node tests/billing.unit.test.js            # GST split (inclusive, CGST/SGST vs IGST), FY, invoice numbering
+cd backend && node tests/billingWebhook.unit.test.js     # mocked Razorpay: updateSubscription body + subscription.charged → GST invoice (idempotent)
 cd backend && node tests/sendCaps.unit.test.js           # trial outbound cap: 50/24h until paying
 cd backend && node tests/otp.unit.test.js                # WhatsApp OTP: attempts, cooldown, single-use
 cd backend && node tests/readOnlyTenant.unit.test.js     # whole-tenant read-only guard (demo clinic)

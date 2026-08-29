@@ -493,7 +493,6 @@ async function migrate() {
         ('reminders'),
         ('feedback'),
         ('backup'),
-        ('weekly_backup'),
         ('weekly_digest'),
         ('webhook_retry'),
         ('recalls'),
@@ -501,6 +500,12 @@ async function migrate() {
         ('billing_dunning'),
         ('account_deletion')
       ON CONFLICT (job_name) DO NOTHING;
+
+      -- 'weekly_backup' tracked a backup-reminder cron that was removed long ago
+      -- (slotGenerator.js's exec()-based startBackupReminderCron). Nothing
+      -- updates the row, so it sits permanently "stale" and reads as a failing
+      -- job on /api/status. Drop it, unconditionally and idempotently.
+      DELETE FROM cron_jobs WHERE job_name = 'weekly_backup';
     `);
 
     // ── FAILED WEBHOOKS (Retry Queue) ─────────────────────────
