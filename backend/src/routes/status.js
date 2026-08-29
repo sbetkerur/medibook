@@ -51,7 +51,14 @@ router.get('/status', async (req, res) => {
     for (const row of r.rows) {
       if (skipPatientCrons && PATIENT_CRONS.has(row.job_name)) continue;
       const maxAgeH = CRON_MAX_AGE_HOURS[row.job_name] || 48;
-      const ageMs = row.last_run_at ? Date.now() - new Date(row.last_run_at).getTime() : Infinity;
+      // Never run yet (a cron added in the deploy that is still before its first
+      // scheduled fire) is "pending", not "down" — it must not drag the overall
+      // status red for the first day after a release.
+      if (!row.last_run_at) {
+        jobs[row.job_name] = { ok: true, pending: true, last_run_at: null, last_status: null };
+        continue;
+      }
+      const ageMs = Date.now() - new Date(row.last_run_at).getTime();
       const fresh = ageMs <= maxAgeH * 3600 * 1000;
       const healthy = fresh && row.last_status !== 'error';
       jobs[row.job_name] = { ok: healthy, last_run_at: row.last_run_at, last_status: row.last_status || null };
