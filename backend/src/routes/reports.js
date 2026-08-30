@@ -265,7 +265,14 @@ router.get('/reports/dues.pdf', async (req, res) => {
                COALESCE(pay.paid, 0)::int AS paid,
                (tp.estimated_cost - COALESCE(pay.paid, 0))::int AS balance,
                lastvis.d::text AS last_visit,
-               (lastvis.d IS NOT NULL AND lastvis.d < ${IST_TODAY_SQL} - INTERVAL '30 days'
+               -- Same test as withProgress()/derivePlanStatus (utils/treatmentPlan.js),
+               -- which the Treatment Plans tab and the stalled-treatment worklist
+               -- use, so the two "stalled" lists agree: work actually STARTED (a
+               -- completed visit — done_n > 0, not just a no-show), nothing is
+               -- booked ahead, and the last sitting was 30+ days ago.
+               (lastvis.done_n > 0
+                 AND lastvis.d IS NOT NULL
+                 AND lastvis.d < ${IST_TODAY_SQL} - INTERVAL '30 days'
                  AND next_up.d IS NULL) AS stalled
         FROM treatment_plans tp
         JOIN patients p ON p.id = tp.patient_id AND p.deleted_at IS NULL
@@ -277,8 +284,9 @@ router.get('/reports/dues.pdf', async (req, res) => {
           FROM treatment_payments WHERE treatment_plan_id = tp.id
         ) pay ON TRUE
         LEFT JOIN LATERAL (
-          SELECT MAX(appointment_date) AS d
-          FROM appointments WHERE treatment_plan_id = tp.id AND status IN ('completed','no_show')
+          SELECT MAX(appointment_date) FILTER (WHERE status IN ('completed','no_show')) AS d,
+                 COUNT(*) FILTER (WHERE status = 'completed') AS done_n
+          FROM appointments WHERE treatment_plan_id = tp.id
         ) lastvis ON TRUE
         LEFT JOIN LATERAL (
           SELECT MIN(appointment_date) AS d
@@ -293,6 +301,11 @@ router.get('/reports/dues.pdf', async (req, res) => {
       // Completed visits whose consultation fee is still pending (the column
       // default). Bounded to a year: a two-year-old unpaid visit is not
       // collectible and only clutters the list the desk actually works.
+      // Treatment-course sittings are excluded UNLESS they carry an explicit
+      // per-visit fee (effective_fee > 0): a course is billed as a whole on the
+      // treatment-balance list above, and falling back to the doctor's
+      // consultation_fee for every root-canal sitting would invent a debt and
+      // list the same patient twice.
       tenantQuery(s, `
         SELECT a.appointment_date::text AS appointment_date,
                p.name AS patient_name, p.phone AS patient_phone,
@@ -303,6 +316,7 @@ router.get('/reports/dues.pdf', async (req, res) => {
         LEFT JOIN doctors d ON d.id = a.doctor_id
         WHERE a.status = 'completed'
           AND (a.payment_status IS NULL OR a.payment_status = 'pending')
+          AND (a.treatment_plan_id IS NULL OR NULLIF(a.effective_fee, 0) IS NOT NULL)
           AND a.appointment_date >= ${IST_TODAY_SQL} - INTERVAL '365 days'
         ORDER BY a.appointment_date
       `),
@@ -725,6 +739,16 @@ router.get('/reports/period.pdf', async (req, res) => {
         ], byTreatmentR.rows.map(x => ({
           treatment: x.treatment, completed: String(x.completed), fees: rupees(x.fees),
         })));
+      }
+
+      if (byDoctorR.rows.length || byTreatmentR.rows.length) {
+        doc.moveDown(0.3);
+        doc.font('body').fontSize(8).fillColor('#777').text(
+          'Fees here are consultation fees on every COMPLETED visit in the period, whether or not the fee is '
+          + 'marked paid yet — a workload split, not a collections split. The "Collected" figure at the top counts '
+          + 'only fees actually marked paid; the gap is what the desk still has to reconcile.'
+        );
+        doc.fillColor('#000');
       }
     });
   } catch (err) {
