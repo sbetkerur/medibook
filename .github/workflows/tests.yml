@@ -165,7 +165,7 @@ jobs:
           # drives a whole patient journey end to end — provision a clinic, book,
           # then cancel — so it earns a place here, and being here is what stops
           # it drifting again.
-          for f in tests/bot.test.js tests/entryFlow.test.js tests/api.test.js tests/smoke.test.js; do
+          for f in tests/bot.test.js tests/entryFlow.test.js tests/api.test.js tests/smoke.test.js tests/crud.test.js tests/dayClosePayments.test.js; do
             echo "── $f"
             if node "$f"; then
               echo "   PASS"
