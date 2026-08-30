@@ -63,6 +63,7 @@ export default function LandingPage() {
           </a>
           <nav className="hidden items-center gap-7 text-sm text-gray-600 md:flex">
             <a href="#how" className="hover:text-gray-900">How it works</a>
+            <a href="#try" className="hover:text-gray-900">Try it</a>
             <a href="#features" className="hover:text-gray-900">Features</a>
             <a href="#pricing" className="hover:text-gray-900">Pricing</a>
           </nav>
@@ -74,17 +75,17 @@ export default function LandingPage() {
               Log in
             </a>
             <a
-              href="/demo"
+              href="#try"
               className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
             >
-              See live demo
+              Try it live
             </a>
           </div>
         </div>
       </header>
 
       {/* ── Hero ────────────────────────────────────────────── */}
-      <Section className="grid gap-10 pb-8 pt-14 sm:pt-20 lg:grid-cols-2 lg:items-center lg:gap-12">
+      <Section id="top" className="grid gap-10 pb-8 pt-14 sm:pt-20 lg:grid-cols-2 lg:items-center lg:gap-12">
         <div>
           <p className="mb-4 inline-flex rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-blue-700">
             For dental clinics in India
@@ -99,10 +100,10 @@ export default function LandingPage() {
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <a
-              href="/demo"
+              href="#try"
               className="rounded-xl bg-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-sm hover:bg-blue-700"
             >
-              See a live demo
+              Try the demo
             </a>
             <a
               href="/signup"
@@ -114,21 +115,35 @@ export default function LandingPage() {
           <p className="mt-3 text-xs text-gray-400">
             14 days free · no card needed · super-admin approves every clinic
           </p>
+          <p className="mt-6 text-sm font-medium text-gray-700 lg:hidden">
+            The live booking bot is right below — type a message and try it. ↓
+          </p>
         </div>
 
         {/* Real WhatsApp bot, live — not a scripted mock. Runs against the
-            same read-only demo clinic as "See a live demo" below. */}
+            same read-only demo clinic as the dashboard demo at /demo. */}
         <div className="relative">
-          <WhatsAppDemoChat />
-          <div className="mx-auto -mt-4 max-w-xs rounded-2xl border border-gray-200 bg-white p-3 shadow-lg">
-            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
-              Front desk · Today
-            </div>
-            <div className="flex items-center justify-between rounded-lg bg-blue-50 px-3 py-2 text-sm">
-              <span className="font-medium">6:30 pm · Ananya Rao</span>
-              <span className="text-blue-700">New booking</span>
-            </div>
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-[11px] font-bold uppercase tracking-wide text-emerald-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+              Live
+            </span>
+            <span className="text-sm font-semibold text-gray-800">
+              This is the booking bot — try it now
+            </span>
           </div>
+          <WhatsAppDemoChat />
+          <p className="mt-3 text-center text-xs text-gray-500">
+            Type a message the way a patient would — book a slot, ask for the address,
+            reschedule. It’s the real bot, not a video.
+          </p>
+          <a
+            href="/demo"
+            className="mt-2 flex items-center justify-center gap-1.5 text-xs font-semibold text-blue-600 hover:underline"
+          >
+            Every booking made here lands on the front-desk dashboard — open it
+            <span aria-hidden>→</span>
+          </a>
         </div>
       </Section>
 
@@ -166,6 +181,56 @@ export default function LandingPage() {
           The QR is the only way in — it routes a patient to <em>your</em> clinic and no one
           else’s. A shared platform number, but from the patient’s side it’s the clinic’s
           WhatsApp.
+        </p>
+      </Section>
+
+      {/* ── Try it: both sides ──────────────────────────────── */}
+      <Section id="try" className="py-16">
+        <h2 className="text-center text-3xl font-bold tracking-tight">Try both sides yourself</h2>
+        <p className="mx-auto mt-3 max-w-2xl text-center text-sm text-gray-500">
+          MediBook has two halves. The patient chats with your clinic on WhatsApp; your
+          front desk runs the day from a dashboard. Both are live right here — no signup,
+          nothing to install.
+        </p>
+        <div className="mt-10 grid gap-6 md:grid-cols-2">
+          <div className="flex flex-col rounded-2xl border border-emerald-200 bg-emerald-50/40 p-6">
+            <div className="text-xs font-bold uppercase tracking-wide text-emerald-700">
+              1 · What the patient does
+            </div>
+            <h3 className="mt-2 font-semibold">Chat with the booking bot</h3>
+            <p className="mt-2 flex-1 text-sm text-gray-600">
+              The green WhatsApp chat box on this page is the real bot. Type a message —
+              book an appointment, reschedule one, ask for directions — exactly as a
+              patient would after scanning your clinic’s QR.
+            </p>
+            <a
+              href="#top"
+              className="mt-4 inline-flex items-center gap-1.5 text-sm font-semibold text-emerald-700 hover:underline"
+            >
+              Go to the chat box <span aria-hidden>↑</span>
+            </a>
+          </div>
+          <div className="flex flex-col rounded-2xl border-2 border-blue-600 p-6 shadow-sm">
+            <div className="text-xs font-bold uppercase tracking-wide text-blue-700">
+              2 · What your front desk sees
+            </div>
+            <h3 className="mt-2 font-semibold">Open the demo dashboard</h3>
+            <p className="mt-2 flex-1 text-sm text-gray-600">
+              A real MediBook dashboard loaded with a sample practice — three dentists, a
+              full appointment book, treatment plans and payments already in it. Read-only,
+              so click anything.
+            </p>
+            <a
+              href="/demo"
+              className="mt-4 inline-flex w-fit items-center gap-1.5 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700"
+            >
+              Open the demo dashboard <span aria-hidden>→</span>
+            </a>
+          </div>
+        </div>
+        <p className="mx-auto mt-6 max-w-2xl text-center text-sm text-gray-500">
+          Book a slot in the chat, then open the dashboard — you’ll see how a booking
+          reaches the front desk.
         </p>
       </Section>
 
@@ -267,14 +332,15 @@ export default function LandingPage() {
       <Section className="py-16 text-center">
         <h2 className="text-3xl font-bold tracking-tight">See it working in 30 seconds</h2>
         <p className="mt-3 text-gray-600">
-          Open a real dashboard loaded with a sample clinic — read-only, nothing to set up.
+          Chat with the live booking bot, then open a real dashboard loaded with a sample
+          clinic — read-only, nothing to set up.
         </p>
         <div className="mt-7 flex flex-wrap justify-center gap-3">
           <a
-            href="/demo"
+            href="#try"
             className="rounded-xl bg-blue-600 px-6 py-3 text-sm font-semibold text-white hover:bg-blue-700"
           >
-            Open the live demo
+            Try both sides
           </a>
           <a
             href="/signup"

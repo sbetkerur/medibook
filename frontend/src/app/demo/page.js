@@ -57,6 +57,13 @@ export default function DemoPage() {
             <span className="font-medium"> Pragati Dental Studio</span> — three dentists,
             a full appointment book, treatment plans and payments already in it.
           </p>
+          <p className="mt-2 text-sm text-gray-600">
+            Want the patient’s side too?{' '}
+            <a href="/#try" className="font-medium text-emerald-700 hover:underline">
+              Chat with the live booking bot
+            </a>{' '}
+            on the home page.
+          </p>
 
           <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
             It’s <strong>read-only</strong>. Click around anything you like — booking,
