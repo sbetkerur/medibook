@@ -19,8 +19,9 @@ via a Next.js dashboard; a super admin manages tenants.
 ```bash
 docker-compose up -d            # postgres + redis for local dev
 cd backend && npm run dev       # API on :3001 (nodemon)
-cd backend && npm run migrate   # public schema + per-tenant migrations
+cd backend && npm run migrate   # public schema + per-tenant migrations (also runs demoData.js)
 cd backend && npm run seed      # demo tenant + doctors + slots
+cd backend && node src/db/demoData.js   # rebuild the pragati-demo scenario dataset (patients, appts, plans, …)
 cd frontend && npm run dev      # dashboard on :3000
 cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
@@ -723,6 +724,23 @@ real clinic. The public site uses it: `frontend/src/app/page.js` is the
 marketing landing page (root `/`; the old `/`→`/login` redirect is gone,
 healthcheck is on `/login`) and `frontend/src/app/demo/page.js` is the "See a
 live demo" button. Tests: `tests/readOnlyTenant.unit.test.js`.
+
+`ensureDemoTenant` seeds only the STRUCTURE (branch, 4 departments, 3 dentists —
+Ananya Rao / Vikram Shetty / Nisha Menon — schedules, admin user, slots).
+`db/demoData.js` `seedDemoData()` then fills it with a **scenario dataset** so
+every dashboard tab, report and chart shows real data: ~16 patients (every
+`referral_source`, a father+child on one phone, encrypted `dental_history`, an
+opted-out one), ~56 appointments across all four statuses and a 60-day span
+(today's queue, tomorrow's reminder call-list, past history), all ten
+`treatment_plans` states (proposed / on-track / **stalled** / completed /
+overpaid / declined / cancelled / ortho / implant), payments in every method,
+`lab_works` and `patient_recalls` in every status, a 1–5 feedback spread, and
+open + handled `clinic_requests`. It runs on every boot right after
+`ensureDemoTenant` (migrate.js), **clears and rebuilds** the demo tenant's
+transactional rows (dates stay relative to "now"), and is gated by
+`DEMO_SEED_DATA` (default on). Standalone: `node src/db/demoData.js`. It also
+sets `settings.google_review_url` + `doctor_daily_schedule_enabled` so the
+newest features read as on.
 
 `enforceReadOnlyTenant` only ever covered the DASHBOARD (`/api/admin` +
 `/api/v1/admin`) — nothing stopped the bot/webhook path from booking,

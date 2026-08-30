@@ -1347,6 +1347,18 @@ async function migrate() {
       console.warn('⚠️  Demo clinic not provisioned:', err.message);
     }
 
+    // ── DEMO SCENARIO DATA ───────────────────────────────────────
+    // ensureDemoTenant builds the structure; this fills it with a dataset that
+    // exercises every dashboard tab, report and chart. It CLEARS and rebuilds
+    // the demo tenant's transactional rows, so the fixture stays relative to
+    // "now". Gated by DEMO_SEED_DATA (default on); never fatal — same reasoning
+    // as the demo clinic itself.
+    try {
+      await require('./demoData').seedDemoData();
+    } catch (err) {
+      console.warn('⚠️  Demo scenario data not seeded:', err.message);
+    }
+
   } finally {
     // generateSlotsForDoctor's public-holiday cache opens the shared Redis
     // client, and its live socket keeps the event loop alive after the pool
