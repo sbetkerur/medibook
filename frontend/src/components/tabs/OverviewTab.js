@@ -7,17 +7,32 @@ import Badge from '@/components/ui/Badge';
 import RequestsPanel from '@/components/RequestsPanel';
 import { todayIST } from '@/lib/dateIST';
 
-// On-demand PDF reports the front desk prints when closing up. schedule.pdf
-// defaults to today; for a future date it also carries each patient's
-// reminder-reply status and a "confirmed / to call" count, so tomorrow's
-// schedule doubles as the evening call-list.
-function reportButtons() {
+// On-demand PDF reports the front desk prints. schedule.pdf defaults to today;
+// for a future date it also carries each patient's reminder-reply status and a
+// "confirmed / to call" count, so tomorrow's schedule doubles as the evening
+// call-list. The worklists below turn the revenue leaks the product already
+// tracks — unpaid visits, treatment balances, stalled courses, due recalls,
+// lab work out — into something the desk can print and phone through.
+function reportGroups() {
   const today = todayIST();
   const tomorrow = format(addDays(parseISO(today), 1), 'yyyy-MM-dd');
   return [
-    { label: "Today's schedule", path: '/admin/reports/schedule.pdf', file: `schedule-${today}.pdf` },
-    { label: "Tomorrow's schedule", path: `/admin/reports/schedule.pdf?date=${tomorrow}`, file: `schedule-${tomorrow}.pdf` },
-    { label: 'Pending requests', path: '/admin/requests?status=open&format=pdf', file: 'requests-open.pdf' },
+    { heading: 'The day', items: [
+      { label: "Today's schedule", path: '/admin/reports/schedule.pdf', file: `schedule-${today}.pdf` },
+      { label: "Tomorrow's schedule", path: `/admin/reports/schedule.pdf?date=${tomorrow}`, file: `schedule-${tomorrow}.pdf` },
+      { label: 'Pending requests', path: '/admin/requests?status=open&format=pdf', file: 'requests-open.pdf' },
+    ] },
+    { heading: 'Money owed & follow-ups', items: [
+      { label: 'Money owed', path: '/admin/reports/dues.pdf', file: `dues-${today}.pdf` },
+      { label: 'Unbooked treatment', path: '/admin/treatment-plans?outstanding=true&format=pdf', file: `unbooked-treatment-${today}.pdf` },
+      { label: 'Stalled treatment', path: '/admin/treatment-plans?outstanding=true&stalled=true&format=pdf', file: `stalled-treatment-${today}.pdf` },
+      { label: 'Check-up call-list', path: '/admin/reports/recalls.pdf', file: `recalls-${today}.pdf` },
+      { label: 'Lab register', path: '/admin/reports/lab-works.pdf', file: `lab-works-${today}.pdf` },
+    ] },
+    { heading: 'This month', items: [
+      { label: 'Period summary', path: '/admin/reports/period.pdf', file: `period-${today}.pdf` },
+      { label: 'Dentist activity', path: '/admin/reports/dentist-activity.pdf', file: `dentist-activity-${today}.pdf` },
+    ] },
   ];
 }
 
@@ -192,13 +207,20 @@ export default function OverviewTab({
 
       <div className="bg-white rounded-xl p-5 shadow-sm">
         <h3 className="font-semibold text-gray-800 mb-1">Reports</h3>
-        <p className="text-xs text-gray-500 mb-3">Printable PDFs for the end-of-day routine.</p>
-        <div className="flex flex-wrap gap-3">
-          {reportButtons().map(r => (
-            <button key={r.label} onClick={() => runReport(r.path, r.file)}
-              className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
-              ⬇ {r.label}
-            </button>
+        <p className="text-xs text-gray-500 mb-4">Printable PDFs — nothing is stored, each one streams on demand.</p>
+        <div className="space-y-4">
+          {reportGroups().map(g => (
+            <div key={g.heading}>
+              <div className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">{g.heading}</div>
+              <div className="flex flex-wrap gap-3">
+                {g.items.map(r => (
+                  <button key={r.label} onClick={() => runReport(r.path, r.file)}
+                    className="px-4 py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+                    ⬇ {r.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           ))}
         </div>
       </div>

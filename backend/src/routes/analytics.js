@@ -32,7 +32,7 @@ router.get('/analytics', makeAnalyticsLimiter(), async (req, res) => {
     // "Top Dentists (30 days)" silently included bookings for next month, and
     // its revenue figure double-counted them as money already taken, same as
     // the bug already fixed on the other two endpoints.
-    const [byDay, byDoctor, byStatus, byDept] = await Promise.all([
+    const [byDay, byDoctor, byStatus, byDept, bySource] = await Promise.all([
       tenantQuery(s, `
         SELECT appointment_date::text as date, COUNT(*) as count
         FROM appointments WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
@@ -63,8 +63,20 @@ router.get('/analytics', makeAnalyticsLimiter(), async (req, res) => {
           AND a.status IN ('confirmed', 'completed')
         GROUP BY COALESCE(dep.name, 'General') ORDER BY count DESC
       `, [d]),
+      // Which board / referral / listing brought NEW patients in over the
+      // window — the marketing-spend question. Keyed on patient creation, not
+      // appointments: referral_source is set once, at the desk, per patient
+      // (PATCH /patients/:id). created_at is a TIMESTAMPTZ so the rolling NOW()
+      // interval is right; no ::date coercion (which would skew by the IST offset).
+      tenantQuery(s, `
+        SELECT COALESCE(NULLIF(referral_source, ''), 'unknown') AS source, COUNT(*)::int AS count
+        FROM patients
+        WHERE deleted_at IS NULL
+          AND created_at >= NOW() - ($1::text || ' days')::INTERVAL
+        GROUP BY 1 ORDER BY count DESC
+      `, [d]),
     ]);
-    res.json({ by_day: byDay.rows, by_doctor: byDoctor.rows, by_status: byStatus.rows, by_department: byDept.rows });
+    res.json({ by_day: byDay.rows, by_doctor: byDoctor.rows, by_status: byStatus.rows, by_department: byDept.rows, by_source: bySource.rows });
   } catch (err) { handleError(res, err); }
 });
 
@@ -271,6 +283,107 @@ router.get('/analytics/cohorts', makeAnalyticsLimiter(), async (req, res) => {
       summary: newVsReturning.rows[0] || { new_patients: 0, returning_patients: 0 },
       monthly_cohorts: monthlyNew.rows,
       days: d,
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── TREATMENT CONVERSION FUNNEL ───────────────────────────────
+// Where the money leaks: a patient books a consultation, the dentist advises a
+// course, and somewhere between "advised" and "paid" a share fall out. This is
+// that funnel, keyed on treatment_plans.created_at. Progress is DERIVED from the
+// linked appointments/payments (same principle as routes/treatmentPlans.js —
+// never a stored counter), so a cancelled visit correctly drops a plan back out
+// of "booked".
+router.get('/analytics/funnel', makeAnalyticsLimiter(), async (req, res) => {
+  try {
+    const s = req.tenant.schema_name;
+    const d = Math.min(Math.max(parseInt(req.query.days) || 90, 7), 365);
+
+    const [consultR, planR, byDentistR, byTreatmentR] = await Promise.all([
+      // Top of funnel: completed visits in the window that are NOT treatment
+      // sittings — i.e. the consultations from which advice comes.
+      tenantQuery(s, `
+        SELECT COUNT(*)::int AS n
+        FROM appointments a
+        WHERE a.status = 'completed'
+          AND a.treatment_plan_id IS NULL
+          AND a.appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+          AND a.appointment_date <= ${IST_TODAY_SQL}
+      `, [d]),
+      tenantQuery(s, `
+        WITH plans AS (
+          SELECT tp.id, tp.status, prog.booked, prog.started, money.paid
+          FROM treatment_plans tp
+          LEFT JOIN LATERAL (
+            SELECT COUNT(*) FILTER (WHERE a.status <> 'cancelled') AS booked,
+                   COUNT(*) FILTER (WHERE a.status =  'completed') AS started
+            FROM appointments a WHERE a.treatment_plan_id = tp.id
+          ) prog ON TRUE
+          LEFT JOIN LATERAL (
+            SELECT COALESCE(SUM(amount), 0) AS paid
+            FROM treatment_payments pay WHERE pay.treatment_plan_id = tp.id
+          ) money ON TRUE
+          WHERE tp.status <> 'cancelled'
+            AND tp.created_at >= NOW() - ($1::text || ' days')::INTERVAL
+        )
+        SELECT
+          COUNT(*)::int                                        AS advised,
+          COUNT(*) FILTER (WHERE booked  > 0)::int             AS booked,
+          COUNT(*) FILTER (WHERE started > 0)::int             AS started,
+          COUNT(*) FILTER (WHERE status = 'completed')::int    AS completed,
+          COUNT(*) FILTER (WHERE paid   > 0)::int              AS paid
+        FROM plans
+      `, [d]),
+      tenantQuery(s, `
+        SELECT COALESCE(dt.name, da.name, 'Unassigned') AS dentist,
+               COUNT(*)::int AS advised,
+               COUNT(*) FILTER (WHERE EXISTS (
+                 SELECT 1 FROM appointments a
+                  WHERE a.treatment_plan_id = tp.id AND a.status <> 'cancelled'))::int AS booked,
+               COUNT(*) FILTER (WHERE tp.status = 'completed')::int AS completed
+        FROM treatment_plans tp
+        LEFT JOIN doctors dt ON dt.id = tp.treating_doctor_id
+        LEFT JOIN doctors da ON da.id = tp.advised_by_doctor_id
+        WHERE tp.status <> 'cancelled'
+          AND tp.created_at >= NOW() - ($1::text || ' days')::INTERVAL
+        GROUP BY COALESCE(dt.name, da.name, 'Unassigned')
+        ORDER BY advised DESC
+        LIMIT 10
+      `, [d]),
+      tenantQuery(s, `
+        SELECT COALESCE(dep.name, 'General') AS treatment,
+               COUNT(*)::int AS advised,
+               COUNT(*) FILTER (WHERE EXISTS (
+                 SELECT 1 FROM appointments a
+                  WHERE a.treatment_plan_id = tp.id AND a.status <> 'cancelled'))::int AS booked,
+               COUNT(*) FILTER (WHERE tp.status = 'completed')::int AS completed
+        FROM treatment_plans tp
+        LEFT JOIN departments dep ON dep.id = tp.department_id
+        WHERE tp.status <> 'cancelled'
+          AND tp.created_at >= NOW() - ($1::text || ' days')::INTERVAL
+        GROUP BY COALESCE(dep.name, 'General')
+        ORDER BY advised DESC
+        LIMIT 10
+      `, [d]),
+    ]);
+
+    const p = planR.rows[0] || {};
+    const advised = p.advised || 0;
+    const pct = (n) => (advised > 0 ? Math.round((n / advised) * 100) : 0);
+    const stages = [
+      { key: 'advised',   label: 'Treatment advised', count: advised,          pct_of_advised: 100 },
+      { key: 'booked',    label: 'A visit booked',    count: p.booked || 0,    pct_of_advised: pct(p.booked || 0) },
+      { key: 'started',   label: 'Treatment started', count: p.started || 0,   pct_of_advised: pct(p.started || 0) },
+      { key: 'completed', label: 'Course completed',  count: p.completed || 0, pct_of_advised: pct(p.completed || 0) },
+      { key: 'paid',      label: 'Payment recorded',  count: p.paid || 0,      pct_of_advised: pct(p.paid || 0) },
+    ];
+
+    res.json({
+      days: d,
+      consultations: consultR.rows[0]?.n || 0,
+      stages,
+      by_dentist: byDentistR.rows,
+      by_treatment: byTreatmentR.rows,
     });
   } catch (err) { handleError(res, err); }
 });

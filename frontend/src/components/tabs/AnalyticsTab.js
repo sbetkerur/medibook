@@ -7,11 +7,19 @@ import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContai
 // `analyticsSummary` (the overview revenue card) stays in page.js and is
 // refreshed by the parent tab-switch effect; this component owns only the
 // analytics breakdown and revenue sections.
+// referral_source codes (backend REFERRAL_SOURCES + the 'unknown' bucket) → labels
+const SOURCE_LABELS = {
+  walk_past: 'Walked past', google: 'Google', friend: 'Friend / family',
+  doctor_referral: 'Doctor referral', social: 'Social media', returning: 'Returning patient',
+  other: 'Other', unknown: 'Not recorded',
+};
+
 export default function AnalyticsTab() {
   const [analytics, setAnalytics] = useState(null);
   const [analyticsFailed, setAnalyticsFailed] = useState(false);
   const [revenueData, setRevenueData] = useState(null);
   const [revenueMonths, setRevenueMonths] = useState(6);
+  const [funnel, setFunnel] = useState(null);
 
   // A failure used to leave `analytics` at null, which renders "Loading
   // analytics..." forever. The toast is gone in four seconds, after which a
@@ -32,6 +40,17 @@ export default function AnalyticsTab() {
   useEffect(() => {
     fetchAnalytics();
   }, [fetchAnalytics]);
+
+  // Treatment conversion funnel — its own endpoint (own rate-limit bucket), so
+  // a failure here never blocks the rest of the tab. Silent-fails to a no-data
+  // state, like the revenue section.
+  useEffect(() => {
+    let cancelled = false;
+    api.get('/admin/analytics/funnel?days=90')
+      .then(({ data }) => { if (!cancelled) setFunnel(data); })
+      .catch(() => { /* silent — funnel section shows no-data state */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // `revenueMonths` is the only trigger for a revenue fetch. The dropdown used
   // to also call fetchRevenue() itself, and because that callback closed over
@@ -125,6 +144,32 @@ export default function AnalyticsTab() {
               </ResponsiveContainer>
             </div>
           )}
+          {/* New patients by source — the marketing-spend question. */}
+          {analytics.by_source?.length > 0 && (
+            <div className="bg-white rounded-xl p-5 shadow-sm">
+              <h3 className="font-semibold text-gray-800 mb-4">New Patients by Source (30 days)</h3>
+              <div className="space-y-3">
+                {(() => {
+                  const total = analytics.by_source.reduce((sum, x) => sum + parseInt(x.count), 0);
+                  return analytics.by_source.map(row => {
+                    const pct = total ? Math.round(parseInt(row.count) / total * 100) : 0;
+                    return (
+                      <div key={row.source}>
+                        <div className="flex justify-between text-sm mb-1">
+                          <span className="text-gray-700">{SOURCE_LABELS[row.source] || row.source}</span>
+                          <span className="font-medium">{row.count} ({pct}%)</span>
+                        </div>
+                        <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                          <div className="h-full bg-teal-500 rounded-full" style={{ width: pct + '%' }} />
+                        </div>
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+              <p className="text-xs text-gray-400 mt-3">Set a patient's source from their profile — Patients tab → open a patient → Source.</p>
+            </div>
+          )}
         </>
       ) : analyticsFailed ? (
         <div className="text-center py-12">
@@ -136,6 +181,57 @@ export default function AnalyticsTab() {
         </div>
       ) : (
         <div className="text-center text-gray-400 py-12">Loading analytics...</div>
+      )}
+
+      {/* ── TREATMENT CONVERSION FUNNEL ── */}
+      {funnel && funnel.stages?.[0]?.count > 0 && (
+        <div className="bg-white rounded-xl p-5 shadow-sm">
+          <h3 className="font-semibold text-gray-800 mb-1">Treatment Conversion (90 days)</h3>
+          <p className="text-xs text-gray-400 mb-4">
+            {funnel.consultations} consultation{funnel.consultations === 1 ? '' : 's'} completed · {funnel.stages[0].count} treatment{funnel.stages[0].count === 1 ? '' : 's'} advised
+          </p>
+          <div className="space-y-2">
+            {funnel.stages.map(st => (
+              <div key={st.key}>
+                <div className="flex justify-between text-sm mb-1">
+                  <span className="text-gray-700">{st.label}</span>
+                  <span className="font-medium">{st.count} <span className="text-gray-400">({st.pct_of_advised}%)</span></span>
+                </div>
+                <div className="h-3 bg-gray-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-indigo-500 rounded-full" style={{ width: Math.max(st.pct_of_advised, st.count > 0 ? 2 : 0) + '%' }} />
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {funnel.by_dentist?.length > 0 && (
+            <div className="mt-6 overflow-x-auto">
+              <h4 className="text-sm font-semibold text-gray-700 mb-2">By dentist</h4>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-xs text-gray-400 text-left">
+                    <th className="py-1 pr-3 font-medium">Dentist</th>
+                    <th className="py-1 px-2 font-medium text-right">Advised</th>
+                    <th className="py-1 px-2 font-medium text-right">Booked</th>
+                    <th className="py-1 px-2 font-medium text-right">Completed</th>
+                    <th className="py-1 pl-2 font-medium text-right">% booked</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {funnel.by_dentist.map(row => (
+                    <tr key={row.dentist} className="border-t border-gray-100">
+                      <td className="py-1.5 pr-3 text-gray-700 whitespace-nowrap">{row.dentist === 'Unassigned' ? row.dentist : `Dr. ${row.dentist}`}</td>
+                      <td className="py-1.5 px-2 text-right">{row.advised}</td>
+                      <td className="py-1.5 px-2 text-right">{row.booked}</td>
+                      <td className="py-1.5 px-2 text-right">{row.completed}</td>
+                      <td className="py-1.5 pl-2 text-right font-medium">{row.advised > 0 ? Math.round(row.booked / row.advised * 100) : 0}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       )}
 
       {/* ── REVENUE SECTION (A6) ── */}

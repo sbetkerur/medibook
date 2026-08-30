@@ -132,6 +132,16 @@ const schemas = {
       // is an argument the receptionist has to have.
       show_consultation_fee: Joi.boolean(),
       reminder_hours_before_24: Joi.number().integer().min(1).max(168),
+      // The clinic's Google review link. When set, a patient who rates a visit
+      // 4 or 5 (services/botEngine.js handleFeedbackComment) gets a one-line
+      // invitation to leave a review — low scores never do. The blob is loaded
+      // and returned in full on every request, so cap the length hard.
+      google_review_url: Joi.string().uri({ scheme: ['http', 'https'] }).max(500).allow('', null),
+      // Opt-in per clinic: when true, jobs/reminders.js sendDoctorDailySchedules
+      // WhatsApps each dentist (doctors.user_id → users.notify_phone) their own
+      // day's list every morning. Off by default — dentist notify_phones are
+      // otherwise unused, so auto-sending would surprise clinics that set one.
+      doctor_daily_schedule_enabled: Joi.boolean(),
     }).optional(),
     notify_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).optional().allow('', null)
       .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +917795676142)' }),

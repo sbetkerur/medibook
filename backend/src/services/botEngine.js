@@ -404,10 +404,10 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   // ── FEEDBACK FLOW ────────────────────────────────────────────
   // Greetings (Hi/Hello/Menu) escape feedback state so patients don't get stuck.
   if (!isGreeting && session.state === STATES.COLLECT_FEEDBACK_RATING) {
-    return handleFeedbackRating(phone, schema, send, ctx, choice, input);
+    return handleFeedbackRating(phone, schema, send, ctx, choice, input, tenant);
   }
   if (!isGreeting && session.state === STATES.COLLECT_FEEDBACK_COMMENT) {
-    return handleFeedbackComment(phone, schema, send, ctx, input);
+    return handleFeedbackComment(phone, schema, send, ctx, input, tenant);
   }
 
   // ── REMINDER SHORTCUTS ───────────────────────────────────────
@@ -812,7 +812,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
 }
 
 // ── FEEDBACK HANDLERS ────────────────────────────────────────
-async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
+async function handleFeedbackRating(phone, schema, send, ctx, choice, input, tenant) {
   if (ctx.feedback_appointment_id) {
     try {
       const existing = await tenantQuery(schema,
@@ -868,7 +868,7 @@ async function handleFeedbackRating(phone, schema, send, ctx, choice, input) {
   await updateSession(schema, phone, STATES.COLLECT_FEEDBACK_COMMENT, ctx);
 }
 
-async function handleFeedbackComment(phone, schema, send, ctx, input) {
+async function handleFeedbackComment(phone, schema, send, ctx, input, tenant) {
   // Exact match only — an unanchored /skip/ silently discarded any genuine
   // comment containing the word ("the receptionist skipped my X-ray review").
   const comment = /^skip$/i.test((input || '').trim()) ? null : input;
@@ -883,6 +883,26 @@ async function handleFeedbackComment(phone, schema, send, ctx, input) {
   } catch (_) {}
   await send.text('Thank you — that is genuinely useful, and the clinic reads every one.\n\nReply *Menu* for anything else.');
   await updateSession(schema, phone, STATES.IDLE, {});
+
+  // Google review funnel: a patient who rated the visit 4 or 5 is invited —
+  // once, here, at the single exit point of the rating flow — to leave a public
+  // review, but ONLY when the clinic has configured its review link. Lower
+  // scores are never asked and stay entirely internal, which is what the rating
+  // prompt promised ("it goes only to the clinic"). This is the one piece of
+  // patient-facing copy that links out, and it links only to the clinic's own
+  // review page — it names no platform and offers no roster. Its own try/catch:
+  // the feedback is already saved and a failed nudge must not surface as an error.
+  try {
+    const reviewUrl = String(tenant?.settings?.google_review_url || '').trim();
+    if (reviewUrl && Number(ctx.feedback_rating) >= 4) {
+      const drName = ctx.doctor_name ? `Dr. ${ctx.doctor_name}` : 'the team';
+      await send.text(
+        `So glad ${drName} looked after you. If you have a moment, a quick Google review helps other patients find us:\n${reviewUrl}`
+      );
+    }
+  } catch (err) {
+    logger.warn('Google review nudge failed', { phone: maskPhone(phone), error: err.message });
+  }
 }
 
 async function triggerFeedback(schemaName, phone, appointmentId, patientId, doctorName) {

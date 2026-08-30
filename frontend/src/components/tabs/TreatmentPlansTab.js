@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect, useCallback, useRef } from 'react';
-import api from '@/lib/api';
+import api, { downloadFile } from '@/lib/api';
 import { format, parseISO, addDays } from 'date-fns';
 import toast from 'react-hot-toast';
 import Modal from '@/components/ui/Modal';
@@ -462,6 +462,24 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal, pendingBoo
               <div><span className="text-gray-500 text-xs">Estimate</span>
                 <p className="font-medium">{detail.treatment_plan.estimated_cost > 0 ? `₹${detail.treatment_plan.estimated_cost.toLocaleString('en-IN')}` : '—'}</p></div>
             </div>
+
+            {/* The printable quotation for the patient. Streams from the server —
+                cost, paid, balance and visits so far — and says on its face that
+                it is not a tax invoice. */}
+            <button
+              onClick={async () => {
+                try {
+                  await downloadFile(
+                    `/admin/treatment-plans/${detail.treatment_plan.id}/estimate.pdf`,
+                    `estimate-${detail.treatment_plan.id}.pdf`,
+                  );
+                } catch {
+                  toast.error('Could not generate the estimate PDF');
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 transition">
+              🖨 Print estimate
+            </button>
 
             {detail.treatment_plan.notes && (
               <div className="bg-gray-50 rounded-lg p-3 text-sm text-gray-700 whitespace-pre-wrap break-words">

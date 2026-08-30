@@ -498,7 +498,8 @@ async function migrate() {
         ('recalls'),
         ('treatment_nudges'),
         ('billing_dunning'),
-        ('account_deletion')
+        ('account_deletion'),
+        ('doctor_schedule')
       ON CONFLICT (job_name) DO NOTHING;
 
       -- 'weekly_backup' tracked a backup-reminder cron that was removed long ago

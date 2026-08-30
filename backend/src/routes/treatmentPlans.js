@@ -18,6 +18,7 @@ const { validateUUID, handleError, UUID_RE, PAYMENT_METHODS } = require('../util
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { planProgress, derivePlanStatus, canTransitionPlan, PLAN_STATUSES } = require('../utils/treatmentPlan');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
+const { streamReport, drawTable, kv, rupees } = require('../utils/pdfReport');
 const logger = require('../utils/logger');
 
 // Shared by POST and PATCH, and matched by the treatment_plans_total_visits_check
@@ -174,6 +175,60 @@ router.get('/treatment-plans', async (req, res) => {
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
+    // ── PRINTABLE WORKLIST ────────────────────────────────────
+    // The weekly digest only ever quotes a COUNT of "advised but not booked".
+    // This is the list itself, for the desk to phone through. `stalled=true`
+    // narrows it to the abandoned courses (work started, nothing booked, last
+    // sitting 30+ days ago) — computed by withProgress, so it is filtered after
+    // the query rather than in SQL. Not paginated; capped at 500.
+    if (req.query.format === 'pdf') {
+      const onlyStalled = req.query.stalled === 'true';
+      const listR = await tenantQuery(s, `
+        ${PLAN_SELECT_SQL}
+        ${whereSql}
+        ORDER BY tp.created_at DESC
+        LIMIT 500
+      `, params);
+      let rows = listR.rows.map(withProgress);
+      if (onlyStalled) rows = rows.filter(x => x.stalled);
+
+      const title = onlyStalled ? 'Stalled Treatments'
+        : outstanding === 'true' ? 'Treatments Advised, Not Booked'
+        : 'Treatment Plans';
+      const owed = rows.reduce((n, x) => n + (Number(x.balance_due) || 0), 0);
+
+      return streamReport(res, {
+        clinicName: req.tenant.name,
+        title,
+        subtitle: `${rows.length} course${rows.length === 1 ? '' : 's'}` +
+          (owed ? `   ·   ${rupees(owed)} in balances outstanding` : ''),
+        filename: `${title.toLowerCase().replace(/[^\w]+/g, '-')}-${new Date().toISOString().slice(0, 10)}`,
+      }, doc => {
+        if (!rows.length) {
+          doc.font('body').fontSize(11).fillColor('#666').text('Nothing on this list — every advised course has its next visit booked.');
+          return;
+        }
+        drawTable(doc, [
+          { key: 'patient', label: 'Patient', width: 13 },
+          { key: 'phone', label: 'Phone', width: 9 },
+          { key: 'treatment', label: 'Treatment', width: 13 },
+          { key: 'dentist', label: 'Dentist', width: 11 },
+          { key: 'visits', label: 'Visits', width: 7, align: 'right' },
+          { key: 'last', label: 'Last visit', width: 8 },
+          { key: 'balance', label: 'Balance', width: 8, align: 'right' },
+        ], rows.map(x => ({
+          patient: x.patient_name || '—',
+          phone: x.patient_phone || '—',
+          treatment: x.title || x.treatment_name || x.service_name || 'Treatment',
+          dentist: (x.treating_doctor_name || x.advised_by_name)
+            ? `Dr. ${x.treating_doctor_name || x.advised_by_name}` : '—',
+          visits: `${x.visitsBooked}/${x.total_visits}`,
+          last: x.last_visit_date || (x.stalled ? 'stalled' : '—'),
+          balance: Number(x.balance_due) ? rupees(x.balance_due) : '—',
+        })));
+      });
+    }
+
     params.push(limit, offset);
     const [r, countR] = await Promise.all([
       tenantQuery(s, `
@@ -214,6 +269,101 @@ router.get('/treatment-plans/:id', validateUUID(), async (req, res) => {
 
     res.json({ treatment_plan: withProgress(r.rows[0]), visits: visits.rows });
   } catch (err) { handleError(res, err, 'GET /treatment-plans/:id'); }
+});
+
+// ── TREATMENT ESTIMATE PDF ────────────────────────────────────
+// The printable quotation a patient takes away. Streamed, stores nothing, and
+// NOT adminOnly — a front-desk print view, like routes/reports.js and the rest
+// of this file's clinical routes. It is explicitly NOT a tax invoice (the GST
+// invoices under /billing are), and the document says so in writing so nobody
+// at the desk treats it as one.
+router.get('/treatment-plans/:id/estimate.pdf', validateUUID(), async (req, res) => {
+  try {
+    const s = req.tenant.schema_name;
+    const r = await tenantQuery(s, `${PLAN_SELECT_SQL} WHERE tp.id = $1`, [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Treatment plan not found' });
+    const plan = withProgress(r.rows[0]);
+
+    const visitsR = await tenantQuery(s, `
+      SELECT a.visit_number, a.status,
+             a.appointment_date::text AS appointment_date, a.appointment_time::text AS appointment_time,
+             d.name AS doctor_name
+      FROM appointments a
+      LEFT JOIN doctors d ON d.id = a.doctor_id
+      WHERE a.treatment_plan_id = $1 AND a.status <> 'cancelled'
+      ORDER BY a.visit_number NULLS LAST, a.appointment_date, a.appointment_time
+    `, [req.params.id]);
+
+    let phone = null;
+    if (plan.hospital_id) {
+      const h = await tenantQuery(s, `SELECT phone FROM hospitals WHERE id = $1`, [plan.hospital_id])
+        .catch(() => ({ rows: [] }));
+      phone = h.rows[0]?.phone || null;
+    }
+
+    const treatmentLabel = plan.title || plan.treatment_name || plan.service_name || 'Treatment';
+    const subtitleBits = [plan.patient_name, treatmentLabel];
+    if (plan.tooth_ref) subtitleBits.push(`tooth ${plan.tooth_ref}`);
+
+    streamReport(
+      res,
+      {
+        clinicName: req.tenant.name,
+        branchName: plan.hospital_name || null,
+        phone,
+        title: 'Treatment Estimate',
+        subtitle: subtitleBits.filter(Boolean).join('   ·   '),
+        filename: `estimate-${req.params.id}`,
+      },
+      doc => {
+        kv(doc, 'Patient:', plan.patient_name || '—');
+        kv(doc, 'Treatment:', treatmentLabel);
+        if (plan.tooth_ref) kv(doc, 'Tooth / site:', String(plan.tooth_ref));
+        kv(doc, 'Dentist:', plan.treating_doctor_name || plan.advised_by_name || 'To be assigned');
+        kv(doc, 'Planned visits:', String(plan.total_visits ?? '—'));
+        doc.moveDown(0.6);
+        kv(doc, 'Estimated cost:', rupees(plan.estimated_cost), { bold: true });
+        kv(doc, 'Paid so far:', rupees(plan.amount_paid));
+        kv(doc, 'Balance:', rupees(plan.balance_due), { bold: true });
+        if (plan.overpaid) {
+          doc.moveDown(0.2);
+          doc.font('body').fontSize(9).fillColor('#a15c00')
+            .text('Amount paid exceeds the current estimate — the estimate may need revising.');
+          doc.fillColor('#000');
+        }
+
+        if (visitsR.rows.length) {
+          doc.moveDown(1);
+          doc.font('bold').fontSize(11).fillColor('#000').text('Visits so far');
+          doc.moveDown(0.3);
+          drawTable(doc, [
+            { key: 'n', label: 'Visit', width: 4, align: 'right' },
+            { key: 'date', label: 'Date', width: 7 },
+            { key: 'time', label: 'Time', width: 5 },
+            { key: 'doctor', label: 'Dentist', width: 12 },
+            { key: 'status', label: 'Status', width: 6 },
+          ], visitsR.rows.map(v => ({
+            n: v.visit_number == null ? '—' : String(v.visit_number),
+            date: v.appointment_date || '—',
+            time: (v.appointment_time || '').slice(0, 5) || '—',
+            doctor: v.doctor_name ? `Dr. ${v.doctor_name}` : '—',
+            status: v.status,
+          })));
+        }
+
+        doc.moveDown(1);
+        doc.font('body').fontSize(8.5).fillColor('#777').text(
+          'This is an estimate for planning only — not a tax invoice or a demand for payment. ' +
+          'The final amount may change with the treatment actually carried out. ' +
+          'Please speak to the front desk for anything about payment or scheduling.',
+          { align: 'left' }
+        );
+        doc.fillColor('#000');
+      }
+    );
+  } catch (err) {
+    if (!res.headersSent) handleError(res, err, 'GET /treatment-plans/:id/estimate.pdf');
+  }
 });
 
 // ── RECORD TREATMENT ADVISED ──────────────────────────────────

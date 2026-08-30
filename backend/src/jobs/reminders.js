@@ -15,7 +15,7 @@ const { sendPatientText, sendPatientTemplate, sendPatientMessage } = require('..
 const { KINDS, recordPendingReply } = require('../services/pendingReply');
 // Persistent logs (logs/combined.log in production) must not carry full patient
 // numbers — same helper the webhook and bot engine use.
-const { maskPhone, notifyAdminWhatsApp } = require('../services/bot/utils');
+const { maskPhone, notifyAdminWhatsApp, sendStaffWhatsApp } = require('../services/bot/utils');
 // Reminders are NEVER gated by this — a patient with an appointment tomorrow
 // wants that message. Only the discretionary sends below are.
 const { canSendDiscretionary, budgetFor } = require('../services/messageBudget');
@@ -430,6 +430,87 @@ async function sendWeeklyDigests() {
   });
 }
 
+// ── EACH DENTIST'S OWN DAY ───────────────────────────────────
+/**
+ * The weekly digest reaches the OWNER. This reaches each DENTIST — their own
+ * list for today, on WhatsApp, so a dentist who is chairside and never opens the
+ * dashboard still walks in knowing what the morning holds.
+ *
+ * Staff-facing: goes out via sendStaffWhatsApp (clinic_staff_alert template,
+ * logged as an 'admin_alert' row) so it never touches a patient's message
+ * budget. Opt-in per clinic — settings.doctor_daily_schedule_enabled — because
+ * a dentist's notify_phone is otherwise unused and auto-messaging it would
+ * surprise a clinic that set one for another reason. A dentist with nothing on
+ * today gets no message, same as the weekly digest skips an empty week.
+ */
+async function sendDoctorDailySchedules() {
+  await forEachActiveTenantParallel('sendDoctorDailySchedules', async (tenant) => {
+    if ((tenant.settings || {}).doctor_daily_schedule_enabled !== true) return;
+
+    let dentists;
+    try {
+      dentists = await tenantQuery(tenant.schema_name, `
+        SELECT d.id AS doctor_id, d.name AS doctor_name, u.notify_phone
+        FROM doctors d
+        JOIN users u ON u.id = d.user_id
+        WHERE d.is_active = true
+          AND u.is_active = true
+          AND u.notify_phone IS NOT NULL AND u.notify_phone <> ''
+      `);
+    } catch (err) {
+      logger.error(`Doctor schedule: dentist lookup failed for ${tenant.name}`, { error: err.message });
+      return;
+    }
+
+    for (const dentist of dentists.rows) {
+      try {
+        const appts = await tenantQuery(tenant.schema_name, `
+          SELECT a.appointment_time, a.status, a.visit_number,
+                 p.name AS patient_name,
+                 h.name AS hospital_name,
+                 tp.title AS treatment_title, tp.total_visits
+          FROM appointments a
+          JOIN patients p ON p.id = a.patient_id
+          JOIN hospitals h ON h.id = a.hospital_id
+          LEFT JOIN treatment_plans tp ON tp.id = a.treatment_plan_id
+          WHERE a.doctor_id = $1
+            AND a.appointment_date = ${IST_TODAY_SQL}
+            AND a.status <> 'cancelled'
+          ORDER BY a.appointment_time
+        `, [dentist.doctor_id]);
+
+        if (!appts.rows.length) continue; // nothing today — no message
+
+        const branches = new Set(appts.rows.map(r => r.hospital_name).filter(Boolean));
+        const multiBranch = branches.size > 1;
+        const MAX_LINES = 15;
+        const lines = appts.rows.slice(0, MAX_LINES).map(r => {
+          const t = (r.appointment_time || '').slice(0, 5) || '--:--';
+          let line = `${t}  ${r.patient_name || 'Patient'}`;
+          if (r.treatment_title) {
+            line += ` — ${r.treatment_title}`;
+            if (r.visit_number && r.total_visits) line += ` (v${r.visit_number}/${r.total_visits})`;
+          }
+          if (multiBranch && r.hospital_name) line += ` @ ${r.hospital_name}`;
+          return line;
+        });
+        if (appts.rows.length > MAX_LINES) lines.push(`…and ${appts.rows.length - MAX_LINES} more`);
+
+        const n = appts.rows.length;
+        const header = multiBranch
+          ? `Today · ${n} appointment${n === 1 ? '' : 's'}`
+          : `Today · ${n} appointment${n === 1 ? '' : 's'}${branches.size ? ` · ${[...branches][0]}` : ''}`;
+        const message = `📅 *Your day, Dr. ${dentist.doctor_name}*\n${header}\n\n${lines.join('\n')}`;
+
+        await sendStaffWhatsApp(tenant.schema_name, dentist.notify_phone, tenant.name, message);
+        logger.info(`Daily schedule sent to Dr. ${dentist.doctor_name} at ${tenant.name}`);
+      } catch (err) {
+        logger.error(`Doctor schedule failed for a dentist at ${tenant.name}`, { error: err.message });
+      }
+    }
+  });
+}
+
 function startReminderCron() {
   // Run every hour at :00
   const reminderTask = cron.schedule('0 * * * *', async () => {
@@ -491,10 +572,25 @@ function startReminderCron() {
     });
   });
 
+  // Each dentist's own day: 07:30 IST (02:00 UTC)
+  const doctorScheduleTask = cron.schedule('0 2 * * *', async () => {
+    await withCronLock('cron:doctor_schedule', 3600, async () => {
+      logger.info('Running per-dentist daily schedule cron...');
+      try {
+        await sendDoctorDailySchedules();
+        await query(`UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='doctor_schedule'`).catch(() => {});
+      } catch (err) {
+        logger.error('Per-dentist daily schedule cron error', { error: err.message });
+        await query(`UPDATE cron_jobs SET last_run_at=NOW(), last_status='error', last_error=$1 WHERE job_name='doctor_schedule'`, [err.message.slice(0, 500)]).catch(() => {});
+      }
+    });
+  });
+
   logger.info('Reminder cron registered (runs hourly)');
   logger.info('Feedback cron registered (daily at 10 AM IST)');
   logger.info('Weekly summary cron registered (Mondays 8 AM IST)');
-  return [reminderTask, feedbackTask, digestTask];
+  logger.info('Per-dentist daily schedule cron registered (daily at 07:30 IST)');
+  return [reminderTask, feedbackTask, digestTask, doctorScheduleTask];
 }
 
 module.exports = {
@@ -502,5 +598,6 @@ module.exports = {
   sendReminders,
   sendFeedbackRequests,
   sendWeeklyDigests,
+  sendDoctorDailySchedules,
   handleReminderConfirmation,
 };

@@ -46,6 +46,7 @@ cd backend && node tests/demoReadOnlyBot.unit.test.js    # same guard, extended 
 cd backend && node tests/askingTenant.unit.test.js       # answers redirect to the clinic that asked (confirmation/feedback/treatment/recall)
 cd backend && node tests/dentalHistoryEncryption.unit.test.js  # dental_history encryption: round-trip, legacy fallback, tamper detection
 cd backend && node tests/backupEncryption.unit.test.js   # backup file format shared by backupManager.js/backup-prod.js/decryptBackup.js
+cd backend && node tests/reviewFunnel.unit.test.js       # Google review funnel: only rating >=4 + settings.google_review_url set
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -236,6 +237,17 @@ through `notifyAdminWhatsApp` to admins with a `notify_phone`. Deliberately
 short — appointments, no-shows, revenue, and treatment advised but not booked —
 and it sends nothing at all for a week with no appointments.
 
+**And each dentist's day arrives the same way.** `sendDoctorDailySchedules`
+(`jobs/reminders.js`, 07:30 IST, rides `startReminderCron`) WhatsApps each
+dentist their own list for today — off by default, opt-in per clinic via
+`settings.doctor_daily_schedule_enabled`, and only to dentists whose
+`doctors.user_id` account has a `notify_phone` (otherwise unused). Staff-facing:
+it goes through `sendStaffWhatsApp` (`services/bot/utils.js` — the
+`clinic_staff_alert` template shared with the admin fan-out, text fallback,
+logged as an `admin_alert` row) so it NEVER counts against a patient's message
+budget. A dentist with nothing booked that day gets no message, same as the
+weekly digest skips an empty week.
+
 **Password recovery is the clinic's own.** `POST /admin/staff/:id/reset-password`
 (`adminOnly`, audited) returns a new password ONCE and revokes that user's
 refresh tokens. It refuses to reset your OWN account: `/auth/change-password` is
@@ -395,6 +407,16 @@ manufactures a written archive of complaints. Keyed on `patient_id` rather than
 phone, so a father's root canal does not silence his daughter's first visit. The
 copy now states plainly that the answer goes only to the clinic.
 
+**A high rating is the ONLY place patient copy links out.** When
+`settings.google_review_url` is set, `handleFeedbackComment` (`botEngine.js` —
+the single exit of the rating flow, reached by a typed comment or `Skip`) sends
+one extra line inviting a patient who rated **4 or 5** to leave a Google review.
+1–3 stars are never asked and stay entirely internal — which is what the rating
+prompt promises. The link goes only to the clinic's own review page; it names no
+platform and offers no roster (the patient-copy rules still hold). Its own
+try/catch — the feedback row is already saved and a failed nudge must not read
+as an error. Blank URL = feature off. `tests/reviewFunnel.unit.test.js`.
+
 **Money leaves a trail the patient keeps.** Recording a `treatment_payment`
 sends a receipt over WhatsApp — amount, method, paid-so-far and balance. It is
 NOT a tax invoice and does not pretend to be; it is the payment slip a front
@@ -435,14 +457,37 @@ a clinic closing at 21:00 sees yesterday.
 `rupees()` is the money format. Noto Sans (regular + bold) is embedded from
 `src/assets/fonts/` and subset into every report — pdfkit's built-in Helvetica
 has no ₹ glyph and would drop it silently, so callers use the logical fonts
-`'body'`/`'bold'`, never `'Helvetica'`. The reports: `GET /reports/schedule.pdf`
-(`routes/reports.js` — a day grouped by dentist; for a FUTURE date it also
+`'body'`/`'bold'`, never `'Helvetica'`. The reports in `routes/reports.js`:
+`GET /reports/schedule.pdf` (a day grouped by dentist; for a FUTURE date it also
 carries each patient's 24h-reminder reply and a "confirmed / to call" count, so
-tomorrow's schedule IS the evening call-list — there is no separate
-unconfirmed report), and the `?format=pdf` arms of `GET /day-close` and
-`GET /requests`. All stream, store nothing, and are NOT `adminOnly` — they are
-read views the front desk prints; the bulk PHI extract that is admin-gated
-(`/analytics/export`) does not go through here.
+tomorrow's schedule IS the evening call-list — there is no separate unconfirmed
+report); `GET /reports/dues.pdf` (money owed — unpaid completed-visit
+consultation fees AND treatment-plan balances, on one worklist; the treatment
+half flags `stalled`); `GET /reports/recalls.pdf` (the check-up call-list —
+recalls due/overdue in the next 45 days, last visit, and whether the WhatsApp
+nudge went unanswered); `GET /reports/lab-works.pdf` (crowns/dentures out at the
+lab, soonest-due first, overdue flagged); `GET /reports/dentist-activity.pdf`
+and `GET /reports/period.pdf` (both `?from=&to=`, default current IST month via
+`parseRange` — per-dentist seen/completed/no-show/fees/advised/rating, and the
+month-end money-by-method + appointment-mix + revenue-by-dentist/treatment
+summary; the money expressions match `day-close` exactly). Plus the `?format=pdf`
+arms of `GET /day-close`, `GET /requests`, and `GET /treatment-plans`
+(`routes/treatmentPlans.js` — the "advised but not booked / `stalled=true`"
+worklist the weekly digest only quotes a count of; filtered on the derived
+`withProgress` fields, not in SQL), and `GET /treatment-plans/:id/estimate.pdf`
+(a printable quotation — cost, paid, balance, visits so far — that states on its
+face it is NOT a tax invoice; the GST invoices under `/billing` are). All stream,
+store nothing, and are NOT `adminOnly` — they are read views the front desk
+prints (surfaced in `OverviewTab.js`'s Reports card); the bulk PHI extract that
+is admin-gated (`/analytics/export`) does not go through here.
+
+**Analytics has a treatment-conversion funnel.** `GET /analytics/funnel`
+(consultation → advised → booked → started → completed → paid, plus per-dentist
+and per-treatment breakdowns) is derived from the linked appointments/payments,
+never a stored counter — same principle as `routes/treatmentPlans.js`. `GET
+/analytics` also returns `by_source` (new patients by `patients.referral_source`
+over the window) — the column already existed and is set at the desk via
+`PATCH /patients/:id`; this is the reporting half.
 
 **A working day is a LIST of sessions.** An Indian dentist routinely does 10–1
 at one clinic and 5–9 at another on the SAME day; for a visiting endodontist it

@@ -18,12 +18,18 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
   const [feeSaving, setFeeSaving] = useState(false);
   const [changePwdForm, setChangePwdForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
   const [changingPwd, setChangingPwd] = useState(false);
+  const [reviewUrl, setReviewUrl] = useState('');
+  const [reviewUrlSaving, setReviewUrlSaving] = useState(false);
+  const [doctorDigest, setDoctorDigest] = useState(false);
+  const [doctorDigestSaving, setDoctorDigestSaving] = useState(false);
 
   // PATCH /settings merges notification_prefs into the TOP level of
   // tenants.settings, so read it back from there.
   useEffect(() => {
     if (!settings) return;
     setShowFee(settings.settings?.show_consultation_fee !== false);
+    setReviewUrl(settings.settings?.google_review_url || '');
+    setDoctorDigest(settings.settings?.doctor_daily_schedule_enabled === true);
   }, [settings]);
 
   async function saveShowFee(next) {
@@ -37,6 +43,32 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
       setShowFee(!next); // revert on failure — the toggle must reflect what's actually saved
       toast.error(err.response?.data?.error || 'Failed to save');
     } finally { setFeeSaving(false); }
+  }
+
+  async function saveReviewUrl() {
+    const next = reviewUrl.trim();
+    if (next === (settings.settings?.google_review_url || '')) return; // nothing changed
+    setReviewUrlSaving(true);
+    try {
+      await api.patch('/admin/settings', { notification_prefs: { google_review_url: next } });
+      toast.success('Saved');
+      fetchSettings();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to save — check the link is a full https:// URL');
+    } finally { setReviewUrlSaving(false); }
+  }
+
+  async function saveDoctorDigest(next) {
+    setDoctorDigest(next);
+    setDoctorDigestSaving(true);
+    try {
+      await api.patch('/admin/settings', { notification_prefs: { doctor_daily_schedule_enabled: next } });
+      toast.success('Saved');
+      fetchSettings();
+    } catch (err) {
+      setDoctorDigest(!next);
+      toast.error(err.response?.data?.error || 'Failed to save');
+    } finally { setDoctorDigestSaving(false); }
   }
 
   async function changePassword(e) {
@@ -107,6 +139,47 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
               Turn this off if you waive or negotiate the consultation fee — patients will see no amount until they are at the clinic.
               {!isAdmin && ' Only clinic admins can change this.'}
             </p>
+
+            {/* Google review link. When set, a patient who rates a visit 4 or 5
+                on WhatsApp is invited once to leave a review — lower scores are
+                never asked and stay internal. */}
+            <div className="mt-6 pt-5 border-t border-gray-100">
+              <label className="block text-sm text-gray-700 mb-1">Google review link</label>
+              <input
+                type="url"
+                inputMode="url"
+                placeholder="https://g.page/r/…/review"
+                value={reviewUrl}
+                disabled={!isAdmin || reviewUrlSaving}
+                onChange={e => setReviewUrl(e.target.value)}
+                onBlur={saveReviewUrl}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-50 disabled:text-gray-400"
+              />
+              <p className="text-xs text-gray-400 mt-1">
+                Paste your clinic's Google review link. Patients who rate a visit 4 or 5 stars get a one-line
+                invitation to review; 1–3 star ratings are never asked and go only to you. Leave blank to turn this off.
+                {!isAdmin && ' Only clinic admins can change this.'}
+              </p>
+            </div>
+
+            {/* Opt-in: each dentist with a WhatsApp alerts number set gets their
+                own list for the day every morning. */}
+            <div className="mt-6 pt-5 border-t border-gray-100">
+              <label className={`flex items-center gap-3 select-none py-2.5 -my-2.5 ${isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
+                <div className="relative">
+                  <input type="checkbox" className="sr-only" disabled={!isAdmin || doctorDigestSaving}
+                    checked={doctorDigest}
+                    onChange={e => saveDoctorDigest(e.target.checked)} />
+                  <div className={`w-10 h-5 rounded-full transition-colors ${doctorDigest ? 'bg-blue-500' : 'bg-gray-300'}`} />
+                  <div className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${doctorDigest ? 'translate-x-5' : ''}`} />
+                </div>
+                <span className="text-sm text-gray-700">WhatsApp each dentist their schedule every morning</span>
+              </label>
+              <p className="text-xs text-gray-400 mt-1">
+                Sent ~07:30 to any dentist who has a WhatsApp alerts number set on their staff account. A dentist with nothing booked that day gets no message.
+                {!isAdmin && ' Only clinic admins can change this.'}
+              </p>
+            </div>
           </div>
         )}
       </div>

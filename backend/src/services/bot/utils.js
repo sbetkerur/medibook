@@ -362,39 +362,60 @@ async function notifyAdminWhatsApp(schema, tenant, message, opts = {}) {
     const clinicName = String(tenant?.name || 'your clinic').slice(0, 60);
 
     for (const admin of adminUsers.rows) {
-      let waMessageId = null;
-      try {
-        waMessageId = await wa.sendTemplate(admin.notify_phone, STAFF_ALERT_TEMPLATE, [{
-          type: 'body',
-          parameters: [
-            { type: 'text', text: clinicName },
-            // Meta rejects newlines in a template parameter, so the body is
-            // flattened. The alert stays readable — it is a short list of
-            // facts, not prose — and the dashboard has the full detail.
-            { type: 'text', text: String(message).replace(/\s*\n+\s*/g, ' · ').slice(0, 900) },
-          ],
-        }], null, null);
-      } catch (_templateErr) {
-        // Falls back to text, which still works for the minority of staff who
-        // HAVE messaged the number recently (during onboarding, say). Better a
-        // best-effort send than none while the template awaits approval.
-        try {
-          waMessageId = await wa.sendText(admin.notify_phone, message, null, null);
-        } catch (err) {
-          logger.warn('Admin WhatsApp alert failed', { error: err.message });
-          continue;
-        }
-      }
-      // Recorded like any other outbound message, but under its own type so a
-      // conversation view can keep staff alerts out of patient threads — and so
-      // services/messageBudget.js never counts a staff alert against a
-      // PATIENT's budget, which matters when a staff member is also a patient.
-      // The Meta id is what delivery receipts key on.
-      await logMessage(schema, admin.notify_phone, 'out', 'admin_alert', message, waMessageId)
-        .catch(() => {});
+      await deliverStaffAlert(wa, schema, admin.notify_phone, clinicName, message);
     }
   } catch (err) {
     logger.warn('notifyAdminWhatsApp failed', { error: err.message });
+  }
+}
+
+/**
+ * One staff-facing WhatsApp send: template-first (clinic_staff_alert), text
+ * fallback, recorded as an 'admin_alert' row. That message_type is deliberate —
+ * a conversation view keeps staff alerts out of patient threads, and
+ * services/messageBudget.js never counts an admin_alert against a PATIENT's
+ * budget (which matters when a staff member is also a patient). Never throws.
+ */
+async function deliverStaffAlert(wa, schema, phone, clinicName, message) {
+  if (!phone) return;
+  let waMessageId = null;
+  try {
+    waMessageId = await wa.sendTemplate(phone, STAFF_ALERT_TEMPLATE, [{
+      type: 'body',
+      parameters: [
+        { type: 'text', text: String(clinicName || 'your clinic').slice(0, 60) },
+        // Meta rejects newlines in a template parameter, so the body is
+        // flattened. The alert stays readable — it is a short list of facts,
+        // not prose — and the dashboard has the full detail.
+        { type: 'text', text: String(message).replace(/\s*\n+\s*/g, ' · ').slice(0, 900) },
+      ],
+    }], null, null);
+  } catch (_templateErr) {
+    // Falls back to text, which still works for the minority of staff who HAVE
+    // messaged the number recently (during onboarding, say). Better a
+    // best-effort send than none while the template awaits approval.
+    try {
+      waMessageId = await wa.sendText(phone, message, null, null);
+    } catch (err) {
+      logger.warn('Staff WhatsApp alert failed', { error: err.message });
+      return;
+    }
+  }
+  await logMessage(schema, phone, 'out', 'admin_alert', message, waMessageId).catch(() => {});
+}
+
+/**
+ * Send a staff-facing WhatsApp alert to ONE arbitrary staff phone (not the
+ * admin fan-out). Used by jobs/reminders.js sendDoctorDailySchedules to message
+ * a dentist their own day. `opts.senders` is the test-harness capture object,
+ * same convention as notifyAdminWhatsApp. Never throws.
+ */
+async function sendStaffWhatsApp(schema, phone, clinicName, message, opts = {}) {
+  try {
+    const wa = opts.senders || require('../whatsapp');
+    await deliverStaffAlert(wa, schema, phone, clinicName, message);
+  } catch (err) {
+    logger.warn('sendStaffWhatsApp failed', { error: err.message });
   }
 }
 
@@ -508,6 +529,7 @@ module.exports = {
   getPatients,
   logMessage,
   notifyAdminWhatsApp,
+  sendStaffWhatsApp,
   clinicPhone,
   clinicPhoneLine,
   reminder24hApplies,
