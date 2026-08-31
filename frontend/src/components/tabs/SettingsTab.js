@@ -22,6 +22,8 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
   const [reviewUrlSaving, setReviewUrlSaving] = useState(false);
   const [doctorDigest, setDoctorDigest] = useState(false);
   const [doctorDigestSaving, setDoctorDigestSaving] = useState(false);
+  const [noShowThreshold, setNoShowThreshold] = useState('');
+  const [noShowSaving, setNoShowSaving] = useState(false);
 
   // PATCH /settings merges notification_prefs into the TOP level of
   // tenants.settings, so read it back from there.
@@ -30,6 +32,9 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
     setShowFee(settings.settings?.show_consultation_fee !== false);
     setReviewUrl(settings.settings?.google_review_url || '');
     setDoctorDigest(settings.settings?.doctor_daily_schedule_enabled === true);
+    setNoShowThreshold(
+      settings.settings?.noshow_block_threshold ? String(settings.settings.noshow_block_threshold) : ''
+    );
   }, [settings]);
 
   async function saveShowFee(next) {
@@ -69,6 +74,26 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
       setDoctorDigest(!next);
       toast.error(err.response?.data?.error || 'Failed to save');
     } finally { setDoctorDigestSaving(false); }
+  }
+
+  async function saveNoShowThreshold() {
+    const raw = noShowThreshold.trim();
+    // Empty or 0 both mean "off". Store 0 so a cleared field turns the gate off.
+    const next = raw === '' ? 0 : parseInt(raw, 10);
+    if (!Number.isInteger(next) || next < 0 || next > 20) {
+      toast.error('Enter a whole number from 0 to 20 (0 turns it off)');
+      setNoShowThreshold(settings.settings?.noshow_block_threshold ? String(settings.settings.noshow_block_threshold) : '');
+      return;
+    }
+    if (next === (settings.settings?.noshow_block_threshold || 0)) return; // nothing changed
+    setNoShowSaving(true);
+    try {
+      await api.patch('/admin/settings', { notification_prefs: { noshow_block_threshold: next } });
+      toast.success('Saved');
+      fetchSettings();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to save');
+    } finally { setNoShowSaving(false); }
   }
 
   async function changePassword(e) {
@@ -177,6 +202,35 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
               </label>
               <p className="text-xs text-gray-400 mt-1">
                 Sent ~07:30 to any dentist who has a WhatsApp alerts number set on their staff account. A dentist with nothing booked that day gets no message.
+                {!isAdmin && ' Only clinic admins can change this.'}
+              </p>
+            </div>
+
+            {/* Repeat no-shows: past this many missed visits (since the
+                patient's last completed visit), the bot stops taking their
+                booking and tells them to call the front desk. The desk can
+                still book them normally. 0 = off. */}
+            <div className="mt-6 pt-5 border-t border-gray-100">
+              <label className="block text-sm text-gray-700 mb-1">Send repeat no-shows to the front desk</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  max={20}
+                  inputMode="numeric"
+                  placeholder="0"
+                  value={noShowThreshold}
+                  disabled={!isAdmin || noShowSaving}
+                  onChange={e => setNoShowThreshold(e.target.value)}
+                  onBlur={saveNoShowThreshold}
+                  className="w-20 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-50 disabled:text-gray-400"
+                />
+                <span className="text-sm text-gray-500">missed appointments</span>
+              </div>
+              <p className="text-xs text-gray-400 mt-1">
+                Once a patient has missed this many appointments since their last completed visit, the WhatsApp bot
+                stops taking their booking and asks them to call you — your front desk can still book them as normal.
+                Set to <strong>0</strong> to turn this off (the default). Missed visits older than ~6 months no longer count.
                 {!isAdmin && ' Only clinic admins can change this.'}
               </p>
             </div>

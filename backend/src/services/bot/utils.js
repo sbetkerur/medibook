@@ -3,7 +3,7 @@
 const { tenantQuery, query } = require('../../db');
 const logger = require('../../utils/logger');
 const { format } = require('date-fns');
-const { toZonedTime } = require('../../utils/dateTz');
+const { toZonedTime, IST_TODAY_SQL } = require('../../utils/dateTz');
 
 const IST = 'Asia/Kolkata';
 
@@ -487,6 +487,59 @@ async function reminder24hApplies(schemaName, appointmentDateStr) {
 }
 
 /**
+ * Repeat-no-show gate for patient SELF-booking in the bot.
+ *
+ * A patient who has missed several appointments on this number is handed to the
+ * front desk instead of self-booking — the desk can decide whether to take a
+ * deposit, hold the slot loosely, or just talk to them, which the bot can't.
+ *
+ * Opt-in per clinic: `settings.noshow_block_threshold` (0 / unset = OFF, which
+ * is every clinic today). Only no-shows AFTER the patient's most recent
+ * `completed` visit count, and only those within `noshow_block_window_days`
+ * (default 180) — so attending once, or simply the passage of time, clears the
+ * record with no admin action. Booking at the DESK (routes/appointments.js) is
+ * never gated and is the manual override; so is a treatment-plan sitting, which
+ * comes through bookingFlow.handleSelectDoctor and not startBooking — a clinic
+ * that advised a course wants that patient back regardless.
+ *
+ * Keyed on PHONE, not patient_id: family members share one number here, and the
+ * clinic wants to speak to whoever holds the phone that keeps missing visits.
+ *
+ * Fails OPEN — a lookup error must never wall a patient out of booking.
+ * Read fresh (not off the passed `tenant`) — a bot session can sit open for
+ * hours after an admin changes the threshold.
+ */
+async function noShowBlock(schemaName, phone) {
+  try {
+    const tr = await query(`SELECT settings FROM tenants WHERE schema_name=$1`, [schemaName]);
+    const threshold = parseInt(tr.rows[0]?.settings?.noshow_block_threshold, 10);
+    if (!Number.isInteger(threshold) || threshold <= 0) return { blocked: false };
+    const windowDays = parseInt(tr.rows[0]?.settings?.noshow_block_window_days, 10);
+    const win = Number.isInteger(windowDays) && windowDays >= 30 ? windowDays : 180;
+
+    const r = await tenantQuery(schemaName, `
+      SELECT COUNT(*)::int AS n
+        FROM appointments a
+        JOIN patients p ON p.id = a.patient_id
+       WHERE p.phone = $1
+         AND a.status = 'no_show'
+         AND a.appointment_date >= (${IST_TODAY_SQL} - $2::int)
+         AND a.appointment_date > COALESCE((
+               SELECT MAX(a2.appointment_date)
+                 FROM appointments a2
+                 JOIN patients p2 ON p2.id = a2.patient_id
+                WHERE p2.phone = $1 AND a2.status = 'completed'
+             ), DATE '1900-01-01')
+    `, [phone, win]);
+    const count = r.rows[0]?.n || 0;
+    return { blocked: count >= threshold, count, threshold };
+  } catch (err) {
+    logger.warn('No-show block check failed — allowing booking', { error: err.message });
+    return { blocked: false };
+  }
+}
+
+/**
  * Whole-tenant read-only guard, extended from the dashboard's `tenants.read_only`
  * flag (`middleware/auth.js` `enforceReadOnlyTenant`) down into the bot engine.
  * That HTTP-layer guard only ever covered `/api/admin` + `/api/v1/admin` — the
@@ -533,6 +586,7 @@ module.exports = {
   clinicPhone,
   clinicPhoneLine,
   reminder24hApplies,
+  noShowBlock,
   isReadOnlyDemo,
   READ_ONLY_DEMO_MESSAGE,
 };

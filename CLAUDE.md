@@ -48,6 +48,7 @@ cd backend && node tests/askingTenant.unit.test.js       # answers redirect to t
 cd backend && node tests/dentalHistoryEncryption.unit.test.js  # dental_history encryption: round-trip, legacy fallback, tamper detection
 cd backend && node tests/backupEncryption.unit.test.js   # backup file format shared by backupManager.js/backup-prod.js/decryptBackup.js
 cd backend && node tests/reviewFunnel.unit.test.js       # Google review funnel: only rating >=4 + settings.google_review_url set
+cd backend && node tests/noShowBlock.unit.test.js        # repeat no-shows -> "call the front desk" (opt-in settings.noshow_block_threshold; fails open)
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -518,6 +519,22 @@ dates is one person wanting one appointment, not three items on the
 receptionist's list. Clearing them is front-desk work, so `PATCH /requests/:id`
 is deliberately NOT `adminOnly`: gate it behind the owner and the list is never
 cleared and stops being trusted.
+
+**Repeat no-shows are sent to the front desk, not walled out.** Opt-in per
+clinic via `settings.noshow_block_threshold` (0 / unset = OFF, which is every
+clinic today). `services/bot/utils.js` `noShowBlock` counts a phone's `no_show`
+appointments SINCE its most recent `completed` visit and within
+`noshow_block_window_days` (default 180) — so attending once, or just time,
+clears the record with no admin action. At or above the threshold,
+`bookingFlow.startBooking` replies with the clinic's phone number and stops;
+it is the ONLY chokepoint, so a treatment-plan sitting
+(`bookingFlow.handleSelectDoctor`, reached from `treatmentFlow.js`) is never
+gated — a clinic that advised a course wants that patient back — and neither is
+desk booking (`POST /appointments`), which is the manual override. Keyed on
+PHONE, not `patient_id` (family members share a number, and the clinic wants
+whoever holds it). Fails OPEN, reads `tenants.settings` fresh, and stays open
+when the clinic has stored no phone number (nothing to tell the patient to
+call). `tests/noShowBlock.unit.test.js`.
 
 **Orthodontics is self-bookable, on its own monthly cadence.** Braces are 18–24
 monthly adjustments over two years. Each adjustment is an ordinary chairside

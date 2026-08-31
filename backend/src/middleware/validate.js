@@ -142,6 +142,14 @@ const schemas = {
       // day's list every morning. Off by default — dentist notify_phones are
       // otherwise unused, so auto-sending would surprise clinics that set one.
       doctor_daily_schedule_enabled: Joi.boolean(),
+      // Repeat-no-show gate (services/bot/utils.js noShowBlock). When > 0, a
+      // patient with this many missed appointments SINCE their last completed
+      // visit (and within noshow_block_window_days) is asked to call the front
+      // desk instead of self-booking in the bot. 0 / unset = off, which is
+      // every clinic today; the desk and treatment-plan sittings are never
+      // gated. Capped low — this walls a patient out of a channel.
+      noshow_block_threshold: Joi.number().integer().min(0).max(20),
+      noshow_block_window_days: Joi.number().integer().min(30).max(730),
     }).optional(),
     notify_phone: Joi.string().pattern(/^[+]?[0-9]{7,20}$/).optional().allow('', null)
       .messages({ 'string.pattern.base': 'notify_phone must be 7-20 digits, optionally starting with + (e.g. +917795676142)' }),

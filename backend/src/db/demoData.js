@@ -442,7 +442,8 @@ async function seedDemoData() {
         SET settings = COALESCE(settings, '{}'::jsonb)
                        || jsonb_build_object(
                             'google_review_url', 'https://g.page/r/pragati-dental-studio/review',
-                            'doctor_daily_schedule_enabled', true)
+                            'doctor_daily_schedule_enabled', true,
+                            'noshow_block_threshold', 3)
       WHERE slug = $1`,
     [DEMO_SLUG]);
 

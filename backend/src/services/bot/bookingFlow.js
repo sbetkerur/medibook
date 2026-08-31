@@ -23,6 +23,7 @@ const {
   logMessage,
   notifyAdminWhatsApp,
   reminder24hApplies,
+  noShowBlock,
   isReadOnlyDemo,
   READ_ONLY_DEMO_MESSAGE,
 } = require('./utils');
@@ -247,6 +248,28 @@ async function _takePendingHospital(phone) {
 }
 
 async function startBooking(phone, schema, tenant, send, ctx) {
+  // Repeat no-shows: hand the patient to the front desk rather than let them
+  // self-book again (opt-in per clinic — see noShowBlock). Checked only here,
+  // at the top of fresh self-booking: a treatment-plan sitting reaches
+  // handleSelectDoctor directly and is deliberately never gated. A clinic with
+  // no phone number on file has nothing to tell the patient to call, so the
+  // gate stays open in that case rather than trapping them.
+  const nsb = await noShowBlock(schema, phone);
+  if (nsb.blocked) {
+    const phoneLine = await clinicPhoneLine(schema);
+    if (phoneLine) {
+      const missed = nsb.count === 1
+        ? 'There has been 1 missed appointment'
+        : `There have been ${nsb.count} missed appointments`;
+      await send.text(
+        `${missed} on this number, so new bookings here go through our front desk. `
+        + `Please give us a call and we'll get you in.`
+        + phoneLine);
+      await updateSession(schema, phone, STATES.IDLE, {});
+      return;
+    }
+  }
+
   const hospitals = await tenantQuery(schema,
     `SELECT id, name, city FROM hospitals WHERE is_active=true ORDER BY name`);
 
