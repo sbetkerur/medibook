@@ -497,7 +497,8 @@ router.post('/tenants', createTenantLimiter, validate(schemas.createTenant), asy
 // ── UPDATE TENANT ─────────────────────────────────────────────
 router.patch('/tenants/:id', validateUUID(), async (req, res) => {
   try {
-    const { status, plan, name, suspension_reason, city, billing_monthly } = req.body;
+    const { status, plan, name, suspension_reason, city, billing_monthly,
+            max_doctors_override, max_branches_override } = req.body;
 
     // 'pending_review' / 'past_due' / 'pending_payment' are lifecycle states of a
     // self-serve clinic — normally moved by /approve, the billing webhook or the
@@ -553,6 +554,21 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
       }
     }
 
+    // Negotiated dentist / branch ceilings. Same `!== undefined` / null-reverts
+    // rule as billing_monthly: null clears the override (back to the tier's
+    // limit), a whole number 0..999 sets it, and 0 is a valid frozen cap.
+    // Resolved everywhere via utils/planLimits.js.
+    for (const col of ['max_doctors_override', 'max_branches_override']) {
+      const val = req.body[col];
+      if (val === undefined) continue;
+      if (val === null) { updates.push(`${col}=NULL`); continue; }
+      if (!Number.isInteger(val) || val < 0 || val > 999) {
+        return res.status(400).json({ error: `${col} must be a whole number 0–999, or null to use the plan limit` });
+      }
+      params.push(val);
+      updates.push(`${col}=$${params.length}`);
+    }
+
     if (!updates.length) return res.json({ message: 'Nothing to update' });
 
     // Fetch current plan before update so we can log the change
@@ -588,7 +604,8 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
         INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
         VALUES ($1,$2,$3,$4,$5,$6,$7)
       `, [req.user.id, 'super_admin', 'UPDATE_TENANT', 'tenant', req.params.id,
-          JSON.stringify({ status, plan, name, suspension_reason }), req.ip]);
+          JSON.stringify({ status, plan, name, suspension_reason, billing_monthly,
+                           max_doctors_override, max_branches_override }), req.ip]);
     } catch (auditErr) { logger.warn('Audit log failed (UPDATE_TENANT)', { error: auditErr.message }); }
 
     res.json({ tenant: r.rows[0] });
@@ -1099,10 +1116,14 @@ router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
     const appts = parseInt(apptCount.rows[0].count);
     const doctors = parseInt(doctorCount.rows[0].count);
     const branches = parseInt(branchCount.rows[0].count);
-    // NULL limit = unlimited plan — report 0% and never recommend an upgrade
+    // A negotiated tenants.max_*_override wins over the tier's list limit —
+    // same rule as utils/planLimits.js (inlined here because this row flattens
+    // plan + tenant columns together). NULL = unlimited: 0% and no upgrade nudge.
+    const doctorLimit = t.max_doctors_override != null ? t.max_doctors_override : (t.max_doctors ?? null);
+    const branchLimit = t.max_branches_override != null ? t.max_branches_override : (t.max_branches ?? null);
     const apptPct = t.max_appointments_per_month ? Math.round((appts / t.max_appointments_per_month) * 100) : 0;
-    const doctorPct = t.max_doctors ? Math.round((doctors / t.max_doctors) * 100) : 0;
-    const branchPct = t.max_branches ? Math.round((branches / t.max_branches) * 100) : 0;
+    const doctorPct = doctorLimit ? Math.round((doctors / doctorLimit) * 100) : 0;
+    const branchPct = branchLimit ? Math.round((branches / branchLimit) * 100) : 0;
 
     // Billing drift for this one tenant — same rule as the /billing sweep.
     const listPrice = t.price_monthly ?? null;
@@ -1115,8 +1136,10 @@ router.get('/tenants/:id/quota', validateUUID(), async (req, res) => {
       tenant_id: t.id,
       plan: t.plan,
       appointments: { used: appts, limit: t.max_appointments_per_month, percent: apptPct },
-      doctors: { used: doctors, limit: t.max_doctors, percent: doctorPct },
-      branches: { used: branches, limit: t.max_branches, percent: branchPct },
+      doctors: { used: doctors, limit: doctorLimit, percent: doctorPct,
+                 plan_limit: t.max_doctors ?? null, override: t.max_doctors_override ?? null },
+      branches: { used: branches, limit: branchLimit, percent: branchPct,
+                  plan_limit: t.max_branches ?? null, override: t.max_branches_override ?? null },
       billing: {
         list_price_per_branch: listPrice,
         billing_monthly: t.billing_monthly ?? null,   // the agreed override, if any

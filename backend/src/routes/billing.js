@@ -22,6 +22,7 @@ const razorpay = require('../services/razorpay');
 const billingSvc = require('../services/billing');
 const invoiceSvc = require('../services/invoice');
 const logger = require('../utils/logger');
+const { effectiveDoctorLimit, effectiveBranchLimit } = require('../utils/planLimits');
 
 // GSTIN: 2-digit state code, 10-char PAN, 1 entity digit, 'Z', 1 checksum.
 const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
@@ -62,20 +63,24 @@ function shapeBilling(tenant, billing, plan) {
   };
 }
 
-// Doctors/branches used vs the plan's ceiling — so the clinic sees "2 of 2
-// dentists" BEFORE it hits the hard block in routes/doctors.js. NULL limit
-// (unlimited) is reported as null, never a number.
-async function loadUsage(schemaName, plan) {
+// Doctors/branches used vs the ceiling — so the clinic sees "2 of 2 dentists"
+// BEFORE it hits the hard block in routes/doctors.js. NULL limit (unlimited) is
+// reported as null, never a number. `planId` is the plan whose list limits
+// apply (the tenant's own for the /billing readout; the DOWNGRADE target for
+// change-plan). `tenant` carries any negotiated max_*_override and is applied
+// on top — pass `null` to get the tier's list limits with no override
+// (change-plan does this so a self-serve downgrade is judged fairly).
+async function loadUsage(schemaName, planId, tenant) {
   try {
     const [d, h, p] = await Promise.all([
       tenantQuery(schemaName, `SELECT COUNT(*)::int AS n FROM doctors WHERE is_active=true`),
       tenantQuery(schemaName, `SELECT COUNT(*)::int AS n FROM hospitals WHERE is_active=true AND deleted_at IS NULL`),
-      query(`SELECT max_doctors, max_branches FROM plans WHERE id=$1`, [plan]),
+      query(`SELECT max_doctors, max_branches FROM plans WHERE id=$1`, [planId]),
     ]);
-    const lim = p.rows[0] || {};
+    const planRow = p.rows[0] || {};
     return {
-      doctors:  { used: d.rows[0].n, limit: lim.max_doctors ?? null },
-      branches: { used: h.rows[0].n, limit: lim.max_branches ?? null },
+      doctors:  { used: d.rows[0].n, limit: effectiveDoctorLimit(tenant, planRow) },
+      branches: { used: h.rows[0].n, limit: effectiveBranchLimit(tenant, planRow) },
     };
   } catch (e) {
     logger.warn('billing: usage read failed', { schema: schemaName, error: e.message });
@@ -105,7 +110,7 @@ router.get('/billing', async (req, res) => {
     if (!tenant) return res.status(404).json({ error: 'Clinic not found' });
     const base = shapeBilling(tenant, billing, plan);
     const [usage, plansR, profR, invCountR] = await Promise.all([
-      loadUsage(tenant.schema_name, tenant.plan),
+      loadUsage(tenant.schema_name, tenant.plan, tenant),
       query(`SELECT id, name, price_monthly, max_doctors, max_branches FROM plans WHERE id IN ('starter','professional') ORDER BY price_monthly ASC`),
       query(`SELECT tenant_id, legal_name, billing_address, gstin, place_of_supply, billing_email FROM tenant_billing_profiles WHERE tenant_id=$1`, [tenant.id]),
       query(`SELECT COUNT(*)::int AS n FROM billing_invoices WHERE tenant_id=$1`, [tenant.id]),
@@ -364,9 +369,13 @@ router.post('/billing/change-plan', adminOnly, async (req, res) => {
     const order = { starter: 0, professional: 1 };
     const isUpgrade = order[target] > order[tenant.plan];
 
-    // Guard a downgrade against live usage.
+    // Guard a downgrade against live usage. Judged against the TARGET tier's
+    // list limits, NOT any negotiated max_*_override (pass null): this is a
+    // self-serve card clinic downgrading its own paid plan, so a super-admin
+    // favour must not let it keep a bigger cap on a cheaper tier. A
+    // super-admin-billed clinic never reaches here (blocked above).
     if (!isUpgrade) {
-      const usage = await loadUsage(tenant.schema_name, target);
+      const usage = await loadUsage(tenant.schema_name, target, null);
       const problems = [];
       if (usage?.doctors?.limit != null && usage.doctors.used > usage.doctors.limit) {
         problems.push(`deactivate ${usage.doctors.used - usage.doctors.limit} dentist(s) (limit ${usage.doctors.limit})`);

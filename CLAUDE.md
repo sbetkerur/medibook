@@ -49,6 +49,7 @@ cd backend && node tests/dentalHistoryEncryption.unit.test.js  # dental_history 
 cd backend && node tests/backupEncryption.unit.test.js   # backup file format shared by backupManager.js/backup-prod.js/decryptBackup.js
 cd backend && node tests/reviewFunnel.unit.test.js       # Google review funnel: only rating >=4 + settings.google_review_url set
 cd backend && node tests/noShowBlock.unit.test.js        # repeat no-shows -> "call the front desk" (opt-in settings.noshow_block_threshold; fails open)
+cd backend && node tests/planLimits.unit.test.js         # per-tenant negotiated dentist/branch caps: tenants.max_*_override ?? plans.max_*
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -900,6 +901,38 @@ enforcer: it ENDS lapsed card-free trials (`active` + `trialing` +
 - `GET /billing` also returns `usage` (dentists/branches used vs plan limit),
   and the doctor/branch quota 403/409 now carries `code:'PLAN_LIMIT'` +
   `upgrade_to`.
+
+**Per-tenant negotiated limits.** A deal may settle on "4 dentists, 1 branch,
+₹1,200/mo" — a middle ground the two published tiers don't express.
+`tenants.billing_monthly` already carried the negotiated PRICE (revenue reads
+are all `COALESCE(t.billing_monthly, p.price_monthly)`);
+`tenants.max_doctors_override` / `max_branches_override` now carry the negotiated
+CAPS. NULL = use the tier's `plans.max_doctors` / `max_branches`; a number caps
+this clinic there regardless of tier; 0 is a valid frozen cap.
+`utils/planLimits.js` (`effectiveDoctorLimit` / `effectiveBranchLimit`) is the
+ONLY place the `override ?? plan` decision is made — every enforcement path
+(`POST /doctors`, `/doctors/import`, `POST /hospitals`) and every usage readout
+(`GET /admin/settings`, `GET /billing`, `GET /superadmin/tenants/:id/quota`)
+goes through it, so the cap a clinic sees can't disagree with the cap enforced.
+The two enforcement routes read `plans.max_*` + `tenants.max_*_override` in ONE
+fresh `tenants ⋈ plans` query (not off the 5s-cached `req.tenant`), so a
+just-raised cap takes effect immediately. Set by the super admin via
+`PATCH /superadmin/tenants/:id` (`max_doctors_override` / `max_branches_override`,
+whole number 0–999 or null, audited) — the "💰 Deal" modal in
+`frontend/src/app/superadmin/page.js` edits all three together. When an override
+is set, the quota 403 drops `upgrade_to` and says "contact MediBook", not
+"upgrade to Professional".
+
+One deliberate exception: `POST /billing/change-plan`'s downgrade fit check
+passes `null` for the tenant, so a self-serve clinic downgrading its own card
+plan is judged against the TARGET tier's list limits, never an override — a
+super-admin favour must not let it keep a bigger cap on a cheaper tier. (A
+super-admin-billed clinic can't reach that route anyway.)
+
+This is for SUPER-ADMIN-BILLED clinics; it does not change what Razorpay charges
+a self-serve card clinic (still `plan_amount × branches` via
+`syncSubscriptionQuantity`, with `billing_monthly` a reporting mirror).
+`tests/planLimits.unit.test.js`.
 
 **Signup review queue + rejection.** `SIGNUP_REVIEW_NOTIFY_PHONE` (comma list)
 gets a WhatsApp ping when a clinic lands in `pending_review`

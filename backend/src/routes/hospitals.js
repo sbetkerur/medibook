@@ -6,6 +6,7 @@ const { validate, schemas } = require('../middleware/validate');
 const { validateUUID, handleError, UUID_RE } = require('../utils/errors');
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
+const { effectiveBranchLimit } = require('../utils/planLimits');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -19,6 +20,8 @@ router.get('/hospitals', async (req, res) => {
 });
 
 router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (req, res) => {
+  // Hoisted for the quota 403 wording in the catch; set from the fresh read below.
+  let negotiatedBranchCap = false;
   try {
     const { name, address, city, phone } = req.body;
     const s = req.tenant.schema_name;
@@ -29,8 +32,18 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
     // check in doctors.js: NULL means no cap, and the count runs inside the
     // transaction under an advisory lock so two concurrent creates can't both
     // read "0 branches" and both insert.
-    const planR = await query(`SELECT max_branches FROM plans WHERE id=$1`, [req.tenant.plan]);
-    const planLimit = planR.rows[0]?.max_branches ?? null;
+    // Plan limit + any negotiated per-tenant override, in ONE fresh read (not
+    // off the 5s-cached req.tenant) — see utils/planLimits.js.
+    const limR = await query(
+      `SELECT p.max_branches, t.max_branches_override
+         FROM tenants t LEFT JOIN plans p ON p.id = t.plan
+        WHERE t.id = $1`,
+      [req.tenant.id]);
+    const limRow = limR.rows[0] || {};
+    negotiatedBranchCap = limRow.max_branches_override != null;
+    const planLimit = effectiveBranchLimit(
+      { max_branches_override: limRow.max_branches_override },
+      { max_branches: limRow.max_branches });
 
     const lockId = crypto.createHash('sha256').update(`branch_quota:${s}`).digest().readInt32BE(0);
 
@@ -66,11 +79,13 @@ router.post('/hospitals', adminOnly, validate(schemas.createHospital), async (re
     if (err.isQuota) {
       const [cur, max] = err.message.replace('QUOTA:', '').split('/');
       return res.status(403).json({
-        error: `Branch limit reached for your plan (${cur}/${max}). Upgrade to Professional to add more branches.`,
+        error: negotiatedBranchCap
+          ? `Branch limit reached (${cur}/${max}). This is the limit agreed for your clinic — contact MediBook to raise it.`
+          : `Branch limit reached for your plan (${cur}/${max}). Upgrade to Professional to add more branches.`,
         quota_exceeded: true,
         code: 'PLAN_LIMIT',
         resource: 'branches',
-        upgrade_to: 'professional',
+        upgrade_to: negotiatedBranchCap ? null : 'professional',
       });
     }
     handleError(res, err);

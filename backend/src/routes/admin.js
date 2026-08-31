@@ -21,6 +21,7 @@ const { VALID_ROLES, UUID_RE, validateUUID, handleError } = require('../utils/er
 const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const { IST_TODAY_SQL, IST_MONTH_START_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const { CURRENT_TERMS_VERSION, hasAcceptedCurrentTerms } = require('../config/terms');
+const { effectiveDoctorLimit } = require('../utils/planLimits');
 const logger = require('../utils/logger');
 const QRCode = require('qrcode');
 const { generateEntryCode, buildEntryLink, buildEntryMessage,
@@ -562,7 +563,10 @@ router.get('/settings', async (req, res) => {
       },
       plan_limits: planData ? {
         name: planData.name,
-        max_doctors: planData.max_doctors,
+        // Negotiated tenants.max_doctors_override wins over the tier's list
+        // limit (utils/planLimits.js) — the Settings usage bar must show the
+        // cap the clinic can actually reach.
+        max_doctors: effectiveDoctorLimit(t, planData),
         max_appointments_per_month: planData.max_appointments_per_month,
         price_monthly: planData.price_monthly,
       } : null,

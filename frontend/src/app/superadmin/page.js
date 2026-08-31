@@ -47,11 +47,14 @@ export default function SuperAdminPage() {
   const [cityValue, setCityValue] = useState('');
   const [savingCity, setSavingCity] = useState(false);
 
-  // Negotiated price. tenants.billing_monthly overrides the tier's list price
-  // for this clinic only; blank / null reverts to list. Same focused-affordance
-  // pattern as the city modal — there is no general tenant-edit form.
+  // Negotiated deal for one clinic: tenants.billing_monthly (price),
+  // max_doctors_override + max_branches_override (caps). Each overrides the
+  // tier default; blank / null reverts to it. Same focused-affordance pattern
+  // as the city modal — there is no general tenant-edit form.
   const [billingModal, setBillingModal] = useState(null); // { tenant }
-  const [billingValue, setBillingValue] = useState('');
+  const [billingValue, setBillingValue] = useState('');       // ₹/mo — blank = list price
+  const [docCapValue, setDocCapValue] = useState('');         // dentist cap — blank = plan limit
+  const [branchCapValue, setBranchCapValue] = useState('');   // branch cap — blank = plan limit
   const [savingBilling, setSavingBilling] = useState(false);
 
   // Tenant health state
@@ -243,31 +246,42 @@ export default function SuperAdminPage() {
   function openBillingModal(tenant) {
     setBillingModal({ tenant });
     setBillingValue(tenant.billing_monthly == null ? '' : String(tenant.billing_monthly));
+    setDocCapValue(tenant.max_doctors_override == null ? '' : String(tenant.max_doctors_override));
+    setBranchCapValue(tenant.max_branches_override == null ? '' : String(tenant.max_branches_override));
+  }
+
+  // blank -> null (revert to plan/list); otherwise a validated whole number.
+  function intOrNull(raw, { max, label }) {
+    const v = String(raw).trim();
+    if (v === '') return { ok: true, value: null };
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 0 || (max != null && n > max)) {
+      return { ok: false, error: `${label}: whole number 0${max != null ? `–${max}` : ' or more'}, or blank` };
+    }
+    return { ok: true, value: n };
   }
 
   async function saveBilling() {
     if (!billingModal) return;
-    const v = billingValue.trim();
-    let payload;
-    if (v === '') {
-      payload = null; // explicit null tells the API to revert to list price
-    } else {
-      const n = Number(v);
-      if (!Number.isInteger(n) || n < 0) {
-        toast.error('Enter a whole rupee amount (0 or more), or blank to use list price');
-        return;
-      }
-      payload = n;
+    const price = intOrNull(billingValue, { label: 'Monthly amount' });
+    const docs  = intOrNull(docCapValue, { max: 999, label: 'Dentist limit' });
+    const brs   = intOrNull(branchCapValue, { max: 999, label: 'Branch limit' });
+    for (const r of [price, docs, brs]) {
+      if (!r.ok) { toast.error(r.error); return; }
     }
     setSavingBilling(true);
     try {
-      await api.patch(`/superadmin/tenants/${billingModal.tenant.id}`, { billing_monthly: payload });
-      toast.success(payload === null ? 'Reverted to list price' : 'Negotiated price saved');
+      await api.patch(`/superadmin/tenants/${billingModal.tenant.id}`, {
+        billing_monthly: price.value,
+        max_doctors_override: docs.value,
+        max_branches_override: brs.value,
+      });
+      toast.success('Negotiated deal saved');
       setBillingModal(null);
-      setBillingValue('');
+      setBillingValue(''); setDocCapValue(''); setBranchCapValue('');
       fetchAll();
     } catch (err) {
-      toast.error(err.response?.data?.error || 'Failed to save price');
+      toast.error(err.response?.data?.error || 'Failed to save');
     } finally { setSavingBilling(false); }
   }
 
@@ -573,7 +587,7 @@ export default function SuperAdminPage() {
                       </button>
                       <button onClick={() => openBillingModal(t)}
                         className="inline-flex items-center justify-center min-h-[40px] px-3 py-2 text-xs text-gray-600 border border-gray-200 bg-gray-50 rounded-lg hover:bg-gray-100 transition">
-                        💰 Price
+                        💰 Deal
                       </button>
                     </div>
                   </div>
@@ -679,7 +693,7 @@ export default function SuperAdminPage() {
                             </button>
                             <button onClick={() => openBillingModal(t)}
                               className="text-xs px-2 py-1 rounded text-gray-600 hover:bg-gray-100 transition whitespace-nowrap">
-                              💰 Price
+                              💰 Deal
                             </button>
                           </div>
                         </td>
@@ -1273,30 +1287,37 @@ export default function SuperAdminPage() {
         </div>
       )}
 
-      {/* ── NEGOTIATED PRICE MODAL ── */}
+      {/* ── NEGOTIATED DEAL MODAL (price + dentist/branch caps) ── */}
       {billingModal && (() => {
-        const list = Number(billingModal.tenant.plan_price_monthly) || 0;
+        const t = billingModal.tenant;
+        const list = Number(t.plan_price_monthly) || 0;
         const raw = billingValue.trim();
         const n = raw === '' ? null : Number(raw);
-        const valid = n === null || (Number.isInteger(n) && n >= 0);
-        const disc = valid && n !== null && list > 0 ? Math.round((1 - n / list) * 100) : null;
+        const priceValid = n === null || (Number.isInteger(n) && n >= 0);
+        const disc = priceValid && n !== null && list > 0 ? Math.round((1 - n / list) * 100) : null;
+        const capValid = (v) => { const s = String(v).trim(); if (s === '') return true; const x = Number(s); return Number.isInteger(x) && x >= 0 && x <= 999; };
+        const docValid = capValid(docCapValue);
+        const brValid = capValid(branchCapValue);
+        const allValid = priceValid && docValid && brValid;
         return (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3 sm:p-4">
             <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-md shadow-2xl max-h-[85vh] supports-[max-height:85dvh]:max-h-[85dvh] overflow-y-auto">
               <div className="flex items-center justify-between gap-2 mb-4">
-                <h2 className="text-base font-semibold text-gray-900">Negotiated price</h2>
+                <h2 className="text-base font-semibold text-gray-900">Negotiated deal</h2>
                 <button onClick={() => setBillingModal(null)} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">✕</button>
               </div>
               <p className="text-sm text-gray-600 mb-4 break-words">
-                The agreed monthly amount for <strong>{billingModal.tenant.name}</strong> ({billingModal.tenant.plan_name || billingModal.tenant.plan}).
-                It overrides the tier&apos;s list price everywhere revenue is counted. Leave blank to bill at list price.
+                Per-clinic overrides for <strong>{t.name}</strong> ({t.plan_name || t.plan}).
+                Each blank field falls back to the tier default. Applies to super-admin-billed clinics;
+                the amount does not change what Razorpay charges a self-serve card clinic.
               </p>
               <div className="rounded-lg bg-gray-50 border border-gray-200 px-3 py-2 mb-4 text-xs text-gray-600">
                 Tier list price: <strong className="text-gray-900">{list > 0 ? `₹${list.toLocaleString('en-IN')}/mo` : '—'}</strong> ex-GST
-                {billingModal.tenant.billing_monthly != null && (
-                  <> · currently set to <strong className="text-gray-900">₹{Number(billingModal.tenant.billing_monthly).toLocaleString('en-IN')}</strong></>
+                {t.billing_monthly != null && (
+                  <> · billed <strong className="text-gray-900">₹{Number(t.billing_monthly).toLocaleString('en-IN')}</strong></>
                 )}
               </div>
+
               <div className="mb-2">
                 <label className="block text-xs font-medium text-gray-700 mb-1">Monthly amount (₹, ex-GST) — blank = list price</label>
                 <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500">
@@ -1307,18 +1328,39 @@ export default function SuperAdminPage() {
                     className="flex-1 px-3 py-2 text-sm focus:outline-none" />
                 </div>
               </div>
-              <p className="text-xs text-gray-500 mb-5 min-h-[16px]">
-                {!valid ? <span className="text-red-500">Enter a whole rupee amount (0 or more), or blank.</span>
-                  : n === null ? 'Will bill at the tier list price.'
+              <p className="text-xs text-gray-500 mb-4 min-h-[16px]">
+                {!priceValid ? <span className="text-red-500">Enter a whole rupee amount (0 or more), or blank.</span>
+                  : n === null ? 'Bills at the tier list price.'
                   : <>₹{n.toLocaleString('en-IN')} ex-GST · ₹{Math.round(n * 1.18).toLocaleString('en-IN')} incl. 18% GST
                       {disc !== null && disc !== 0 ? ` · ${disc > 0 ? disc + '% discount' : Math.abs(disc) + '% above list'}` : ''}</>}
               </p>
+
+              <div className="grid grid-cols-2 gap-3 mb-1">
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Dentist limit</label>
+                  <input type="number" min="0" max="999" step="1" value={docCapValue}
+                    onChange={e => setDocCapValue(e.target.value)}
+                    placeholder="plan default"
+                    className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${docValid ? 'border-gray-300' : 'border-red-400'}`} />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Branch limit</label>
+                  <input type="number" min="0" max="999" step="1" value={branchCapValue}
+                    onChange={e => setBranchCapValue(e.target.value)}
+                    placeholder="plan default"
+                    className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${brValid ? 'border-gray-300' : 'border-red-400'}`} />
+                </div>
+              </div>
+              <p className="text-xs text-gray-500 mb-5 min-h-[16px]">
+                Blank = the {t.plan_name || t.plan} tier limit. A number caps this clinic there regardless of tier; 0 freezes it.
+              </p>
+
               <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
                 <button onClick={() => setBillingModal(null)}
                   className="flex-1 px-4 py-2.5 sm:py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
                   Cancel
                 </button>
-                <button onClick={saveBilling} disabled={savingBilling || !valid}
+                <button onClick={saveBilling} disabled={savingBilling || !allValid}
                   className="flex-1 px-4 py-2.5 sm:py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition">
                   {savingBilling ? 'Saving...' : 'Save'}
                 </button>

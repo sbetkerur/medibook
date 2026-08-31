@@ -414,6 +414,20 @@ async function migrate() {
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS billing_monthly INTEGER;
     `);
 
+    // tenants.max_doctors_override / max_branches_override — the NEGOTIATED
+    //   dentist / branch ceiling for this one clinic, overriding the tier's
+    //   plans.max_doctors / plans.max_branches. Same story as billing_monthly:
+    //   a deal may settle on "4 dentists, 1 branch, ₹1,200/mo" — a middle
+    //   ground the two published tiers don't express. NULL means "use the
+    //   plan's limit"; 0 is honoured literally (a frozen pilot). Resolved in
+    //   ONE place — utils/planLimits.js — which every quota check and usage
+    //   readout goes through. Set by the super admin via
+    //   PATCH /superadmin/tenants/:id, alongside billing_monthly.
+    await client.query(`
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_doctors_override  INTEGER;
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_branches_override INTEGER;
+    `);
+
     // ── TENANTS: city ─────────────────────────────────────────
     // A real column, not settings->>'city': the bot looks clinics up by city at
     // first contact, and a JSONB key can't be indexed case-insensitively without

@@ -8,6 +8,7 @@ const { adminOnly, writeAuditLog } = require('./adminHelpers');
 const logger = require('../utils/logger');
 const { IST_TODAY_SQL } = require('../utils/dateTz');
 const { normalizeDepartmentIds, syncDoctorDepartments, MAX_DEPARTMENTS_PER_DOCTOR } = require('../utils/doctorDepartments');
+const { effectiveDoctorLimit } = require('../utils/planLimits');
 
 // Auth + tenant middleware applied once in index.js for /api/admin and /api/v1/admin
 
@@ -124,6 +125,10 @@ router.get('/doctors', async (req, res) => {
 });
 
 router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, res) => {
+  // Hoisted so the quota 403 in the catch below can word itself correctly. Read
+  // FRESH from the DB (see below), not off the 5s-cached req.tenant, so a
+  // super admin who just raised the cap isn't fought by a stale value.
+  let negotiatedDoctorCap = false;
   try {
     const { name, specialization, qualification, department_id, department_ids, hospital_id, consultation_fee, slot_duration_minutes } = req.body;
     const s = req.tenant.schema_name;
@@ -147,8 +152,19 @@ router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, r
     // receipts and analytics read.
     const primaryDeptId = deptIds[0] || null;
 
-    const planR = await query(`SELECT max_doctors FROM plans WHERE id=$1`, [req.tenant.plan]);
-    const planLimit = planR.rows[0]?.max_doctors ?? null;
+    // Plan limit + any negotiated per-tenant override, in ONE fresh read (same
+    // round trip as the old plans-only query). effectiveDoctorLimit applies the
+    // override on top of plans.max_doctors — see utils/planLimits.js.
+    const limR = await query(
+      `SELECT p.max_doctors, t.max_doctors_override
+         FROM tenants t LEFT JOIN plans p ON p.id = t.plan
+        WHERE t.id = $1`,
+      [req.tenant.id]);
+    const limRow = limR.rows[0] || {};
+    negotiatedDoctorCap = limRow.max_doctors_override != null;
+    const planLimit = effectiveDoctorLimit(
+      { max_doctors_override: limRow.max_doctors_override },
+      { max_doctors: limRow.max_doctors });
 
     // Atomic quota check + insert: advisory lock serialises concurrent doctor creation per tenant
     // pg_advisory_xact_lock is released automatically at transaction end
@@ -188,12 +204,16 @@ router.post('/doctors', adminOnly, validate(schemas.createDoctor), async (req, r
   } catch (err) {
     if (err.isQuota) {
       const [cur, max] = err.message.replace('QUOTA:', '').split('/');
+      // With a negotiated cap, "upgrade to Professional" is the wrong advice —
+      // the limit was agreed with MediBook, so raising it is a conversation.
       return res.status(403).json({
-        error: `Doctor limit reached for your plan (${cur}/${max}). Upgrade to Professional to add more dentists.`,
+        error: negotiatedDoctorCap
+          ? `Dentist limit reached (${cur}/${max}). This is the limit agreed for your clinic — contact MediBook to raise it.`
+          : `Doctor limit reached for your plan (${cur}/${max}). Upgrade to Professional to add more dentists.`,
         quota_exceeded: true,
         code: 'PLAN_LIMIT',
         resource: 'doctors',
-        upgrade_to: 'professional',
+        upgrade_to: negotiatedDoctorCap ? null : 'professional',
       });
     }
     handleError(res, err, 'POST /doctors');
@@ -892,10 +912,18 @@ router.post('/doctors/import', adminOnly, async (req, res) => {
     let skipped = 0;
     const errors = [];
 
-    // Enforce the plan's doctor quota — same limit POST /doctors applies.
-    // Without this check, CSV import silently bypassed max_doctors.
-    const planR = await query(`SELECT max_doctors FROM plans WHERE id=$1`, [req.tenant.plan]);
-    const planLimit = planR.rows[0]?.max_doctors ?? null;
+    // Enforce the doctor quota — same limit (and same fresh plan + per-tenant
+    // override read) POST /doctors applies. Without this check, CSV import
+    // silently bypassed the cap.
+    const limR = await query(
+      `SELECT p.max_doctors, t.max_doctors_override
+         FROM tenants t LEFT JOIN plans p ON p.id = t.plan
+        WHERE t.id = $1`,
+      [req.tenant.id]);
+    const limRow = limR.rows[0] || {};
+    const planLimit = effectiveDoctorLimit(
+      { max_doctors_override: limRow.max_doctors_override },
+      { max_doctors: limRow.max_doctors });
     let activeCount = 0;
     if (planLimit !== null) {
       const countR = await tenantQuery(s, `SELECT COUNT(*) FROM doctors WHERE is_active=true`);
