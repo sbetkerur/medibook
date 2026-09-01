@@ -212,7 +212,9 @@ const schemas = {
       }).messages({ 'any.invalid': 'appointment_date must be today or in the future' }),
     appointment_time: Joi.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/).required()
       .messages({ 'string.pattern.base': 'appointment_time must be HH:MM (valid 24-hour time, e.g. 09:30)' }),
-    visit_type: Joi.string().valid('in_person', 'video').optional().default('in_person'),
+    // Dental is always in-person. 'video' was a half-built option (a dropdown
+    // and one word in an admin alert, no link/join flow) and has been removed.
+    visit_type: Joi.string().valid('in_person').optional().default('in_person'),
     notes: Joi.string().max(500).optional().allow('', null),
   }),
 

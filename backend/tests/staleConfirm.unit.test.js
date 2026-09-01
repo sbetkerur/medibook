@@ -402,6 +402,22 @@ async function run() {
     assert.strictEqual(db.appointments[0].rescheduled, false, texts());
   });
 
+  // The button label is "✅ Yes, Reschedule" and people retype what they see.
+  // An anchored /^(yes|reschedule|confirm)$/ used to answer "yes, reschedule"
+  // with "Kept as it was" — the opposite of what they picked. Mirrors the fix
+  // already covered for handleCancelConfirm above.
+  await test('typing the button label ("yes, reschedule") reschedules, not "kept as it was"', async () => {
+    for (const reply of ['yes, reschedule', 'reschedule it', 'Yes Reschedule']) {
+      restoreAppointment();
+      const ctx = await rescheduleCtx();
+      reset();
+      await handleRescheduleConfirm(PHONE, SCHEMA, tenant, send, ctx, reply.toLowerCase());
+      assert.strictEqual(db.appointments[0].rescheduled, true,
+        `"${reply}" did not reschedule: ${texts()}`);
+      assert(!/nothing has changed|Kept as it was/i.test(texts()), `"${reply}" → ${texts()}`);
+    }
+  });
+
   // "We'll remind you the day before" is a promise the 24h cron has to keep —
   // it never fires for a same-day appointment (see jobs/reminders.js), so the
   // line must not appear when the reschedule lands on today.

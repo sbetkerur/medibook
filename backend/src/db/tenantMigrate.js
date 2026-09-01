@@ -1118,7 +1118,11 @@ async function runTenantMigrations(schemaName) {
     // New analytics indexes
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_appt_patient_created ON appointments(patient_id, created_at);
-      CREATE INDEX IF NOT EXISTS idx_appt_followup_sent ON appointments(appointment_date, follow_up_sent) WHERE status='confirmed' AND follow_up_sent=false;
+      -- idx_appt_followup_sent is gone: the post-visit follow-up cron it served
+      -- was removed, nothing sets follow_up_sent=true any more, so the partial
+      -- index covered EVERY confirmed future appointment and just grew with the
+      -- table. Dropped idempotently.
+      DROP INDEX IF EXISTS idx_appt_followup_sent;
     `);
 
     // Feature 21: Link users to doctor records
@@ -1205,6 +1209,77 @@ async function runTenantMigrations(schemaName) {
       await client.query(
         `INSERT INTO seed_markers (key) VALUES ('backfill_schedule_hospital_v1') ON CONFLICT DO NOTHING`
       ).catch(() => {});
+    }
+
+    // v2: the same backfill, re-run once. v1's UPDATE is `.catch(warn)` — a
+    // transient failure on the boot it first ran left that tenant's legacy NULL
+    // sessions unresolved forever (the v1 marker was still written). Re-running
+    // it makes doctor_schedules.hospital_id complete enough that slot generation
+    // and GET /doctors/:id/schedule no longer need the doctor_hospitals fallback
+    // join at all — which is what lets those read paths be simplified.
+    const backfilledV2 = await client.query(
+      `SELECT 1 FROM seed_markers WHERE key='backfill_schedule_hospital_v2'`
+    ).catch(() => ({ rows: [] }));
+    if (!backfilledV2.rows.length) {
+      // Track whether the two UPDATEs actually succeeded. runTenantMigrations
+      // is autocommit and each statement is `.catch(warn)`, so a transient
+      // failure (e.g. a lock_timeout during a rolling deploy) must NOT let the
+      // marker be written — v1 did exactly that and this is v1's retry. With the
+      // doctor_hospitals read-fallback now gone, an unresolved legacy NULL
+      // session would silently generate slots at the doctor's primary branch
+      // instead of the visiting one.
+      let v2Ok = true;
+      await client.query(`
+        UPDATE doctor_schedules s
+           SET hospital_id = dh.hospital_id
+          FROM doctor_hospitals dh
+         WHERE dh.doctor_id = s.doctor_id
+           AND dh.day_of_week = s.day_of_week
+           AND s.hospital_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM doctor_schedules s2
+              WHERE s2.doctor_id = s.doctor_id
+                AND s2.day_of_week = s.day_of_week
+                AND s2.hospital_id IS NOT NULL
+           )
+           AND (SELECT COUNT(*) FROM doctor_hospitals dh2
+                 WHERE dh2.doctor_id = s.doctor_id
+                   AND dh2.day_of_week = s.day_of_week) = 1;
+      `).catch(err => { v2Ok = false; logger.warn('doctor_schedules branch backfill v2 skipped — will retry next boot', { schema: schemaName, error: err.message }); });
+      // Anything still NULL is, by CLAUDE.md's definition, "the doctor's PRIMARY
+      // branch" — make that explicit so the read paths can drop the COALESCE.
+      // (A 2+-dh-row ambiguous legacy weekday stays NULL and still resolves to
+      // primary at read time, unchanged; it is logged below for a human.)
+      await client.query(`
+        UPDATE doctor_schedules s
+           SET hospital_id = d.hospital_id
+          FROM doctors d
+         WHERE d.id = s.doctor_id AND s.hospital_id IS NULL AND d.hospital_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM doctor_hospitals dh2
+              WHERE dh2.doctor_id = s.doctor_id AND dh2.day_of_week = s.day_of_week
+           );
+      `).catch(err => { v2Ok = false; logger.warn('doctor_schedules primary-branch fill skipped — will retry next boot', { schema: schemaName, error: err.message }); });
+      const ambiguous = await client.query(`
+        SELECT DISTINCT s.doctor_id, s.day_of_week
+          FROM doctor_schedules s
+         WHERE s.hospital_id IS NULL
+           AND (SELECT COUNT(*) FROM doctor_hospitals dh2
+                 WHERE dh2.doctor_id = s.doctor_id AND dh2.day_of_week = s.day_of_week) > 1
+      `).catch(() => ({ rows: [] }));
+      if (ambiguous.rows.length) {
+        logger.warn('doctor_schedules: legacy weekdays with 2+ branch rows left NULL (resolve in the schedule UI)', {
+          schema: schemaName, count: ambiguous.rows.length,
+        });
+      }
+      // Only claim it done if both UPDATEs ran. A failed boot leaves the marker
+      // absent so the whole block re-runs next time (all statements are
+      // idempotent — the UPDATEs only touch rows still NULL).
+      if (v2Ok) {
+        await client.query(
+          `INSERT INTO seed_markers (key) VALUES ('backfill_schedule_hospital_v2') ON CONFLICT DO NOTHING`
+        ).catch(() => {});
+      }
     }
     // Swap UNIQUE(doctor,day) for UNIQUE(doctor,day,start_time). Dropped by
     // lookup rather than by its default name: a schema created before the

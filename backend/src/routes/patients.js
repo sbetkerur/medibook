@@ -86,7 +86,11 @@ router.get('/patients/:id/appointments', validateUUID(), async (req, res) => {
 // ── UPDATE PATIENT ────────────────────────────────────────────
 router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
   try {
-    const { name, email, gender, date_of_birth, referral_source } = req.body;
+    // `email` is deliberately NOT accepted here any more. Nothing in the product
+    // reads patients.email (WhatsApp is the only channel — see CLAUDE.md), so
+    // collecting it via manual entry was PII held for no purpose. The column and
+    // the CSV-import path (a clinic bringing its own records) are left as-is.
+    const { name, gender, date_of_birth, referral_source } = req.body;
     const s = req.tenant.schema_name;
     // Which board, referral or listing actually brought them in. Set at the
     // DESK, not asked in the bot: the booking flow is long enough already, and
@@ -103,21 +107,21 @@ router.patch('/patients/:id', adminOnly, validateUUID(), async (req, res) => {
     }
     const r = await tenantQuery(s, `
       UPDATE patients SET
-        name=COALESCE($1,name), email=COALESCE($2,email),
-        gender=COALESCE($3,gender), date_of_birth=COALESCE($4::date,date_of_birth),
-        referral_source=COALESCE($6,referral_source), updated_at=NOW()
-      WHERE id=$5 AND deleted_at IS NULL
+        name=COALESCE($1,name),
+        gender=COALESCE($2,gender), date_of_birth=COALESCE($3::date,date_of_birth),
+        referral_source=COALESCE($5,referral_source), updated_at=NOW()
+      WHERE id=$4 AND deleted_at IS NULL
       RETURNING id, name, phone, email, gender, date_of_birth, visit_count, referral_source
-    `, [name || null, email || null, gender || null, date_of_birth || null, req.params.id,
+    `, [name || null, gender ? gender.toLowerCase() : null, date_of_birth || null, req.params.id,
         referral_source || null]);
     // deleted_at IS NULL, matching every other read in this file. Without it a
-    // PATCH wrote name/email/DOB/gender straight back onto a row that DELETE
+    // PATCH wrote name/DOB/gender straight back onto a row that DELETE
     // /patients/:id had anonymised — the record stayed hidden from the list
     // (deleted_at is still set) while carrying live PII again, which is the
     // worst of both states for something the clinic has attested is erased.
     if (!r.rows[0]) return res.status(404).json({ error: 'Patient not found' });
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_PATIENT', 'patient', req.params.id,
-      null, { name, email, gender }, req.ip);
+      null, { name, gender }, req.ip);
     res.json({ patient: r.rows[0] });
   } catch (err) { handleError(res, err); }
 });

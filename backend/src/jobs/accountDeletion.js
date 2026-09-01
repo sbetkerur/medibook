@@ -38,6 +38,26 @@ async function purgeOne(t) {
     return;
   }
 
+  // A final snapshot must EXIST, not just be "scheduled earlier in the night".
+  // The 03:30 IST slot only lands after the 02:30 backup if that backup ran and
+  // succeeded — a failed pg_dump (disk full, binary missing, DB blip) on the
+  // same night a deletion comes due would otherwise drop the schema with the
+  // newest usable backup 24h+ stale, and the recovery file the docstring
+  // promises absent. Skip loudly and retry next run; deletions are not urgent.
+  try {
+    const bk = await query(
+      `SELECT 1 FROM backup_log
+        WHERE status='success' AND completed_at > NOW() - INTERVAL '26 hours'
+        LIMIT 1`);
+    if (!bk.rows.length) {
+      logger.error('account_deletion: no successful backup in the last 26h — deferring purge', { slug: row.slug });
+      return;
+    }
+  } catch (e) {
+    logger.error('account_deletion: backup check failed — deferring purge', { slug: row.slug, error: e.message });
+    return;
+  }
+
   // Cancel the Razorpay subscription outright — no reason to keep it around.
   try {
     const bR = await query(`SELECT razorpay_subscription_id FROM tenant_billing WHERE tenant_id=$1`, [row.id]);

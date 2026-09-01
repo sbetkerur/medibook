@@ -234,21 +234,24 @@ async function retryStuckProvisioning() {
     JOIN tenants t ON t.id = ps.tenant_id
     WHERE t.status = 'pending_payment'
   `)).rows;
-  const TRIAL_DAYS = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '14', 10) || 14);
   for (const pending of rows) {
     try {
       const { provisionSelfServeTenant } = require('../services/signupProvision');
       const { tenant } = await provisionSelfServeTenant(pending);
-      // The card-free trial row + consumed flag are normally written by the
-      // /signup/confirm route. If the client abandoned after the schema build
-      // failed, this cron is the only thing that ever finishes the job — so it
-      // has to start the trial too, or the clinic goes live billed by nobody.
+      // provisionSelfServeTenant leaves the tenant at 'pending_review' — it
+      // still needs POST /superadmin/tenants/:id/approve, which builds the
+      // schema and STARTS THE TRIAL CLOCK at approval time. Seed a placeholder
+      // billing row so the tenant is trackable, but with trial_end NULL: a
+      // 'pending_review' clinic cannot log in or send, so counting trial days it
+      // can't use would just shorten the real trial. /approve's ON CONFLICT DO
+      // UPDATE stamps trial_end when it runs (it only writes it while still
+      // 'trialing' with no subscription, so this stays a placeholder until then).
       await query(`
         INSERT INTO tenant_billing
           (tenant_id, provider, plan_id, razorpay_customer_id, subscription_status, trial_end, updated_at)
-        VALUES ($1,'razorpay',$2,$3,'trialing', NOW() + make_interval(days => $4::int), NOW())
+        VALUES ($1,'razorpay',$2,$3,'trialing', NULL, NOW())
         ON CONFLICT (tenant_id) DO NOTHING
-      `, [tenant.id, tenant.plan, pending.razorpay_customer_id, TRIAL_DAYS]).catch(() => {});
+      `, [tenant.id, tenant.plan, pending.razorpay_customer_id]).catch(() => {});
       await query(
         `UPDATE pending_signups SET consumed_at=COALESCE(consumed_at, NOW()), tenant_id=$1 WHERE token=$2`,
         [tenant.id, pending.token]
@@ -256,6 +259,40 @@ async function retryStuckProvisioning() {
       logger.info('billing_dunning: stuck provisioning recovered', { slug: tenant.slug });
     } catch (e) {
       logger.error('billing_dunning: provisioning retry still failing', { slug: pending.slug, error: e.message });
+    }
+  }
+}
+
+/**
+ * Re-send the go-live message to any self-serve owner whose approval
+ * notification never landed (owner_notified_at still NULL after activation).
+ * Without this, a Meta blip at the moment of approval strands the owner on a
+ * "we'll message you" screen with no way in and only a log line to show for it.
+ * Bounded to the first week after activation — past that an operator should be
+ * handing over the link by hand.
+ */
+async function retryOwnerNotifications() {
+  const rows = (await query(`
+    SELECT t.id, t.name, t.slug,
+           (SELECT ps.phone FROM pending_signups ps
+             WHERE ps.tenant_id = t.id AND ps.phone IS NOT NULL
+             ORDER BY ps.created_at DESC LIMIT 1) AS phone
+      FROM tenants t
+     WHERE t.status = 'active'
+       AND t.signup_source = 'self_serve'
+       AND t.owner_notified_at IS NULL
+       AND t.activated_at > NOW() - INTERVAL '7 days'
+  `)).rows.filter(r => r.phone);
+  for (const t of rows) {
+    try {
+      const res = await require('../services/signupNotify')
+        .notifyOwnerApproved(t.phone, { clinicName: t.name, slug: t.slug });
+      if (res?.ok) {
+        await query(`UPDATE tenants SET owner_notified_at=NOW() WHERE id=$1`, [t.id]);
+        logger.info('billing_dunning: owner go-live message delivered on retry', { slug: t.slug });
+      }
+    } catch (e) {
+      logger.warn('billing_dunning: owner notification retry failed', { slug: t.slug, error: e.message });
     }
   }
 }
@@ -269,6 +306,7 @@ async function runOnce() {
   await backfillMissingInvoices();
   await suspendExpiredGrace();
   await retryStuckProvisioning();
+  await retryOwnerNotifications();
 }
 
 function startBillingDunningCron() {

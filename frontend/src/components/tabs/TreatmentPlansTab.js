@@ -55,6 +55,9 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal, pendingBoo
 
 
   const [detail, setDetail] = useState(null);        // { treatment_plan, visits }
+  // openDetail fires 3 parallel requests; opening plan B while A is in flight
+  // must not let A's slower response paint over B's modal.
+  const detailReqRef = useRef(0);
   const [showCreate, setShowCreate] = useState(false);
   // "Book visit N" used to fire straight off with no picker — it took whatever
   // slot was first free at least N days out and told the operator afterwards.
@@ -144,6 +147,7 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal, pendingBoo
     // consent record — the one record whose whole value is being an accurate
     // account of what was explained to whom.
     setConsentNote('');
+    const reqId = ++detailReqRef.current;
     try {
       // One round-trip each for money and lab work rather than folding them
       // into the plan payload: the list view needs neither, and it keeps the
@@ -153,10 +157,16 @@ export default function TreatmentPlansTab({ isAdmin, setConfirmModal, pendingBoo
         api.get(`/admin/treatment-plans/${id}/payments`).catch(() => ({ data: {} })),
         api.get('/admin/lab-works').catch(() => ({ data: {} })),
       ]);
+      // Another plan was opened while these were in flight — its requests own
+      // the modal now. Applying this plan's payments/lab-work/consent record
+      // under the other patient's title is a clinical + money data mismatch.
+      if (reqId !== detailReqRef.current) return;
       setDetail(planRes.data);
       setPayments(payRes.data.payments || []);
       setLabWorks((labRes.data.lab_works || []).filter(lw => lw.treatment_plan_id === id));
-    } catch (err) { toast.error(err.response?.data?.error || 'Failed to load plan'); }
+    } catch (err) {
+      if (reqId === detailReqRef.current) toast.error(err.response?.data?.error || 'Failed to load plan');
+    }
   }
 
   async function savePayment(e) {

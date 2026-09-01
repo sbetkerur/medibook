@@ -268,7 +268,7 @@ async function seedDemoData() {
       { k: 'ananyaK', doc: VIKRAM, dep: RCT, d: 10, st: 'completed', pay: 'paid', m: 'upi' },
       { k: 'ravi', doc: ANANYA, dep: GD, d: 11, st: 'cancelled', reason: 'Schedule clash' },
       { k: 'nikhil', doc: ANANYA, dep: GD, d: 13, st: 'completed', pay: 'paid', m: 'cash' },
-      { k: 'pooja', doc: NISHA, dep: ORTHO, d: 15, st: 'completed', pay: 'paid', m: 'upi', video: true },
+      { k: 'pooja', doc: NISHA, dep: ORTHO, d: 15, st: 'completed', pay: 'paid', m: 'upi' },
       { k: 'lakshmi', doc: ANANYA, dep: GD, d: 18, st: 'completed', pay: 'paid', m: 'cash' },
       { k: 'aditya', doc: ANANYA, dep: GD, d: 18, st: 'completed', pay: 'paid', m: 'cash', fee: 200 }, // child, negotiated fee
       { k: 'rohan', doc: VIKRAM, dep: RCT, d: 22, st: 'completed', pay: 'paid', m: 'card' },
@@ -284,7 +284,7 @@ async function seedDemoData() {
       await mkAppt({
         patientId: pid[x.k], doctorId: x.doc, deptId: x.dep, date: dstr(-x.d), time: '11:00',
         status: x.st, daysAgo: x.d, paymentStatus: x.pay, paymentMethod: x.m,
-        effectiveFee: x.fee ?? 0, visitType: x.video ? 'video' : 'in_person',
+        effectiveFee: x.fee ?? 0, visitType: 'in_person',
         cancelReason: x.reason, feedbackRequestSent: x.st === 'completed',
       });
     }

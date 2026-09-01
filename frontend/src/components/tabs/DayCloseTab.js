@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { format, parseISO, subDays, addDays } from 'date-fns';
 import api, { downloadFile } from '@/lib/api';
 import toast from 'react-hot-toast';
@@ -47,16 +47,23 @@ export default function DayCloseTab() {
     } finally { setPdfBusy(false); }
   };
 
+  // Guards against out-of-order responses when ← / → are tapped quickly: if
+  // fetchDay(N-1) resolves after fetchDay(N-2), the money totals would be shown
+  // against the wrong date. Only the latest request may write state.
+  const dayReqRef = useRef(0);
   const fetchDay = useCallback(async (d) => {
+    const reqId = ++dayReqRef.current;
     setLoading(true);
     try {
       const { data } = await api.get(`/admin/day-close?date=${encodeURIComponent(d)}`);
+      if (reqId !== dayReqRef.current) return;
       setData(data);
       setFailed(false);
     } catch (err) {
+      if (reqId !== dayReqRef.current) return;
       setFailed(true);
       toast.error(err.response?.data?.error || 'Could not load the day');
-    } finally { setLoading(false); }
+    } finally { if (reqId === dayReqRef.current) setLoading(false); }
   }, []);
 
   useEffect(() => { fetchDay(date); }, [date, fetchDay]);

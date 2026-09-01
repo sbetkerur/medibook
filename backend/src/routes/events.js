@@ -167,7 +167,16 @@ router.get('/events', (req, res) => {
       consecutiveCheckFailures = 0;
       const row = r.rows[0] || {};
       if (row.revoked) return endStream('token_revoked');
-      if (row.tenant_status !== 'active') return endStream('tenant_inactive');
+      // Match middleware/auth.js DASHBOARD_ALLOWED_STATUSES, not a bare
+      // 'active' check: 'past_due' is a legitimate dashboard state (lapsed
+      // trial / failed card, owner needs in to fix payment). Killing the
+      // stream for it made every past_due clinic's live feed flap every 30s —
+      // the client sees {type:'token_expired'}, closes the EventSource and
+      // waits for a token refresh that is up to an hour away, then reconnects
+      // (tenantMiddleware lets past_due through) only to be killed again.
+      if (row.tenant_status !== 'active' && row.tenant_status !== 'past_due') {
+        return endStream('tenant_inactive');
+      }
     } catch (err) {
       // Table absent on a first deploy is not a revocation — same carve-out as
       // middleware/auth.js's blacklist check.

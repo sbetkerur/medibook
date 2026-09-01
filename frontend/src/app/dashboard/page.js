@@ -225,7 +225,7 @@ export default function Dashboard() {
   // Patient edit state
   const [showPatientEditModal, setShowPatientEditModal] = useState(false);
   const [editingPatient, setEditingPatient] = useState(null);
-  const [patientEditForm, setPatientEditForm] = useState({ name: '', email: '', gender: '', date_of_birth: '' });
+  const [patientEditForm, setPatientEditForm] = useState({ name: '', gender: '', date_of_birth: '' });
   const [patientEditSaving, setPatientEditSaving] = useState(false);
   const [importingPatients, setImportingPatients] = useState(false);
   const [importingDoctors, setImportingDoctors] = useState(false);
@@ -249,7 +249,7 @@ export default function Dashboard() {
   const openWalkinModal = useCallback(() => {
     if (!hospitals.length) fetchHospitals();
     if (!doctors.length) fetchDoctors();
-    setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '', effective_fee: '' });
+    setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', notes: '', effective_fee: '' });
     setWalkinSlots([]);
     setShowWalkinModal(true);
   }, [hospitals.length, doctors.length]);
@@ -261,7 +261,7 @@ export default function Dashboard() {
   const [walkinSlotsLoading, setWalkinSlotsLoading] = useState(false);
   const [walkinForm, setWalkinForm] = useState({
     patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '',
-    appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '',
+    appointment_date: '', appointment_time: '', slot_id: '', notes: '',
     // Blank = use the doctor's own consultation_fee (appointments.effective_fee,
     // see CLAUDE.md — the fee is quotable, not fixed, and varies per patient).
     effective_fee: '',
@@ -750,7 +750,6 @@ export default function Dashboard() {
     setEditingPatient(patient);
     setPatientEditForm({
       name: patient.name || '',
-      email: patient.email || '',
       gender: patient.gender || '',
       date_of_birth: patient.date_of_birth ? patient.date_of_birth.slice(0, 10) : '',
       referral_source: patient.referral_source || '',
@@ -765,7 +764,6 @@ export default function Dashboard() {
     try {
       const payload = {};
       if (patientEditForm.name) payload.name = patientEditForm.name;
-      if (patientEditForm.email) payload.email = patientEditForm.email;
       if (patientEditForm.gender) payload.gender = patientEditForm.gender;
       if (patientEditForm.date_of_birth) payload.date_of_birth = patientEditForm.date_of_birth;
       if (patientEditForm.referral_source) payload.referral_source = patientEditForm.referral_source;
@@ -1170,12 +1168,17 @@ export default function Dashboard() {
     try {
       // '__manual__' is a UI sentinel for the unreserved path — never send it as
       // a slot id, or the backend's slot lookup fails with a confusing error.
-      const { slot_id, ...rest } = walkinForm;
+      const { slot_id, effective_fee, ...rest } = walkinForm;
+      // The fee input is a text field: '' means "no override, use the doctor's
+      // rate". Send a number or omit it — never the raw string (mirrors
+      // saveApptFee, which does the same conversion deliberately).
+      const payload = { ...rest };
+      if (effective_fee !== '') payload.effective_fee = Number(effective_fee);
       await api.post('/admin/appointments',
-        slot_id && slot_id !== '__manual__' ? { ...rest, slot_id } : rest);
+        slot_id && slot_id !== '__manual__' ? { ...payload, slot_id } : payload);
       toast.success('Walk-in appointment created!');
       setShowWalkinModal(false);
-      setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', visit_type: 'in_person', notes: '', effective_fee: '' });
+      setWalkinForm({ patient_phone: '', patient_name: '', gender: '', doctor_id: '', hospital_id: '', appointment_date: '', appointment_time: '', slot_id: '', notes: '', effective_fee: '' });
       setWalkinSlots([]);
       fetchAppointments();
       fetchStats();
@@ -2549,14 +2552,6 @@ export default function Dashboard() {
             </p>
           )}
           <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Visit Type</label>
-            <select value={walkinForm.visit_type} onChange={e => setWalkinForm(f => ({ ...f, visit_type: e.target.value }))}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              <option value="in_person">In-Person</option>
-              <option value="video">Video Consultation</option>
-            </select>
-          </div>
-          <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">
               Consultation Fee <span className="text-gray-400 font-normal">(optional)</span>
             </label>
@@ -2599,12 +2594,6 @@ export default function Dashboard() {
             <input value={patientEditForm.name} onChange={e => setPatientEditForm(f => ({ ...f, name: e.target.value }))}
               placeholder="Patient full name"
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-700 mb-1">Email</label>
-            <input type="email" value={patientEditForm.email} onChange={e => setPatientEditForm(f => ({ ...f, email: e.target.value }))}
-              placeholder="patient@email.com"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>

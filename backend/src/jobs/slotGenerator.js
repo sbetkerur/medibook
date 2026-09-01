@@ -254,47 +254,24 @@ async function updateNoShowScores(schema) {
 }
 
 async function generateSlotsForTenant(schema) {
-  // One row per SESSION. `doctor_schedules.hospital_id` is now the branch for
-  // that session, so a dentist can have two rows for one weekday — 10–1 here,
-  // 5–9 there. It is only joined back to doctor_hospitals for rows written
-  // before that column existed and never backfilled; NULL in both still means
-  // the doctor's primary branch, which is every non-visiting doctor.
+  // One row per SESSION. `doctor_schedules.hospital_id` is the branch for that
+  // session — a dentist can have two rows for one weekday (10–1 here, 5–9
+  // there). NULL means "the doctor's primary branch" (every non-visiting
+  // doctor), resolved by `|| doc.hospital_id` when the session is grouped below.
   //
-  // The join is scoped to the SESSION's branch, not just the weekday. Matching
-  // on weekday alone is what produced the original bug: two branch rows for one
-  // day multiplied every schedule row in two.
+  // The old `LEFT JOIN doctor_hospitals` fallback for pre-column legacy rows is
+  // gone: tenantMigrate.js's backfill_schedule_hospital_v2 resolves every such
+  // NULL into doctor_schedules.hospital_id (or leaves it NULL = primary), so the
+  // join could only ever match nothing. doctor_hospitals remains a mirror for
+  // the /locations API, written alongside doctor_schedules by POST
+  // /doctors/:id/schedule.
   const doctors = await tenantQuery(schema,
     `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
             s.day_of_week, s.start_time, s.end_time,
             s.lunch_start_time, s.lunch_end_time, s.week_of_month,
-            COALESCE(s.hospital_id, dh.hospital_id) AS day_hospital_id
+            s.hospital_id AS day_hospital_id
      FROM doctors d
      JOIN doctor_schedules s ON s.doctor_id=d.id
-     LEFT JOIN doctor_hospitals dh
-       ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
-      AND s.hospital_id IS NULL
-      -- Scoped exactly as tenantMigrate.js's backfill scopes itself, and for
-      -- the same reason. /doctors/:id/schedule writes a doctor_hospitals row
-      -- ONLY for a session that names a branch, so a Tuesday split of
-      -- "10-13 at branch B / 17-21 at primary (NULL)" has exactly ONE dh row.
-      -- Joining on weekday alone hands that row to the 17:00 session too, and
-      -- the whole evening at the main clinic is generated, told to patients,
-      -- and holiday-checked as branch B. If any session that weekday names a
-      -- branch, the NULLs beside it mean "primary branch" and must be left
-      -- alone; only a genuinely legacy weekday (every session NULL) may fall
-      -- back to dh.
-      AND NOT EXISTS (
-        SELECT 1 FROM doctor_schedules s2
-         WHERE s2.doctor_id = d.id AND s2.day_of_week = s.day_of_week
-           AND s2.hospital_id IS NOT NULL
-      )
-      -- And only when that weekday is unambiguous. Two dh rows for one day
-      -- would otherwise MULTIPLY the session into two planned rows, and
-      -- flushSlots' ON CONFLICT DO NOTHING would keep whichever branch landed
-      -- first — the original two-branch bug, re-entering through the join
-      -- instead of the schedule table.
-      AND (SELECT COUNT(*) FROM doctor_hospitals dh2
-            WHERE dh2.doctor_id = d.id AND dh2.day_of_week = s.day_of_week) = 1
      WHERE d.is_active=true AND s.is_working=true`);
 
   if (!doctors.rows.length) return 0;
@@ -615,7 +592,12 @@ function startSlotGeneratorCron() {
 
 /**
  * Regenerate slots for a single doctor after their schedule changes.
- * Deletes future available/blocked slots then re-creates them from the new schedule.
+ *
+ * This function ONLY inserts (flushPlanned → `ON CONFLICT DO NOTHING`). It does
+ * NOT delete — the caller must clear future unreferenced slots first
+ * (routes/doctors.js runs deleteFutureUnreferencedSlots before every call).
+ * Skipping that pre-delete leaves a stale grid beside the new one, which the
+ * nightly sweep cannot repair for the same ON CONFLICT reason.
  *
  * When dryRun=true, returns a preview object instead of inserting rows.
  *
@@ -626,48 +608,19 @@ function startSlotGeneratorCron() {
  * @returns {number|object} - Slot count, or dry-run preview object
  *
  * The doctor query below must stay IDENTICAL in shape to the tenant sweep's
- * (see the note above it): a schedule row IS a session, so the session's own
- * hospital_id wins and doctor_hospitals is consulted only when it is NULL.
- * This path had drifted — it read dh.hospital_id alone and joined on weekday
- * only, so a dentist with two branches on one weekday matched both dh rows,
- * multiplied 2 sessions into 4, and stamped the evening session with the
- * MORNING branch (flushSlots' ON CONFLICT DO NOTHING keeps whichever lands
- * first). It runs on every schedule save, and the nightly sweep could not
- * repair it for the same ON CONFLICT reason.
+ * (see the note above it): a schedule row IS a session, and the session's own
+ * hospital_id is the branch (NULL = the doctor's primary, resolved by
+ * `sched.hospitalId || doc.hospital_id` when the rows are grouped below). The
+ * old doctor_hospitals fallback join is gone from both — see the tenant sweep.
  */
 async function generateSlotsForDoctor(schema, doctorId, dryRun = false, days = CRON_LOOKAHEAD_DAYS) {
   const docR = await tenantQuery(schema,
     `SELECT d.id, d.hospital_id, d.slot_duration_minutes,
             s.day_of_week, s.start_time, s.end_time,
             s.lunch_start_time, s.lunch_end_time, s.week_of_month,
-            COALESCE(s.hospital_id, dh.hospital_id) AS day_hospital_id
+            s.hospital_id AS day_hospital_id
      FROM doctors d
      JOIN doctor_schedules s ON s.doctor_id=d.id
-     LEFT JOIN doctor_hospitals dh
-       ON dh.doctor_id = d.id AND dh.day_of_week = s.day_of_week
-      AND s.hospital_id IS NULL
-      -- Scoped exactly as tenantMigrate.js's backfill scopes itself, and for
-      -- the same reason. /doctors/:id/schedule writes a doctor_hospitals row
-      -- ONLY for a session that names a branch, so a Tuesday split of
-      -- "10-13 at branch B / 17-21 at primary (NULL)" has exactly ONE dh row.
-      -- Joining on weekday alone hands that row to the 17:00 session too, and
-      -- the whole evening at the main clinic is generated, told to patients,
-      -- and holiday-checked as branch B. If any session that weekday names a
-      -- branch, the NULLs beside it mean "primary branch" and must be left
-      -- alone; only a genuinely legacy weekday (every session NULL) may fall
-      -- back to dh.
-      AND NOT EXISTS (
-        SELECT 1 FROM doctor_schedules s2
-         WHERE s2.doctor_id = d.id AND s2.day_of_week = s.day_of_week
-           AND s2.hospital_id IS NOT NULL
-      )
-      -- And only when that weekday is unambiguous. Two dh rows for one day
-      -- would otherwise MULTIPLY the session into two planned rows, and
-      -- flushSlots' ON CONFLICT DO NOTHING would keep whichever branch landed
-      -- first — the original two-branch bug, re-entering through the join
-      -- instead of the schedule table.
-      AND (SELECT COUNT(*) FROM doctor_hospitals dh2
-            WHERE dh2.doctor_id = d.id AND dh2.day_of_week = s.day_of_week) = 1
      WHERE d.id=$1 AND d.is_active=true AND s.is_working=true`,
     [doctorId]);
 

@@ -75,6 +75,11 @@ router.post('/recalls', async (req, res) => {
       DO UPDATE SET due_date=EXCLUDED.due_date, hospital_id=EXCLUDED.hospital_id, updated_at=NOW()
       RETURNING *
     `, [patient_id, due_date, (reason || 'Routine check-up').slice(0, 255), hospital_id || null]);
+    // Audited like DELETE: a recall drives clinic-initiated outreach to a
+    // patient, so who scheduled or moved it is worth a trail. Not adminOnly —
+    // scheduling recare is front-desk work, same tier as booking a walk-in.
+    await writeAuditLog(s, req.user.id, req.user.role, 'UPSERT_RECALL', 'recall', r.rows[0].id,
+      null, { patient_id, due_date, reason: reason || 'Routine check-up' }, req.ip);
     res.json({ recall: r.rows[0] });
   } catch (err) { handleError(res, err, 'POST /recalls'); }
 });
@@ -99,6 +104,8 @@ router.patch('/recalls/:id', validateUUID(), async (req, res) => {
     const r = await tenantQuery(s,
       `UPDATE patient_recalls SET ${updates.join(',')} WHERE id=$${params.length} RETURNING *`, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Recall not found' });
+    await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_RECALL', 'recall', req.params.id,
+      null, { status, due_date, reason }, req.ip);
     res.json({ recall: r.rows[0] });
   } catch (err) {
     // Partial unique index on (patient_id, reason) WHERE status='due' — moving

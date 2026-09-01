@@ -40,7 +40,14 @@ export default function OnboardingPage() {
   // ── boot ────────────────────────────────────────────────
   useEffect(() => {
     if (!localStorage.getItem('token')) { router.push('/login'); return; }
-    try { setUser(JSON.parse(localStorage.getItem('user') || '{}')); } catch {}
+    let u = {};
+    try { u = JSON.parse(localStorage.getItem('user') || '{}'); } catch {}
+    setUser(u);
+    // The wizard's every step is an adminOnly mutation (hospital / doctor /
+    // schedule). A dentist-role user who reaches here by URL would watch each
+    // step 403. CLAUDE.md: "Gated to role === 'admin'". Read-only demo tenants
+    // also have nothing to do here (everything is pre-seeded).
+    if (u.role !== 'admin' || u.read_only) { router.push('/dashboard'); return; }
     (async () => {
       try {
         const [{ data: s }, { data: h }, { data: d }] = await Promise.all([

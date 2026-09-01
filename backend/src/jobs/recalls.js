@@ -78,6 +78,12 @@ async function sendRecalls() {
       // Six months have passed already; another week costs nothing.
       if (!await canSendDiscretionary(tenant.schema_name, rec.phone, budgetFor(tenant))) continue;
 
+      // Set when the trial send cap swallowed the message (returns
+      // { via: 'suppressed_cap' } rather than throwing). The patient saw
+      // nothing, so neither the pending-reply hint nor the attempt counter
+      // below should move — the cap lifts on its own when the tenant starts
+      // paying or the 24h window rolls, and the recall should still be waiting.
+      let suppressedByCap = false;
       try {
         const firstName = rec.patient_name ? rec.patient_name.split(' ')[0] : 'there';
         // In step with the `patient_recall_checkup` template.
@@ -87,7 +93,7 @@ async function sendRecalls() {
           `A check-up takes about twenty minutes and catches small problems while they're still small — and still cheap to fix.\n\n` +
           `Reply *Menu* to find a time that suits you.`;
 
-        await sendPatientMessage(tenant.schema_name, rec.phone, {
+        const sendResult = await sendPatientMessage(tenant.schema_name, rec.phone, {
           template: RECALL_TEMPLATE,
           components: [{
             type: 'body',
@@ -99,6 +105,11 @@ async function sendRecalls() {
           buttonPayloads: ['Menu'],
           text,
         });
+        if (sendResult?.via === 'suppressed_cap') {
+          suppressedByCap = true;
+          logger.info('Recall suppressed by trial send cap — will retry', { recall: rec.id });
+          continue;
+        }
         // Clinic-initiated question, so the answer has to be able to find its
         // way back. Without this, a patient who has since searched for another
         // clinic on the shared number opened THAT clinic's menu and, if they
@@ -118,10 +129,14 @@ async function sendRecalls() {
       } finally {
         // Counted on the ATTEMPT — same reasoning as the treatment nudge. A send
         // that can never succeed (no approved template, patient blocked us) must
-        // exhaust its budget rather than retry every day forever.
-        await tenantQuery(tenant.schema_name,
-          `UPDATE patient_recalls SET last_sent_at=NOW(), send_count=send_count+1, updated_at=NOW() WHERE id=$1`,
-          [rec.id]).catch(e => logger.warn('Recall bookkeeping failed', { recall: rec.id, error: e.message }));
+        // exhaust its budget rather than retry every day forever. A cap
+        // suppression is NOT such an attempt: nothing reached Meta and the state
+        // is transient, so it must not consume one of the three sends.
+        if (!suppressedByCap) {
+          await tenantQuery(tenant.schema_name,
+            `UPDATE patient_recalls SET last_sent_at=NOW(), send_count=send_count+1, updated_at=NOW() WHERE id=$1`,
+            [rec.id]).catch(e => logger.warn('Recall bookkeeping failed', { recall: rec.id, error: e.message }));
+        }
       }
     }
   });

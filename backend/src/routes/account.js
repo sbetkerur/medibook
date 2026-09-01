@@ -108,8 +108,18 @@ router.post('/account/deletion/cancel', adminOnly, async (req, res) => {
     await query(`
       UPDATE tenants SET deletion_requested_at=NULL, deletion_scheduled_for=NULL, deletion_requested_by=NULL WHERE id=$1
     `, [req.tenant.id]);
-    // Leave cancel_at_period_end as the admin may still want to cancel billing
-    // independently — undo that explicitly from the billing panel.
+    // Undo the subscription wind-down THIS flow started — but only that one.
+    // POST /account/deletion sets cancel_at_period_end with
+    // cancel_reason=COALESCE(cancel_reason,'account_deletion'), so a row still
+    // reading 'account_deletion' was flagged BY the deletion request and must
+    // be un-flagged with it; anything else is an independent billing cancel the
+    // admin made separately and we leave it alone. Without this, cancelling a
+    // deletion left the subscription winding down silently → past_due → suspended.
+    await query(`
+      UPDATE tenant_billing
+         SET cancel_at_period_end=false, cancel_reason=NULL, updated_at=NOW()
+       WHERE tenant_id=$1 AND cancel_at_period_end=true AND cancel_reason='account_deletion'
+    `, [req.tenant.id]).catch(() => {});
     await query(`
       INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, ip_address)
       VALUES ($1,$2,'ACCOUNT_DELETION_CANCELLED','tenant',$3,$4)

@@ -1,5 +1,5 @@
 const cron = require('node-cron');
-const { query } = require('../db');
+const { query, tenantQuery } = require('../db');
 const botEngine = require('../services/botEngine');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
@@ -65,6 +65,39 @@ async function retryFailedWebhooks() {
     );
     if (!claimed.rows[0]) continue; // claimed by someone else
 
+    // Duplicate-reply guard. A previous attempt can have delivered its reply and
+    // then died before writing status='succeeded' — the 15-minute orphan sweep
+    // above flips such a row back to 'pending' and we would replay it, so the
+    // patient gets the same bot answer twice (the BullMQ path dedups inbound by
+    // wa_message_id and completeBooking is idempotent, but a generic reply is
+    // neither). If this is a retry (a prior attempt ran) and the clinic sent
+    // this phone ANY outbound message after that attempt started, treat the
+    // reply as already delivered: mark succeeded, don't replay.
+    if (row.attempts > 0 && row.last_attempt_at && row.schema_name) {
+      try {
+        // Narrow window: a crashed attempt delivers its reply within seconds of
+        // last_attempt_at. Bounding the look at +2min keeps an UNRELATED later
+        // cron send (a reminder, a feedback request hours after) from being
+        // misread as "this reply already went out" and dropping the owed reply.
+        const already = await tenantQuery(row.schema_name,
+          `SELECT 1 FROM wa_messages
+            WHERE phone=$1 AND direction='out'
+              AND created_at > $2 AND created_at <= $2::timestamptz + INTERVAL '2 minutes'
+            LIMIT 1`,
+          [row.phone, row.last_attempt_at]);
+        if (already.rows.length) {
+          await query(`UPDATE failed_webhooks SET status='succeeded' WHERE id=$1`, [row.id]);
+          logger.info('Webhook retry skipped — a reply already went out after the last attempt', {
+            phone: maskPhone(row.phone), id: row.id,
+          });
+          continue;
+        }
+      } catch (e) {
+        // Best-effort — fall through to a normal replay if the check fails.
+        logger.warn('Duplicate-reply guard check failed — replaying', { id: row.id, error: e.message });
+      }
+    }
+
     try {
       const tenant = {
         id: row.tenant_id,
@@ -86,12 +119,21 @@ async function retryFailedWebhooks() {
         });
       }
       try {
-        await botEngine.handle({
-          phone: row.phone,
-          text: row.text || '',
-          buttonId: row.button_id || null,
-          tenant,
-        });
+        if (row.message_type === 'audio') {
+          // Queued by the webhook's voice branch: `text` holds the Meta media id.
+          await botEngine.handleVoiceMessage({ phone: row.phone, audioId: row.text, tenant });
+        } else {
+          await botEngine.handle({
+            phone: row.phone,
+            text: row.text || '',
+            buttonId: row.button_id || null,
+            tenant,
+            // A first-contact (QR-scan) message that failed its first attempt
+            // must still replay onto the clinic-name arrival banner, not the
+            // plain menu.
+            welcome: row.welcome === true,
+          });
+        }
       } finally {
         if (acquired) await releasePhoneLock(lockKey, token);
       }

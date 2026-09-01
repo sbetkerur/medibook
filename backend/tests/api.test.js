@@ -298,20 +298,27 @@ async function run() {
     console.log('     error:' + r.body.error);
   });
 
-  // Self-service password recovery is GONE, deliberately: it delivered a link by
-  // email, and WhatsApp is the only channel out. These two tests asserted the
-  // endpoints still answered, so they failed the moment the feature was removed —
-  // and nothing ran them, so nobody noticed. Now they assert the removal, which
-  // is the property that actually matters: the only reset paths are the audited
-  // admin one (POST /admin/staff/:id/reset-password) and the super-admin one.
-  await test('POST /auth/forgot-password is gone (email recovery was removed)', async () => {
-    const r = await req('POST', '/api/auth/forgot-password', { email: 'nonexistent@example.com' });
-    if (r.status !== 404) throw new Error('expected 404 got ' + r.status);
+  // Self-service password recovery is back — but on the ONLY channel this
+  // product has: a WhatsApp code to the staff member's notify_phone (services/
+  // otp.js), never email. The invariant worth pinning is that it is
+  // ENUMERATION-SAFE: an unknown account gets the same generic 200 as a known
+  // one (routes/auth.js GENERIC_FORGOT_REPLY), and a bad reset code is a clean
+  // 400, never a 500 or a leak. (These tests used to assert the endpoints were
+  // gone — true only of the removed EMAIL versions; they drifted when the
+  // WhatsApp-OTP versions were added in the self-serve signup work.)
+  await test('POST /auth/forgot-password answers generically for an unknown account (no enumeration)', async () => {
+    const r = await req('POST', '/api/auth/forgot-password', { tenant_slug: 'demo-clinic', email: 'nonexistent@example.com' });
+    if (r.status !== 200) throw new Error('expected 200 got ' + r.status);
+    if (!/reset code has been sent/i.test(r.body.message || '')) {
+      throw new Error('expected the generic "if that account has a number…" reply, got: ' + JSON.stringify(r.body));
+    }
   });
 
-  await test('POST /auth/reset-password is gone too', async () => {
-    const r = await req('POST', '/api/auth/reset-password', { token: 'x', password: 'Whatever@123' });
-    if (r.status !== 404) throw new Error('expected 404 got ' + r.status);
+  await test('POST /auth/reset-password rejects a bad code with a 400, not a 500', async () => {
+    const r = await req('POST', '/api/auth/reset-password', {
+      tenant_slug: 'demo-clinic', email: 'nonexistent@example.com', code: '000000', new_password: 'Whatever@12345',
+    });
+    if (r.status !== 400) throw new Error('expected 400 got ' + r.status);
   });
 
   console.log('\n─────────────────────────────────');

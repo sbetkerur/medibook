@@ -224,7 +224,11 @@ async function runBackup() {
 }
 
 function startBackupCron() {
-  const task = cron.schedule('0 21 * * *', async () => {
+  // 02:30 IST, stated explicitly like every other cron in the codebase rather
+  // than relying on the server happening to run TZ=UTC (which is only a startup
+  // WARNING, not enforced). This is the snapshot jobs/accountDeletion.js at
+  // 03:30 IST depends on existing, so the ordering must not hinge on process TZ.
+  const task = cron.schedule('30 2 * * *', async () => {
     await withCronLock('cron:backup', 3600, async () => {
       logger.info('Starting scheduled database backup...');
       try {
@@ -234,8 +238,8 @@ function startBackupCron() {
         logger.error('Backup cron failed', { error: err.message });
       }
     });
-  });
-  logger.info('Backup cron registered (daily at 2:30 AM IST)');
+  }, { timezone: 'Asia/Kolkata' });
+  logger.info('Backup cron registered (daily at 02:30 IST)');
   return task;
 }
 

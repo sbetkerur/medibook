@@ -177,12 +177,12 @@ function startBotWorker() {
       // retry-with-backoff and alerting instead of silently waiting in a
       // queue nobody actively drains.
       try {
-        const { phone, text, buttonId, tenantId } = job.data || {};
+        const { phone, text, buttonId, tenantId, welcome } = job.data || {};
         if (phone && tenantId) {
           await query(`
-            INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, error_message, next_retry_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '2 minutes')
-          `, [phone, tenantId, text || null, buttonId || null, 'text', err.message?.slice(0, 500)]);
+            INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, welcome, error_message, next_retry_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '2 minutes')
+          `, [phone, tenantId, text || null, buttonId || null, 'text', !!welcome, err.message?.slice(0, 500)]);
         }
       } catch (fwErr) {
         logger.error('Failed to record bot job failure in failed_webhooks', { error: fwErr.message });

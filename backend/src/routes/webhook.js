@@ -105,9 +105,9 @@ function processSyncWithRetryFallback({ phone, text, buttonId, tenant, messageTy
   botEngine.handle({ phone, text, buttonId, tenant, welcome }).catch(err => {
     logger.error(`Sync bot processing error (${context})`, { error: err.message });
     query(`
-      INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, error_message, next_retry_at)
-      VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '2 minutes')
-    `, [phone, tenant.id, text || null, buttonId || null, messageType || 'text', err.message?.slice(0, 500)])
+      INSERT INTO failed_webhooks (phone, tenant_id, text, button_id, message_type, welcome, error_message, next_retry_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '2 minutes')
+    `, [phone, tenant.id, text || null, buttonId || null, messageType || 'text', !!welcome, err.message?.slice(0, 500)])
       .catch(dbErr => logger.warn('Failed to save webhook to retry queue', { error: dbErr.message }));
   });
 }
@@ -1052,6 +1052,16 @@ async function processIncomingMessage(msg) {
         logger.info('Audio message → dispatching to Whisper transcription', { phone: maskPhone(phone), audioId, tenant: tenant.slug });
         botEngine.handleVoiceMessage({ phone, audioId, tenant }).catch(err => {
           logger.error('Voice transcription failed', { error: err.message });
+          // Meta already got its 200, so a lost voice note is lost for good
+          // unless we persist it. Text failures land in failed_webhooks via
+          // processSyncWithRetryFallback / the BullMQ dead-letter; the voice
+          // path had neither. Store the media id in `text` and tag the row
+          // 'audio' so retryWebhooks routes it back to handleVoiceMessage.
+          query(`
+            INSERT INTO failed_webhooks (phone, tenant_id, text, message_type, error_message, next_retry_at)
+            VALUES ($1, $2, $3, 'audio', $4, NOW() + INTERVAL '2 minutes')
+          `, [phone, tenant.id, audioId, err.message?.slice(0, 500)])
+            .catch(dbErr => logger.warn('Failed to queue voice message for retry', { error: dbErr.message }));
         });
         return;
       }

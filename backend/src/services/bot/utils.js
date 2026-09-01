@@ -28,12 +28,10 @@ const STATES = {
   CANCEL_REASON: 'cancel_reason',
   CANCEL_CONFIRM: 'cancel_confirm',
   SELECT_PATIENT: 'select_patient',
-  COLLECT_EMAIL: 'collect_email',
   COLLECT_CHIEF_COMPLAINT: 'collect_chief_complaint',
   CHECK_BOOKING_STATUS: 'check_booking_status',
   COLLECT_FEEDBACK_RATING: 'collect_feedback_rating',
   COLLECT_FEEDBACK_COMMENT: 'collect_feedback_comment',
-  RESUME_CONFIRM: 'resume_confirm',
   SELECT_TREATMENT_PLAN: 'select_treatment_plan',
 };
 

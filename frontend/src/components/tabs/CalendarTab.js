@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import api from '@/lib/api';
 import { todayIST } from '@/lib/dateIST';
 import { format, parseISO } from 'date-fns';
@@ -23,8 +23,15 @@ export default function CalendarTab() {
   const [calendarAppts, setCalendarAppts] = useState({});
   const [selectedCalDay, setSelectedCalDay] = useState(null);
   const [calDayAppts, setCalDayAppts] = useState([]);
+  // Each fetch is a slow multi-page loop and Prev/Next/Today can fire three in a
+  // row. Without this guard, whichever resolves LAST wins — so a fast October
+  // response landing after November paints October's badges under a November
+  // header, and clicking a day then reads an empty slot in the map. Only the
+  // newest invocation is allowed to call setCalendarAppts.
+  const calReqRef = useRef(0);
 
   const fetchCalendarAppts = useCallback(async (year, month) => {
+    const reqId = ++calReqRef.current;
     try {
       const startDate = `${year}-${String(month + 1).padStart(2, '0')}-01`;
       const endDate = `${year}-${String(month + 1).padStart(2, '0')}-${new Date(year, month + 1, 0).getDate()}`;
@@ -52,6 +59,8 @@ export default function CalendarTab() {
           break;
         }
       }
+      // A newer month was requested while this was in flight — drop this result.
+      if (reqId !== calReqRef.current) return;
       if (partial) {
         toast.error(all.length
           ? 'Some appointments could not be loaded — this month may be incomplete'
@@ -65,7 +74,9 @@ export default function CalendarTab() {
         byDate[d].push(a);
       });
       setCalendarAppts(byDate);
-    } catch { toast.error('Could not load this month’s appointments'); }
+    } catch {
+      if (reqId === calReqRef.current) toast.error('Could not load this month’s appointments');
+    }
   }, []);
 
   useEffect(() => {

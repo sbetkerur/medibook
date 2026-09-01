@@ -246,6 +246,8 @@ router.get('/doctors/:id', validateUUID(), async (req, res) => {
 });
 
 router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
+  // Hoisted so the quota 403 in catch can phrase itself for a negotiated cap.
+  let reNegotiatedCap = false;
   try {
     const { name, specialization, qualification, consultation_fee, slot_duration_minutes, is_active, department_id, department_ids, hospital_id, pricing_rules, is_visiting, online_bookable } = req.body;
     const s = req.tenant.schema_name;
@@ -301,6 +303,25 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
       }
     }
 
+    // Reactivating counts against the plan cap exactly as POST /doctors does —
+    // otherwise "deactivate A, create C to fill the seat, reactivate A" walks a
+    // clinic past its dentist limit. Fresh tenants⋈plans read (not the 5s-cached
+    // req.tenant) so a just-raised cap applies immediately; the count itself
+    // runs under the same advisory lock inside the transaction below.
+    const reactivating = isActive === true && oldR.rows[0].is_active === false;
+    let reDoctorLimit = null;
+    if (reactivating) {
+      const limR = await query(
+        `SELECT p.max_doctors, t.max_doctors_override
+           FROM tenants t LEFT JOIN plans p ON p.id = t.plan
+          WHERE t.id = $1`, [req.tenant.id]);
+      const limRow = limR.rows[0] || {};
+      reNegotiatedCap = limRow.max_doctors_override != null;
+      reDoctorLimit = effectiveDoctorLimit(
+        { max_doctors_override: limRow.max_doctors_override },
+        { max_doctors: limRow.max_doctors });
+    }
+
     // Two shapes, deliberately different:
     //   department_ids present → REPLACE the bookable set outright.
     //   department_id alone    → change the primary and ADD it to the set, leaving
@@ -329,6 +350,20 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
     // One transaction: the primary department and the bookable set must not be
     // able to disagree, which is what syncDoctorDepartments' invariant rests on.
     const r = await tenantTransaction(s, async (client) => {
+      // Enforce the dentist cap on reactivation under the same per-tenant
+      // advisory lock POST /doctors takes, so two concurrent reactivations (or a
+      // reactivation racing a create) can't both slip past the count.
+      if (reactivating && reDoctorLimit !== null) {
+        const crypto = require('crypto');
+        const lockId = crypto.createHash('sha256').update(`doctor_quota:${s}`).digest().readInt32BE(0);
+        await client.query(`SELECT pg_advisory_xact_lock($1)`, [lockId]);
+        const countR = await client.query(`SELECT COUNT(*)::int AS n FROM doctors WHERE is_active=true`);
+        if (countR.rows[0].n >= reDoctorLimit) {
+          const err = new Error(`QUOTA:${countR.rows[0].n}/${reDoctorLimit}`);
+          err.isQuota = true;
+          throw err;
+        }
+      }
       const updated = await client.query(`
         UPDATE doctors SET
           name=COALESCE($1,name), specialization=COALESCE($2,specialization),
@@ -361,7 +396,21 @@ router.patch('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
     await writeAuditLog(s, req.user.id, req.user.role, 'UPDATE_DOCTOR', 'doctor', req.params.id,
       oldR.rows[0], { name, is_active: isActive, department_ids: replacingSet ? deptIds : undefined }, req.ip);
     res.json({ doctor: r.rows[0] });
-  } catch (err) { handleError(res, err); }
+  } catch (err) {
+    if (err.isQuota) {
+      const [cur, max] = err.message.replace('QUOTA:', '').split('/');
+      return res.status(403).json({
+        error: reNegotiatedCap
+          ? `Dentist limit reached (${cur}/${max}). This is the limit agreed for your clinic — contact MediBook to raise it.`
+          : `Doctor limit reached for your plan (${cur}/${max}). Upgrade to Professional to reactivate more dentists.`,
+        quota_exceeded: true,
+        code: 'PLAN_LIMIT',
+        resource: 'doctors',
+        upgrade_to: reNegotiatedCap ? null : 'professional',
+      });
+    }
+    handleError(res, err);
+  }
 });
 
 router.delete('/doctors/:id', adminOnly, validateUUID(), async (req, res) => {
@@ -393,36 +442,13 @@ router.get('/doctors/:id/schedule', validateUUID(), async (req, res) => {
   try {
     // A schedule row IS a session: doctor + weekday + hours + branch. Ordered
     // by start_time within the day so two sessions come back morning-first.
-    //
-    // doctor_schedules.hospital_id is authoritative and is what slot generation
-    // reads; doctor_hospitals is consulted only to fill a legacy NULL. The
-    // `AND s.hospital_id IS NULL` on the join is load-bearing — without it a
-    // dentist with two branches on one weekday matched both dh rows and the
-    // query returned 2 sessions × 2 branches = 4 rows. The dashboard then
-    // rendered phantom sessions, and any client round-tripping this payload
-    // back into POST /doctors/:id/schedule tripped the overlap check and was
-    // told the dentist "cannot be in two places at once" — making a schedule
-    // that already existed impossible to save.
+    // doctor_schedules.hospital_id is authoritative (NULL = the doctor's primary
+    // branch); the old doctor_hospitals fallback join is gone now that
+    // tenantMigrate.js's backfill_schedule_hospital_v2 has resolved every legacy
+    // NULL it could have matched.
     const r = await tenantQuery(req.tenant.schema_name,
-      `SELECT s.*, COALESCE(s.hospital_id, dh.hospital_id) AS hospital_id
+      `SELECT s.*
        FROM doctor_schedules s
-       LEFT JOIN doctor_hospitals dh
-         ON dh.doctor_id = s.doctor_id AND dh.day_of_week = s.day_of_week
-        AND s.hospital_id IS NULL
-        -- Same scoping as the backfill in tenantMigrate.js and the two slot
-        -- generation queries. A deliberate NULL sitting BESIDE a session that
-        -- names a branch means "the primary branch", not "that branch": on a
-        -- Tuesday split 10-13 at B / 17-21 at primary there is exactly one dh
-        -- row, and handing it to the evening session made the dashboard show
-        -- both sessions at B. That is the reading a client then POSTs back,
-        -- which writes the wrong branch into doctor_schedules for good.
-        AND NOT EXISTS (
-          SELECT 1 FROM doctor_schedules s2
-           WHERE s2.doctor_id = s.doctor_id AND s2.day_of_week = s.day_of_week
-             AND s2.hospital_id IS NOT NULL
-        )
-        AND (SELECT COUNT(*) FROM doctor_hospitals dh2
-              WHERE dh2.doctor_id = s.doctor_id AND dh2.day_of_week = s.day_of_week) = 1
        WHERE s.doctor_id=$1 ORDER BY s.day_of_week, s.start_time`, [req.params.id]);
     res.json({ schedule: r.rows });
   } catch (err) { handleError(res, err); }

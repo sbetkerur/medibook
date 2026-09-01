@@ -385,6 +385,10 @@ async function migrate() {
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspension_reason TEXT;
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;
       ALTER TABLE tenants ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT false;
+      -- Set when the self-serve owner has been told (over WhatsApp) their clinic
+      -- is live. NULL after approval means the go-live message never landed —
+      -- jobs/billingDunning.js retries it, and the superadmin view can flag it.
+      ALTER TABLE tenants ADD COLUMN IF NOT EXISTS owner_notified_at TIMESTAMPTZ;
     `);
 
     // ── TENANTS: read-only flag ──────────────────────────────────
@@ -538,8 +542,13 @@ async function migrate() {
         last_attempt_at TIMESTAMPTZ,
         next_retry_at TIMESTAMPTZ DEFAULT NOW(),
         status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','processing','succeeded','failed')),
+        welcome BOOLEAN DEFAULT false,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      -- welcome carries the QR-arrival flag through a retry: a first-contact
+      -- message that fails its first attempt would otherwise be replayed onto
+      -- the plain main menu instead of the clinic-name arrival banner.
+      ALTER TABLE failed_webhooks ADD COLUMN IF NOT EXISTS welcome BOOLEAN DEFAULT false;
       CREATE INDEX IF NOT EXISTS idx_failed_webhooks_status ON failed_webhooks(status, next_retry_at);
       CREATE INDEX IF NOT EXISTS idx_failed_webhooks_tenant ON failed_webhooks(tenant_id);
     `);
@@ -840,16 +849,6 @@ async function migrate() {
       `);
     });
 
-    // Version 17: Drop obsolete per-tenant WA credential columns (now global via env vars)
-    await runMigration(client, 17, 'drop_per_tenant_wa_columns', async () => {
-      await client.query(`
-        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_phone_number_id;
-        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_access_token_enc;
-        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_webhook_verify_token;
-        DROP INDEX IF EXISTS idx_tenants_wa_phone;
-      `);
-    });
-
     // Version 16: Global bot sessions — shared WhatsApp number routing
     // Maps patient phone → tenant so all tenants can share a single WA number.
     await runMigration(client, 16, 'global_bot_sessions', async () => {
@@ -864,6 +863,16 @@ async function migrate() {
         );
         CREATE INDEX IF NOT EXISTS idx_global_sessions_phone ON global_bot_sessions(phone);
         CREATE INDEX IF NOT EXISTS idx_global_sessions_tenant ON global_bot_sessions(tenant_id);
+      `);
+    });
+
+    // Version 17: Drop obsolete per-tenant WA credential columns (now global via env vars)
+    await runMigration(client, 17, 'drop_per_tenant_wa_columns', async () => {
+      await client.query(`
+        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_phone_number_id;
+        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_access_token_enc;
+        ALTER TABLE tenants DROP COLUMN IF EXISTS wa_webhook_verify_token;
+        DROP INDEX IF EXISTS idx_tenants_wa_phone;
       `);
     });
 
@@ -1299,19 +1308,27 @@ async function migrate() {
         const { generateEntryCode } = require('../utils/entryCode');
         let filled = 0;
         for (const t of missing.rows) {
-          // Retry on the unique index rather than pre-checking: a SELECT-then-
-          // INSERT would race a concurrently booting instance, and the index is
-          // the only thing that can actually answer "is this code taken".
-          for (let attempt = 0; attempt < 5; attempt++) {
-            try {
-              await client.query(
-                `UPDATE tenants SET entry_code=$1 WHERE id=$2 AND entry_code IS NULL`,
-                [generateEntryCode(), t.id]);
-              filled++;
-              break;
-            } catch (e) {
-              if (e.code !== '23505') throw e; // not a collision — real failure
+          // Per-tenant try/catch: a deterministic failure on ONE tenant (say a
+          // check constraint added later) must not abandon the backfill for
+          // every other NULL-code tenant in the same boot. Codes are also minted
+          // at tenant creation, so a skipped one self-heals on the next restart.
+          try {
+            // Retry on the unique index rather than pre-checking: a SELECT-then-
+            // INSERT would race a concurrently booting instance, and the index is
+            // the only thing that can actually answer "is this code taken".
+            for (let attempt = 0; attempt < 5; attempt++) {
+              try {
+                await client.query(
+                  `UPDATE tenants SET entry_code=$1 WHERE id=$2 AND entry_code IS NULL`,
+                  [generateEntryCode(), t.id]);
+                filled++;
+                break;
+              } catch (e) {
+                if (e.code !== '23505') throw e; // not a collision — real failure
+              }
             }
+          } catch (perTenantErr) {
+            console.warn(`⚠️  Entry code backfill failed for tenant ${t.id}:`, perTenantErr.message);
           }
         }
         console.log(`✅ Entry codes backfilled for ${filled} tenant(s)`);

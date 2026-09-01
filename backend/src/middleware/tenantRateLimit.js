@@ -73,6 +73,30 @@ function localIncr(key) {
   return n;
 }
 
+// IP-abuse counters must NOT ride localIncr's per-minute wipe: escalation needs
+// ~10 exceedances inside a rolling 5-minute window, and a slow abuser only racks
+// up two or three per minute — so the whole-map clear reset them to ~0 every
+// minute and the block never fired without Redis. Kept in their own map with an
+// explicit 5-minute expiry per key, mirroring the Redis path's `incrWithTTL(key,
+// 5*60)`.
+const ABUSE_WINDOW_MS = 5 * 60 * 1000;
+const _localAbuse = new Map(); // key -> { count, expiresAt }
+function localAbuseIncr(key) {
+  const now = Date.now();
+  // Opportunistic prune so an instance that has seen many distinct IPs does not
+  // hold their counters forever.
+  if (_localAbuse.size > 1000) {
+    for (const [k, v] of _localAbuse) if (v.expiresAt <= now) _localAbuse.delete(k);
+  }
+  const cur = _localAbuse.get(key);
+  if (!cur || cur.expiresAt <= now) {
+    _localAbuse.set(key, { count: 1, expiresAt: now + ABUSE_WINDOW_MS });
+    return 1;
+  }
+  cur.count += 1;
+  return cur.count;
+}
+
 // Logged once per process, not once per request.
 let _warnedNoRedis = false;
 function noteRedisUnavailable(err, tenantId) {
@@ -188,7 +212,7 @@ module.exports = async function tenantRateLimit(req, res, next) {
           abuseCount = await incrWithTTL(abuseKey, 5 * 60);
         } catch (err) {
           if (err?.code !== 'REDIS_NOT_CONFIGURED') throw err;
-          abuseCount = localIncr(abuseKey);
+          abuseCount = localAbuseIncr(abuseKey);
         }
         if (abuseCount >= 10) {
           await recordIPAbuse(clientIp, `Rate limit exceeded ${abuseCount} times for tenant ${tenantId}`);
@@ -218,3 +242,9 @@ module.exports = async function tenantRateLimit(req, res, next) {
 
   next();
 };
+
+// Exposed for tests/rateLimitAbuse.unit.test.js — the no-Redis abuse counter
+// must survive the per-minute rollover that wipes the request-count map.
+module.exports._localAbuseIncr = localAbuseIncr;
+module.exports._resetLocalAbuse = () => _localAbuse.clear();
+module.exports._ABUSE_WINDOW_MS = ABUSE_WINDOW_MS;

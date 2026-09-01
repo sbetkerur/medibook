@@ -128,8 +128,13 @@ function encryptJSON(value) {
  * default it to `{}`.
  */
 function decryptJSON(raw) {
-  if (!raw || typeof raw !== 'object') return {};
-  if (!raw._enc) return raw;
+  // Only a genuinely absent value reads as "no history recorded". A JSONB
+  // scalar or array (hand-edited row, or some future writer's format we don't
+  // understand) is NOT an empty record — surface it as unreadable (null) so a
+  // dentist is told the read failed, never shown a falsely-reassuring {}.
+  if (raw == null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (!raw._enc) return raw; // legacy plaintext object — accepted, re-encrypted on next write
   const decrypted = decrypt(raw._enc);
   if (decrypted == null) return null;
   try {

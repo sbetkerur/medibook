@@ -177,7 +177,13 @@ export default function LeavesTab({ isAdmin, setConfirmModal }) {
               </div>
             ) : leavesDoctorList.map(d => (
               <button key={d.id}
-                onClick={() => { setLeavesDoctor(d); fetchLeaves(d.id); setAffectedAppointments([]); }}
+                /* Do NOT clear affectedAppointments on doctor switch: they are
+                   still unresolved on the backend (the patient shows up to an
+                   absent doctor), and this amber panel is the only surface for
+                   them. addLeave deliberately MERGES for the same reason. The
+                   Dismiss button and per-row Reschedule/Cancel (re-read by id)
+                   are how the desk clears them. */
+                onClick={() => { setLeavesDoctor(d); fetchLeaves(d.id); }}
                 className={`w-full text-left px-3 py-2.5 rounded-lg text-sm font-medium transition-colors border ${
                   leavesDoctor?.id === d.id
                     ? 'bg-blue-50 text-blue-700 border-blue-200'

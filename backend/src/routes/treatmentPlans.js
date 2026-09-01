@@ -784,8 +784,36 @@ router.patch('/treatment-plans/:id', validateUUID(), async (req, res) => {
     // overwritten between the check and this UPDATE.
     let guard = '';
     if (status) { params.push(cur.status); guard = ` AND status=$${params.length}`; }
-    const r = await tenantQuery(s,
-      `UPDATE treatment_plans SET ${updates.join(',')} WHERE id=$${idParam}${guard} RETURNING *`, params);
+
+    const shrinking = visits !== undefined && visits < cur.total_visits;
+    let r;
+    if (shrinking) {
+      // The `visits < cur.visitsBooked` check above read from an UNLOCKED
+      // snapshot; a visit booked concurrently (POST /:id/visits, which locks
+      // the plan FOR UPDATE) between that read and this write would leave
+      // total_visits below the number of live appointments — the exact
+      // canBookNext/outstanding-queue disagreement that check exists to stop.
+      // Re-validate under the plan row lock, same lock the visits route takes.
+      let liveCount = null;
+      r = await tenantTransaction(s, async (client) => {
+        await client.query(`SELECT id FROM treatment_plans WHERE id=$1 FOR UPDATE`, [req.params.id]);
+        const liveR = await client.query(
+          `SELECT COUNT(*)::int AS n FROM appointments WHERE treatment_plan_id=$1 AND status <> 'cancelled'`,
+          [req.params.id]);
+        liveCount = liveR.rows[0].n;
+        if (visits < liveCount) return { rows: [] }; // signal conflict without aborting the tx
+        return client.query(
+          `UPDATE treatment_plans SET ${updates.join(',')} WHERE id=$${idParam}${guard} RETURNING *`, params);
+      });
+      if (!r.rows[0] && liveCount !== null && visits < liveCount) {
+        return res.status(409).json({
+          error: `${liveCount} visit(s) are already booked — cancel one before lowering total_visits to ${visits}`,
+        });
+      }
+    } else {
+      r = await tenantQuery(s,
+        `UPDATE treatment_plans SET ${updates.join(',')} WHERE id=$${idParam}${guard} RETURNING *`, params);
+    }
     if (!r.rows[0]) {
       return res.status(409).json({ error: 'Treatment plan changed concurrently — reload and retry' });
     }
@@ -1109,6 +1137,19 @@ router.delete('/treatment-plans/:id', adminOnly, validateUUID(), async (req, res
     if (usedR.rows[0].n > 0) {
       return res.status(409).json({
         error: 'This treatment plan has appointments — set status to cancelled instead of deleting it',
+      });
+    }
+    // A plan can carry a pre-booking payment or a lab order with no appointment
+    // yet. Deleting it would either cascade recorded revenue away or throw a
+    // raw 23503 → generic 500. Same "cancel, don't remove" rule as appointments.
+    const attachedR = await tenantQuery(s, `
+      SELECT
+        (SELECT COUNT(*) FROM treatment_payments WHERE treatment_plan_id=$1)::int AS payments,
+        (SELECT COUNT(*) FROM lab_works        WHERE treatment_plan_id=$1)::int AS lab_works
+    `, [req.params.id]);
+    if (attachedR.rows[0].payments > 0 || attachedR.rows[0].lab_works > 0) {
+      return res.status(409).json({
+        error: 'This treatment plan has payments or lab work recorded against it — set status to cancelled instead of deleting it',
       });
     }
     const r = await tenantQuery(s, `DELETE FROM treatment_plans WHERE id=$1 RETURNING id`, [req.params.id]);

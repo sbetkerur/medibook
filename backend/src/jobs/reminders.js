@@ -19,6 +19,10 @@ const { maskPhone, notifyAdminWhatsApp, sendStaffWhatsApp } = require('../servic
 // Reminders are NEVER gated by this — a patient with an appointment tomorrow
 // wants that message. Only the discretionary sends below are.
 const { canSendDiscretionary, budgetFor } = require('../services/messageBudget');
+// triggerFeedback writes bot_sessions.state; without the per-phone lock it can
+// race a live inbound message and clobber the patient's current step (or be
+// clobbered). Same lock key the BullMQ worker and the webhook-retry cron use.
+const { acquirePhoneLock, releasePhoneLock } = require('../utils/phoneLock');
 
 // Allow timezone override via env var so multi-region deployments work without code changes
 const TIMEZONE = /^[A-Za-z0-9_/+-]+$/.test(process.env.TIMEZONE || '')
@@ -199,12 +203,11 @@ async function sendFeedbackRequests() {
   const { triggerFeedback } = require('../services/botEngine');
 
   await forEachActiveTenantParallel('sendFeedbackRequests', async (tenant) => {
-    // follow_up_sent is a leftover from the (now removed) post-appointment
-    // follow-up cron, which used to ask for feedback 1-2h after the visit.
-    // Kept here purely so an appointment that already got THAT ask, back when
-    // it existed, is not asked again by this one — nothing sets the flag true
-    // any more, so for every appointment created after its removal this
-    // condition is always satisfied.
+    // The old `AND a.follow_up_sent IS NOT TRUE` guard is gone: the
+    // post-appointment follow-up cron that set that flag was removed years ago,
+    // so the condition was always true and only obscured the query. The column
+    // stays in the schema (dropping per-tenant columns is the irreversible move)
+    // but nothing reads it now.
     const appts = await tenantQuery(tenant.schema_name, `
       SELECT a.id, a.status, a.appointment_date::text AS appointment_date,
              p.phone, p.id as patient_id, p.name as patient_name, d.name as doctor_name
@@ -235,7 +238,6 @@ async function sendFeedbackRequests() {
         -- visit completed today is asked about starting tomorrow's run, not today's.
         AND a.appointment_date BETWEEN ${IST_TODAY_SQL} - INTERVAL '30 days'
                                    AND ${IST_TODAY_SQL} - INTERVAL '1 day'
-        AND a.follow_up_sent IS NOT TRUE
         AND a.feedback_request_sent IS NOT TRUE
         -- Once per patient per month, not once per appointment. Keyed on the
         -- PATIENT rather than the phone: a family shares one number, and the
@@ -287,7 +289,7 @@ async function sendFeedbackRequests() {
 
         // Template-first for the same reason as the feedback job: this runs
         // days after the visit, well outside the 24-hour window.
-        await sendPatientMessage(tenant.schema_name, appt.phone, {
+        const sendResult = await sendPatientMessage(tenant.schema_name, appt.phone, {
           template: appt.status === 'no_show' ? 'appointment_missed_rebook' : 'appointment_feedback_request',
           buttonPayloads: appt.status === 'no_show' ? ['Menu'] : ['5', '3', '1'],
           components: [{
@@ -302,6 +304,16 @@ async function sendFeedbackRequests() {
           }],
           text: message,
         });
+        // The trial send cap suppresses the message without throwing (returns
+        // { via: 'suppressed_cap' }). Setting feedback_request_sent=true here
+        // would then permanently drop the request for a patient who never saw
+        // it — a thrown error at least leaves the flag false for the next run.
+        // Skip all the bookkeeping so the row stays eligible. Same guard the
+        // treatment-nudge and recall crons apply to a suppressed send.
+        if (sendResult?.via === 'suppressed_cap') {
+          logger.info(`Feedback request suppressed by trial send cap — will retry`, { appointment: appt.id });
+          continue;
+        }
         // Marked the moment the send SUCCEEDS, and before the bookkeeping
         // below. It still means "not sent, try next run" if sendPatientMessage
         // threw — but the message has now definitely gone out, and anything
@@ -319,6 +331,11 @@ async function sendFeedbackRequests() {
         // session costs this one rating, and that is strictly better than
         // re-sending the request to get it.
         if (appt.status !== 'no_show') {
+          // Serialise the bot_sessions write against any live inbound message
+          // from this phone. FAILS OPEN (same policy as everywhere else): a
+          // Redis blip must not stop the rating flow being armed.
+          const lockKey = `botlock:${tenant.id}:${appt.phone}`;
+          const { acquired, token } = await acquirePhoneLock(lockKey);
           try {
             await triggerFeedback(
               tenant.schema_name,
@@ -334,6 +351,8 @@ async function sendFeedbackRequests() {
           } catch (armErr) {
             logger.warn(`Feedback sent but rating flow not armed for appointment ${appt.id}`,
               { error: armErr.message });
+          } finally {
+            if (acquired) await releasePhoneLock(lockKey, token);
           }
         }
         logger.info(`Feedback request sent for appointment ${appt.id}`);
@@ -426,6 +445,62 @@ async function sendWeeklyDigests() {
       logger.info(`Weekly summary sent for tenant ${tenant.name}`);
     } catch (err) {
       logger.error(`Weekly summary failed for ${tenant.name}`, { error: err.message });
+    }
+  });
+}
+
+// ── "IS YOUR QR CODE ACTUALLY UP?" ──────────────────────────
+/**
+ * The QR code is the ONLY way a patient reaches the bot (CLAUDE.md). A clinic
+ * whose poster never got printed — or got taken down — is silently unreachable:
+ * the dashboard still works, so nobody notices until the practice wonders where
+ * its WhatsApp bookings went. This is the one signal that catches that.
+ *
+ * Fires only when the clinic HAS launched (active > 21 days) and NO inbound
+ * patient message has arrived in 14 days — so a brand-new clinic still setting
+ * up, and a clinic that simply had a quiet fortnight after a busy one, are both
+ * left alone the first time (a genuinely dead QR keeps tripping it). Throttled
+ * to once per 21 days via settings.unreachable_alert_at; opt out with
+ * settings.unreachable_alerts_enabled = false.
+ */
+async function sendUnreachableClinicAlerts() {
+  await forEachActiveTenantParallel('sendUnreachableClinicAlerts', async (tenant) => {
+    const settings = tenant.settings || {};
+    if (settings.unreachable_alerts_enabled === false) return;
+    if (!tenant.activated_at || new Date(tenant.activated_at).getTime() > Date.now() - 21 * 864e5) return;
+
+    const last = settings.unreachable_alert_at ? new Date(settings.unreachable_alert_at).getTime() : 0;
+    if (last > Date.now() - 21 * 864e5) return; // already nudged them recently
+
+    try {
+      const r = await tenantQuery(tenant.schema_name, `
+        SELECT
+          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '14 days') AS recent,
+          COUNT(*) AS ever
+        FROM wa_messages WHERE direction = 'in'
+      `);
+      const recent = parseInt(r.rows[0].recent);
+      const ever = parseInt(r.rows[0].ever);
+      // A fortnight of silence is the trigger, whether the QR was never put up
+      // (ever === 0, and we already know the clinic is 21+ days old) or it came
+      // down / stopped working (ever > 0 but recent === 0). Either way, one nudge.
+      if (recent > 0) return;
+
+      await notifyAdminWhatsApp(tenant.schema_name, tenant,
+        `⚠️ *No WhatsApp bookings coming in*\n\n` +
+        `${tenant.name} hasn't had a single patient message on WhatsApp in the last 14 days.\n\n` +
+        `Patients can only reach the booking bot by scanning your clinic's QR code, so if that's unexpected:\n` +
+        `• check the QR poster is up where patients wait\n` +
+        `• print a fresh one from *Settings* in the dashboard\n\n` +
+        `If your QR is up and this still seems wrong, reply here and we'll look into it.`);
+
+      await query(
+        `UPDATE tenants SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb),
+           '{unreachable_alert_at}', to_jsonb(NOW()::text)) WHERE id = $1`,
+        [tenant.id]).catch(e => logger.warn('unreachable alert: settings stamp failed', { tenant: tenant.slug, error: e.message }));
+      logger.info(`Unreachable-clinic alert sent for ${tenant.name}`, { ever_inbound: ever });
+    } catch (err) {
+      logger.error(`Unreachable-clinic check failed for ${tenant.name}`, { error: err.message });
     }
   });
 }
@@ -564,6 +639,10 @@ function startReminderCron() {
       logger.info('Running weekly summary cron...');
       try {
         await sendWeeklyDigests();
+        // Same Monday-morning cadence and same staff audience — the owner reads
+        // both in one sitting. Its own try inside sendUnreachableClinicAlerts
+        // per tenant, so a failure here does not lose the digest's ok status.
+        await sendUnreachableClinicAlerts();
         await query(`UPDATE cron_jobs SET last_run_at=NOW(), last_status='ok', last_error=NULL WHERE job_name='weekly_digest'`).catch(() => {});
       } catch (err) {
         logger.error('Weekly summary cron error', { error: err.message });
@@ -598,6 +677,7 @@ module.exports = {
   sendReminders,
   sendFeedbackRequests,
   sendWeeklyDigests,
+  sendUnreachableClinicAlerts,
   sendDoctorDailySchedules,
   handleReminderConfirmation,
 };

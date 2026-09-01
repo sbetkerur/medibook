@@ -9,15 +9,40 @@ function loadRazorpay() {
   return new Promise((resolve, reject) => {
     if (typeof window === 'undefined') return reject(new Error('no window'));
     if (window.Razorpay) return resolve(window.Razorpay);
+
     let s = document.querySelector(`script[src="${RZP_SRC}"]`);
+    // A tag left over from an earlier attempt that already fired `error` will
+    // never fire `load` or `error` again — reusing it means the promise (and
+    // "Add card") hangs forever. Drop it and start fresh.
+    if (s && s.dataset.rzpFailed === '1') { s.remove(); s = null; }
     if (!s) {
       s = document.createElement('script');
       s.src = RZP_SRC;
       s.async = true;
+      s.addEventListener('load', () => { s.dataset.rzpLoaded = '1'; });
+      s.addEventListener('error', () => { s.dataset.rzpFailed = '1'; });
       document.body.appendChild(s);
+    } else if (s.dataset.rzpLoaded === '1' && !window.Razorpay) {
+      // Loaded once but the global never appeared — treat as failed and retry.
+      s.remove();
+      return loadRazorpay().then(resolve, reject);
     }
-    s.addEventListener('load', () => resolve(window.Razorpay));
-    s.addEventListener('error', () => reject(new Error('Could not load the payment window')));
+
+    // Hard ceiling so the card flow always resolves or fails, even if the
+    // script element never emits either event.
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('The payment window took too long to load. Please try again.'));
+    }, 15000);
+    const onLoad = () => { cleanup(); resolve(window.Razorpay); };
+    const onError = () => { cleanup(); s.dataset.rzpFailed = '1'; reject(new Error('Could not load the payment window')); };
+    function cleanup() {
+      clearTimeout(timer);
+      s.removeEventListener('load', onLoad);
+      s.removeEventListener('error', onError);
+    }
+    s.addEventListener('load', onLoad);
+    s.addEventListener('error', onError);
   });
 }
 

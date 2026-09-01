@@ -137,6 +137,7 @@ router.get('/analytics/heatmap', makeAnalyticsLimiter(), async (req, res) => {
         COUNT(*) as count
       FROM appointments
       WHERE appointment_date >= ${IST_TODAY_SQL} - ($1::text || ' days')::INTERVAL
+        AND appointment_date <= ${IST_TODAY_SQL}
         AND status IN ('confirmed', 'completed')
       GROUP BY day_of_week, hour ORDER BY day_of_week, hour
     `, [d]);
@@ -230,9 +231,13 @@ router.get('/analytics/noshowrisk', makeAnalyticsLimiter(), async (req, res) => 
       FROM appointments a
       JOIN patients p ON p.id = a.patient_id
       JOIN doctors d ON d.id = a.doctor_id
+      -- Denominator is ATTENDANCE history only (completed + no_show). Counting
+      -- 'cancelled' in it let a serial canceller show a LOWER no-show risk —
+      -- a cancellation is not a kept appointment and says nothing about whether
+      -- they turn up. Matches services/bot/utils.js noShowBlock's metric.
       LEFT JOIN appointments prev ON prev.patient_id = a.patient_id
         AND prev.appointment_date < a.appointment_date
-        AND prev.status IN ('no_show', 'completed', 'cancelled')
+        AND prev.status IN ('no_show', 'completed')
       WHERE a.status = 'confirmed'
         AND a.appointment_date BETWEEN ${IST_TODAY_SQL} AND ${IST_TODAY_SQL} + INTERVAL '7 days'
       GROUP BY a.id, a.booking_id, a.appointment_date, a.appointment_time, d.name, p.name, p.phone

@@ -1470,8 +1470,7 @@ async function completeBooking(phone, schema, tenant, send, ctx) {
             `Patient: ${ctx.patient_name || phone} · ${phone}\n` +
             `Dr. ${ctx.doctor_name}\n` +
             `📅 ${dateLabel3} at ${(ctx.appointment_time || '').slice(0, 5)}\n` +
-            `🦷 ${ctx.hospital_name}\n` +
-            `Type: ${ctx.visit_type === 'video' ? 'Video Consultation' : 'In-Clinic'}`,
+            `🦷 ${ctx.hospital_name}`,
             { senders: send._senders }
           );
         } catch (waErr) {

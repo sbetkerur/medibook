@@ -871,24 +871,21 @@ router.get('/audit-logs', adminOnly, async (req, res) => {
 
     const where = conditions.join(' AND ');
 
-    // Total count for pagination
-    const countR = await tenantQuery(s, `SELECT COUNT(*) FROM audit_logs WHERE ${where}`, params);
-    const total = parseInt(countR.rows[0].count);
-
-    params.push(safeLimit, offset);
-    const r = await tenantQuery(s, `
-      SELECT id, actor_id, actor_role, action, resource_type, resource_id,
-             old_values, new_values, ip_address, created_at
-      FROM audit_logs
-      WHERE ${where}
-      ORDER BY created_at DESC
-      LIMIT $${params.length - 1} OFFSET $${params.length}
-    `, params);
-
-    // CSV export
+    // CSV export: an "export" that only serialised the current 50-row page was
+    // a partial file with no sign rows were dropped — worthless for the
+    // compliance review it exists for. Run a dedicated unpaginated query with a
+    // hard cap instead (mirrors /analytics/export's 50k ceiling).
     if (doExport === 'csv') {
+      const EXPORT_CAP = 50000;
+      const exR = await tenantQuery(s, `
+        SELECT created_at, actor_role, action, resource_type, resource_id, ip_address
+        FROM audit_logs
+        WHERE ${where}
+        ORDER BY created_at DESC
+        LIMIT ${EXPORT_CAP}
+      `, params);
       const headers = ['timestamp', 'actor_role', 'action', 'resource_type', 'resource_id', 'ip_address'];
-      const rows = r.rows.map(l => [
+      const rows = exR.rows.map(l => [
         l.created_at?.toISOString() || '',
         l.actor_role || '',
         l.action || '',
@@ -903,6 +900,20 @@ router.get('/audit-logs', adminOnly, async (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename="audit_logs_${new Date().toISOString().slice(0,10)}.csv"`);
       return res.send(csv);
     }
+
+    // Total count for pagination
+    const countR = await tenantQuery(s, `SELECT COUNT(*) FROM audit_logs WHERE ${where}`, params);
+    const total = parseInt(countR.rows[0].count);
+
+    params.push(safeLimit, offset);
+    const r = await tenantQuery(s, `
+      SELECT id, actor_id, actor_role, action, resource_type, resource_id,
+             old_values, new_values, ip_address, created_at
+      FROM audit_logs
+      WHERE ${where}
+      ORDER BY created_at DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params);
 
     res.json({ logs: r.rows, total, page: parseInt(page), limit: safeLimit, has_more: offset + r.rows.length < total });
   } catch (err) { handleError(res, err); }

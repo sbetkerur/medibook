@@ -246,10 +246,14 @@ async function proactiveRefresh() {
     api.defaults.headers.common.Authorization = `Bearer ${newToken}`;
     processQueue(null, newToken);
   } catch (err) {
-    // Swallow failures here — this is a best-effort early refresh. If it
-    // genuinely can't refresh, the next real API call will 401 and go
-    // through the reactive path (which does force a logout on failure), or
-    // the expiry timer below will retry once more as a last resort.
+    // Best-effort early refresh. Drain the queue with the failure so any
+    // request parked while this was in flight gets a rejection it can retry
+    // from — never a silent hang. This matches the reactive 401 path, which
+    // also calls processQueue(err) on a failed refresh; leaving the queue
+    // pending on a transient failure risked an idle tab where nothing else
+    // ever drains it (the expiry timer is one-shot). A genuinely dead refresh
+    // token (401/403) additionally triggers logout via the reactive path on
+    // the next call.
     processQueue(err, null);
   } finally {
     isRefreshing = false;

@@ -178,6 +178,14 @@ async function sendTreatmentNudges() {
       // has an open course and will be reminded again in a week.
       if (!await canSendDiscretionary(tenant.schema_name, plan.phone, budgetFor(tenant))) continue;
 
+      // Set when the trial send cap swallowed the nudge (sendPatientMessage
+      // returns { via: 'suppressed_cap' } rather than throwing). Nothing
+      // reached the patient and the cap is transient, so the finally must not
+      // spend one of the three attempts on it — otherwise a trial clinic that
+      // stays over its cap for three runs exhausts nudge_count without the
+      // patient ever seeing a nudge, the exact permanent silence this job
+      // exists to prevent.
+      let suppressedByCap = false;
       try {
         const nextVisit = nextFreeVisitNumber(plan.used_visit_numbers, plan.booked_visits);
         const isFirst = plan.booked_visits === 0;
@@ -219,9 +227,12 @@ async function sendTreatmentNudges() {
         // Skip when the new-tenant send cap suppressed the nudge: the patient
         // never saw it, so a pending "treatment" reply would only misroute
         // their next unrelated message (resolveAskingTenant).
-        if (sendResult?.via !== 'suppressed_cap') {
-          await recordPendingReply(plan.phone, tenant.id, KINDS.TREATMENT, 24 * 7);
+        if (sendResult?.via === 'suppressed_cap') {
+          suppressedByCap = true;
+          logger.info('Treatment nudge suppressed by trial send cap — will retry', { plan: plan.id });
+          continue;
         }
+        await recordPendingReply(plan.phone, tenant.id, KINDS.TREATMENT, 24 * 7);
 
         logger.info('Treatment nudge sent', {
           tenant: tenant.slug, plan: plan.id, phone: maskPhone(plan.phone), visit: nextVisit,
@@ -237,9 +248,12 @@ async function sendTreatmentNudges() {
         // and nudge_count never reached MAX_NUDGES_PER_PLAN to stop it. The
         // trade is that a transient failure costs one of three attempts, which
         // is much cheaper than an unbounded daily retry against every plan.
-        await tenantQuery(tenant.schema_name,
-          `UPDATE treatment_plans SET last_nudge_at=NOW(), nudge_count=nudge_count+1 WHERE id=$1`,
-          [plan.id]).catch(e => logger.warn('Nudge bookkeeping failed', { plan: plan.id, error: e.message }));
+        // A cap suppression is the one non-attempt: it will clear itself.
+        if (!suppressedByCap) {
+          await tenantQuery(tenant.schema_name,
+            `UPDATE treatment_plans SET last_nudge_at=NOW(), nudge_count=nudge_count+1 WHERE id=$1`,
+            [plan.id]).catch(e => logger.warn('Nudge bookkeeping failed', { plan: plan.id, error: e.message }));
+        }
       }
     }
   });

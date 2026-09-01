@@ -82,6 +82,31 @@ export default function SuperAdminPage() {
   const [triggeringBackup, setTriggeringBackup] = useState(false);
   const backupPollRef = useRef(null);
 
+  // Needs-attention state — stuck webhooks + owners never told they're live
+  const [attention, setAttention] = useState(null);
+  const [attentionLoading, setAttentionLoading] = useState(false);
+  const [resendingId, setResendingId] = useState(null);
+
+  async function fetchAttention() {
+    setAttentionLoading(true);
+    try {
+      const { data } = await api.get('/superadmin/needs-attention');
+      setAttention(data);
+    } catch { toast.error('Could not load the needs-attention view'); }
+    finally { setAttentionLoading(false); }
+  }
+
+  async function resendWelcome(tenantId) {
+    setResendingId(tenantId);
+    try {
+      await api.post(`/superadmin/tenants/${tenantId}/resend-welcome`);
+      toast.success('Go-live message sent');
+      fetchAttention();
+    } catch (err) {
+      toast.error(err?.response?.data?.error || 'Could not resend');
+    } finally { setResendingId(null); }
+  }
+
   useEffect(() => {
     const u = localStorage.getItem('user');
     if (!u) { router.push('/login'); return; }
@@ -443,6 +468,7 @@ export default function SuperAdminPage() {
             { id: 'billing', label: '💰 Billing', onClick: () => { setTab('billing'); if (!billing) fetchBilling(); } },
             { id: 'rate_limits', label: '🚦 Rate Limits', onClick: () => { setTab('rate_limits'); if (!rateLimits) fetchRateLimits(); } },
             { id: 'backups', label: '💾 Backups', onClick: () => { setTab('backups'); if (!backups) fetchBackups(); } },
+            { id: 'attention', label: '🔧 Health', onClick: () => { setTab('attention'); fetchAttention(); } },
           ].map(t => (
             <button key={t.id}
               onClick={() => { if (t.onClick) t.onClick(); else setTab(t.id); }}
@@ -1119,6 +1145,69 @@ export default function SuperAdminPage() {
               <div className="bg-white rounded-xl p-12 text-center">
                 <button onClick={fetchBackups} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">Load Backup History</button>
               </div>
+            )}
+          </div>
+        )}
+
+        {/* Health / needs-attention — things that otherwise only hit a log line */}
+        {tab === 'attention' && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-gray-800">Needs attention</h2>
+              <button onClick={fetchAttention} className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition">🔄 Refresh</button>
+            </div>
+
+            {attentionLoading && !attention && <p className="text-sm text-gray-400">Loading…</p>}
+
+            {attention && (
+              <>
+                <div className="bg-white rounded-xl shadow-sm p-4 sm:p-5">
+                  <h3 className="font-medium text-gray-800 mb-2">Undeliverable bot messages</h3>
+                  {(() => {
+                    const w = attention.failed_webhooks || {};
+                    const total = (w.pending || 0) + (w.processing || 0) + (w.failed || 0);
+                    if (!total) return <p className="text-sm text-green-600">Nothing stuck.</p>;
+                    return (
+                      <div className="text-sm text-gray-700 space-y-1">
+                        <p>{w.failed || 0} failed · {w.pending || 0} pending · {w.processing || 0} in progress</p>
+                        {w.latest && <p className="text-xs text-gray-400">most recent: {new Date(w.latest).toLocaleString('en-IN')}</p>}
+                        <p className="text-xs text-gray-400">Inspect via GET /api/superadmin/webhooks/failed; retry with POST /api/superadmin/webhooks/:id/retry.</p>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 sm:px-5 py-3 border-b border-gray-100">
+                    <h3 className="font-medium text-gray-800">Owners never told they're live</h3>
+                    <p className="text-xs text-gray-400">Self-serve clinics approved but whose go-live WhatsApp never landed. The dunning cron retries for 7 days.</p>
+                  </div>
+                  {!attention.owners_not_notified?.length ? (
+                    <p className="px-5 py-6 text-sm text-green-600">Everyone has been notified.</p>
+                  ) : (
+                    <div className="divide-y divide-gray-100">
+                      {attention.owners_not_notified.map(o => (
+                        <div key={o.tenant_id} className="px-4 sm:px-5 py-3 flex flex-wrap items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium text-gray-900">{o.name}</div>
+                            <div className="text-xs text-gray-500">
+                              {o.slug}{o.activated_at ? ` · live since ${new Date(o.activated_at).toLocaleDateString('en-IN')}` : ''}
+                            </div>
+                          </div>
+                          {o.resendable ? (
+                            <button onClick={() => resendWelcome(o.tenant_id)} disabled={resendingId === o.tenant_id}
+                              className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50">
+                              {resendingId === o.tenant_id ? 'Sending…' : 'Resend go-live link'}
+                            </button>
+                          ) : (
+                            <span className="text-xs text-amber-600">no phone on file — hand over manually</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
             )}
           </div>
         )}

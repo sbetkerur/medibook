@@ -106,14 +106,14 @@ export default function LandingPage() {
               Try the demo
             </a>
             <a
-              href="/signup"
+              href="https://pragatisolutions.com/contact"
               className="rounded-xl border border-gray-300 px-6 py-3 text-sm font-semibold text-gray-800 hover:bg-gray-50"
             >
-              Start a free trial
+              Request access
             </a>
           </div>
           <p className="mt-3 text-xs text-gray-400">
-            14 days free · no card needed · super-admin approves every clinic
+            14 days free · no card needed · we approve every clinic, usually the same day
           </p>
           <p className="mt-6 text-sm font-medium text-gray-700 lg:hidden">
             The live booking bot is right below — type a message and try it. ↓
@@ -270,7 +270,7 @@ export default function LandingPage() {
       <Section id="pricing" className="py-16">
         <h2 className="text-center text-3xl font-bold tracking-tight">Simple pricing</h2>
         <p className="mt-3 text-center text-sm text-gray-500">
-          14-day free trial on both. No card to start. No GST charged.
+          14-day free trial on both. No card to start. Prices include GST.
         </p>
         <div className="mx-auto mt-10 grid max-w-3xl gap-6 sm:grid-cols-2">
           <div className="rounded-2xl border border-gray-200 p-7">
@@ -286,10 +286,10 @@ export default function LandingPage() {
               <li>No appointment quota</li>
             </ul>
             <a
-              href="/signup"
+              href="https://pragatisolutions.com/contact"
               className="mt-6 block rounded-xl border border-gray-300 py-2.5 text-center text-sm font-semibold hover:bg-gray-50"
             >
-              Start free trial
+              Request access
             </a>
           </div>
           <div className="rounded-2xl border-2 border-blue-600 p-7 shadow-sm">
@@ -307,10 +307,10 @@ export default function LandingPage() {
               <li>No appointment quota</li>
             </ul>
             <a
-              href="/signup"
+              href="https://pragatisolutions.com/contact"
               className="mt-6 block rounded-xl bg-blue-600 py-2.5 text-center text-sm font-semibold text-white hover:bg-blue-700"
             >
-              Start free trial
+              Request access
             </a>
           </div>
         </div>
@@ -323,7 +323,7 @@ export default function LandingPage() {
           <p className="mx-auto mt-3 max-w-2xl text-sm text-gray-600">
             WhatsApp is the only channel — no email lists, no SMS. We process patient data
             only to run the service for you, never to sell or to train AI models. Aligned
-            with India’s DPDP Act; you can export everything for 30 days if you leave.
+            with India’s DPDP Act; you can export everything, including when you leave.
           </p>
         </div>
       </Section>
@@ -343,10 +343,10 @@ export default function LandingPage() {
             Try both sides
           </a>
           <a
-            href="/signup"
+            href="https://pragatisolutions.com/contact"
             className="rounded-xl border border-gray-300 px-6 py-3 text-sm font-semibold text-gray-800 hover:bg-gray-50"
           >
-            Start a free trial
+            Request access
           </a>
         </div>
       </Section>

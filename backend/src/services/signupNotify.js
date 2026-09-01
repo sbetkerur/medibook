@@ -27,8 +27,13 @@ const TEMPLATE = () => (process.env.SIGNUP_APPROVED_TEMPLATE || '').trim();
  * @param {string} opts.clinicName
  * @param {string} opts.slug    the clinic ID the owner logs in with
  */
+/**
+ * @returns {Promise<{ok: boolean}>} ok=false means nothing reached the owner —
+ *   the caller should leave tenants.owner_notified_at NULL so the dunning cron
+ *   retries and the superadmin view can surface it.
+ */
 async function notifyOwnerApproved(phone, { clinicName, slug }) {
-  if (!phone) return;
+  if (!phone) return { ok: false };
   const loginUrl = `${frontendBaseUrl()}/login`;
   const text =
     `${clinicName} is approved and live on MediBook. ` +
@@ -46,7 +51,7 @@ async function notifyOwnerApproved(phone, { clinicName, slug }) {
         ],
       }];
       await wa.sendTemplate(phone, tpl, components, null, null);
-      return;
+      return { ok: true };
     } catch (err) {
       logger.warn('Approval template send failed — falling back to text', {
         template: tpl, error: err.response?.data?.error?.message || err.message,
@@ -58,12 +63,14 @@ async function notifyOwnerApproved(phone, { clinicName, slug }) {
 
   try {
     await wa.sendText(phone, text, null, null);
+    return { ok: true };
   } catch (err) {
     // Best-effort: the clinic is already active. Surface it so an operator can
-    // hand the owner the link by another route.
+    // hand the owner the link by another route, and let the dunning cron retry.
     logger.warn('Approval text send failed — owner not notified', {
       slug, error: err.response?.data?.error?.message || err.message,
     });
+    return { ok: false };
   }
 }
 

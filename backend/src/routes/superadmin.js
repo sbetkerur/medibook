@@ -355,11 +355,23 @@ router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
     logger.info('Self-serve clinic approved', { slug: t.slug, by: req.user.email });
 
     // The owner has been waiting on a "we'll message you" screen — this is the
-    // only thing that tells them they can log in. Best-effort.
+    // only thing that tells them they can log in. Best-effort, but record
+    // whether it landed: a NULL owner_notified_at on an active self-serve tenant
+    // is what jobs/billingDunning.js retries.
     if (pending?.phone) {
       require('../services/signupNotify')
         .notifyOwnerApproved(pending.phone, { clinicName: r.rows[0].name, slug: r.rows[0].slug })
+        .then(outcome => {
+          if (outcome?.ok) {
+            return query(`UPDATE tenants SET owner_notified_at=NOW() WHERE id=$1`, [req.params.id]).catch(() => {});
+          }
+          logger.error('approve: owner go-live message did not land — dunning will retry', { slug: t.slug });
+        })
         .catch(e => logger.warn('approve: owner notify failed', { slug: t.slug, error: e.message }));
+    } else {
+      // No phone on file at all — mark notified so the retry cron doesn't chase
+      // a number that does not exist. The audit log records the approval.
+      await query(`UPDATE tenants SET owner_notified_at=NOW() WHERE id=$1`, [req.params.id]).catch(() => {});
     }
 
     res.json({ tenant: r.rows[0], message: 'Clinic approved and live' });
@@ -506,6 +518,26 @@ router.patch('/tenants/:id', validateUUID(), async (req, res) => {
     const VALID_STATUSES = ['active', 'suspended', 'inactive', 'pending_review', 'past_due', 'pending_payment'];
     if (status && !VALID_STATUSES.includes(status)) {
       return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_STATUSES.join(', ')}` });
+    }
+
+    // Going straight to 'active' from a pre-provisioning state is NOT the same as
+    // resuming a suspended clinic. A 'pending_review' / 'pending_payment'
+    // self-serve tenant has no PG schema, no users row and no tenant_billing
+    // trial — only POST /tenants/:id/approve builds those. Flipping status here
+    // would make the entry-code lookup resolve the clinic (status='active')
+    // while every tenantQuery against the missing schema throws, the owner still
+    // can't log in, and billingDunning never catches it (no trial row) so it
+    // runs forever as a free active clinic. Force the operator through /approve.
+    if (status === 'active') {
+      const nowR = await query(`SELECT status FROM tenants WHERE id=$1`, [req.params.id]);
+      if (!nowR.rows[0]) return res.status(404).json({ error: 'Tenant not found' });
+      const from = nowR.rows[0].status;
+      if (from === 'pending_review' || from === 'pending_payment') {
+        return res.status(409).json({
+          error: `This clinic is "${from}" — it has no schema or admin user yet. Use Approve (POST /superadmin/tenants/:id/approve), which builds those and starts the trial, not the status field.`,
+          code: 'USE_APPROVE',
+        });
+      }
     }
 
     const updates = [];
@@ -1061,6 +1093,70 @@ router.post('/webhooks/:id/retry', validateUUID(), async (req, res) => {
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Webhook not found or not in retryable state' });
     res.json({ success: true, id });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── NEEDS ATTENTION — one operator view of everything stuck ───
+// Aggregates the things that otherwise only ever hit a log line: undeliverable
+// bot messages, and self-serve owners who were approved but never got their
+// go-live link (tenants.owner_notified_at still NULL). jobs/billingDunning.js
+// retries the latter for 7 days; this surfaces it, and lets an operator resend
+// on demand.
+router.get('/needs-attention', async (req, res) => {
+  try {
+    const [webhooks, ownersR] = await Promise.all([
+      query(`
+        SELECT status, COUNT(*)::int AS n, MAX(created_at) AS latest
+          FROM failed_webhooks
+         WHERE status IN ('pending','processing','failed')
+         GROUP BY status`),
+      query(`
+        SELECT t.id, t.name, t.slug, t.activated_at,
+               (SELECT ps.phone FROM pending_signups ps
+                 WHERE ps.tenant_id = t.id
+                 ORDER BY ps.created_at DESC LIMIT 1) IS NOT NULL AS has_phone
+          FROM tenants t
+         WHERE t.status = 'active'
+           AND t.signup_source = 'self_serve'
+           AND t.owner_notified_at IS NULL
+         ORDER BY t.activated_at DESC NULLS LAST
+         LIMIT 50`),
+    ]);
+    const wh = { pending: 0, processing: 0, failed: 0, latest: null };
+    for (const row of webhooks.rows) { wh[row.status] = row.n; if (row.latest && (!wh.latest || row.latest > wh.latest)) wh.latest = row.latest; }
+    res.json({
+      failed_webhooks: wh,
+      owners_not_notified: ownersR.rows.map(r => ({
+        tenant_id: r.id, name: r.name, slug: r.slug,
+        activated_at: r.activated_at, resendable: !!r.has_phone,
+      })),
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+// Resend the go-live WhatsApp to a self-serve owner and stamp owner_notified_at
+// if it lands. The same call jobs/billingDunning.js makes automatically.
+router.post('/tenants/:id/resend-welcome', validateUUID(), async (req, res) => {
+  try {
+    const r = await query(`
+      SELECT t.name, t.slug, t.status, t.signup_source,
+             (SELECT ps.phone FROM pending_signups ps
+               WHERE ps.tenant_id = t.id
+               ORDER BY ps.created_at DESC LIMIT 1) AS phone
+        FROM tenants t
+       WHERE t.id = $1`, [req.params.id]);
+    const t = r.rows[0];
+    if (!t) return res.status(404).json({ error: 'Tenant not found' });
+    if (t.signup_source !== 'self_serve') return res.status(400).json({ error: 'Not a self-serve clinic' });
+    if (!t.phone) return res.status(400).json({ error: 'No owner phone on file — hand over the login link manually.' });
+
+    const outcome = await require('../services/signupNotify')
+      .notifyOwnerApproved(t.phone, { clinicName: t.name, slug: t.slug });
+    if (outcome?.ok) {
+      await query(`UPDATE tenants SET owner_notified_at=NOW() WHERE id=$1`, [req.params.id]);
+      return res.json({ sent: true });
+    }
+    res.status(502).json({ sent: false, error: 'The message did not go through — try again shortly.' });
   } catch (err) { handleError(res, err); }
 });
 

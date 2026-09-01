@@ -447,7 +447,13 @@ async function handleRescheduleConfirm(phone, schema, tenant, send, ctx, choice)
   // word "reschedule" and would otherwise match the positive pattern below.
   // btn_1/btn_0 are matched by index now, not as substrings of the raw id.
   const isNegative = btnIdx === 1 || /\bno\b|\bdon'?t\b|\bdont\b|\bkeep\b|\bnahi\b|^2$/i.test(choice);
-  if (!isNegative && (btnIdx === 0 || /^(yes|reschedule|confirm)$|^1$/.test(choice))) {
+  // Prefix match (\b), not anchored ($), and case-insensitive — mirrors the
+  // widening in handleCancelConfirm. WhatsApp keeps the card tappable but people
+  // also retype what they see, and the button reads "✅ Yes, Reschedule": an
+  // anchored /^(yes|reschedule|confirm)$/ answered "yes, reschedule" with "Kept
+  // as it was — nothing has changed", the opposite of what they asked. The
+  // negative test above still runs first, so "no, keep it" is unaffected.
+  if (!isNegative && (btnIdx === 0 || /^(yes|reschedule|confirm)\b|^1$/i.test(choice))) {
     // Whole-tenant read-only guard — checked right before the commit, not
     // earlier, so browsing dates/slots up to this point still works. See
     // isReadOnlyDemo in bot/utils.js.

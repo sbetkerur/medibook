@@ -258,7 +258,10 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
                       {settings.usage?.active_doctors ?? '—'} / {settings.plan_limits.max_doctors == null ? '∞' : settings.plan_limits.max_doctors}
                     </span>
                   </div>
-                  {settings.usage?.active_doctors != null && settings.plan_limits.max_doctors != null && (
+                  {/* `> 0`, not `!= null`: a per-tenant override of 0 is a valid
+                      frozen cap (utils/planLimits.js) and would divide to
+                      Infinity/NaN here. The "N / 0" text above still shows it. */}
+                  {settings.usage?.active_doctors != null && settings.plan_limits.max_doctors > 0 && (
                     <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
                       <div
                         className={`h-full rounded-full transition-all ${
@@ -270,26 +273,18 @@ export default function SettingsTab({ settings, fetchSettings, settingsFailed, i
                     </div>
                   )}
                 </div>
-                {/* Appointments this month */}
-                <div>
-                  <div className="flex justify-between text-sm mb-1">
-                    <span className="text-gray-600">Appts this month</span>
-                    <span className="font-medium text-gray-900">
-                      {settings.usage?.appointments_this_month ?? '—'} / {settings.plan_limits.max_appointments_per_month == null ? '∞' : settings.plan_limits.max_appointments_per_month}
-                    </span>
-                  </div>
-                  {settings.usage?.appointments_this_month != null && settings.plan_limits.max_appointments_per_month != null && (
-                    <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all ${
-                          settings.usage.appointments_this_month / settings.plan_limits.max_appointments_per_month >= 0.9 ? 'bg-red-500' :
-                          settings.usage.appointments_this_month / settings.plan_limits.max_appointments_per_month >= 0.7 ? 'bg-yellow-500' : 'bg-blue-500'
-                        }`}
-                        style={{ width: `${Math.min(100, Math.round(settings.usage.appointments_this_month / settings.plan_limits.max_appointments_per_month * 100))}%` }}
-                      />
+                {/* "Appointments this month" was removed: max_appointments_per_month
+                    is NULL on every tier (dentist-count pricing), so it only ever
+                    rendered "N / ∞" — a limit that isn't one. Re-add if volume
+                    pricing returns. */}
+                {settings.usage?.appointments_this_month != null && (
+                  <div>
+                    <div className="flex justify-between text-sm mb-1">
+                      <span className="text-gray-600">Appts this month</span>
+                      <span className="font-medium text-gray-900">{settings.usage.appointments_this_month}</span>
                     </div>
-                  )}
-                </div>
+                  </div>
+                )}
               </div>
             </div>
           )}

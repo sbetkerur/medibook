@@ -592,18 +592,18 @@ alternate weeks are `{1,3,5}`, and NULL/empty means every week —
 (3) `isBlockedDay(dateStr, hospitalId)` takes the branch, so a holiday at one
 branch can't close the day the doctor spends at the other.
 
-The `doctor_hospitals` fallback is scoped in FOUR places that must stay
-identical — `tenantMigrate.js`'s backfill, both `slotGenerator` queries and
-`GET /doctors/:id/schedule`. A session whose `hospital_id` is deliberately NULL
-means "the doctor's PRIMARY branch", and `/doctors/:id/schedule` writes a
-`doctor_hospitals` row only for a session that names a branch. So on a Tuesday
-split "10–13 at branch B / 17–21 at primary (NULL)" there is exactly ONE `dh`
-row, and joining it on weekday alone hands branch B to the evening session too:
-the whole evening at the main clinic is generated, told to patients and
-holiday-checked as B. The fallback therefore applies only where NO session that
-weekday names a branch, and only where that weekday has exactly one `dh` row
-(two would MULTIPLY the session and `ON CONFLICT DO NOTHING` would keep an
-arbitrary branch).
+`doctor_schedules.hospital_id` is now the SOLE source of a session's branch
+(NULL = the doctor's primary). The old `doctor_hospitals` read-fallback — a
+LEFT JOIN scoped identically across four places, kept for pre-column legacy
+rows — has been removed from both `slotGenerator` queries and
+`GET /doctors/:id/schedule`. `tenantMigrate.js`'s one-shot
+`backfill_schedule_hospital_v2` resolves every legacy NULL it could have
+matched into `doctor_schedules.hospital_id` (an unresolvable 2+-`dh`-row
+weekday stays NULL and still reads as primary, and is logged for a human).
+`doctor_hospitals` remains ONLY as the `/locations` API mirror, written
+alongside `doctor_schedules` by `POST /doctors/:id/schedule` — the single
+writer of both — and it is still one of the branches `POST /appointments`
+accepts for a visiting doctor.
 
 Consequence for the desk: a walk-in with a visiting consultant is booked at the
 branch they SIT at that day, not their primary. `POST /appointments` accepts any

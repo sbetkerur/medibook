@@ -21,6 +21,7 @@ const {
   sendConfirmButtons,
   confirmButtonIndex,
   clinicPhoneLine,
+  isReadOnlyDemo,
 } = require('./bot/utils');
 
 const {
@@ -280,13 +281,24 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   const lowerInput = input.toLowerCase();
   const choice = buttonId || lowerInput;
 
+  // Opt-out / re-subscribe recognition tolerates trailing punctuation ("Stop.")
+  // and a bare courtesy word ("stop please", "please stop") — a patient telling
+  // their dentist to stop should not have to type the exact token. Anything
+  // longer is a real sentence ("stop sending me to the wrong dentist") and
+  // still falls through to normal handling.
+  const optOutInput = input
+    .replace(/^\s*please\s+/i, '')
+    .replace(/\s+please$/i, '')
+    .replace(/[\s.!,]+$/, '')
+    .trim();
+
   // ── OPTED-OUT check — silently drop all messages from opted-out patients ──
   // We check opted_out before any state handling so opted-out patients can
   // still send STOP/START but get no other bot responses.
   // isOptedOut (bot/utils) is the single definition — the webhook's
   // unsupported-type reply, the clinic-selection confirmation and the voice
   // path all sit OUTSIDE this function and have to ask the same question.
-  if (!/^(stop|unsubscribe|opt.?out|block|start)$/i.test(input)) {
+  if (!/^(stop|unsubscribe|opt.?out|block|start)$/i.test(optOutInput)) {
     if (await isOptedOut(schema, phone)) {
       logger.info(`Dropped message from opted-out patient`, { phone: maskPhone(phone) });
       return;
@@ -294,7 +306,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   }
 
   // ── OPT-OUT handler ─────────────────────────────────────────
-  if (/^(stop|unsubscribe|opt.?out|block)$/i.test(input)) {
+  if (/^(stop|unsubscribe|opt.?out|block)$/i.test(optOutInput)) {
     await tenantQuery(schema,
       `UPDATE patients SET opted_out=true, updated_at=NOW() WHERE phone=$1`, [phone])
       .catch(err => logger.warn('Opt-out patient update failed', { phone: maskPhone(phone), error: err.message }));
@@ -311,13 +323,14 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
   }
 
   // ── RE-SUBSCRIBE handler ─────────────────────────────────────
-  if (/^start$/i.test(input)) {
+  if (/^start$/i.test(optOutInput)) {
     await tenantQuery(schema,
       `UPDATE patients SET opted_out=false, updated_at=NOW() WHERE phone=$1`, [phone])
       .catch(() => {});
   }
 
-  const isGreeting = /^(hi|hello|hey|menu|start|helo|hy|hai)$/i.test(input);
+  const isGreeting = /^(hi|hello|hey|menu|start|helo|hy|hai)$/i.test(input)
+    || /^start$/i.test(optOutInput);
 
   // ── GREETING — fast path ─────────────────────────────────────
   // Handled BEFORE session context loading so that "Hi" reliably
@@ -600,7 +613,7 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     STATES.SELECT_HOSPITAL, STATES.SELECT_DEPARTMENT, STATES.SELECT_DOCTOR,
     STATES.SELECT_DATE, STATES.SELECT_SLOT, STATES.SELECT_PATIENT,
     STATES.COLLECT_NAME, STATES.COLLECT_DOB,
-    STATES.COLLECT_GENDER, STATES.COLLECT_EMAIL, STATES.COLLECT_CHIEF_COMPLAINT,
+    STATES.COLLECT_GENDER, STATES.COLLECT_CHIEF_COMPLAINT,
     STATES.CONFIRM_BOOKING, STATES.SELECT_TREATMENT_PLAN,
   ];
   if (BOOKING_STATES.includes(session.state)) {
@@ -713,16 +726,12 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
     ctx.patient_dob = `${yyyy}-${mm.padStart(2,'0')}-${dd.padStart(2,'0')}`;
     return askChiefComplaint(phone, schema, send, ctx);
   }
-  // The gender and email questions were removed from the flow: nothing in the
-  // product ever branched on gender, and the patient email only fed a
-  // confirmation email — a channel that no longer exists at all. Both columns
-  // remain in the schema; staff still set gender from the dashboard.
-  //
-  // These two states are kept ONLY to drain sessions that were already parked in
-  // them when this shipped — they accept anything and move the patient on rather
-  // than stranding a half-finished booking. bot_sessions are cleared after 4
-  // hours, so both branches can be deleted a day after deploy.
-  if (session.state === STATES.COLLECT_GENDER || session.state === STATES.COLLECT_EMAIL) {
+  // The gender and email questions were removed from the flow long ago (nothing
+  // branched on gender; patient email only fed a confirmation email, a channel
+  // that no longer exists). The drain branch that caught sessions parked mid-way
+  // through them has been removed too — bot_sessions clear after 4h, so none
+  // can still exist. Gender is still set from the dashboard; the columns remain.
+  if (session.state === STATES.COLLECT_GENDER) {
     return askChiefComplaint(phone, schema, send, ctx);
   }
   if (session.state === STATES.COLLECT_CHIEF_COMPLAINT) {
@@ -744,7 +753,12 @@ async function _handleInner({ phone, text, buttonId, tenant, waMessageId, schema
       await updateSession(schema, phone, STATES.IDLE, {});
       return;
     }
-    if (btnIdx === 0 || /^(yes|confirm|ok|sure|haan)$|^1$/.test(choice)) {
+    // Prefix match (\b), not anchored ($), and case-insensitive — same widening
+    // as handleRescheduleConfirm/handleCancelConfirm. "yes please" / "confirm it"
+    // typed as text used to match neither this nor the negative pattern and fell
+    // through to the re-prompt; the button label is "✅ Confirm", so a literal
+    // retype must land here. Negative intent is still tested first above.
+    if (btnIdx === 0 || /^(yes|confirm|ok|sure|haan)\b|^1$/i.test(choice)) {
       return completeBooking(phone, schema, tenant, send, ctx);
     }
     // Re-prompt — and re-bind, because these are freshly minted buttons; the
@@ -872,8 +886,12 @@ async function handleFeedbackComment(phone, schema, send, ctx, input, tenant) {
   // Exact match only — an unanchored /skip/ silently discarded any genuine
   // comment containing the word ("the receptionist skipped my X-ray review").
   const comment = /^skip$/i.test((input || '').trim()) ? null : input;
+  // Defence in depth: like the five documented mutation points, refuse to
+  // persist on a read-only demo tenant. Unreachable via the public demo widget
+  // today (its synthetic phone has no completed visit to arm this flow), but the
+  // guarantee should rest on the guard, not on that precondition holding.
   try {
-    if (ctx.feedback_appointment_id && ctx.feedback_patient_id) {
+    if (!isReadOnlyDemo(tenant) && ctx.feedback_appointment_id && ctx.feedback_patient_id) {
       await tenantQuery(schema,
         `INSERT INTO appointment_feedback (appointment_id, patient_id, rating, comment)
          VALUES ($1,$2,$3,$4)

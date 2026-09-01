@@ -67,13 +67,19 @@ router.patch('/services/:id', adminOnly, validateUUID(), async (req, res) => {
     if (hospital_id !== undefined && hospital_id !== null && !UUID_RE.test(hospital_id)) {
       return res.status(400).json({ error: 'Invalid hospital_id format' });
     }
+    // Reject a non-boolean rather than coerce: Boolean("false") === true, so
+    // {"is_active":"false"} would silently REACTIVATE a service. Same footgun
+    // PATCH /doctors/:id was hardened against.
+    if (is_active !== undefined && typeof is_active !== 'boolean') {
+      return res.status(400).json({ error: 'is_active must be true or false' });
+    }
     const sets = [], params = [];
     if (name !== undefined)             { params.push(name.trim());             sets.push(`name=$${params.length}`); }
     if (description !== undefined)      { params.push(description);             sets.push(`description=$${params.length}`); }
     if (category !== undefined)         { params.push(category);                sets.push(`category=$${params.length}`); }
     if (duration_minutes !== undefined) { params.push(parseInt(duration_minutes) || 30); sets.push(`duration_minutes=$${params.length}`); }
     if (price !== undefined)            { params.push(parseInt(price) || 0);    sets.push(`price=$${params.length}`); }
-    if (is_active !== undefined)        { params.push(Boolean(is_active));      sets.push(`is_active=$${params.length}`); }
+    if (is_active !== undefined)        { params.push(is_active);               sets.push(`is_active=$${params.length}`); }
     if (hospital_id !== undefined)      { params.push(hospital_id || null);     sets.push(`hospital_id=$${params.length}`); }
     if (!sets.length) return res.json({ message: 'nothing to update' });
     params.push(req.params.id);
@@ -137,6 +143,14 @@ router.post('/holidays', adminOnly, async (req, res) => {
     }
     if (!DATE_RE.test(holiday_date) || isNaN(Date.parse(holiday_date))) {
       return res.status(400).json({ error: 'holiday_date must be a valid YYYY-MM-DD date' });
+    }
+    // Reject past dates, consistent with POST /doctors/:id/leaves. A past
+    // holiday blocks nothing (only 'available' slots, and past slots are gone)
+    // but it clutters the list and reads as a mistake. IST, hardcoded +5:30, so
+    // the 18:30–23:59 UTC window doesn't let "today IST" slip to yesterday.
+    const todayIST = new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    if (holiday_date < todayIST) {
+      return res.status(400).json({ error: 'holiday_date cannot be in the past' });
     }
     if (hospital_id && !UUID_RE.test(hospital_id)) {
       return res.status(400).json({ error: 'Invalid hospital_id format' });
