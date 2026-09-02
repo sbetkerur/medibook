@@ -28,13 +28,23 @@ const { query } = require('../db');
 const logger = require('../utils/logger');
 const { withCronLock } = require('../utils/cronLock');
 const { getKeyBuffer } = require('../utils/encryption');
+const backupUpload = require('../services/backupUpload');
+const { pingHealthcheck } = require('../utils/healthPing');
 
 // Defaults to os.tmpdir() only so local dev works without configuration. In a
 // container that is an EPHEMERAL path — every deploy discards the dumps, so the
 // retention logic below silently guards an empty directory. Point BACKUP_DIR at
 // a mounted volume in any deployment whose backups need to survive a restart.
 const BACKUP_DIR = process.env.BACKUP_DIR || os.tmpdir();
-const MAX_BACKUP_FILES = parseInt(process.env.BACKUP_MAX_FILES) || 7;
+// Local/volume retention. Bumped 7 → 14: a bad migration can go unnoticed for
+// several days, and the off-site copy (backupUpload) has its own longer count.
+const MAX_BACKUP_FILES = parseInt(process.env.BACKUP_MAX_FILES) || 14;
+// The IN-CONTAINER copy dies with the Railway project, so this is only half the
+// story — see scripts/backup-prod.js and docs/railway-recovery-plan.md.
+const HEALTHCHECK_URL = process.env.HEALTHCHECK_BACKUP_URL;
+// Schedule is env-configurable so an operator can move to `0 */6 * * *` once the
+// off-site upload is live without a code change. Default is unchanged.
+const BACKUP_CRON = process.env.BACKUP_CRON || '30 2 * * *';
 
 if (process.env.NODE_ENV === 'production' && !process.env.BACKUP_DIR) {
   logger.warn(
@@ -45,6 +55,9 @@ if (process.env.NODE_ENV === 'production' && !process.env.BACKUP_DIR) {
 
 async function runBackup() {
   const startedAt = Date.now();
+  // Fire-and-forget: tells the monitor "the job is alive" so it can alert if the
+  // matching success ping never lands. pingHealthcheck never rejects.
+  pingHealthcheck(HEALTHCHECK_URL, { status: 'start' });
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   // .sql.enc, not .sql: this is no longer a file `psql` can read directly, and
   // the extension has to say so before anyone tries.
@@ -188,12 +201,50 @@ async function runBackup() {
           }
         } catch (_) {}
 
-        resolve({ filePath, sizeBytes, durationMs });
+        // Off-site copy. Best-effort — the volume copy already succeeded, and a
+        // bucket outage must not turn a good backup into a failed cron. A failed
+        // upload is recorded on backup_log so `/api/status` and an audit can see
+        // the volume copy is not mirrored.
+        let offsite = null;
+        if (backupUpload.isConfigured()) {
+          offsite = await backupUpload.uploadBackup(filePath);
+          if (offsite.ok) {
+            await backupUpload.pruneRemote().catch(() => {});
+          } else {
+            logger.error('Off-site backup upload failed (volume copy is fine)', { error: offsite.error });
+            try {
+              await query(
+                `UPDATE backup_log SET error_message=$1 WHERE id=$2`,
+                [`offsite upload failed: ${offsite.error}`, logId]);
+            } catch (_) {}
+          }
+          // Same `offsite_backup` cron_jobs row scripts/backup-prod.js writes,
+          // so `/api/status` (48h staleness budget) alarms on a Railway-side
+          // off-site upload that has silently started failing every night. Only
+          // written when BACKUP_S3_* is configured — otherwise the row stays
+          // `pending` and status.js correctly treats it as "not in use".
+          try {
+            await query(
+              `INSERT INTO cron_jobs (job_name, last_run_at, last_status, last_error)
+               VALUES ('offsite_backup', NOW(), $1, $2)
+               ON CONFLICT (job_name) DO UPDATE
+                 SET last_run_at = NOW(), last_status = $1, last_error = $2`,
+              [offsite.ok ? 'ok' : 'error', offsite.ok ? null : `upload failed: ${offsite.error}`]);
+          } catch (_) {}
+        }
+
+        pingHealthcheck(HEALTHCHECK_URL, {
+          status: 'success',
+          message: `${fileName} ${Math.round((fileBytes) / 1024)}KB` +
+            (backupUpload.isConfigured() ? ` offsite=${offsite && offsite.ok ? 'ok' : 'FAILED'}` : ''),
+        });
+        resolve({ filePath, sizeBytes, durationMs, offsite });
       } else {
         const errMsg = streamError
           ? `backup write failed: ${streamError.message}`
           : `pg_dump exited with code ${code}`;
         logger.error('Backup failed', { code, durationMs });
+        pingHealthcheck(HEALTHCHECK_URL, { status: 'fail', message: errMsg });
         try {
           await query(`
             UPDATE backup_log SET status='failed', completed_at=NOW(), error_message=$1, duration_ms=$2
@@ -211,6 +262,7 @@ async function runBackup() {
       const durationMs = Date.now() - startedAt;
       const errMsg = err.message;
       logger.error('Backup spawn error', { error: errMsg });
+      pingHealthcheck(HEALTHCHECK_URL, { status: 'fail', message: `spawn error: ${errMsg}` });
       try {
         await query(`
           UPDATE backup_log SET status='failed', completed_at=NOW(), error_message=$1, duration_ms=$2
@@ -224,11 +276,12 @@ async function runBackup() {
 }
 
 function startBackupCron() {
-  // 02:30 IST, stated explicitly like every other cron in the codebase rather
-  // than relying on the server happening to run TZ=UTC (which is only a startup
-  // WARNING, not enforced). This is the snapshot jobs/accountDeletion.js at
-  // 03:30 IST depends on existing, so the ordering must not hinge on process TZ.
-  const task = cron.schedule('30 2 * * *', async () => {
+  // Default 02:30 IST, stated explicitly like every other cron in the codebase
+  // rather than relying on the server happening to run TZ=UTC (which is only a
+  // startup WARNING, not enforced). This is the snapshot jobs/accountDeletion.js
+  // at 03:30 IST depends on existing, so a custom BACKUP_CRON must still put a
+  // run before 03:30 IST — keep the minute/hour, widen the frequency.
+  const task = cron.schedule(BACKUP_CRON, async () => {
     await withCronLock('cron:backup', 3600, async () => {
       logger.info('Starting scheduled database backup...');
       try {
@@ -239,7 +292,8 @@ function startBackupCron() {
       }
     });
   }, { timezone: 'Asia/Kolkata' });
-  logger.info('Backup cron registered (daily at 02:30 IST)');
+  logger.info(`Backup cron registered (${BACKUP_CRON} IST` +
+    `${backupUpload.isConfigured() ? ', off-site upload ON' : ''})`);
   return task;
 }
 

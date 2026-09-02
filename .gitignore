@@ -6,7 +6,16 @@ node_modules/
 .env
 .env.local
 .env.production
+.env.prod
 .env.*.local
+
+# Backups & DR artefacts — full encrypted copies of every clinic's data, and
+# plaintext secret snapshots. Belt-and-braces in case a restore/verify/dump is
+# ever run from inside the repo tree.
+*.dump
+*.dump.enc
+*.sql.enc
+railway-env-snapshot-*.txt
 
 # Build output
 .next/

@@ -57,6 +57,14 @@ export default function SuperAdminPage() {
   const [branchCapValue, setBranchCapValue] = useState('');   // branch cap — blank = plan limit
   const [savingBilling, setSavingBilling] = useState(false);
 
+  // Ad-hoc trial extension. The card-free trial is written once by Approve and
+  // then only ever ended by the dunning cron — this is the supported way to give
+  // one clinic longer. Only shown while the clinic is still trialing or just
+  // lapsed (billing_sub_status), never once a card is attached.
+  const [trialModal, setTrialModal] = useState(null); // { tenant }
+  const [trialDays, setTrialDays] = useState('14');
+  const [savingTrial, setSavingTrial] = useState(false);
+
   // Tenant health state
   const [tenantHealth, setTenantHealth] = useState({}); // { [tenantId]: healthData }
   const [loadingHealth, setLoadingHealth] = useState(null);
@@ -266,6 +274,37 @@ export default function SuperAdminPage() {
       fetchAll();
     } catch { toast.error('Failed to update city'); }
     finally { setSavingCity(false); }
+  }
+
+  function openTrialModal(tenant) {
+    setTrialModal({ tenant });
+    setTrialDays('14');
+  }
+
+  async function extendTrial() {
+    if (!trialModal) return;
+    const days = parseInt(trialDays, 10);
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      toast.error('Enter a whole number of days between 1 and 365');
+      return;
+    }
+    setSavingTrial(true);
+    try {
+      const { data } = await api.post(
+        `/superadmin/tenants/${trialModal.tenant.id}/extend-trial`, { days });
+      toast.success(data.message || `Trial extended by ${days} day(s)`);
+      setTrialModal(null);
+      fetchAll();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to extend trial');
+    } finally { setSavingTrial(false); }
+  }
+
+  // A clinic on a card-free trial we can still extend: no subscription attached,
+  // and billing is either running (`trialing`) or just lapsed (`trial_ended`).
+  function canExtendTrial(t) {
+    return !t.billing_sub_id
+      && (t.billing_sub_status === 'trialing' || t.billing_sub_status === 'trial_ended');
   }
 
   function openBillingModal(tenant) {
@@ -615,6 +654,12 @@ export default function SuperAdminPage() {
                         className="inline-flex items-center justify-center min-h-[40px] px-3 py-2 text-xs text-gray-600 border border-gray-200 bg-gray-50 rounded-lg hover:bg-gray-100 transition">
                         💰 Deal
                       </button>
+                      {canExtendTrial(t) && (
+                        <button onClick={() => openTrialModal(t)}
+                          className="inline-flex items-center justify-center min-h-[40px] px-3 py-2 text-xs text-amber-700 border border-amber-200 bg-amber-50 rounded-lg hover:bg-amber-100 transition">
+                          ⏳ Extend trial
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -721,6 +766,12 @@ export default function SuperAdminPage() {
                               className="text-xs px-2 py-1 rounded text-gray-600 hover:bg-gray-100 transition whitespace-nowrap">
                               💰 Deal
                             </button>
+                            {canExtendTrial(t) && (
+                              <button onClick={() => openTrialModal(t)}
+                                className="text-xs px-2 py-1 rounded text-amber-700 hover:bg-amber-50 transition whitespace-nowrap">
+                                ⏳ Extend trial
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -1375,6 +1426,50 @@ export default function SuperAdminPage() {
           </div>
         </div>
       )}
+
+      {/* ── EXTEND TRIAL MODAL ── */}
+      {trialModal && (() => {
+        const t = trialModal.tenant;
+        const end = t.billing_trial_end ? parseISO(t.billing_trial_end) : null;
+        const lapsed = t.billing_sub_status === 'trial_ended' || (end && end < new Date());
+        const days = parseInt(trialDays, 10);
+        const valid = Number.isInteger(days) && days >= 1 && days <= 365;
+        return (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3 sm:p-4">
+            <div className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-md shadow-2xl max-h-[85vh] supports-[max-height:85dvh]:max-h-[85dvh] overflow-y-auto">
+              <div className="flex items-center justify-between gap-2 mb-4">
+                <h2 className="text-base font-semibold text-gray-900">Extend free trial</h2>
+                <button onClick={() => setTrialModal(null)} className="text-gray-400 hover:text-gray-600 text-xl shrink-0">✕</button>
+              </div>
+              <p className="text-sm text-gray-600 mb-3 break-words">
+                Card-free trial for <strong>{t.name}</strong>.{' '}
+                {end
+                  ? lapsed
+                    ? <>It <strong>lapsed</strong> on {format(end, 'd MMM yyyy')} — the new days will run from today.</>
+                    : <>Currently ends {format(end, 'd MMM yyyy')} — the new days are added to that.</>
+                  : <>No end date set yet — the days will run from today.</>}
+                {lapsed && ' The clinic will be reactivated.'}
+              </p>
+              <div className="mb-5">
+                <label className="block text-xs font-medium text-gray-700 mb-1">Extra days (1–365)</label>
+                <input type="number" min={1} max={365} value={trialDays}
+                  onChange={e => setTrialDays(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+              <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
+                <button onClick={() => setTrialModal(null)}
+                  className="flex-1 px-4 py-2.5 sm:py-2 border border-gray-300 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition">
+                  Cancel
+                </button>
+                <button onClick={extendTrial} disabled={savingTrial || !valid}
+                  className="flex-1 px-4 py-2.5 sm:py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50 transition">
+                  {savingTrial ? 'Extending…' : `Add ${valid ? days : '…'} day${days === 1 ? '' : 's'}`}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── NEGOTIATED DEAL MODAL (price + dentist/branch caps) ── */}
       {billingModal && (() => {

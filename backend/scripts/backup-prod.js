@@ -32,6 +32,8 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { getEncryptionKey } = require('./decryptBackup');
+const backupUpload = require('../src/services/backupUpload');
+const { pingHealthcheck } = require('../src/utils/healthPing');
 
 const REPO = path.resolve(__dirname, '..', '..');
 const BACKUP_HOME = process.env.MEDIBOOK_BACKUP_DIR
@@ -39,6 +41,10 @@ const BACKUP_HOME = process.env.MEDIBOOK_BACKUP_DIR
 const KEEP = Number(process.env.MEDIBOOK_BACKUP_KEEP || 14);
 const IMAGE = 'postgres:18-alpine';
 const MIN_SERVER_MAJOR = 18;
+// Dead-man's switch: a laptop backup that quietly stops is invisible until the
+// day it's needed. This URL is pinged on start/success/fail so a monitor
+// (Healthchecks.io etc.) alerts a human when the success ping is overdue.
+const HEALTHCHECK_URL = process.env.HEALTHCHECK_BACKUP_PROD_URL;
 
 function log(msg) {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -142,7 +148,7 @@ function encryptFileInPlace(plainPath, encPath, keyBuffer) {
   fs.unlinkSync(plainPath);
 }
 
-function main() {
+async function main() {
   fs.mkdirSync(BACKUP_HOME, { recursive: true });
 
   // Fetched FIRST and fails fast — no point running a multi-minute pg_dump
@@ -208,15 +214,57 @@ function main() {
         `Encrypt or delete them.`);
   }
 
+  // ── Off-site copy (Cloudflare R2 / Backblaze B2 / S3) ──────────────────────
+  // The laptop is a softer target than Railway, not a safer one, and it has to
+  // be switched on. A bucket on an unrelated provider is the copy that survives
+  // "Railway account gone" AND "laptop off". Same encrypted file, no plaintext.
+  if (backupUpload.isConfigured()) {
+    const up = await backupUpload.uploadBackup(encTarget);
+    if (up.ok) {
+      log(`off-site: uploaded ${up.key} (${up.size.toLocaleString()} bytes)`);
+      const pr = await backupUpload.pruneRemote();
+      log(pr.ok
+        ? `off-site retention: ${pr.kept} kept, ${pr.deleted} pruned`
+        : `off-site retention skipped: ${pr.error}`);
+    } else {
+      log(`WARNING: off-site upload FAILED (${up.error}) — only the local copy exists`);
+    }
+  } else {
+    log('off-site: not configured (set BACKUP_S3_* to enable) — local copy only');
+  }
+
+  // Let /api/status surface off-site-backup staleness via the 'offsite_backup'
+  // cron_jobs row (seeded by migrate.js). Best-effort — the backup already
+  // succeeded, so a failed status write changes nothing that matters.
+  try {
+    const { Client } = require('pg');
+    const c = new Client({ connectionString: url });
+    await c.connect();
+    await c.query(
+      `INSERT INTO cron_jobs (job_name, last_run_at, last_status, last_error)
+       VALUES ('offsite_backup', NOW(), 'ok', NULL)
+       ON CONFLICT (job_name) DO UPDATE
+         SET last_run_at = NOW(), last_status = 'ok', last_error = NULL`);
+    await c.end();
+  } catch (err) {
+    log(`status update skipped: ${err.message}`);
+  }
+
   log('backup OK');
 }
 
 // A backup that fails silently is worse than no backup, because it is believed.
 // Every failure lands in backup.log next to the successes, so one file answers
-// "when did this last actually work".
-try {
-  main();
-} catch (err) {
-  log(`BACKUP FAILED: ${err.message}`);
-  process.exit(1);
-}
+// "when did this last actually work" — and the healthcheck ping means a human
+// is told when a success is overdue, not left to notice.
+(async () => {
+  await pingHealthcheck(HEALTHCHECK_URL, { status: 'start' });
+  try {
+    await main();
+    await pingHealthcheck(HEALTHCHECK_URL, { status: 'success', message: 'backup OK' });
+  } catch (err) {
+    log(`BACKUP FAILED: ${err.message}`);
+    await pingHealthcheck(HEALTHCHECK_URL, { status: 'fail', message: err.message });
+    process.exit(1);
+  }
+})();

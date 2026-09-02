@@ -23,6 +23,14 @@ cd backend && npm run migrate   # public schema + per-tenant migrations (also ru
 cd backend && npm run seed      # demo tenant + doctors + slots
 cd backend && node src/db/demoData.js   # rebuild the pragati-demo scenario dataset (patients, appts, plans, …)
 cd frontend && npm run dev      # dashboard on :3000
+
+# Backups & disaster recovery — full guide: docs/railway-recovery-plan.md
+cd backend && npm run backup:prod    # pull an encrypted off-Railway copy (+ off-site S3 if configured)
+cd backend && npm run backup:verify  # restore newest backup into a throwaway container and assert it works ( -- --from-s3 )
+cd backend && npm run restore:prod   # scripted, guard-railed restore ( -- --target <url> --yes --migrate [--from-s3] )
+cd backend && npm run dr:gameday     # timed full restore rehearsal ( -- --from-s3 )
+cd backend && npm run env:dump       # snapshot every Railway variable for the offline vault
+docker compose -f docker-compose.prod.yml up   # self-hosted fallback stack (needs backend/.env.prod)
 cd backend && node tests/bot.test.js        # bot flow tests (needs DB + seed)
 cd backend && node tests/botFlow.unit.test.js
 cd backend && node tests/entryCode.unit.test.js      # QR entry codes (the only way in)
@@ -47,9 +55,11 @@ cd backend && node tests/demoReadOnlyBot.unit.test.js    # same guard, extended 
 cd backend && node tests/askingTenant.unit.test.js       # answers redirect to the clinic that asked (confirmation/feedback/treatment/recall)
 cd backend && node tests/dentalHistoryEncryption.unit.test.js  # dental_history encryption: round-trip, legacy fallback, tamper detection
 cd backend && node tests/backupEncryption.unit.test.js   # backup file format shared by backupManager.js/backup-prod.js/decryptBackup.js
+cd backend && node tests/backupUpload.unit.test.js       # off-site S3 upload + prune (mocked) and the backup dead-man's-switch ping
 cd backend && node tests/reviewFunnel.unit.test.js       # Google review funnel: only rating >=4 + settings.google_review_url set
 cd backend && node tests/noShowBlock.unit.test.js        # repeat no-shows -> "call the front desk" (opt-in settings.noshow_block_threshold; fails open)
 cd backend && node tests/planLimits.unit.test.js         # per-tenant negotiated dentist/branch caps: tenants.max_*_override ?? plans.max_*
+cd backend && node tests/trialExtension.unit.test.js     # POST /superadmin/tenants/:id/extend-trial: guard, day maths, un-lapse of past_due+trial_ended
 ```
 
 Deploy (Railway): `backend/entrypoint.sh` runs migrate → seed → start on every
@@ -865,8 +875,26 @@ source of truth; `billing_events` dedups Razorpay webhooks on the
 the subscription's health changes, and never touches `pending_review` /
 `suspended`. `jobs/billingDunning.js` (06:15 IST) is the backstop and the
 enforcer: it ENDS lapsed card-free trials (`active` + `trialing` +
-`trial_end` passed → `past_due`), reconciles subscriptions, and after
-`SIGNUP_DUNNING_GRACE_DAYS` (default 7) moves `past_due` → `suspended`.
+`trial_end` passed → `past_due`, `suspension_reason='trial_ended'`,
+`tenant_billing.subscription_status='trial_ended'`), reconciles subscriptions,
+and after `SIGNUP_DUNNING_GRACE_DAYS` (default 7) moves `past_due` → `suspended`.
+
+**Extending one clinic's trial.** `trial_end` is written ONCE by
+`POST /superadmin/tenants/:id/approve` and then only ever ended by the dunning
+cron — `PATCH /superadmin/tenants/:id` does not touch it, and flipping a lapsed
+clinic to `active` by hand just gets re-lapsed the next morning. The supported,
+audited way to give one clinic longer is
+`POST /superadmin/tenants/:id/extend-trial {days}` (1–365). `utils/trialExtension.js`
+holds the three pure pieces: `trialExtensionGuard` (refuses a clinic that is
+paying — has a `razorpay_subscription_id` — or not on a `trialing`/`trial_ended`
+billing status), `nextTrialEnd` (adds the days to the current end if the trial
+is still running, or runs them from now if it has already lapsed, so "14 more
+days" is always a full 14), and `shouldRelapseToActive` (only a
+`past_due` + `trial_ended` clinic is put back to `active` — a payment-failure
+`past_due` is left alone). The super-admin tenant list now LEFT JOINs
+`tenant_billing` (`billing_trial_end` / `billing_sub_status` / `billing_sub_id`)
+so `frontend/src/app/superadmin/page.js` can show an "⏳ Extend trial" action
+only while it applies. `tests/trialExtension.unit.test.js`.
 
 **Self-serve billing management** (`routes/billing.js`, tenant-facing under
 `/api/admin`). A clinic runs its own subscription — no support ticket needed:
@@ -1009,6 +1037,31 @@ the original key. `scripts/verify-backup.js` decrypts to a temp file before
 failed. Tests: `tests/dentalHistoryEncryption.unit.test.js`,
 `tests/backupEncryption.unit.test.js`.
 
+**Neither of those backups survives losing the Railway account** — the volume
+copy is in the same project as the DB, the laptop copy needs the laptop on, and
+both scripts fetch `ENCRYPTION_KEY` *through the Railway CLI*. So both paths ALSO
+push the encrypted file to an S3-compatible bucket on an unrelated provider
+(`services/backupUpload.js`, `@aws-sdk/client-s3`) when `BACKUP_S3_*` is set —
+Cloudflare R2 / Backblaze B2 / S3, endpoint-driven, best-effort (a bucket outage
+logs but never fails the cron), with its own `BACKUP_S3_KEEP` retention.
+`services/backupUpload.js`'s `pruneRemote` only ever deletes objects whose
+basename matches this project's backup naming, so a shared bucket is safe.
+`utils/healthPing.js` pings a dead-man's-switch URL (`HEALTHCHECK_BACKUP_URL` /
+`HEALTHCHECK_BACKUP_PROD_URL`, Healthchecks.io-style `/start` + `/fail`) on every
+run of each backup, so a backup that *stops* running is alerted on, not just one
+that errors. `scripts/backup-prod.js` also writes the `offsite_backup` row in
+`cron_jobs` (seeded by `migrate.js`, read by `routes/status.js` with a 48h
+staleness threshold), so `/api/status` shows off-site backup freshness.
+`scripts/restore-prod.js` is the scripted, guard-railed restore (refuses
+prod-looking `--target` hosts without `--i-really-mean-prod`, accepts either
+backup shape, `--from-s3`, optional `--migrate`); `scripts/dr-gameday.js` times
+a full rehearsal against a throwaway container; `scripts/dump-env.js` snapshots
+every Railway variable for an offline vault. `docker-compose.prod.yml` is the
+self-hosted fallback stack. **Incident runbook: `docs/railway-recovery-plan.md`;
+the one-time operator setup (bucket, monitors, offline vault, 2FA, DNS) is a
+described step-by-step in `docs/railway-dr-setup.md`.** Tests:
+`tests/backupUpload.unit.test.js`.
+
 ## Environment variables
 
 Required in prod (startup fails or warns otherwise): `DATABASE_URL`,
@@ -1027,6 +1080,20 @@ bound for more than one, and logs the condition ONCE rather than per request), `
 `WEBHOOK_RATE_LIMIT_PER_MIN` (default 2000; per-IP, and Meta delivers every
 tenant's traffic from a shared IP pool, so this is effectively platform-wide).
 Frontend: `BACKEND_URL` (server-side, Railway).
+
+Backups + DR (`docs/railway-recovery-plan.md`): `BACKUP_CRON` (default
+`30 2 * * *`; set `0 */6 * * *` once off-site upload is on — must still put a run
+before 03:30 IST, which `accountDeletion` depends on), `BACKUP_MAX_FILES`
+(local/volume retention, default 14). Off-site upload — all optional, unset
+`BACKUP_S3_BUCKET` disables it: `BACKUP_S3_BUCKET`, `BACKUP_S3_ENDPOINT` (R2/B2;
+omit for real AWS S3), `BACKUP_S3_REGION` (default `auto`), `BACKUP_S3_ACCESS_KEY_ID`,
+`BACKUP_S3_SECRET_ACCESS_KEY`, `BACKUP_S3_PREFIX` (default `medibook-backups/`),
+`BACKUP_S3_KEEP` (default 30), `BACKUP_S3_FORCE_PATH_STYLE` (default true).
+Dead-man's-switch ping URLs (alert channel must NOT be WhatsApp):
+`HEALTHCHECK_BACKUP_URL` (in-container nightly), `HEALTHCHECK_BACKUP_PROD_URL`
+(`scripts/backup-prod.js` on the off-Railway machine). For the off-Railway
+scripts: `MEDIBOOK_BACKUP_DIR` (default `~/MediBookBackups`), `MEDIBOOK_BACKUP_KEEP`
+(default 14). Template: `backend/.env.prod.example`.
 
 Self-serve signup (`docs/self-serve-signup.md`): `SELF_SIGNUP_ENABLED` (master
 switch, default false — the ONLY one required outside production, where the flag

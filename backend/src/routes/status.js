@@ -23,7 +23,10 @@ const CRON_MAX_AGE_HOURS = {
   recalls: 30,
   treatment_nudges: 30,
   weekly_digest: 24 * 8,
-  weekly_backup: 24 * 8,
+  // Off-Railway backup (scripts/backup-prod.js, run on a machine that is not
+  // Railway). It writes its own cron_jobs row on success. 48h: it is expected
+  // to run at least daily, so two missed days is a real "go look" signal.
+  offsite_backup: 48,
 };
 
 // Patient-facing crons are deliberately switched off on the dev environment

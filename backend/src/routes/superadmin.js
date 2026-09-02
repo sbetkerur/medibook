@@ -12,6 +12,9 @@ const { handleError } = require('../utils/errors');
 const { IST_TODAY_SQL, IST_MONTH_START_TS_SQL } = require('../utils/dateTz');
 const { getClient: getRedisClient } = require('../utils/redisClient');
 const { generateEntryCode } = require('../utils/entryCode');
+const {
+  trialExtensionGuard, nextTrialEnd, shouldRelapseToActive, MAX_EXTENSION_DAYS,
+} = require('../utils/trialExtension');
 
 // v2: the meaning of total_appointments_30d / appointments_this_month changed
 // (see GET /stats below). A v1 payload written by the previous deploy would be
@@ -235,7 +238,14 @@ router.get('/tenants', async (req, res) => {
 
     const [r, countR] = await Promise.all([
       query(
-        `SELECT t.*, p.name as plan_name, p.price_monthly AS plan_price_monthly FROM tenants t LEFT JOIN plans p ON p.id=t.plan${where} ORDER BY t.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        `SELECT t.*, p.name as plan_name, p.price_monthly AS plan_price_monthly,
+                b.trial_end AS billing_trial_end,
+                b.subscription_status AS billing_sub_status,
+                b.razorpay_subscription_id AS billing_sub_id
+           FROM tenants t
+           LEFT JOIN plans p ON p.id=t.plan
+           LEFT JOIN tenant_billing b ON b.tenant_id=t.id${where}
+          ORDER BY t.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
         params
       ),
       query(`SELECT COUNT(*) FROM tenants t${where}`, countParams),
@@ -375,6 +385,85 @@ router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
     }
 
     res.json({ tenant: r.rows[0], message: 'Clinic approved and live' });
+  } catch (err) { handleError(res, err); }
+});
+
+// ── EXTEND A CARD-FREE TRIAL ─────────────────────────────────
+// The trial is written once by /approve and then only ever ENDED by
+// jobs/billingDunning.js. This is the supported, audited way to give one clinic
+// longer — e.g. an onboarding call slipped, or a pilot needs another fortnight.
+//
+//   POST /superadmin/tenants/:id/extend-trial  { days: 14 }
+//
+// `days` is added to the current end while the trial is still running, or runs
+// from now if it has already lapsed (utils/trialExtension.js `nextTrialEnd`), so
+// "give them 14 more days" always yields a full 14 usable days. If the clinic
+// has already been moved to `past_due` for `trial_ended`, this also puts it back
+// to `active` — the exact reverse of what the dunning cron did. A clinic that is
+// paying (has a Razorpay subscription) or not on a trial at all is rejected with
+// a clear reason.
+router.post('/tenants/:id/extend-trial', validateUUID(), async (req, res) => {
+  try {
+    const days = Number(req.body?.days);
+    if (!Number.isInteger(days) || days < 1 || days > MAX_EXTENSION_DAYS) {
+      return res.status(400).json({ error: `days must be a whole number 1–${MAX_EXTENSION_DAYS}` });
+    }
+
+    const tR = await query(
+      `SELECT id, slug, name, schema_name, status, suspension_reason, signup_source FROM tenants WHERE id=$1`,
+      [req.params.id]
+    );
+    const tenant = tR.rows[0];
+    if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+
+    const bR = await query(`SELECT * FROM tenant_billing WHERE tenant_id=$1`, [req.params.id]);
+    const billing = bR.rows[0] || null;
+
+    const guard = trialExtensionGuard({ billing });
+    if (!guard.ok) return res.status(409).json({ error: guard.error, code: guard.code });
+
+    const oldTrialEnd = billing.trial_end;
+    const newTrialEnd = nextTrialEnd(oldTrialEnd, days);
+    const relapse = shouldRelapseToActive(tenant);
+
+    await query(
+      `UPDATE tenant_billing
+          SET trial_end = $2, subscription_status = 'trialing', updated_at = NOW()
+        WHERE tenant_id = $1`,
+      [req.params.id, newTrialEnd.toISOString()]
+    );
+
+    if (relapse) {
+      await query(
+        `UPDATE tenants SET status='active', suspension_reason=NULL, suspended_at=NULL WHERE id=$1`,
+        [req.params.id]
+      );
+      invalidateTenantCache(req.params.id);
+    }
+
+    await query(`
+      INSERT INTO audit_logs (actor_id, actor_role, action, resource_type, resource_id, new_values, ip_address)
+      VALUES ($1,'super_admin','EXTEND_TRIAL','tenant',$2,$3,$4)
+    `, [req.user.id, req.params.id, JSON.stringify({
+      days, old_trial_end: oldTrialEnd, new_trial_end: newTrialEnd.toISOString(),
+      un_lapsed: relapse,
+    }), req.ip]).catch(() => {});
+
+    logger.info('Trial extended', {
+      slug: tenant.slug, days, new_trial_end: newTrialEnd.toISOString(),
+      un_lapsed: relapse, by: req.user.email,
+    });
+
+    res.json({
+      message: relapse
+        ? `Trial extended by ${days} day(s) and clinic reactivated`
+        : `Trial extended by ${days} day(s)`,
+      tenant_id: req.params.id,
+      extended_by_days: days,
+      old_trial_end: oldTrialEnd,
+      new_trial_end: newTrialEnd.toISOString(),
+      un_lapsed: relapse,
+    });
   } catch (err) { handleError(res, err); }
 });
 

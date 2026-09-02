@@ -1,0 +1,108 @@
+# MediBook — self-hosted production stack. The DR fallback when Railway is
+# unavailable, and the thing to keep working so it isn't theoretical.
+#
+# This is NOT the local-dev stack (that's docker-compose.yml, NODE_ENV=development
+# with placeholder secrets). This one runs the real production image with
+# NODE_ENV=production, so every startup guard applies — it needs a real
+# ENCRYPTION_KEY, JWT_SECRET, META_* and a non-localhost FRONTEND_URL, all from
+# backend/.env.prod (create it from backend/.env.prod.example, values out of the
+# offline vault — see docs/railway-recovery-plan.md).
+#
+# Full recovery order:
+#   1. docker compose -f docker-compose.prod.yml up -d postgres redis
+#   2. cd backend && node scripts/restore-prod.js \
+#        --target postgresql://postgres:$POSTGRES_PASSWORD@localhost:5432/medibook \
+#        --yes --migrate --from-s3
+#   3. docker compose -f docker-compose.prod.yml up -d backend frontend
+#   4. repoint api./app. DNS at this host; verify /health and /api/proxy/health
+#
+# Postgres is pinned to 18 to match Railway's major and the pg_dump baked into
+# the backend image; bump both together if Railway's Postgres moves.
+
+services:
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: medibook
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or a .env file}
+    ports:
+      - "5432:5432"
+    volumes:
+      - medibook_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d medibook"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - medibook_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - ./backend/.env.prod
+    environment:
+      # Point the app at the compose services regardless of what .env.prod's
+      # own DATABASE_URL/REDIS_URL say (those may still hold Railway hosts).
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?}@postgres:5432/medibook
+      REDIS_URL: redis://redis:6379
+      PORT: "3001"
+      # entrypoint.sh runs migrate (idempotent) then seed (no-ops when
+      # SEED_DEMO_DATA=false) then start — safe against a freshly restored DB.
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Rewrites are compiled at build time, so this must be the URL the
+        # frontend will actually reach the backend on. Default: the compose
+        # network. For a public cutover, set BACKEND_URL=https://api.<domain>
+        # in the environment before `docker compose build`.
+        BACKEND_URL: ${BACKEND_URL:-http://backend:3001}
+    environment:
+      BACKEND_URL: ${BACKEND_URL:-http://backend:3001}
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/login >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  medibook_pgdata:
+  medibook_redis:

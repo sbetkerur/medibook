@@ -2,8 +2,9 @@
  * Restore a backup into a throwaway database and check it actually contains a
  * working MediBook.
  *
- *   node scripts/verify-backup.js            # newest backup
+ *   node scripts/verify-backup.js            # newest LOCAL backup
  *   node scripts/verify-backup.js <path>     # a specific one
+ *   node scripts/verify-backup.js --from-s3  # newest object in the backup bucket
  *
  * An untested backup is a hypothesis. This session already showed why: a restore
  * reported success twice while silently producing a corrupt result. So the check
@@ -23,6 +24,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { decryptFile } = require('./decryptBackup');
+const backupUpload = require('../src/services/backupUpload');
 
 const BACKUP_HOME = process.env.MEDIBOOK_BACKUP_DIR
   || path.join(os.homedir(), 'MediBookBackups');
@@ -42,8 +44,19 @@ function newest() {
   return files[0].p;
 }
 
-(function main() {
-  let file = process.argv[2] || newest();
+(async function main() {
+  let s3Temp = null;
+  let file;
+  if (process.argv[2] === '--from-s3') {
+    if (!backupUpload.isConfigured()) {
+      console.error('--from-s3 needs BACKUP_S3_* configured'); process.exit(1);
+    }
+    s3Temp = fs.mkdtempSync(path.join(os.tmpdir(), 'medibook-verify-s3-'));
+    console.log('fetching newest object from the backup bucket...');
+    file = await backupUpload.downloadLatest(s3Temp);
+  } else {
+    file = process.argv[2] || newest();
+  }
   let decryptedTemp = null;
   if (file.endsWith('.enc')) {
     decryptedTemp = path.join(os.tmpdir(), `medibook-verify-${Date.now()}.dump`);
@@ -119,5 +132,8 @@ function newest() {
     // The decrypted copy is plaintext PHI for every clinic — clean it up
     // whether verification passed or failed, not just on the happy path.
     if (decryptedTemp) { try { fs.unlinkSync(decryptedTemp); } catch { /* already gone */ } }
+    if (s3Temp) {
+      try { fs.rmSync(s3Temp, { recursive: true, force: true }); } catch { /* gone */ }
+    }
   }
-})();
+})().catch(err => { console.error(`FAILED: ${err.message}`); process.exit(1); });
