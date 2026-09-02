@@ -218,15 +218,19 @@ async function runBackup() {
                 [`offsite upload failed: ${offsite.error}`, logId]);
             } catch (_) {}
           }
-          // Same `offsite_backup` cron_jobs row scripts/backup-prod.js writes,
-          // so `/api/status` (48h staleness budget) alarms on a Railway-side
-          // off-site upload that has silently started failing every night. Only
-          // written when BACKUP_S3_* is configured — otherwise the row stays
-          // `pending` and status.js correctly treats it as "not in use".
+          // Its OWN cron_jobs row, distinct from the `offsite_backup` row that
+          // scripts/backup-prod.js writes from the off-Railway machine. They are
+          // two independent off-site copies with independent failure modes — if
+          // this Railway-side upload wrote the same row, a healthy container
+          // upload would keep it fresh and mask the laptop copy silently
+          // stopping, which is the copy that survives losing the Railway account.
+          // `/api/status` (48h staleness budget) alarms on this one going stale
+          // or 'error'. Only written when BACKUP_S3_* is configured — otherwise
+          // the row stays `pending` and status.js treats it as "not in use".
           try {
             await query(
               `INSERT INTO cron_jobs (job_name, last_run_at, last_status, last_error)
-               VALUES ('offsite_backup', NOW(), $1, $2)
+               VALUES ('offsite_backup_volume', NOW(), $1, $2)
                ON CONFLICT (job_name) DO UPDATE
                  SET last_run_at = NOW(), last_status = $1, last_error = $2`,
               [offsite.ok ? 'ok' : 'error', offsite.ok ? null : `upload failed: ${offsite.error}`]);

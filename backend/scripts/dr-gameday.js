@@ -24,6 +24,7 @@
  */
 const { execFileSync } = require('child_process');
 const path = require('path');
+const { assertMediBook } = require('./lib/assertMediBook');
 
 const BACKEND = path.resolve(__dirname, '..');
 const IMAGE = 'postgres:18-alpine';
@@ -78,28 +79,10 @@ try {
 
   step('3/3  asserting a working MediBook');
   const q = sql => d(['exec', NAME, 'psql', '-t', '-A', '-U', 'postgres', '-d', 'medibook', '-c', sql]).trim();
-  const checks = [
-    ['platform tables', Number(q(`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`)), n => n > 20],
-    ['plans',           Number(q(`SELECT count(*) FROM plans`)),            n => n >= 2],
-    ['super admins',    Number(q(`SELECT count(*) FROM super_admins`)),     n => n >= 1],
-    ['migrations',      Number(q(`SELECT count(*) FROM schema_migrations`)), n => n > 15],
-    ['tenants',         Number(q(`SELECT count(*) FROM tenants`)),          () => true],
-    ['tenant schemas',  Number(q(`SELECT count(*) FROM information_schema.schemata WHERE schema_name LIKE 'tenant_%'`)), () => true],
-  ];
-  let failed = 0;
-  for (const [label, value, pass] of checks) {
-    const good = pass(value);
-    if (!good) failed++;
-    console.log(`  ${good ? '✓' : '✗'} ${label}: ${value}`);
-  }
-  if (checks[4][1] !== checks[5][1]) {
-    failed++;
-    console.log(`  ✗ MISMATCH: ${checks[4][1]} tenant rows but ${checks[5][1]} schemas`);
-  } else {
-    console.log(`  ✓ tenant rows and schemas agree (${checks[4][1]})`);
-  }
+  const asserted = assertMediBook(q);
+  asserted.lines.forEach(l => console.log(l));
+  ok = asserted.ok;
 
-  ok = failed === 0;
   const total = Date.now() - t0;
   console.log('\n' + '-'.repeat(60));
   console.log(`  restore + migrate : ${fmt(restoreMs)}`);

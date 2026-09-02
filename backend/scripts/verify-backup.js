@@ -25,6 +25,7 @@ const path = require('path');
 const os = require('os');
 const { decryptFile } = require('./decryptBackup');
 const backupUpload = require('../src/services/backupUpload');
+const { assertMediBook } = require('./lib/assertMediBook');
 
 const BACKUP_HOME = process.env.MEDIBOOK_BACKUP_DIR
   || path.join(os.homedir(), 'MediBookBackups');
@@ -99,34 +100,11 @@ function newest() {
 
     const q = sql => d(['exec', NAME, 'psql', '-t', '-A', '-U', 'postgres', '-d', 'verify', '-c', sql]).trim();
 
-    const checks = [
-      ['platform tables', Number(q(`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`)), n => n > 20],
-      ['plans',           Number(q(`SELECT count(*) FROM plans`)),            n => n >= 2],
-      ['super admins',    Number(q(`SELECT count(*) FROM super_admins`)),     n => n >= 1],
-      ['migrations',      Number(q(`SELECT count(*) FROM schema_migrations`)), n => n > 15],
-      ['tenants',         Number(q(`SELECT count(*) FROM tenants`)),          () => true],
-      ['tenant schemas',  Number(q(`SELECT count(*) FROM information_schema.schemata WHERE schema_name LIKE 'tenant_%'`)), () => true],
-    ];
+    const { ok, lines } = assertMediBook(q);
+    lines.forEach(l => console.log(l));
 
-    let failed = 0;
-    for (const [label, value, pass] of checks) {
-      const good = pass(value);
-      if (!good) failed++;
-      console.log(`  ${good ? '✓' : '✗'} ${label}: ${value}`);
-    }
-
-    // Tenant count and schema count must agree, or a restore dropped clinics
-    // without dropping their rows — the exact silent corruption seen earlier.
-    const tenants = checks[4][1], schemas = checks[5][1];
-    if (tenants !== schemas) {
-      failed++;
-      console.log(`  ✗ MISMATCH: ${tenants} tenant rows but ${schemas} schemas`);
-    } else {
-      console.log(`  ✓ tenant rows and schemas agree (${tenants})`);
-    }
-
-    console.log(failed ? '\nBACKUP VERIFICATION FAILED' : '\nBACKUP VERIFIED — this file restores to a working MediBook');
-    process.exitCode = failed ? 1 : 0;
+    console.log(ok ? '\nBACKUP VERIFIED — this file restores to a working MediBook' : '\nBACKUP VERIFICATION FAILED');
+    process.exitCode = ok ? 0 : 1;
   } finally {
     try { d(['rm', '-f', NAME], { stdio: 'ignore' }); } catch { /* gone */ }
     // The decrypted copy is plaintext PHI for every clinic — clean it up

@@ -94,7 +94,7 @@ function dockerReady() {
   catch { return false; }
 }
 
-function resolveSource(a, tmpDir) {
+async function resolveSource(a, tmpDir) {
   if (a.source) {
     if (!fs.existsSync(a.source)) die(`--source not found: ${a.source}`);
     return path.resolve(a.source);
@@ -102,7 +102,9 @@ function resolveSource(a, tmpDir) {
   if (a.fromS3) {
     if (!backupUpload.isConfigured()) die('--from-s3 needs BACKUP_S3_* configured');
     console.log('fetching newest object from the backup bucket...');
-    return backupUpload.downloadLatest(tmpDir); // throws if none / on error
+    // MUST be awaited here, not returned as a Promise — the caller does string
+    // ops (`srcFile.startsWith`) on the result straight away.
+    return await backupUpload.downloadLatest(tmpDir); // throws if none / on error
   }
   const local = fs.existsSync(BACKUP_HOME)
     ? fs.readdirSync(BACKUP_HOME)
@@ -179,7 +181,7 @@ async function main() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'medibook-restore-'));
   const cleanup = [];
   try {
-    const srcFile = resolveSource(a, tmpDir);
+    const srcFile = await resolveSource(a, tmpDir);
     if (srcFile.startsWith(tmpDir)) cleanup.push(srcFile);
 
     let restoreFile = srcFile;

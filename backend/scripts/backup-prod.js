@@ -229,25 +229,32 @@ async function main() {
     } else {
       log(`WARNING: off-site upload FAILED (${up.error}) — only the local copy exists`);
     }
+
+    // Let /api/status surface off-site-backup staleness via the 'offsite_backup'
+    // cron_jobs row (seeded by migrate.js). Only written when BACKUP_S3_* is
+    // configured — with no bucket there is no off-site copy to have an opinion
+    // about, so the row stays `pending` and status.js treats it as "not in use".
+    // last_status/last_error track the ACTUAL upload result (mirroring
+    // jobs/backupManager.js): a nightly upload that has silently started failing
+    // must turn the row 'error', not read green off the local laptop copy alone.
+    // Best-effort — the local backup already succeeded, so a failed status write
+    // changes nothing that matters.
+    try {
+      const { Client } = require('pg');
+      const c = new Client({ connectionString: url });
+      await c.connect();
+      await c.query(
+        `INSERT INTO cron_jobs (job_name, last_run_at, last_status, last_error)
+         VALUES ('offsite_backup', NOW(), $1, $2)
+         ON CONFLICT (job_name) DO UPDATE
+           SET last_run_at = NOW(), last_status = $1, last_error = $2`,
+        [up.ok ? 'ok' : 'error', up.ok ? null : `upload failed: ${up.error}`]);
+      await c.end();
+    } catch (err) {
+      log(`status update skipped: ${err.message}`);
+    }
   } else {
     log('off-site: not configured (set BACKUP_S3_* to enable) — local copy only');
-  }
-
-  // Let /api/status surface off-site-backup staleness via the 'offsite_backup'
-  // cron_jobs row (seeded by migrate.js). Best-effort — the backup already
-  // succeeded, so a failed status write changes nothing that matters.
-  try {
-    const { Client } = require('pg');
-    const c = new Client({ connectionString: url });
-    await c.connect();
-    await c.query(
-      `INSERT INTO cron_jobs (job_name, last_run_at, last_status, last_error)
-       VALUES ('offsite_backup', NOW(), 'ok', NULL)
-       ON CONFLICT (job_name) DO UPDATE
-         SET last_run_at = NOW(), last_status = 'ok', last_error = NULL`);
-    await c.end();
-  } catch (err) {
-    log(`status update skipped: ${err.message}`);
   }
 
   log('backup OK');

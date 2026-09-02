@@ -512,6 +512,7 @@ async function migrate() {
         ('feedback'),
         ('backup'),
         ('offsite_backup'),
+        ('offsite_backup_volume'),
         ('weekly_digest'),
         ('webhook_retry'),
         ('recalls'),

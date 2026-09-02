@@ -10,9 +10,11 @@
  *     a Razorpay subscription) or one not on a trial is refused with a reason.
  *  2. "Give them N more days" means a FULL N days: added to the current end if
  *     the trial is still running, run from now if it has already lapsed.
- *  3. Extending un-lapses a clinic ONLY if it sits in the exact state the
- *     dunning cron leaves — `past_due` + `suspension_reason='trial_ended'`. A
- *     `past_due` for a real payment failure is left alone.
+ *  3. Extending un-lapses a clinic ONLY if the dunning cron lapsed it —
+ *     `past_due` + `suspension_reason='trial_ended'`, OR `suspended` +
+ *     `suspension_reason='payment_grace_elapsed'` with billing still
+ *     `trial_ended` (grace window elapsed). A real payment failure, or a
+ *     kill-switch suspension, is left alone.
  *
  * Run: node tests/trialExtension.unit.test.js   (no Postgres/Redis)
  */
@@ -101,8 +103,29 @@ test('accepts the maximum allowed extension', () => {
 });
 
 // ── shouldRelapseToActive ────────────────────────────────────
-test('un-lapses only past_due + trial_ended', () => {
+test('un-lapses past_due + trial_ended', () => {
   assert.strictEqual(shouldRelapseToActive({ status: 'past_due', suspension_reason: 'trial_ended' }), true);
+});
+
+test('un-lapses suspended + grace-elapsed when billing is still trial_ended', () => {
+  assert.strictEqual(shouldRelapseToActive(
+    { status: 'suspended', suspension_reason: 'payment_grace_elapsed' },
+    { subscription_status: 'trial_ended' }), true);
+});
+
+test('leaves suspended + grace-elapsed alone when it was a real payment failure', () => {
+  // Same tenant shape, but the card path — billing is not a trial state.
+  assert.strictEqual(shouldRelapseToActive(
+    { status: 'suspended', suspension_reason: 'payment_grace_elapsed' },
+    { subscription_status: 'halted' }), false);
+  assert.strictEqual(shouldRelapseToActive(
+    { status: 'suspended', suspension_reason: 'payment_grace_elapsed' }, null), false);
+});
+
+test('leaves a kill-switch suspension alone', () => {
+  assert.strictEqual(shouldRelapseToActive(
+    { status: 'suspended', suspension_reason: 'manual suspension' },
+    { subscription_status: 'trial_ended' }), false);
 });
 
 test('leaves a payment-failure past_due alone', () => {

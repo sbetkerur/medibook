@@ -397,11 +397,12 @@ router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
 //
 // `days` is added to the current end while the trial is still running, or runs
 // from now if it has already lapsed (utils/trialExtension.js `nextTrialEnd`), so
-// "give them 14 more days" always yields a full 14 usable days. If the clinic
-// has already been moved to `past_due` for `trial_ended`, this also puts it back
-// to `active` — the exact reverse of what the dunning cron did. A clinic that is
-// paying (has a Razorpay subscription) or not on a trial at all is rejected with
-// a clear reason.
+// "give them 14 more days" always yields a full 14 usable days. If the dunning
+// cron has already lapsed the clinic — `past_due` for `trial_ended`, or
+// `suspended` once the grace window elapsed — this also puts it back to
+// `active` (utils/trialExtension.js `shouldRelapseToActive`), the exact reverse
+// of what the cron did. A clinic that is paying (has a Razorpay subscription) or
+// not on a trial at all is rejected with a clear reason.
 router.post('/tenants/:id/extend-trial', validateUUID(), async (req, res) => {
   try {
     const days = Number(req.body?.days);
@@ -424,7 +425,7 @@ router.post('/tenants/:id/extend-trial', validateUUID(), async (req, res) => {
 
     const oldTrialEnd = billing.trial_end;
     const newTrialEnd = nextTrialEnd(oldTrialEnd, days);
-    const relapse = shouldRelapseToActive(tenant);
+    const relapse = shouldRelapseToActive(tenant, billing);
 
     await query(
       `UPDATE tenant_billing

@@ -1432,6 +1432,11 @@ export default function SuperAdminPage() {
         const t = trialModal.tenant;
         const end = t.billing_trial_end ? parseISO(t.billing_trial_end) : null;
         const lapsed = t.billing_sub_status === 'trial_ended' || (end && end < new Date());
+        // Mirrors backend shouldRelapseToActive: extending only un-lapses a
+        // clinic the dunning cron put in past_due (trial_ended) or suspended
+        // (grace elapsed) — not a healthy trial, not a kill-switch suspension.
+        const willReactivate = t.status === 'past_due'
+          || (t.status === 'suspended' && t.suspension_reason === 'payment_grace_elapsed');
         const days = parseInt(trialDays, 10);
         const valid = Number.isInteger(days) && days >= 1 && days <= 365;
         return (
@@ -1448,7 +1453,7 @@ export default function SuperAdminPage() {
                     ? <>It <strong>lapsed</strong> on {format(end, 'd MMM yyyy')} — the new days will run from today.</>
                     : <>Currently ends {format(end, 'd MMM yyyy')} — the new days are added to that.</>
                   : <>No end date set yet — the days will run from today.</>}
-                {lapsed && ' The clinic will be reactivated.'}
+                {willReactivate && ' The clinic will be reactivated.'}
               </p>
               <div className="mb-5">
                 <label className="block text-xs font-medium text-gray-700 mb-1">Extra days (1–365)</label>

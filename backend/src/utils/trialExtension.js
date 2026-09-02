@@ -67,13 +67,31 @@ function nextTrialEnd(currentTrialEnd, days, now = new Date()) {
 }
 
 /**
- * True when the tenant sits in the exact state billingDunning.endLapsedTrials
- * leaves behind — so extending the trial should also put it back to `active`.
- * A `past_due` for any other reason (a real payment failure) is left alone.
+ * True when extending the trial should also lift a lapse the dunning cron
+ * applied. Two states qualify, both from the card-free-trial path only:
+ *   - `past_due` + `suspension_reason='trial_ended'`  (billingDunning.endLapsedTrials)
+ *   - `suspended` + `suspension_reason='payment_grace_elapsed'` once the grace
+ *     window elapsed (billingDunning.suspendExpiredGrace) — which does NOT touch
+ *     tenant_billing, so `subscription_status` is still 'trial_ended' and tells
+ *     it apart from a real card-payment failure that reached the same status.
+ * A `past_due`/`suspended` for a genuine payment failure is left alone (the
+ * route's guard has already rejected any clinic with a Razorpay subscription,
+ * so a `trial_ended` billing status here is an unambiguous "card-free trial").
  * @param {{ status: string, suspension_reason?: string|null }} tenant
+ * @param {{ subscription_status?: string|null }|null} [billing]
  */
-function shouldRelapseToActive(tenant) {
-  return tenant.status === 'past_due' && tenant.suspension_reason === 'trial_ended';
+function shouldRelapseToActive(tenant, billing) {
+  if (tenant.status === 'past_due' && tenant.suspension_reason === 'trial_ended') {
+    return true;
+  }
+  if (
+    tenant.status === 'suspended'
+    && tenant.suspension_reason === 'payment_grace_elapsed'
+    && billing && billing.subscription_status === 'trial_ended'
+  ) {
+    return true;
+  }
+  return false;
 }
 
 module.exports = {
