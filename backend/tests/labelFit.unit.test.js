@@ -134,6 +134,29 @@ test('a row with nothing to add carries no description at all', () => {
   assert.strictEqual(row.description, undefined);
 });
 
+// ── Two long labels sharing a prefix must not fit to the same title ──
+// Regression: a clinic's ONLY branch ("Pragati Dental Studio") and a SECOND
+// branch named after it plus a locality ("Pragati Dental Studio — Whitefield")
+// both fitted to "Pragati Dental Studio…" — the word-boundary snap-back landed
+// right before the branch's own distinguishing suffix, so the patient's branch
+// picker showed what looked like the same clinic twice — the second row still
+// worked once picked, but nothing on the row let a patient pick it correctly.
+test('two branches sharing a long name prefix stay TELLABLE APART', () => {
+  const rows = fitRows([
+    { id: 'br-1', title: 'Pragati Dental Studio', description: 'Bengaluru' },
+    { id: 'br-2', title: 'Pragati Dental Studio — Whitefield', description: 'Bengaluru' },
+  ]);
+  assert.notStrictEqual(rows[0].title, rows[1].title,
+    `both branches fitted to the same title: ${rows[0].title}`);
+  // Also guard the confusable case a plain Set misses: one title an exact
+  // prefix of the other plus "…" reads identically to a scanning patient.
+  const stripEllipsis = t => (t.endsWith('…') ? t.slice(0, -1) : t);
+  assert.notStrictEqual(stripEllipsis(rows[0].title), stripEllipsis(rows[1].title),
+    `branches are visually indistinguishable: "${rows[0].title}" vs "${rows[1].title}"`);
+  assert(rows[1].description.includes('Whitefield'), 'full branch name must still reach the patient');
+  for (const r of rows) assert(r.title.length <= LIST_TITLE_MAX, `title over cap: ${r.title}`);
+});
+
 // ── Nothing may exceed a cap, whatever the input ──────────────
 test('no fitted row can exceed the caps, however long the source', () => {
   const monstrous = 'Advanced Restorative Cosmetic and Maxillofacial Reconstructive Dentistry Unit';

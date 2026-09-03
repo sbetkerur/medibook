@@ -194,9 +194,31 @@ async function sendChoice(send, prompt, items, opts, { listLabel, sectionTitle }
  * instead of hand-rolling rows that truncate.
  */
 function fitRows(items) {
+  // Word-boundary fitting can make two DIFFERENT long labels collapse onto the
+  // same fitted title when they share a long prefix — "Pragati Dental Studio"
+  // and "Pragati Dental Studio — Whitefield" both fit to "Pragati Dental
+  // Studio…", because the boundary snap-back lands right before the branch's
+  // own distinguishing suffix. That is exactly the outcome fitTitle/fitPersonName
+  // exist to prevent for names ("two dentists sharing a long given name stay
+  // TELLABLE APART") — extended here to any list, generically, since fitTitle
+  // has no sibling-name trick to fall back on. On a collision, re-cut the
+  // colliding row at the raw character limit instead of the word boundary: it
+  // keeps whatever of the distinguishing suffix survives, rather than trimming
+  // it away.
+  // Compared with the trailing ellipsis stripped: "Pragati Dental Studio" and
+  // "Pragati Dental Studio…" read as the same clinic to a patient scanning the
+  // list, even though they are different strings — an exact-string Set would
+  // miss exactly this collision.
+  const normalize = t => (t.endsWith('…') ? t.slice(0, -1) : t);
+  const usedTitles = new Set();
   return items.map(i => {
     const full = String(i.fullTitle || i.title);
-    const title = fitTitle(String(i.title));
+    let title = fitTitle(String(i.title));
+    if (usedTitles.has(normalize(title)) && full.length > LIST_ROW_TITLE_MAX) {
+      const raw = `${full.slice(0, LIST_ROW_TITLE_MAX - 1)}…`;
+      if (!usedTitles.has(normalize(raw))) title = raw;
+    }
+    usedTitles.add(normalize(title));
     // The full label leads the description whenever the title had to shorten
     // it — ahead of the caller's own detail, because identifying the row is what
     // the patient is doing here and the specialisation is context.
@@ -396,13 +418,29 @@ async function showDepartments(phone, schema, tenant, send, ctx) {
   // Via doctor_departments, not doctors.department_id: a dentist can render
   // several treatments (a GP who also does simple RCTs), and the join table is
   // the bookable set. The doctor's primary department is always in it.
+  //
+  // The branch match itself must NOT be doc.hospital_id alone — that is a
+  // doctor's PRIMARY branch, and a visiting consultant's whole reason for
+  // existing is that they sit at a branch that is not their primary
+  // (doctor_schedules.hospital_id / doctor_hospitals, see the "Visiting
+  // consultants" note in CLAUDE.md and the same OR EXISTS idiom in
+  // routes/appointments.js's walk-in booking). Requiring the primary here
+  // made a branch with only a visiting consultant list ZERO departments —
+  // "Nothing is set up for online booking yet" — even though that consultant
+  // has real slots at this branch on their day.
   const depts = await tenantQuery(schema,
     `SELECT DISTINCT d.id, d.name FROM departments d
      JOIN doctor_departments dd ON dd.department_id=d.id
      JOIN doctors doc ON doc.id=dd.doctor_id
      WHERE d.hospital_id=$1 AND d.is_active=true AND doc.is_active=true
        AND doc.online_bookable=true
-       AND doc.hospital_id=$1
+       AND (
+         doc.hospital_id=$1
+         OR EXISTS (SELECT 1 FROM doctor_schedules ds
+                     WHERE ds.doctor_id=doc.id AND ds.hospital_id=$1)
+         OR EXISTS (SELECT 1 FROM doctor_hospitals dh
+                     WHERE dh.doctor_id=doc.id AND dh.hospital_id=$1)
+       )
      ORDER BY d.name`, [ctx.hospital_id]);
 
   if (!depts.rows.length) {
@@ -448,13 +486,22 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
   // Re-fetch from DB if cache is missing (e.g. session resumed after expiry).
   // Without this, a stale empty _depts leaves the user permanently stuck.
   if (!depts.length && ctx.hospital_id) {
+    // Same visiting-consultant widening as the query above — kept identical so
+    // a session resumed after expiry doesn't see a DIFFERENT department list
+    // than the one shown a moment ago.
     const r = await tenantQuery(schema,
       `SELECT DISTINCT d.id, d.name FROM departments d
        JOIN doctor_departments dd ON dd.department_id=d.id
        JOIN doctors doc ON doc.id=dd.doctor_id
        WHERE d.hospital_id=$1 AND d.is_active=true AND doc.is_active=true
          AND doc.online_bookable=true
-         AND doc.hospital_id=$1
+         AND (
+           doc.hospital_id=$1
+           OR EXISTS (SELECT 1 FROM doctor_schedules ds
+                       WHERE ds.doctor_id=doc.id AND ds.hospital_id=$1)
+           OR EXISTS (SELECT 1 FROM doctor_hospitals dh
+                       WHERE dh.doctor_id=doc.id AND dh.hospital_id=$1)
+         )
        ORDER BY d.name`, [ctx.hospital_id]);
     depts = [GENERAL_CONSULT, ...r.rows];
     ctx._depts = depts;
@@ -522,6 +569,12 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
   // those whose PRIMARY department it is — the general dentist offering root
   // canals has to appear alongside the endodontist. Specialists first (the
   // doctor whose primary department this is leads the list), then by name.
+  // Same widening as showDepartments: `d.hospital_id=$N` alone is the doctor's
+  // PRIMARY branch and misses a visiting consultant whose only presence at
+  // THIS branch is a doctor_schedules/doctor_hospitals session — the branch
+  // could clear the department check above (a department only appears there
+  // once some doctor is confirmed to work it at this branch) and still find no
+  // doctors here if this step re-narrowed to the primary alone.
   const doctors = isGeneralConsult
     ? await tenantQuery(schema,
         // General dentists first, then by fee, then by name. Alphabetical put
@@ -533,7 +586,14 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
                 false AS is_primary
          FROM doctors d
          LEFT JOIN departments dep ON dep.id = d.department_id
-         WHERE d.hospital_id=$1 AND d.is_active=true AND d.online_bookable=true
+         WHERE d.is_active=true AND d.online_bookable=true
+           AND (
+             d.hospital_id=$1
+             OR EXISTS (SELECT 1 FROM doctor_schedules ds
+                         WHERE ds.doctor_id=d.id AND ds.hospital_id=$1)
+             OR EXISTS (SELECT 1 FROM doctor_hospitals dh
+                         WHERE dh.doctor_id=d.id AND dh.hospital_id=$1)
+           )
          ORDER BY (COALESCE(d.specialization,'') ILIKE '%general%'
                    OR COALESCE(dep.name,'') ILIKE 'general%') DESC,
                   d.consultation_fee ASC NULLS LAST,
@@ -544,7 +604,14 @@ async function handleSelectDept(phone, schema, tenant, send, ctx, choice, input,
                 (d.department_id = $1) AS is_primary
          FROM doctors d
          JOIN doctor_departments dd ON dd.doctor_id=d.id AND dd.department_id=$1
-         WHERE d.hospital_id=$2 AND d.is_active=true AND d.online_bookable=true
+         WHERE d.is_active=true AND d.online_bookable=true
+           AND (
+             d.hospital_id=$2
+             OR EXISTS (SELECT 1 FROM doctor_schedules ds
+                         WHERE ds.doctor_id=d.id AND ds.hospital_id=$2)
+             OR EXISTS (SELECT 1 FROM doctor_hospitals dh
+                         WHERE dh.doctor_id=d.id AND dh.hospital_id=$2)
+           )
          ORDER BY is_primary DESC, d.name`,
         [dept.id, ctx.hospital_id]);
 
