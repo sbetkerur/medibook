@@ -4,6 +4,13 @@ One-shot text to dentists in the IDA directory (SMS/DLT or the IDA channel).
 **Plain text only — no links, no attachments, no images.** Both website
 addresses are given as plain text for the dentist to open themselves.
 
+**Body-only channel — there is no subject line and no sender field.** The
+`Subject:` under each variant below is an internal label for this doc, never
+sent. The dentist sees only the message body, and the first ~6 words of it are
+the entire "preview" (see *Why the opening words matter*) — so nothing that
+would have gone in a subject can be assumed read. Each variant's body already
+stands on its own without one.
+
 The message does not pitch or explain MediBook. Its only job is to make the
 dentist *curious enough to look*.
 
@@ -89,56 +96,86 @@ on the surname alone.
 
 ## Variant A — the after-hours gap  *(default)*
 
+**Subject (internal label — not sent):** After-hours booking gap
+
 > Dr. {surname}, what happens when a patient wants to book at your clinic at 9pm,
-> after you close? I built a system for it: patients book by chatting on WhatsApp
-> - no app, no call to the desk. See it: pragatisolutions.com. Try it:
-> demo.pragatisolutions.com. {sender}. Reply STOP to opt out.
+> after you close? Right now they wait till morning, call around, or forget. I
+> built a system for it: patients book by chatting on WhatsApp, day or night - no
+> app, no call to the desk, and they get an automatic reminder before every
+> visit. Plans start at Rs799/month, no setup fee, no per-booking charge, and the
+> first 14 days are free with no card needed. See it working in under a minute.
+> See it: pragatisolutions.com. Try it: demo.pragatisolutions.com. {sender}.
+> Reply STOP to opt out.
 
 Why it works: a specific, real moment they recognise, and the proof is them
 testing it in under a minute — no claim to take on trust. `demo.pragatisolutions.com`
-runs the live bot, so "try it" is literally true.
+runs the live bot, so "try it" is literally true. The pricing and no-setup-fee
+line are real published terms (pragatisolutions.com), not a claim — a dentist
+who checks finds it holds up.
 
 ---
 
 ## Variant B — a number they can't answer
 
+**Subject (internal label — not sent):** Missed appointments last week
+
 > Dr. {surname}, how many patients didn't show up at your clinic last week? Most
-> clinics don't track it. This WhatsApp booking system sends 24-hour reminders
-> with one-tap confirm, so the desk knows before a chair sits empty. See it:
-> pragatisolutions.com. Try it: demo.pragatisolutions.com. {sender}. Reply STOP
-> to opt out.
+> clinics don't track it, so it's easy to miss how much chair time actually sits
+> empty and how much that costs in lost fees. This WhatsApp booking system sends
+> automatic 24-hour reminders with one-tap confirm, flags who hasn't replied so
+> the desk can follow up before the slot goes to waste, and tracks the day's
+> collections so nothing is guessed at. Plans start at Rs799/month with a 14-day
+> free trial, no card needed. See it: pragatisolutions.com. Try it:
+> demo.pragatisolutions.com. {sender}. Reply STOP to opt out.
 
 Why it works: the question is about *their* practice and has no ready answer, so
-the loop stays open until they look. The reminder-and-confirm behaviour is a
-real feature, stated plainly. **Tightest variant** — with a long surname or
-sender it can tip to 3 segments; see sending notes.
+the loop stays open until they look. The reminder-and-confirm and day-close
+tracking are real features, stated plainly, and turn a vague worry ("we lose
+patients") into two concrete things the product actually does about it.
+**Longest of the four and closest to the 5th-segment boundary** — see sending
+notes before a bulk send.
 
 ---
 
 ## Variant C — your WhatsApp number is sitting idle
 
-> Dr. {surname}, your clinic probably has a WhatsApp number already. It could be
-> taking bookings, sending reminders and texting you each morning's schedule -
-> instead of just sitting there. See it: pragatisolutions.com. Try it:
-> demo.pragatisolutions.com. {sender}. Reply STOP to opt out.
+**Subject (internal label — not sent):** Your WhatsApp number is sitting idle
+
+> Dr. {surname}, your clinic probably has a WhatsApp number already. Right now it
+> likely just sits there between calls. On Meta's official WhatsApp Business
+> platform, it could instead be taking bookings any time of day, sending
+> reminders, texting you each morning's schedule, and answering basic questions
+> like your address and hours - instead of your front desk repeating them all
+> day, all for Rs799/month with a free 14-day trial and no card needed. See it:
+> pragatisolutions.com. Try it: demo.pragatisolutions.com. {sender}. Reply STOP
+> to opt out.
 
 Why it works: reframes something they already own as wasted — no new thing to
 buy in the framing, so the guard stays down. Every capability named is real
-(booking, reminders, the per-dentist morning schedule).
+(booking, reminders, the per-dentist morning schedule, address & hours), and
+naming Meta's official platform plus the price answers the "is this legitimate,
+what does it cost" question before it's even asked.
 
 ---
 
 ## Variant D — the treatments that never got finished  *(revenue angle)*
 
+**Subject (internal label — not sent):** Treatments advised but never finished
+
 > Dr. {surname}, of the root canals and implants you advised last month, how many
-> came back to finish? More slip away than most notice. This system nudges them
-> on WhatsApp and lets them book the next sitting themselves. See it:
+> patients came back to finish? More slip away than most notice, especially
+> multi-visit cases. This system tracks each course as one plan, nudges the
+> patient on WhatsApp when the next sitting is due, and lets them book it
+> themselves - no phone tag needed from your desk, and no separate app for them
+> to install. Free for 14 days, no card, from Rs799/month after. See it:
 > pragatisolutions.com. Try it: demo.pragatisolutions.com. {sender}. Reply STOP
 > to opt out.
 
 Why it works: names a real, expensive gap and makes the dentist supply the
-number themselves — no fabricated statistic. The nudge-and-self-book mechanism
-is a real feature.
+number themselves — no fabricated statistic. Tracking the course "as one plan"
+and the nudge-and-self-book mechanism are real features, and naming the price
+turns curiosity into something they can act on immediately. **Shortest of the
+four** — most headroom before the next segment boundary; see sending notes.
 
 ---
 
@@ -160,13 +197,21 @@ is a real feature.
 ## Sending notes
 
 - **Keep it ASCII.** These variants use straight quotes and `-`, no em dashes or
-  arrows, so they encode as GSM-7. With both URLs they run ~270–305 characters
-  = **2 SMS segments** (153 chars/segment when concatenated). Variant B and a
-  long `{sender}` can push past 306 into a 3rd segment — check your final,
-  merged text in the DLT console before the bulk send. A 3rd segment is still
-  cheap (~₹0.10–0.15 more per recipient); losing GSM-7 is not — a single curly
-  apostrophe or arrow flips the whole message to Unicode (70 chars/segment) and
-  roughly doubles the cost.
+  arrows, so they encode as GSM-7. The bodies were expanded again in this pass
+  to carry real pricing/product data (not just more words) and, with both URLs,
+  now run ~535–595 characters (measuring the merge tokens `{surname}`/`{sender}`
+  at their literal length, same convention as before) = **4 SMS segments** each
+  (153 chars/segment when concatenated, up to 612 total) — up from 2 segments
+  before this pass. Variant D is shortest (~540 chars, most headroom) and
+  Variant B is longest (~595 chars, closest to the 612-char/5th-segment
+  boundary) — a long `{surname}` or `{sender}` merge value can tip B past it;
+  check your final, merged text in the DLT console before the bulk send. Each
+  extra segment is still cheap (~₹0.10–0.15 more per recipient); losing GSM-7 is
+  not — a single curly apostrophe or arrow flips the whole message to Unicode
+  (70 chars/segment) and roughly doubles the segment count for the same text.
+  This also means each variant needs its own DLT template re-registered before
+  it can be sent — the previously-registered 2-segment templates don't cover
+  this longer text, and template approval isn't instant.
 - **Compliance:** DLT-registered template, `STOP` opt-out in every message, send
   11:00–18:00 IST, throttle to a volume you can support.
 - **Do not send this over WhatsApp** to numbers that haven't opted in — the
