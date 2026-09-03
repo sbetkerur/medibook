@@ -8,7 +8,10 @@
  * slots. This file builds the LIFE inside it: patients, appointments across
  * every status, treatment plans in every state, payments, lab work, recalls,
  * feedback and front-desk requests — so a prospect who opens any dashboard tab,
- * report or chart sees something real instead of an empty state.
+ * report or chart sees something real instead of an empty state. A curated set
+ * (one row per state) is followed by a larger SEEDED background layer — extra
+ * patients with visit history, more plans, payments, lab work, recalls and chat
+ * threads — so lists and charts carry the volume of a real single-branch practice.
  *
  * It runs on every boot right after `ensureDemoTenant()` (migrate.js), gated by
  * DEMO_SEED_DATA (default on) and DEMO_TENANT. It CLEARS the demo tenant's
@@ -430,6 +433,164 @@ async function seedDemoData() {
          VALUES ($1,$2,$3,$4,$5)`,
         [type === 'admin_alert' ? P(99) : phoneOf('priya'),
          dir, type, content, ago(1 - i * 0.01)]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  BULK BACKGROUND LAYER
+    //  Everything above is hand-shaped to light up ONE specific dashboard
+    //  state. This adds VOLUME on top — extra patients each with a spread
+    //  of past visits, a few more treatment courses, lab items, recalls
+    //  and chat threads — so lists, charts and revenue reports read like
+    //  an established single-branch practice, not a fixture.
+    //  Seeded RNG → every rebuild produces the same demo.
+    // ═══════════════════════════════════════════════════════════════════
+    const rnd = (() => {
+      let a = 0x51ed2c93;
+      return () => {
+        a |= 0; a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    })();
+    const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+    const rint = (lo, hi) => lo + Math.floor(rnd() * (hi - lo + 1));
+
+    const FIRST = ['Aarav', 'Vihaan', 'Ishaan', 'Kabir', 'Reyansh', 'Ayaan', 'Dhruv', 'Arnav',
+      'Ananya', 'Diya', 'Aadhya', 'Anika', 'Navya', 'Sara', 'Aarohi', 'Riya',
+      'Suresh', 'Ramesh', 'Girish', 'Harish', 'Mahesh', 'Naveen', 'Rajesh', 'Vijay',
+      'Divya', 'Shruti', 'Rekha', 'Sunita', 'Anjali', 'Kavita', 'Latha', 'Geetha'];
+    const LAST = ['Rao', 'Shetty', 'Menon', 'Nair', 'Iyer', 'Reddy', 'Gupta', 'Sharma', 'Kumar',
+      'Joshi', 'Desai', 'Patel', 'Hegde', 'Bhat', 'Pai', 'Kamath', 'Shenoy', 'Naik'];
+    const SOURCES = ['google', 'friend', 'doctor_referral', 'social', 'walk_past', 'returning', 'other', null];
+    const METHODS = ['cash', 'cash', 'upi', 'upi', 'upi', 'card', 'bank_transfer'];
+    const TIMES = ['10:00', '10:30', '11:00', '11:30', '12:00', '15:00', '15:30', '16:00', '16:30', '17:00'];
+    const BULK_COMMENTS = ['Very professional, clean clinic.', null, 'Quick appointment, barely any wait.',
+      'Doctor explained the options clearly.', null, 'Friendly staff at the front desk.',
+      'Painless, happy with the result.', 'Good experience overall.', null,
+      'Booking on WhatsApp was so convenient.', 'Slightly long wait but worth it.', null,
+      'Fair pricing, no surprises.'];
+    const DOC_DEPT = [
+      ...Array(5).fill({ doc: ANANYA, dep: GD }),
+      ...Array(2).fill({ doc: VIKRAM, dep: RCT }),
+      { doc: NISHA, dep: ORTHO }, { doc: NISHA, dep: COSM },
+    ];
+
+    // — extra patients, each with a history of past visits —
+    const bpids = [];
+    for (let i = 0; i < 19; i++) {
+      const nVisits = rint(1, 5);
+      const earliest = rint(35, 280);
+      const bpid = await mkPatient({
+        name: `${pick(FIRST)} ${pick(LAST)}`, phone: P(40 + i),
+        gender: rnd() < 0.5 ? 'male' : 'female',
+        dob: `${rint(1962, 2008)}-${String(rint(1, 12)).padStart(2, '0')}-${String(rint(1, 28)).padStart(2, '0')}`,
+        visits: nVisits, source: pick(SOURCES),
+        joinedDaysAgo: earliest + 10, firstVisit: dstr(-earliest),
+      });
+      bpids.push(bpid);
+
+      let d = earliest;
+      for (let v = 0; v < nVisits; v++) {
+        const { doc, dep } = pick(DOC_DEPT);
+        const roll = rnd();
+        const status = roll < 0.76 ? 'completed' : roll < 0.88 ? 'no_show' : 'cancelled';
+        let payStatus = 'pending', method = null;
+        if (status === 'completed') {
+          const pr = rnd();
+          if (pr < 0.7) { payStatus = 'paid'; method = pick(METHODS); }
+          else if (pr >= 0.88) { payStatus = 'waived'; }
+        }
+        const apptId = await mkAppt({
+          patientId: bpid, doctorId: doc, deptId: dep, date: dstr(-d), time: pick(TIMES),
+          status, daysAgo: d, paymentStatus: payStatus, paymentMethod: method,
+          cancelReason: status === 'cancelled'
+            ? pick(['Something came up', 'Schedule clash', 'Feeling better now', 'Will rebook later']) : undefined,
+          feedbackRequestSent: status === 'completed',
+        });
+        if (status === 'completed' && rnd() < 0.55) {
+          await c.query(
+            `INSERT INTO appointment_feedback (appointment_id, patient_id, rating, comment, created_at)
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT (appointment_id) DO NOTHING`,
+            [apptId, bpid, pick([5, 5, 5, 4, 4, 4, 3, 5, 4, 2]), pick(BULK_COMMENTS), ago(Math.max(1, d - 1))]);
+        }
+        d = Math.max(2, d - rint(20, 70));
+      }
+    }
+    const bp = (i) => bpids[i % bpids.length];
+
+    // — a few more treatment courses on the new patients —
+    await mkPlan({ patientId: bp(0), deptId: GD, advisedBy: ANANYA, title: 'Composite filling — tooth 37',
+      tooth: '37', totalVisits: 1, estimatedCost: 2500, status: 'proposed', advisedDaysAgo: 4 });
+    await mkPlan({ patientId: bp(3), deptId: RCT, advisedBy: VIKRAM, title: 'Root canal — tooth 25',
+      tooth: '25', totalVisits: 2, estimatedCost: 8500, status: 'proposed', advisedDaysAgo: 9,
+      notes: 'Irreversible pulpitis. RCT advised over two visits.' });
+
+    const bplA = await mkPlan({ patientId: bp(5), deptId: RCT, advisedBy: VIKRAM, title: 'Root canal + crown — tooth 46',
+      tooth: '46', totalVisits: 3, estimatedCost: 14000, status: 'in_progress', advisedDaysAgo: 26,
+      consent: 'RCT and crown procedure, alternatives (extraction) and risks explained. Consented.' });
+    await mkAppt({ patientId: bp(5), doctorId: VIKRAM, deptId: RCT, date: dstr(-18), status: 'completed', daysAgo: 18, planId: bplA, visitNumber: 1, paymentStatus: 'paid', paymentMethod: 'upi' });
+    await mkAppt({ patientId: bp(5), doctorId: VIKRAM, deptId: RCT, date: dstr(-4), status: 'completed', daysAgo: 4, planId: bplA, visitNumber: 2, paymentStatus: 'pending' });
+    await mkAppt({ patientId: bp(5), doctorId: VIKRAM, deptId: RCT, date: dstr(5), time: '11:00', status: 'confirmed', bookSlot: true, planId: bplA, visitNumber: 3 });
+    await mkPayment(bplA, 5000, 'upi', 18, 'Visit 1');
+
+    const bplB = await mkPlan({ patientId: bp(8), deptId: COSM, advisedBy: NISHA, title: 'Composite veneers — 11, 21',
+      totalVisits: 2, estimatedCost: 16000, status: 'in_progress', advisedDaysAgo: 15 });
+    await mkAppt({ patientId: bp(8), doctorId: NISHA, deptId: COSM, date: dstr(-9), status: 'completed', daysAgo: 9, planId: bplB, visitNumber: 1, paymentStatus: 'paid', paymentMethod: 'card' });
+    await mkAppt({ patientId: bp(8), doctorId: NISHA, deptId: COSM, date: dstr(6), time: '15:00', status: 'confirmed', bookSlot: true, planId: bplB, visitNumber: 2 });
+    await mkPayment(bplB, 8000, 'card', 9, 'Veneers — sitting 1');
+
+    const bplC = await mkPlan({ patientId: bp(11), deptId: GD, advisedBy: ANANYA, title: 'Crown — tooth 16',
+      tooth: '16', totalVisits: 2, estimatedCost: 13000, status: 'in_progress', advisedDaysAgo: 52 });
+    await mkAppt({ patientId: bp(11), doctorId: ANANYA, deptId: GD, date: dstr(-47), status: 'completed', daysAgo: 47, planId: bplC, visitNumber: 1, paymentStatus: 'paid', paymentMethod: 'cash' });
+    await mkPayment(bplC, 4000, 'cash', 47, 'Crown prep — advance');
+
+    const bplD = await mkPlan({ patientId: bp(14), deptId: RCT, advisedBy: VIKRAM, title: 'Root canal — tooth 36',
+      tooth: '36', totalVisits: 2, estimatedCost: 9000, status: 'completed', advisedDaysAgo: 40 });
+    await mkAppt({ patientId: bp(14), doctorId: VIKRAM, deptId: RCT, date: dstr(-36), status: 'completed', daysAgo: 36, planId: bplD, visitNumber: 1, paymentStatus: 'paid', paymentMethod: 'upi' });
+    await mkAppt({ patientId: bp(14), doctorId: VIKRAM, deptId: RCT, date: dstr(-22), status: 'completed', daysAgo: 22, planId: bplD, visitNumber: 2, paymentStatus: 'paid', paymentMethod: 'upi' });
+    await mkPayment(bplD, 9000, 'upi', 22, 'RCT — paid in full');
+
+    await mkPlan({ patientId: bp(17), deptId: COSM, advisedBy: NISHA, title: 'Teeth whitening (in-office)',
+      totalVisits: 1, estimatedCost: 5500, status: 'declined', advisedDaysAgo: 14, notes: 'Cost concern — will revisit.' });
+
+    // — more lab work, mixed status —
+    await mkLab({ planId: bplA, patientId: bp(5), item: 'Zirconia crown — 46', status: 'pending', expected: dstr(4), cost: 6500, createdDaysAgo: 4 });
+    await mkLab({ planId: bplC, patientId: bp(11), item: 'PFM crown — 16', status: 'sent', sent: dstr(-40), expected: dstr(-10), cost: 5500, notes: 'Overdue — lab chased twice.', createdDaysAgo: 44 });
+    await mkLab({ planId: bplB, patientId: bp(8), item: 'Veneer mock-up — 11, 21', status: 'received', sent: dstr(-14), expected: dstr(-6), received: dstr(-5), cost: 3000, lab: 'Apex Ceramics', createdDaysAgo: 14 });
+    await mkLab({ planId: bplD, patientId: bp(14), item: 'Post & core — 36', status: 'fitted', sent: dstr(-30), expected: dstr(-24), received: dstr(-23), cost: 2200, createdDaysAgo: 30 });
+    await mkLab({ patientId: bp(2), item: 'Night guard (upper)', status: 'sent', sent: dstr(-6), expected: dstr(5), cost: 3500, createdDaysAgo: 6 });
+    await mkLab({ patientId: bp(9), item: 'Study models', status: 'received', sent: dstr(-20), expected: dstr(-14), received: dstr(-13), cost: 800, createdDaysAgo: 20 });
+
+    // — more recalls, mixed status (distinct patients → no partial-unique clash) —
+    for (let i = 0; i < 8; i++) {
+      const roll = rnd();
+      await mkRecall({
+        patientId: bpids[(i * 2 + 1) % bpids.length],
+        due: dstr(rint(-40, 45)),
+        status: roll < 0.55 ? 'due' : roll < 0.8 ? 'done' : 'dismissed',
+        reason: pick(['Routine check-up', 'Post-treatment review', 'Scaling & polishing due']),
+        sendCount: roll < 0.55 ? rint(0, 2) : 0, lastSentDaysAgo: 5,
+        createdDaysAgo: rint(150, 220),
+      });
+    }
+
+    // — a few more chat threads —
+    const bulkThreads = [
+      { k: 0, rows: [['in', 'text', 'Hi'], ['out', 'text', 'Welcome to Pragati Dental Studio 🦷\nReply *Menu* for options.'], ['in', 'interactive', 'My appointments'], ['out', 'text', 'You have no upcoming appointments. Reply *Menu* to book one.']] },
+      { k: 3, rows: [['in', 'text', 'Hello, do you do root canal treatment?'], ['out', 'text', 'Yes we do. Reply *Menu* and choose Book an appointment to see open times.'], ['in', 'interactive', 'Book an appointment'], ['out', 'text', 'Which treatment is it for?'], ['in', 'text', 'Root canal'], ['out', 'text', 'With Dr. Vikram Shetty. Open times this week: Wed 11:00, Fri 15:00.']] },
+      { k: 8, rows: [['in', 'text', 'i need to reschedule my appointment'], ['out', 'text', 'Sure — which day works better for you?'], ['in', 'text', 'next monday morning'], ['out', 'text', 'Dr. Nisha Menon has 10:00 and 11:30 on Monday. Reply with a time to confirm.']] },
+      { k: 12, rows: [['in', 'text', 'what are your timings'], ['out', 'text', 'Pragati Dental Studio is open Mon–Sat, 10:00–13:00 and 15:00–19:00. Reply *Menu* → Address & Phone for directions.']] },
+    ];
+    for (const th of bulkThreads) {
+      const base = rint(3, 22);
+      for (let i = 0; i < th.rows.length; i++) {
+        const [dir, type, content] = th.rows[i];
+        await c.query(
+          `INSERT INTO wa_messages (phone, direction, message_type, content, created_at)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [P(40 + th.k), dir, type, content, ago(base - i * 0.02)]);
+      }
     }
 
     // ── DOCTOR FLAG: visiting orthodontist ───────────────────────────
