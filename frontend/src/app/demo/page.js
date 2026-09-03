@@ -95,7 +95,12 @@ export default function DemoPage() {
 
           <p className="mt-4 text-center text-sm text-gray-500">
             Ready to run your own clinic on it?{' '}
-            <a href="/signup" className="font-medium text-blue-600 hover:underline">
+            <a
+              href="https://pragatisolutions.com/contact"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-medium text-blue-600 hover:underline"
+            >
               Start a free trial
             </a>
           </p>
