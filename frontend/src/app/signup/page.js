@@ -32,7 +32,7 @@ export default function SignupPage() {
   const [code, setCode] = useState('');
   const [resendIn, setResendIn] = useState(0);
   const [signupToken, setSignupToken] = useState('');
-  const [trialDays, setTrialDays] = useState(14);
+  const [trialDays, setTrialDays] = useState(30);
   const [submitted, setSubmitted] = useState(false);
   const [reviewPhone, setReviewPhone] = useState('');
 

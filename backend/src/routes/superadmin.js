@@ -339,7 +339,7 @@ router.post('/tenants/:id/approve', validateUUID(), async (req, res) => {
     // Start the card-free trial now. subscription_status 'trialing' is OUR
     // marker (not a Razorpay state) — jobs/billingDunning.js moves the tenant to
     // past_due when trial_end passes with no razorpay_subscription_id attached.
-    const trialDays = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '14', 10) || 14);
+    const trialDays = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '30', 10) || 30);
     await query(`
       INSERT INTO tenant_billing
         (tenant_id, provider, plan_id, razorpay_customer_id, subscription_status, trial_end, updated_at)

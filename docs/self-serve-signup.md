@@ -83,7 +83,7 @@ server log.
 
 ```
 SELF_SIGNUP_ENABLED=true
-SIGNUP_TRIAL_DAYS=14          # optional, default 14
+SIGNUP_TRIAL_DAYS=30          # optional, default 30
 SIGNUP_DUNNING_GRACE_DAYS=7   # optional, default 7
 ```
 
@@ -103,7 +103,7 @@ SIGNUP_DUNNING_GRACE_DAYS=7   # optional, default 7
 super admin
      POST /superadmin/tenants/:id/approve
          builds the PG schema + first admin user (from pending_signups),
-         starts the 14-day card-free trial (trial_end = now + SIGNUP_TRIAL_DAYS),
+         starts the 30-day card-free trial (trial_end = now + SIGNUP_TRIAL_DAYS),
          pending_review → active, stamps activated_at,
          WhatsApps the owner a login link (SIGNUP_APPROVED_TEMPLATE)
 

@@ -113,7 +113,7 @@ export default function LandingPage() {
             </a>
           </div>
           <p className="mt-3 text-xs text-gray-400">
-            14 days free · no card needed · we approve every clinic, usually the same day
+            30 days free · no card needed · we approve every clinic within 1 business day
           </p>
           <p className="mt-6 text-sm font-medium text-gray-700 lg:hidden">
             The live booking bot is right below — type a message and try it. ↓
@@ -270,7 +270,7 @@ export default function LandingPage() {
       <Section id="pricing" className="py-16">
         <h2 className="text-center text-3xl font-bold tracking-tight">Simple pricing</h2>
         <p className="mt-3 text-center text-sm text-gray-500">
-          14-day free trial on both. No card to start. Prices include GST.
+          30-day free trial on both. No card to start.
         </p>
         <div className="mx-auto mt-10 grid max-w-3xl gap-6 sm:grid-cols-2">
           <div className="rounded-2xl border border-gray-200 p-7">

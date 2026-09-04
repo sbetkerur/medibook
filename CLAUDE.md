@@ -829,7 +829,7 @@ owner's password hash. No PG schema, no admin user, no session, no trial — the
 owner finishes on a "we'll WhatsApp you" screen and CANNOT log in.
 `POST /superadmin/tenants/:id/approve` then does the rest: it builds the schema +
 first admin user (`buildSelfServeTenantSchema`), starts the **card-free** trial
-(`SIGNUP_TRIAL_DAYS`, default 14; `trial_end = now + N`), flips the tenant to
+(`SIGNUP_TRIAL_DAYS`, default 30; `trial_end = now + N`), flips the tenant to
 `active`, stamps `activated_at`, and WhatsApps the owner a login link
 (`services/signupNotify.js`, `SIGNUP_APPROVED_TEMPLATE`, text fallback in dev).
 It is idempotent (`CREATE SCHEMA IF NOT EXISTS` + `INSERT … ON CONFLICT DO
@@ -1097,7 +1097,7 @@ scripts: `MEDIBOOK_BACKUP_DIR` (default `~/MediBookBackups`), `MEDIBOOK_BACKUP_K
 
 Self-serve signup (`docs/self-serve-signup.md`): `SELF_SIGNUP_ENABLED` (master
 switch, default false — the ONLY one required outside production, where the flag
-alone opens signup), `SIGNUP_TRIAL_DAYS` (default 14),
+alone opens signup), `SIGNUP_TRIAL_DAYS` (default 30),
 `SIGNUP_DUNNING_GRACE_DAYS` (default 7), `SIGNUP_TRIAL_SEND_CAP` (default 50 —
 clinic-initiated patient messages / 24h while a self-serve tenant is on the
 card-free trial; uncapped once paying), `SIGNUP_OTP_TEMPLATE` (+

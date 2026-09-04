@@ -2,7 +2,7 @@
 /**
  * Self-serve clinic signup — public, unauthenticated.
  *
- * The trial is CARD-FREE. A clinic gets 14 days on signing up; the card is only
+ * The trial is CARD-FREE. A clinic gets 30 days on signing up; the card is only
  * needed to keep going past the trial (POST /admin/billing/subscribe).
  *
  * Flow (frontend: src/app/signup/page.js):
@@ -45,7 +45,7 @@ const razorpay = require('../services/razorpay');
 const { issueOtp, verifyOtp, normalizePhone } = require('../services/otp');
 const { registerSelfServeTenant, schemaNameForSlug } = require('../services/signupProvision');
 
-const TRIAL_DAYS = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '14', 10) || 14);
+const TRIAL_DAYS = Math.max(0, parseInt(process.env.SIGNUP_TRIAL_DAYS || '30', 10) || 30);
 const PENDING_TTL_MINUTES = 45;
 
 // Slugs that would collide with a route, the demo clinic, or an obvious phish.
