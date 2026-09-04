@@ -80,7 +80,7 @@ router.get('/status', async (req, res) => {
   // Webhook processing backlog
   try {
     const r = await query(
-      `SELECT COUNT(*)::int AS n FROM failed_webhooks WHERE resolved_at IS NULL`);
+      `SELECT COUNT(*)::int AS n FROM failed_webhooks WHERE status IN ('pending','processing','failed')`);
     const backlog = r.rows[0]?.n ?? 0;
     out.components.webhook_queue = { ok: backlog < 50, unresolved: backlog };
     if (backlog >= 50) out.ok = false;

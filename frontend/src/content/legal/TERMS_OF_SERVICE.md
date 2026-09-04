@@ -57,8 +57,8 @@ additional branch is ₹1,799/month less any discount agreed in writing. Adding 
 branch increases your charge from the next cycle. Exceeding plan limits requires
 an upgrade.
 
-**Tax.** {{ENTITY}} is not GST-registered, so no GST is charged. We will give 30
-days' notice if that changes.
+**Tax.** Plan prices are GST-inclusive. We issue a GST tax invoice for every
+charge, showing {{ENTITY}}'s GSTIN and the tax breakdown.
 
 **Payment** is monthly in advance. We may suspend after fees are 30 days
 overdue, on 7 days' notice, and may change fees on 30 days' notice — you may

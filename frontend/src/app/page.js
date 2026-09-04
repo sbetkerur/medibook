@@ -270,7 +270,7 @@ export default function LandingPage() {
       <Section id="pricing" className="py-16">
         <h2 className="text-center text-3xl font-bold tracking-tight">Simple pricing</h2>
         <p className="mt-3 text-center text-sm text-gray-500">
-          30-day free trial on both. No card to start.
+          30-day free trial on both. No card to start. Prices are GST-inclusive.
         </p>
         <div className="mx-auto mt-10 grid max-w-3xl gap-6 sm:grid-cols-2">
           <div className="rounded-2xl border border-gray-200 p-7">

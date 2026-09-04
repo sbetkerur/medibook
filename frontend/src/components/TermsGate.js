@@ -118,7 +118,8 @@ export default function TermsGate({ version, canAccept, onAccepted }) {
             </li>
             <li className="list-disc">
               <strong>Billing.</strong> Starter is ₹799/month. Professional is
-              ₹1,799/month <em>per branch</em>. No GST is charged.
+              ₹1,799/month <em>per branch</em>, GST-inclusive — we issue a tax
+              invoice for every charge.
             </li>
             <li className="list-disc">
               <strong>If you leave</strong>, you can export everything for 30

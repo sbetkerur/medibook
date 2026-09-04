@@ -100,8 +100,7 @@ async function sendPatientMessage(schema, phone, { template, components, buttonP
   }
   if (template) {
     try {
-      await sendPatientTemplate(schema, phone, template,
-        [...(components || []), ...quickReplyComponents(buttonPayloads)], text);
+      await sendPatientTemplate(schema, phone, template, components, text, buttonPayloads);
       return { via: 'template' };
     } catch (err) {
       // Not an error worth surfacing: an unapproved template is the normal

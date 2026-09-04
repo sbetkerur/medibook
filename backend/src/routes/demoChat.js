@@ -52,9 +52,9 @@ const demoChatLimiter = rateLimit({
  * patient data to reach: nothing has ever written a `patients` row there
  * (the dashboard's read-only guard always blocked the admin walk-in route,
  * and the bot's own read-only guard now blocks its own booking path too), so
- * this can only ever address empty state. The '9999' prefix is a reserved
- * block, not a real Indian mobile prefix, so a synthetic phone reads
- * unmistakably fake in any log line it ends up in.
+ * this can only ever address empty state. The result is 18 digits — always
+ * longer than any real 10-digit Indian mobile number — so a synthetic phone
+ * reads unmistakably fake in any log line it ends up in.
  */
 function syntheticPhone(sessionId) {
   const hash = crypto.createHash('sha256').update(String(sessionId)).digest('hex');
